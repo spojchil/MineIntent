@@ -8,27 +8,5 @@ research/repos/
 __pycache__/
 *.pyc
 
-# Local Minecraft server runtime and worlds
-mcserver/.mc-server/
-mcserver/cache/
-mcserver/libraries/
-mcserver/logs/
-mcserver/plugins/
-mcserver/versions/
-mcserver/world/
-mcserver/world_nether/
-mcserver/world_the_end/
-mcserver/__pycache__/
-mcserver/*.jar
-mcserver/eula.txt
-mcserver/banned-ips.json
-mcserver/banned-players.json
-mcserver/ops.json
-mcserver/usercache.json
-mcserver/whitelist.json
-mcserver/bukkit.yml
-mcserver/commands.yml
-mcserver/help.yml
-mcserver/permissions.yml
-mcserver/spigot.yml
-mcserver/version_history.json
+# Local Minecraft server installations are not part of the repository.
+mcserver/

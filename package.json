@@ -9,7 +9,6 @@
     "dev": "tsx src/main.ts",
     "start": "tsx src/main.ts",
     "test": "tsx --test \"src/**/*.test.ts\"",
-    "test:paper": "tsx src/minecraft/paper-integration.ts",
     "test:paper:ci": "tsx src/integration/paper-ci-integration.ts"
   },
   "keywords": [],
@@ -22,7 +21,6 @@
   },
   "dependencies": {
     "mineflayer": "^4.37.1",
-    "mineflayer-pathfinder": "^2.4.5",
     "vec3": "^0.2.0",
     "zod": "^4.4.3"
   },
