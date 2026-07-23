@@ -5,7 +5,6 @@
   "private": true,
   "scripts": {
     "check": "tsc --noEmit",
-    "check:docs": "node scripts/check-docs.mjs",
     "dev": "tsx src/main.ts",
     "start": "tsx src/main.ts",
     "test": "tsx --test \"src/**/*.test.ts\"",

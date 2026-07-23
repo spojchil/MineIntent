@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: 开放讨论
-    url: https://github.com/spojchil/mineintent/discussions
+    url: https://github.com/spojchil/maineintent/discussions
     about: 尚未形成明确问题或方案的想法，请先在 Discussions 交流。
   - name: 安全问题
-    url: https://github.com/spojchil/mineintent/security/advisories/new
+    url: https://github.com/spojchil/maineintent/security/advisories/new
     about: 请私密报告漏洞、密钥泄露或其他安全问题。

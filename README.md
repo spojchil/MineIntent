@@ -2,126 +2,93 @@
 
 MineIntent 是一个面向 Minecraft Java Edition 的 AI 同伴项目。
 
-它不是只接受命令并交付结果的任务机器人，而是希望成为能够进入同一个世界，与玩家自然交流、共同生活、合作、探索、建造和冒险的游戏伙伴。
+它的目标不是成为只接受命令并交付结果的任务机器人，而是进入同一个世界，与玩家自然交流、共同生活、合作、探索、建造和冒险，缓解独自游玩时缺少朋友陪伴的问题。
 
-长期高层目标之一，是让它在经服务器管理方许可的外部原版生存服务器中，仅凭普通玩家能够获得的信息和合法游戏行为长期参与；其他玩家仅从游戏内观察，难以可靠区分它与一名较安静、反应较慢的普通玩家。这个目标强调行为可信和无作弊，不以虚假身份声明、规避反作弊或绕过服务器规则为手段。
+长期目标之一，是让同伴在服务器管理方许可的原版生存服务器中，只使用普通玩家可获得的信息和合法游戏行为参与游戏；其他玩家仅从游戏内长期观察，难以可靠区分它与一名较安静、反应较慢、技术普通的人类玩家。这个目标不授权规避反作弊、隐瞒部署身份或违反服务器规则。
 
 ## 当前状态
 
-项目已经实现首个纵向原型，但仍是开发者预览，尚不是可供长期日常游玩的成品。
+项目仍处于开发实验期，不是可供长期日常游玩的成品。
 
-> 默认分支 `main` 与最新实验分支并不相同：最新实验已经删除采木、跟随和 Action Runtime，换成一个很窄的可信注视闭环，但尚未形成新的接受架构。**逐项事实、分支提交、测试结果和 tracker 漂移见[当前项目状态](./docs/current-status.md)**；以下列表描述的是 `main`。
+当前工作集中在 [D40 look + move 端到端实验](./docs/d40-experiment.md)：让模型根据当前视野相对转头，再通过真实按键语义移动，并从动作后的新观察继续判断。它用于暴露延迟、费用、打断、碰撞和幻觉纠正等真实问题，不代表最终架构已经确定。
 
-目前已经完成：
-
-- 产品定位与体验设计。
-- 相邻 Agent、AI 伴侣和 Minecraft Bot 项目调研。
-- 事件驱动的持续同伴系统设计。
-- Mineflayer Backend、认知观察边界、受约束动作运行时与聊天调度。
-- “一起收集木材”共同活动的聊天、采集、暂停、危险反射、返回和跨重启记忆闭环。
-- OpenAI-compatible 模型适配器、可编辑自然语言同伴档案与本地持久数据。
-- 只绑定本机、只读且脱敏的同伴调试状态接口。
-- 基于持久基准世界副本的 Paper 1.21.1 self-hosted 集成测试。
-- 站立不动时的被动信息接口：生命/饥饿/氧气/经验/药水效果、背包内容、最近声音（相对方向与距离）、正前方合理视觉（视线方块与附近协议追踪实体）；同伴据此如实回答玩家提问，不臆造未观察到的信息。
-
-当前原型用来验证最小同伴闭环：玩家与 AI 通过游戏聊天形成“共同收集木材”的活动，AI 能参与、接受中途调整、处理简单意外、验证真实结果，并在重启后记住共同经历。它还没有完整生存能力树、成熟战斗或长期自主规划。
-
-真实 Paper 1.21.1 测试的本地与 self-hosted CI 用法见 [Paper 集成测试](./docs/guides/paper-integration.md)。
+已确认的能力、实验边界和首轮问题见[当前项目状态](./docs/current-status.md)。仓库不再用大量未来设计文档替尚不存在的实现背书；当前行为以代码、测试和真实运行结果为准。
 
 ## 核心原则
 
 1. AI 是可协商的队友，不是绝对服从的工具，也不与玩家争夺游戏主导权。
-2. 自主性来自同伴档案、关系、共同经历和当前情境，而不是一组机械性格参数。
-3. 语言、意图、行动、真实结果和记忆必须保持一致。
-4. 游戏动作只能通过可取消、带超时、可验证的能力执行。
-5. 记忆保留来源和证据，并允许纠正。
-6. 协议客户端获得的信息不自动等于同伴角色应该知道的信息。
-7. 同伴的知识、身体过程和游戏内表现应处于普通原版玩家的可能范围内。
+2. 语言、行动、真实结果和记忆应保持一致；模型声称不能替代世界事实。
+3. 同伴只能依据普通玩家可合法获得的信息行动。
+4. 游戏行为必须经过其他玩家可观察的正常身体过程，并能被暂停或停止。
+5. 先用小型纵向实验认识问题，再决定值得长期保留的机制。
 
 ## 文档
 
-- [文档总入口与真相优先级](./docs/README.md)
-- [当前项目状态](./docs/current-status.md)
+- [文档入口](./docs/README.md)
 - [产品设计](./docs/product-design.md)
-- [当前系统实况](./docs/architecture/current-system.md)
+- [当前项目状态](./docs/current-status.md)
+- [D40 实验](./docs/d40-experiment.md)
 - [架构决策记录](./docs/decisions/README.md)
-- [开放提案与具身决策登记册](./docs/proposals/README.md)
-- [项目演进史与早期档案](./docs/history/project-evolution.md)
-- [贡献与文档治理](./CONTRIBUTING.md)
+- [Paper 集成测试](./docs/guides/paper-integration.md)
+- [贡献规范](./CONTRIBUTING.md)
 
 ## 技术基线
 
-- Node.js 22 或更高版本。
-- TypeScript、ESM、pnpm。
-- Mineflayer 作为第一版 Minecraft Backend。
-- Minecraft Java Edition 1.21.1 测试服务器。
+- Node.js 22 或更高版本
+- TypeScript、ESM、pnpm
+- Python 3，用于当前模型服务
+- Mineflayer 作为第一版 Minecraft Backend
+- Minecraft Java Edition / Paper 1.21.1 测试环境
 
-技术基线会通过原型验证继续评估，不代表所有未来实现已经锁定。
+这些是当前实现选择，不是对所有未来后端和运行形态的承诺。
 
-## 本地验证
+## 本地运行
 
-安装依赖：
+安装依赖并复制配置：
 
-```powershell
+~~~powershell
 pnpm install
-```
-
-运行类型检查与文档检查：
-
-```powershell
-pnpm check
-pnpm check:docs
-```
-
-运行自动单元和契约测试：
-
-```powershell
-pnpm test
-```
-
-## 运行首个同伴原型
-
-复制配置样例并填写主要玩家名、模型服务地址、模型名和密钥：
-
-```powershell
 Copy-Item .env.example .env
-```
+~~~
 
-确保目标 Minecraft Java Edition 1.21.1 服务器已经运行，再启动同伴决策服务和 Node 进程（两个独立进程）：
+在 .env 中填写玩家名、模型服务地址、模型名和密钥，并为 Node 与本地 Agent Service 配置同一个独立随机令牌 `MINEINTENT_AGENT_SERVICE_TOKEN`（至少 32 个字符，不要复用模型密钥）。不要提交 .env、认证目录、私人聊天或世界存档。
 
-```powershell
+先启动模型服务：
+
+~~~powershell
 python agent-service/server.py
-```
+~~~
 
-```powershell
+再在另一个终端启动 MineIntent：
+
+~~~powershell
 pnpm start
-```
+~~~
 
-同伴通过游戏聊天与主要玩家交流。默认调试状态位于 `http://127.0.0.1:3211/v1/state`；该接口只有 GET 能力，不提供游戏控制，并会遮盖密钥、令牌和原始私人正文。
+同伴通过游戏聊天与玩家交流。当前模型服务与工具循环直接由 [agent-service/server.py](./agent-service/server.py) 及相邻测试定义。
 
-决策层（prompt 构造、OpenAI-compatible 调用与结果校验）在 `agent-service/`（Python，仅用标准库），通过本地 HTTP 与 Node 侧的 `CompanionRuntime` 交互，边界见该目录下的 [README](./agent-service/README.md)。Mineflayer 协议驱动、动作执行与编排仍在 Node 侧。模型密钥只从本地 `.env` 读取；`.env` 和运行数据目录 `.mineintent/` 已被 Git 忽略。运行细节见 [首个同伴原型](./docs/guides/companion-prototype.md)。
+## 验证
 
-在 `localhost:25565` 已运行受管理的 Paper 1.21.1 离线验证服务器时，可执行 Backend 生命周期集成验收：
+~~~powershell
+pnpm check
+pnpm test
+~~~
 
-```powershell
-pnpm test:paper
-```
+在仓库创建的临时 Paper 1.21.1 世界中运行通用生命周期与协议测试：
 
-该测试会杀死并传送测试 Bot，还会安全停止并重启本地 Paper。默认检测到其他玩家在线时拒绝执行。明确作为观察者上线时，可通过环境变量放行用户名：
+~~~powershell
+$env:MC_JAVA = "C:\path\to\java.exe"
+$env:MC_SERVER_JAR = "C:\path\to\paper-1.21.1.jar"
+$env:MC_SERVER_TEMPLATE = "C:\path\to\paper-template"
+$env:MC_EULA = "true"
+pnpm test:paper:ci
+~~~
 
-```powershell
-$env:MC_HOST = "localhost"
-$env:MC_PORT = "25565"
-$env:MC_USERNAME = "MineIntentBot"
-$env:MC_OBSERVER_USERNAMES = "spojchil"
-pnpm test:paper
-```
+该测试会控制测试 Bot，并可能停止或重启 Paper。不要在存在未授权玩家或重要世界存档时运行。更多说明见 [Paper 集成测试](./docs/guides/paper-integration.md)。
 
 ## 开发流程
 
-项目采用 GitHub Flow：非琐碎工作通过 Issue 说明目标，在短期分支中实现，由 Pull Request 关联 Issue 并经过自动检查后合并。
-
-硬规则只有一条：`main` 只通过合并 PR 变更。架构或产品方向的结论必须以一个合并的 PR 落地，`main` 上留下的 `(#NN)` 就是它的引用地址。详细规则见 [CONTRIBUTING.md](./CONTRIBUTING.md) 与[文档治理规则](./docs/documentation-policy.md)。
+项目使用 GitHub Flow。非琐碎改动在短期分支中完成，经 Pull Request 和自动检查后进入 main。设计讨论可以从实验开始；合并说明必须如实记录实际验证结果和仍未解决的问题。
 
 ## 许可证
 
