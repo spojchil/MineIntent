@@ -10,7 +10,7 @@ import type {
   BlockPosition,
   MinecraftBackendApi,
   MinecraftBackendConfig,
-  MinecraftControlsApi,
+  MinecraftMotorDriverApi,
   MinecraftSnapshotV1,
   ProtocolBlockEvent,
   ProtocolChatEvent,
@@ -32,7 +32,7 @@ import type {
 } from './internal.js'
 import { systemClock, systemRandom, systemScheduler } from './internal.js'
 import { DefaultMineflayerBotFactory } from './mineflayer-bot-factory.js'
-import { MineflayerGameControls } from './game-controls.js'
+import { MineflayerMotorDriver } from './motor-driver.js'
 import type { Bot } from 'mineflayer'
 import { buildSnapshot, isReady } from './snapshot.js'
 
@@ -200,10 +200,10 @@ export class MinecraftBackend implements MinecraftBackendApi {
     active.bot.chat(message)
   }
 
-  controls(): MinecraftControlsApi {
+  motor(): MinecraftMotorDriverApi {
     const active = this.#active
     if (!active || this.#state.status !== 'ready') throw new BackendNotReadyError()
-    return new MineflayerGameControls(active.bot as unknown as Bot)
+    return new MineflayerMotorDriver(active.bot as unknown as Bot)
   }
 
   observationSource(): ProtocolObservationSource {

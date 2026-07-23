@@ -21,10 +21,13 @@ export class BackendPerceptionPort implements PerceptionPort {
     return this.backend.observationSource().selfPose()
   }
 
+  revision(): number { return this.backend.snapshot().snapshotRevision }
+
   blockAt(position: PerceptionPose['position']): ReturnType<PerceptionPort['blockAt']> {
     const result = this.backend.observationSource().readBlock(position)
     if (result.status !== 'loaded') return 'unloaded'
-    return { name: result.block.name, solid: result.block.boundingBox !== 'empty' && result.block.name !== 'air' }
+    const visible = !['air', 'cave_air', 'void_air'].includes(result.block.name)
+    return { name: result.block.name, visible, occludes: visible && !result.block.transparentHint }
   }
 
   nearbyEntities(): readonly PerceptionEntityCandidate[] {
@@ -37,6 +40,7 @@ export class BackendPerceptionPort implements PerceptionPort {
         ...(entity.name ? { name: entity.name } : {}),
         ...(entity.username ? { username: entity.username } : {}),
         position: entity.position,
+        height: entity.height,
       }))
   }
 }

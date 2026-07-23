@@ -254,25 +254,17 @@ export interface BackendReady {
   snapshot: Readonly<MinecraftSnapshotV1>
 }
 
-export interface GameBlockTarget {
-  name: string
-  position: BlockPosition
-}
+export type MotorMoveDirection = 'forward' | 'back' | 'left' | 'right'
 
-export interface GameThreat {
-  name: string
-  position: Vec3Value
-  distance: number
-}
-
-export interface MinecraftControlsApi {
-  findNearestBlock(names: readonly string[], maxDistance: number): GameBlockTarget | undefined
-  navigateNear(position: Vec3Value, range: number, signal: AbortSignal): Promise<void>
-  navigateToPlayer(username: string, range: number, signal: AbortSignal): Promise<void>
-  dig(position: BlockPosition, signal: AbortSignal): Promise<GameBlockTarget>
-  inventoryCount(names: readonly string[]): number
-  nearestThreat(maxDistance: number): GameThreat | undefined
-  stop(): void
+/**
+ * The deliberately small physical boundary used by the D40 experiment. These methods are
+ * player inputs, not navigation or target-specific skills. A future observed-space navigation
+ * tool may be built above this boundary, but it must remain a distinct model-visible tool.
+ */
+export interface MinecraftMotorDriverApi {
+  lookRelative(yawDegrees: number, pitchDegrees: number, signal: AbortSignal): Promise<void>
+  move(direction: MotorMoveDirection, durationMs: number, sprint: boolean | undefined, signal: AbortSignal): Promise<void>
+  releaseAll(): void
 }
 
 export interface MinecraftBackendApi {
@@ -282,6 +274,6 @@ export interface MinecraftBackendApi {
   snapshot(): Readonly<MinecraftSnapshotV1>
   subscribe(listener: (event: BackendEventEnvelope) => void): Unsubscribe
   observationSource(): ProtocolObservationSource
-  controls(): MinecraftControlsApi
+  motor(): MinecraftMotorDriverApi
   sendChat(message: string): void
 }

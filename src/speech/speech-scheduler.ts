@@ -1,7 +1,6 @@
 import type { SpeechEvent, SpeechRequest, SpeechTransport } from './contracts.js'
 
 interface Queued { request: SpeechRequest; segments: string[]; next: number }
-type Pressure = 'normal' | 'precise_operation' | 'danger'
 
 export interface SpeechSchedulerOptions {
   maxSegmentLength?: number
@@ -19,9 +18,6 @@ export class SpeechScheduler {
   #queue: Queued[] = []
   #timer?: ReturnType<typeof setTimeout>
   #lastSentAt = Number.NEGATIVE_INFINITY
-  #pressure: Pressure = 'normal'
-  #accepted = new Set<string>()
-  #terminal = new Map<string, string>()
 
   constructor(transport: SpeechTransport, options: SpeechSchedulerOptions = {}) {
     this.#transport = transport
@@ -41,17 +37,6 @@ export class SpeechScheduler {
     this.#pump()
   }
 
-  actionAccepted(actionId: string): void { this.#accepted.add(actionId); this.#pump() }
-  actionTerminal(actionId: string, status: 'completed' | 'failed' | 'cancelled'): void { this.#terminal.set(actionId, status); this.#pump() }
-  setPressure(pressure: Pressure): void { this.#pressure = pressure; this.#pump() }
-
-  cancel(requestId: string, reason: string): boolean {
-    const before = this.#queue.length
-    this.#queue = this.#queue.filter(item => item.request.id !== requestId)
-    if (this.#queue.length !== before) this.#onEvent({ type: 'cancelled', requestId, reason })
-    return this.#queue.length !== before
-  }
-
   stop(reason = 'scheduler_stopped'): void {
     if (this.#timer) clearTimeout(this.#timer)
     this.#timer = undefined
@@ -59,27 +44,15 @@ export class SpeechScheduler {
     this.#queue = []
   }
 
-  #eligible(item: Queued): boolean {
-    if (item.request.urgency !== 'urgent' && this.#pressure !== 'normal') return false
-    const dependencies = item.request.dependsOn ?? []
-    if (item.request.timing === 'after_actions_accepted') return dependencies.length > 0 && dependencies.every(id => this.#accepted.has(id))
-    if (item.request.timing === 'after_action_terminal') {
-      if (dependencies.length !== 1) return false
-      const status = this.#terminal.get(dependencies[0]!)
-      return Boolean(status && (item.request.terminalCondition === 'any' || item.request.terminalCondition === status))
-    }
-    return true
-  }
-
   #pump(): void {
     if (this.#timer) return
     const item = this.#queue[0]
-    if (!item || !this.#eligible(item)) return
+    if (!item) return
     const delay = Math.max(0, this.#interval - (this.#now() - this.#lastSentAt))
     this.#timer = setTimeout(() => {
       this.#timer = undefined
       const current = this.#queue[0]
-      if (!current || !this.#eligible(current)) return this.#pump()
+      if (!current) return this.#pump()
       const text = current.segments[current.next]!
       try {
         this.#transport.send(text)

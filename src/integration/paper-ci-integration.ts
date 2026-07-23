@@ -1,36 +1,41 @@
 import assert from 'node:assert/strict'
-import path from 'node:path'
 import { copyFileSync, existsSync, rmSync, writeFileSync } from 'node:fs'
+import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import mineflayer, { type Bot } from 'mineflayer'
-import { randomUUID } from 'node:crypto'
-import { CompanionRuntime } from '../companion/runtime.js'
-import { JsonlEventJournal } from '../events/journal.js'
-import { FileMemoryStore } from '../memory/memory-store.js'
 import type { BackendEventEnvelope, BackendLifecyclePayload } from '../minecraft/contracts.js'
 import { defaultMinecraftBackendConfig } from '../minecraft/config.js'
 import { MinecraftBackend } from '../minecraft/minecraft-backend.js'
-import { DebugStateStore } from '../telemetry/debug-state.js'
+import type { ScenarioResult } from './contracts.js'
 import { JsonlIntegrationRecorder } from './recorder.js'
 import { PaperProcessServer } from './paper-process-server.js'
 import { PaperScenarioRunner } from './scenario-runner.js'
-import { PrototypeScenarioModel } from './prototype-scenario-model.js'
 
+// This suite validates reusable Paper and protocol boundaries only. Product behavior
+// experiments belong in their own scenarios and must not become CI architecture by accident.
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
 const runId = process.env.GITHUB_RUN_ID ?? `local-${Date.now()}`
 const artifactsRoot = path.resolve(process.env.MC_ARTIFACTS_DIR ?? path.join(root, '.artifacts', 'paper'))
 const runtimeDirectory = path.join(artifactsRoot, runId, 'server')
-const templateDirectory = required('MC_SERVER_TEMPLATE')
-const port = Number(process.env.MC_PORT ?? 25566)
-const username = process.env.MC_USERNAME ?? 'MineIntentBotCI'
+const templateDirectory = requiredPath('MC_SERVER_TEMPLATE')
+const java = required('MC_JAVA')
+const jar = requiredPath('MC_SERVER_JAR')
+const port = readPort(process.env.MC_PORT ?? '25566')
+const username = readMinecraftUsername(process.env.MC_USERNAME ?? 'MineIntentBotCI')
 const recorder = new JsonlIntegrationRecorder(artifactsRoot, runId)
 const server = new PaperProcessServer({
-  java: required('MC_JAVA'), jar: required('MC_SERVER_JAR'), directory: runtimeDirectory, port,
-  eulaAccepted: process.env.MC_EULA === 'true', templateDirectory, startupTimeoutMs: 180_000, stopTimeoutMs: 90_000,
+  java,
+  jar,
+  directory: runtimeDirectory,
+  port,
+  eulaAccepted: process.env.MC_EULA === 'true',
+  templateDirectory,
+  startupTimeoutMs: 180_000,
+  stopTimeoutMs: 90_000,
 })
 
 async function main(): Promise<void> {
-  const results = []
+  const results: ScenarioResult[] = []
   let backend: MinecraftBackend | undefined
   try {
     await ensureTemplate()
@@ -46,10 +51,8 @@ async function main(): Promise<void> {
     backend = undefined
 
     const bot = await connectBot(username)
-    try { results.push(...await behaviorScenarios(bot)) }
+    try { results.push(...await protocolScenarios(bot)) }
     finally { bot.quit('integration_complete') }
-
-    results.push(await companionPrototypeScenario())
 
     assert.equal(results.every(result => result.status === 'passed'), true, JSON.stringify(results))
   } finally {
@@ -64,141 +67,50 @@ async function main(): Promise<void> {
   }
 }
 
-async function companionPrototypeScenario() {
-  const runner = new PaperScenarioRunner(recorder)
-  const companionName = 'IntentBotCI', playerName = 'IntentPlayerCI'
-  const dataDirectory = path.join(recorder.directory, 'prototype-data')
-  const memoryFile = path.join(dataDirectory, 'memories.json')
-  let player: Bot | undefined
-  let runtime: CompanionRuntime | undefined
-  let backend: MinecraftBackend | undefined
-  return runner.run({
-    name: 'companion-v0.1-vertical-slice', timeoutMs: 240_000,
-    setup: async ctx => {
-      player = await connectBot(playerName)
-      server.send(`execute at ${playerName} run fill ~-8 ~-1 ~-8 ~12 ~-1 ~8 minecraft:stone`)
-      server.send(`execute at ${playerName} run fill ~-8 ~ ~-8 ~12 ~5 ~8 minecraft:air`)
-      for (let index = 3; index <= 9; index++) server.send(`execute at ${playerName} run setblock ~${index} ~ ~ minecraft:oak_log`)
-      await waitUntil(() => player!.blockAt(player!.entity.position.offset(0, -1, 0).floored())?.name === 'stone', 10_000, 'prototype platform')
-      ctx.record('setup', 'prototype_fixture_ready', { playerName, companionName, logCount: 7 })
-    },
-    run: async ctx => {
-      const messages: string[] = []
-      player!.on('chat', (sender, message) => { if (sender === companionName) messages.push(message) })
-      const firstModel = new PrototypeScenarioModel()
-      const first = createPrototypeRuntime(companionName, playerName, firstModel, memoryFile, dataDirectory, 'first')
-      runtime = first.runtime; backend = first.backend
-      await runtime.start()
-      server.send(`tp ${companionName} ${player!.entity.position.x} ${player!.entity.position.y} ${player!.entity.position.z + 1}`)
-      await waitUntil(() => distance(backend!.snapshot().self.position, player!.entity.position) < 3, 10_000, 'companion fixture teleport')
-      await waitUntil(() => messages.some(message => message.includes('我来了')), 10_000, 'natural greeting')
-
-      player!.chat('一起收集些木头吧')
-      await waitUntil(() => first.debug.snapshot().currentAction?.skill === 'collect_wood', 15_000, 'wood collection action')
-      const activityAnchor = runtime.activity()?.anchor
-      assert.ok(activityAnchor)
-      player!.chat('等一下')
-      await waitUntil(() => runtime!.activity()?.status === 'paused' && !first.debug.snapshot().currentAction, 15_000, 'deterministic pause')
-      await waitUntil(() => messages.some(message => message.includes('停下')), 5_000, 'pause acknowledgement')
-      ctx.record('assertion', 'pause_verified', { wood: woodCount(backend.snapshot()) })
-
-      const woodBeforeResume = woodCount(backend.snapshot())
-      player!.chat('继续吧')
-      await waitUntil(() => woodCount(backend!.snapshot()) >= woodBeforeResume + 2, 60_000, 'verified wood pickup after resume')
-      ctx.record('assertion', 'resume_and_pickup_verified', { before: woodBeforeResume, after: woodCount(backend.snapshot()) })
-
-      server.send(`damage ${companionName} 13`)
-      await waitUntil(() => messages.some(message => message.includes('有危险')), 15_000, 'danger warning')
-      server.send(`effect give ${companionName} minecraft:instant_health 1 5 true`)
-      await waitUntil(() => backend!.snapshot().self.health > 8, 10_000, 'companion healed')
-      ctx.record('assertion', 'danger_response_verified', { health: backend.snapshot().self.health })
-
-      player!.chat('够了，我们回刚才那里吧')
-      await waitUntil(() => runtime!.activity()?.status === 'completed', 90_000, 'activity completion')
-      assert.equal(distance(backend.snapshot().self.position, activityAnchor) <= 3, true)
-      const memories = await new FileMemoryStore(memoryFile).list('paper-ci-v0.1')
-      assert.equal(memories.length, 1)
-      assert.equal(memories[0]!.evidence.some(evidence => evidence.kind === 'action_result'), true)
-      ctx.record('assertion', 'first_session_verified', { wood: woodCount(backend.snapshot()), memoryId: memories[0]!.id })
-
-      await runtime.stop('prototype_restart')
-      runtime = undefined; backend = undefined
-      await delay(500)
-
-      const secondModel = new PrototypeScenarioModel()
-      const second = createPrototypeRuntime(companionName, playerName, secondModel, memoryFile, dataDirectory, 'second')
-      runtime = second.runtime; backend = second.backend
-      await runtime.start()
-      server.send(`tp ${companionName} ${player!.entity.position.x} ${player!.entity.position.y} ${player!.entity.position.z + 1}`)
-      await waitUntil(() => secondModel.contexts[0]?.memories.length === 1, 15_000, 'startup memory retrieval')
-      const messageStart = messages.length
-      player!.chat('上次我们做了什么？')
-      await waitUntil(() => messages.slice(messageStart).some(message => message.includes('上次我们一起收集了木材')), 20_000, 'cross-session memory answer')
-      assert.equal(second.debug.snapshot().decision?.retrievedMemoryIds.includes(memories[0]!.id), true)
-      ctx.record('assertion', 'restart_memory_verified', { memoryId: memories[0]!.id, debug: second.debug.snapshot() })
-    },
-    cleanup: async ctx => {
-      if (runtime) await runtime.stop('prototype_cleanup')
-      runtime = undefined; backend = undefined
-      player?.quit('prototype_complete'); player = undefined
-      server.send('kill @e[type=minecraft:item]')
-      ctx.record('cleanup', 'prototype_clients_stopped', {})
-    },
-  })
-}
-
-function createPrototypeRuntime(
-  companionName: string,
-  playerName: string,
-  model: PrototypeScenarioModel,
-  memoryFile: string,
-  dataDirectory: string,
-  session: string,
-) {
-  const backend = new MinecraftBackend({
-    worldId: 'paper-ci-v0.1', server: { host: '127.0.0.1', port, version: '1.21.1' },
-    identity: { username: companionName, auth: 'offline' }, ...defaultMinecraftBackendConfig,
-    timeouts: { connectMs: 10_000, loginMs: 20_000, spawnMs: 60_000, stopMs: 5_000 },
-    reconnect: { ...defaultMinecraftBackendConfig.reconnect, initialDelayMs: 250, maxDelayMs: 1_000 },
-  })
-  const debug = new DebugStateStore()
-  const runtime = new CompanionRuntime({
-    backend, model, memory: new FileMemoryStore(memoryFile),
-    journal: new JsonlEventJournal(path.join(dataDirectory, `events-${session}.jsonl`), 'paper-ci-v0.1', randomUUID()),
-    profile: { profileId: 'ci-companion', versionId: 'ci-v1', content: '你是可靠、自然且诚实的 Minecraft 伙伴。', sourcePath: 'ci-profile' },
-    debug, primaryPlayer: playerName, speechIntervalMs: 100,
-  })
-  return { runtime, backend, debug }
-}
-
 async function ensureTemplate(): Promise<void> {
   if (existsSync(path.join(templateDirectory, 'world', 'level.dat'))) {
     recorder.record('template', 'setup', 'template_reused', { templateDirectory })
     return
   }
   const builder = new PaperProcessServer({
-    java: required('MC_JAVA'), jar: required('MC_SERVER_JAR'), directory: templateDirectory, port,
-    eulaAccepted: process.env.MC_EULA === 'true', startupTimeoutMs: 180_000, stopTimeoutMs: 90_000,
+    java,
+    jar,
+    directory: templateDirectory,
+    port,
+    eulaAccepted: process.env.MC_EULA === 'true',
+    startupTimeoutMs: 180_000,
+    stopTimeoutMs: 90_000,
   })
   recorder.record('template', 'setup', 'template_generation_started', { templateDirectory })
   builder.prepareFresh()
-  try { await builder.start() } finally { await builder.stop() }
-  writeFileSync(path.join(templateDirectory, 'mineintent-template.json'), `${JSON.stringify({ minecraft: '1.21.1', paperBuild: 133, createdAt: new Date().toISOString() }, null, 2)}\n`, 'utf8')
+  try { await builder.start() }
+  finally { await builder.stop() }
+  writeFileSync(
+    path.join(templateDirectory, 'mineintent-template.json'),
+    `${JSON.stringify({ minecraft: '1.21.1', createdAt: new Date().toISOString() }, null, 2)}\n`,
+    'utf8',
+  )
   recorder.record('template', 'cleanup', 'template_generation_completed', { templateDirectory })
 }
 
-async function lifecycleScenario() {
+async function lifecycleScenario(): Promise<{ result: ScenarioResult; backend: MinecraftBackend }> {
   const events: BackendEventEnvelope[] = []
   const backend = new MinecraftBackend({
-    worldId: 'paper-ci-1.21.1', server: { host: '127.0.0.1', port, version: '1.21.1' },
-    identity: { username, auth: 'offline' }, ...defaultMinecraftBackendConfig,
+    worldId: 'paper-ci-lifecycle',
+    server: { host: '127.0.0.1', port, version: '1.21.1' },
+    identity: { username, auth: 'offline' },
+    ...defaultMinecraftBackendConfig,
     timeouts: { connectMs: 10_000, loginMs: 20_000, spawnMs: 60_000, stopMs: 5_000 },
     reconnect: { ...defaultMinecraftBackendConfig.reconnect, initialDelayMs: 250, maxDelayMs: 1_000, stableResetMs: 2_000 },
   })
-  backend.subscribe(event => { events.push(event); recorder.record('lifecycle-death-reconnect', 'companion', 'backend_event', event) })
+  backend.subscribe(event => {
+    events.push(event)
+    recorder.record('lifecycle-death-reconnect', 'companion', 'backend_event', event)
+  })
   const runner = new PaperScenarioRunner(recorder)
   const result = await runner.run({
-    name: 'lifecycle-death-reconnect', timeoutMs: 180_000,
+    name: 'lifecycle-death-reconnect',
+    timeoutMs: 180_000,
     setup: async ctx => { ctx.record('setup', 'known_state', { freshWorld: true, port }) },
     run: async ctx => {
       const ready = await backend.start(ctx.signal)
@@ -217,11 +129,12 @@ async function lifecycleScenario() {
   return { result, backend }
 }
 
-async function behaviorScenarios(bot: Bot) {
+async function protocolScenarios(bot: Bot): Promise<ScenarioResult[]> {
   const runner = new PaperScenarioRunner(recorder)
-  const results = []
+  const results: ScenarioResult[] = []
   results.push(await runner.run({
-    name: 'movement', timeoutMs: 30_000,
+    name: 'protocol-movement',
+    timeoutMs: 30_000,
     setup: async ctx => { await fixture(bot); ctx.record('setup', 'fixture_ready', {}) },
     run: async ctx => {
       const start = bot.entity.position.clone()
@@ -230,33 +143,44 @@ async function behaviorScenarios(bot: Bot) {
       try { await waitUntil(() => bot.entity.position.distanceTo(start) >= 2, 10_000, 'two-block movement') }
       finally { bot.setControlState('forward', false) }
       ctx.record('assertion', 'movement_verified', { distance: bot.entity.position.distanceTo(start) })
-    }, cleanup: async () => bot.clearControlStates(),
+    },
+    cleanup: async () => bot.clearControlStates(),
   }))
   results.push(await runner.run({
-    name: 'movement-cancellation', timeoutMs: 30_000,
+    name: 'protocol-movement-cancellation',
+    timeoutMs: 30_000,
     setup: async () => fixture(bot),
     run: async ctx => {
       await bot.lookAt(bot.entity.position.offset(6, 0, 0), true)
-      bot.setControlState('forward', true); await delay(250); bot.clearControlStates()
-      const cancelledAt = bot.entity.position.clone(); await delay(750)
+      bot.setControlState('forward', true)
+      await delay(250)
+      bot.clearControlStates()
+      const cancelledAt = bot.entity.position.clone()
+      await delay(750)
       const drift = bot.entity.position.distanceTo(cancelledAt)
       assert.equal(drift < 0.35, true, `Bot drifted ${drift} blocks after cancellation`)
       ctx.record('assertion', 'cancellation_verified', { drift })
-    }, cleanup: async () => bot.clearControlStates(),
+    },
+    cleanup: async () => bot.clearControlStates(),
   }))
   results.push(await runner.run({
-    name: 'dig-and-inventory', timeoutMs: 45_000,
+    name: 'protocol-dig-and-inventory',
+    timeoutMs: 45_000,
     setup: async ctx => {
-      await fixture(bot); server.send(`clear ${username}`); server.send(`give ${username} minecraft:iron_pickaxe 1`)
-      server.send(`execute at ${username} run setblock ~1 ~ ~ minecraft:stone`)
+      await fixture(bot)
+      server.send(`clear ${bot.username}`)
+      server.send(`give ${bot.username} minecraft:iron_pickaxe 1`)
+      server.send(`execute at ${bot.username} run setblock ~1 ~ ~ minecraft:stone`)
       await waitUntil(() => bot.inventory.items().some(item => item.name === 'iron_pickaxe'), 10_000, 'iron pickaxe inventory')
       await waitUntil(() => bot.blockAt(bot.entity.position.offset(1, 0, 0).floored())?.name === 'stone', 10_000, 'dig target block')
       ctx.record('setup', 'dig_fixture_ready', { relativeBlock: [1, 0, 0] })
     },
     run: async ctx => {
-      const pickaxe = bot.inventory.items().find(item => item.name === 'iron_pickaxe'); assert.ok(pickaxe)
+      const pickaxe = bot.inventory.items().find(item => item.name === 'iron_pickaxe')
+      assert.ok(pickaxe)
       await bot.equip(pickaxe, 'hand')
-      const block = bot.blockAt(bot.entity.position.offset(1, 0, 0).floored()); assert.equal(block?.name, 'stone')
+      const block = bot.blockAt(bot.entity.position.offset(1, 0, 0).floored())
+      assert.equal(block?.name, 'stone')
       await bot.dig(block)
       await waitUntil(() => bot.blockAt(block.position)?.name === 'air', 10_000, 'stone removal')
       const pickupPosition = block.position.offset(0.5, 0, 0.5)
@@ -265,33 +189,83 @@ async function behaviorScenarios(bot: Bot) {
       try { await waitUntil(() => bot.entity.position.distanceTo(pickupPosition) < 0.45, 5_000, 'drop pickup position') }
       finally { bot.setControlState('forward', false) }
       await waitUntil(() => bot.inventory.items().some(item => item.name === 'cobblestone'), 10_000, 'cobblestone inventory')
-      ctx.record('assertion', 'dig_inventory_verified', { inventory: bot.inventory.items().map(item => ({ name: item.name, count: item.count })) })
-    }, cleanup: async () => { bot.stopDigging(); server.send(`clear ${username}`) },
+      ctx.record('assertion', 'dig_inventory_verified', {
+        inventory: bot.inventory.items().map(item => ({ name: item.name, count: item.count })),
+      })
+    },
+    cleanup: async () => {
+      bot.stopDigging()
+      server.send(`clear ${bot.username}`)
+    },
   }))
   return results
 }
 
 async function fixture(bot: Bot): Promise<void> {
   bot.clearControlStates()
-  server.send(`execute at ${username} run fill ~-4 ~-1 ~-4 ~8 ~-1 ~4 minecraft:stone`)
-  server.send(`execute at ${username} run fill ~-4 ~ ~-4 ~8 ~3 ~4 minecraft:air`)
+  server.send(`execute at ${bot.username} run fill ~-4 ~-1 ~-4 ~8 ~-1 ~4 minecraft:stone`)
+  server.send(`execute at ${bot.username} run fill ~-4 ~ ~-4 ~8 ~3 ~4 minecraft:air`)
   await waitUntil(() => bot.blockAt(bot.entity.position.offset(0, -1, 0).floored())?.name === 'stone', 10_000, 'fixture platform')
   await delay(100)
 }
 
 async function connectBot(name: string): Promise<Bot> {
   const bot = mineflayer.createBot({ host: '127.0.0.1', port, username: name, auth: 'offline', version: '1.21.1', logErrors: false })
-  await new Promise<void>((resolve, reject) => { bot.once('spawn', resolve); bot.once('error', reject); bot.once('kicked', reason => reject(new Error(String(reason)))) })
-  recorder.record('behavior-suite', 'companion', 'bot_connected', { username: name })
+  await new Promise<void>((resolve, reject) => {
+    bot.once('spawn', resolve)
+    bot.once('error', reject)
+    bot.once('kicked', reason => reject(new Error(String(reason))))
+  })
+  recorder.record('protocol-referee', 'companion', 'bot_connected', { username: name })
   return bot
 }
 
-function lifecycleType(event: BackendEventEnvelope): string | undefined { return event.kind === 'lifecycle' ? (event.payload as BackendLifecyclePayload).type : undefined }
-function woodCount(snapshot: ReturnType<MinecraftBackend['snapshot']>): number { return snapshot.inventory.slots.filter(slot => slot.itemName.endsWith('_log') || slot.itemName.endsWith('_stem')).reduce((sum, slot) => sum + slot.count, 0) }
-function distance(left: { x: number; y: number; z: number }, right: { x: number; y: number; z: number }): number { return Math.hypot(left.x - right.x, left.y - right.y, left.z - right.z) }
-async function waitFor(events: BackendEventEnvelope[], predicate: (event: BackendEventEnvelope) => boolean, description: string, timeout = 30_000) { return waitUntil(() => events.find(predicate), timeout, description) }
-async function waitUntil<T>(predicate: () => T | undefined | false, timeoutMs: number, description: string): Promise<T> { const start = Date.now(); while (Date.now() - start < timeoutMs) { const value = predicate(); if (value) return value; await delay(25) } throw new Error(`Timed out waiting for ${description}`) }
-function delay(ms: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, ms)) }
-function required(name: string): string { const value = process.env[name]; if (!value) throw new Error(`${name} is required`); return path.resolve(value) }
+function lifecycleType(event: BackendEventEnvelope): string | undefined {
+  return event.kind === 'lifecycle' ? (event.payload as BackendLifecyclePayload).type : undefined
+}
+
+async function waitFor(
+  events: BackendEventEnvelope[],
+  predicate: (event: BackendEventEnvelope) => boolean,
+  description: string,
+  timeout = 30_000,
+): Promise<BackendEventEnvelope> {
+  return waitUntil(() => events.find(predicate), timeout, description)
+}
+
+async function waitUntil<T>(predicate: () => T | undefined | false, timeoutMs: number, description: string): Promise<T> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    const value = predicate()
+    if (value) return value
+    await delay(25)
+  }
+  throw new Error(`Timed out waiting for ${description}`)
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function required(name: string): string {
+  const value = process.env[name]?.trim()
+  if (!value) throw new Error(`${name} is required`)
+  return value
+}
+
+function requiredPath(name: string): string {
+  return path.resolve(required(name))
+}
+
+function readPort(value: string): number {
+  const parsed = Number(value)
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65_535) throw new Error('MC_PORT must be an integer from 1 to 65535')
+  return parsed
+}
+
+function readMinecraftUsername(value: string): string {
+  if (!/^[A-Za-z0-9_]{1,16}$/.test(value)) throw new Error('MC_USERNAME must be a valid offline Minecraft username')
+  return value
+}
 
 await main()

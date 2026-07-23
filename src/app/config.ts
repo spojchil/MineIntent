@@ -14,6 +14,7 @@ const envSchema = z.object({
   MINEINTENT_DATA_DIR: z.string().trim().min(1).default('.mineintent'),
   MINEINTENT_DEBUG_PORT: z.coerce.number().int().min(0).max(65_535).default(3211),
   MINEINTENT_AGENT_SERVICE_URL: z.string().url().default('http://127.0.0.1:8765'),
+  MINEINTENT_AGENT_SERVICE_TOKEN: z.string().trim().min(32).max(512),
 })
 
 export interface AppConfig {
@@ -23,6 +24,7 @@ export interface AppConfig {
   dataDirectory: string
   debugPort: number
   agentServiceUrl: string
+  agentServiceToken: string
 }
 
 export function loadAppConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.cwd()): AppConfig {
@@ -40,5 +42,6 @@ export function loadAppConfig(env: NodeJS.ProcessEnv = process.env, cwd = proces
     dataDirectory: path.resolve(cwd, value.MINEINTENT_DATA_DIR),
     debugPort: value.MINEINTENT_DEBUG_PORT,
     agentServiceUrl: value.MINEINTENT_AGENT_SERVICE_URL,
+    agentServiceToken: value.MINEINTENT_AGENT_SERVICE_TOKEN,
   }
 }

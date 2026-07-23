@@ -30,7 +30,8 @@ function buildRuntime(allowedInterfaces: '*' | readonly InformationInterfaceId[]
   const sound: SoundHistoryPort = { recent: () => [], revision: () => 0 }
   const perception: PerceptionPort = {
     selfPose: () => ({ position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 }),
-    blockAt: () => ({ name: 'air', solid: false }),
+    revision: () => 0,
+    blockAt: () => ({ name: 'air', visible: false, occludes: false }),
     nearbyEntities: () => [],
   }
   const registry = new InformationRegistry()

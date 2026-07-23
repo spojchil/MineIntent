@@ -41,7 +41,7 @@ test('segmentChat respects Unicode length and keeps ordered content', () => {
   assert.equal(segments.join('').replaceAll(' ', ''), '这是第一句话。这是第二句话，需要被安全分开。')
 })
 
-test('scheduler waits for accepted actions, rate limits, and preserves segment order', async () => {
+test('scheduler rate limits and preserves segment order', async () => {
   const sent: string[] = []
   const events: string[] = []
   const scheduler = new SpeechScheduler({ send: message => sent.push(message) }, {
@@ -49,28 +49,25 @@ test('scheduler waits for accepted actions, rate limits, and preserves segment o
     minimumIntervalMs: 5,
     onEvent: event => events.push(`${event.type}:${'requestId' in event ? event.requestId : ''}`),
   })
-  scheduler.schedule({ id: 'promise', text: '我去拿一些木头回来', timing: 'after_actions_accepted', purpose: 'coordinate', dependsOn: ['collect'] })
-  await wait(10)
-  assert.deepEqual(sent, [])
-  scheduler.actionAccepted('collect')
+  scheduler.schedule({ id: 'reply', text: '我去拿一些木头回来' })
   await wait(30)
   assert.equal(sent.join(''), '我去拿一些木头回来')
-  assert.equal(events[0], 'scheduled:promise')
+  assert.equal(events[0], 'scheduled:reply')
   scheduler.stop()
 })
 
-test('scheduler delays normal speech under pressure and can cancel unsent speech', async () => {
+test('scheduler stop cancels queued speech before it is sent', async () => {
   const sent: string[] = []
-  const scheduler = new SpeechScheduler({ send: message => sent.push(message) }, { minimumIntervalMs: 0 })
-  scheduler.setPressure('danger')
-  scheduler.schedule({ id: 'social', text: '这里风景不错', timing: 'now', purpose: 'social' })
+  const events: string[] = []
+  const scheduler = new SpeechScheduler({ send: message => sent.push(message) }, {
+    minimumIntervalMs: 0,
+    onEvent: event => events.push(event.type),
+  })
+  scheduler.schedule({ id: 'reply', text: '这里风景不错' })
+  scheduler.stop('test_stopped')
   await wait(5)
   assert.deepEqual(sent, [])
-  assert.equal(scheduler.cancel('social', 'context_changed'), true)
-  scheduler.setPressure('normal')
-  await wait(5)
-  assert.deepEqual(sent, [])
-  scheduler.stop()
+  assert.deepEqual(events, ['scheduled', 'cancelled'])
 })
 
 function wait(ms: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, ms)) }

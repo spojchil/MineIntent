@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { ActionRuntime, type ActionResult } from '../actions/index.js'
+import { z } from 'zod'
 import type { JsonlEventJournal } from '../events/index.js'
 import {
   composePassiveObservations,
@@ -10,14 +10,15 @@ import {
   InventoryProvider,
   SoundInformationProvider,
   ViewportInformationProvider,
+  lookDirection,
   type PassiveObservations,
   type TrustedInformationCaller,
+  type ViewportValues,
 } from '../information/index.js'
-import type { FileMemoryStore, MemoryKind } from '../memory/index.js'
-import type { BackendEventEnvelope, MinecraftBackendApi, ProtocolChatEvent, Vec3Value } from '../minecraft/contracts.js'
-import type { CompanionDecision, DecisionContext, ModelProvider } from '../models/index.js'
+import type { FileMemoryStore } from '../memory/index.js'
+import type { BackendEventEnvelope, MinecraftBackendApi, ProtocolChatEvent } from '../minecraft/contracts.js'
+import type { D40DecisionContext, D40ToolInvocation, ModelProvider } from '../models/index.js'
 import { interpretPlayerChat, SpeechScheduler } from '../speech/index.js'
-import { registerPrototypeSkills } from '../skills/index.js'
 import type { DebugContextSource } from '../telemetry/contracts.js'
 import type { DebugStateStore } from '../telemetry/debug-state.js'
 import {
@@ -32,14 +33,15 @@ import type { CompanionProfile } from './profile.js'
 const INFORMATION_GRANT_ID = 'grant-context-composer'
 const INFORMATION_PRINCIPAL_ID = 'context-composer'
 
-export interface CompanionActivity {
-  id: string
-  kind: 'wood_collection'
-  status: 'active' | 'paused' | 'completing' | 'completed' | 'abandoned'
-  summary: string
-  anchor: Vec3Value
-  startedAt: string
-}
+const lookArgumentsSchema = z.strictObject({
+  yaw_degrees: z.number().finite().min(-90).max(90),
+  pitch_degrees: z.number().finite().min(-90).max(90),
+})
+const moveArgumentsSchema = z.strictObject({
+  direction: z.enum(['forward', 'back', 'left', 'right']),
+  duration_ms: z.number().int().min(50).max(1_500),
+  sprint: z.boolean().optional(),
+})
 
 export interface CompanionRuntimeOptions {
   backend: MinecraftBackendApi
@@ -52,12 +54,23 @@ export interface CompanionRuntimeOptions {
   speechIntervalMs?: number
 }
 
-interface DeferredMemory {
-  kind: MemoryKind
-  summary: string
-  triggerEventId: string
+interface RunScope {
+  processSessionId: string
+  connectionEpoch: number
+  worldId: string
+  dimension: string
 }
 
+interface ActiveRun extends RunScope { runId: string; controller: AbortController }
+
+const MOVE_EFFECT_EPSILON = 0.01
+const LOOK_EFFECT_EPSILON_DEGREES = 0.01
+
+/**
+ * The D40 runtime intentionally has one model route: an addressed player chat. Startup and
+ * danger remain local runtime events, and the only model-visible body surface is two short
+ * relative inputs. This is an experiment loop, not a replacement planning architecture.
+ */
 export class CompanionRuntime {
   readonly #backend: MinecraftBackendApi
   readonly #model: ModelProvider
@@ -66,21 +79,16 @@ export class CompanionRuntime {
   readonly #profile: CompanionProfile
   readonly #debug: DebugStateStore
   readonly #primaryPlayer: string
-  readonly #actions = new ActionRuntime()
   readonly #speech: SpeechScheduler
   readonly #soundHistory: SoundHistory
   readonly #informationRuntime: InformationRuntime
   readonly #abort = new AbortController()
   readonly #recentEvents: Array<{ id: string; type: string; summary: string }> = []
-  readonly #deferredMemories = new Map<string, DeferredMemory>()
-  #activity?: CompanionActivity
-  #attention?: { kind: string; target?: string }
-  #intent?: { kind: string; summary: string }
   #unsubscribe?: () => void
   #modelAbort?: AbortController
+  #activeRun?: ActiveRun
   #decisionTail = Promise.resolve()
-  #activeCompletions = new Set<Promise<readonly ActionResult[]>>()
-  #backgroundTasks = new Set<Promise<void>>()
+  #toolBusy = false
   #started = false
   #lastDangerAt = 0
 
@@ -98,24 +106,7 @@ export class CompanionRuntime {
     })
     this.#soundHistory = new SoundHistory(this.#backend)
     this.#informationRuntime = buildInformationRuntime(this.#backend, this.#soundHistory)
-    registerPrototypeSkills(this.#actions, this.#backend, this.#primaryPlayer, () => this.#activity)
-    this.#actions.subscribe(event => {
-      if (event.type === 'action_started') {
-        this.#debug.update({
-          currentAction: { id: event.actionId, skill: 'starting', purpose: this.#intent?.summary ?? '执行当前意图', startedAt: new Date().toISOString() },
-          resourceLocks: this.#actions.resources(),
-        })
-      } else if (event.type === 'action_terminal') {
-        this.#debug.update({ currentAction: undefined, resourceLocks: this.#actions.resources() })
-        if (event.result.status !== 'completed') this.#debug.failure({
-          at: event.result.endedAt, source: 'action', code: event.result.failure?.code ?? event.result.status,
-          summary: event.result.failure?.detail ?? `${event.result.skill} ${event.result.status}`,
-        })
-      }
-    })
   }
-
-  activity(): Readonly<CompanionActivity> | undefined { return this.#activity ? structuredClone(this.#activity) : undefined }
 
   async start(): Promise<void> {
     if (this.#started) return
@@ -125,37 +116,14 @@ export class CompanionRuntime {
     await this.#backend.start(this.#abort.signal)
     await this.#waitForSelfChunk()
     this.#refreshDebug()
-    const event = await this.#rememberRecent('companion.started', '同伴加入世界')
-    this.#enqueueDecision({ type: 'startup', eventId: event.id })
-  }
-
-  /**
-   * `MinecraftBackendApi.start()` resolves once Mineflayer reports spawn-ready, but the chunk
-   * under the bot's own feet can still arrive a moment later — without this wait, the very
-   * first decision's viewport observation reports `standingOnBlock: null` even while standing
-   * on solid, server-confirmed ground, purely because of this startup race.
-   */
-  async #waitForSelfChunk(attempts = 20, intervalMs = 100): Promise<void> {
-    for (let attempt = 0; attempt < attempts; attempt++) {
-      try {
-        const position = this.#backend.snapshot().self.position
-        const result = this.#backend.observationSource().readBlock({
-          x: Math.floor(position.x), y: Math.floor(position.y) - 1, z: Math.floor(position.z),
-        })
-        if (result.status !== 'unloaded') return
-      } catch { /* backend not yet ready for observation queries */ }
-      await new Promise(resolve => setTimeout(resolve, intervalMs))
-    }
+    const event = await this.#journal.append('companion.started', { summary: '同伴加入世界' })
+    this.#pushRecent(event.id, event.type, '同伴加入世界')
   }
 
   async stop(reason = 'runtime_stopped'): Promise<void> {
     if (!this.#started) return
     this.#started = false
-    this.#modelAbort?.abort(reason)
-    this.#actions.cancelAll(reason, true)
-    try { this.#backend.controls().stop() } catch { /* backend may already be disconnected */ }
-    await Promise.allSettled([...this.#activeCompletions])
-    await Promise.allSettled([...this.#backgroundTasks])
+    this.#abortRunsAndRelease(reason)
     await this.#decisionTail
     this.#speech.stop(reason)
     this.#unsubscribe?.()
@@ -163,21 +131,81 @@ export class CompanionRuntime {
     await this.#backend.stop(reason)
     await this.#journal.append('companion.stopped', { reason })
     await this.#journal.flush()
-    this.#debug.update({ connection: this.#backend.state(), currentAction: undefined, resourceLocks: this.#actions.resources() })
+    this.#debug.update({ connection: this.#backend.state(), currentBodyTool: undefined })
   }
 
-  async idle(): Promise<void> {
-    await this.#decisionTail
-    await Promise.allSettled([...this.#activeCompletions])
-    await Promise.allSettled([...this.#backgroundTasks])
-    await this.#decisionTail
-    await Promise.allSettled([...this.#backgroundTasks])
+  async idle(): Promise<void> { await this.#decisionTail }
+
+  /** Called only by the authenticated loopback bridge while the matching player-chat run lives. */
+  async executeBodyTool(invocation: D40ToolInvocation): Promise<unknown> {
+    const active = this.#activeRun
+    if (!active || active.runId !== invocation.runId) throw new Error('tool_run_is_not_active')
+    this.#assertRunCurrent(active)
+    if (this.#toolBusy) throw new Error('body_tool_already_running')
+    this.#toolBusy = true
+    const actionId = randomUUID()
+    const startedAt = new Date().toISOString()
+    let motor: ReturnType<MinecraftBackendApi['motor']> | undefined
+    try {
+      this.#debug.update({ currentBodyTool: { id: actionId, tool: invocation.name, purpose: 'D40 short input', startedAt } })
+      this.#assertRunCurrent(active)
+      motor = this.#backend.motor()
+      const before = this.#backend.observationSource().selfPose()
+      if (invocation.name === 'look_relative') {
+        const args = lookArgumentsSchema.parse(invocation.arguments)
+        await motor.lookRelative(args.yaw_degrees, args.pitch_degrees, active.controller.signal)
+      } else {
+        const args = moveArgumentsSchema.parse(invocation.arguments)
+        await motor.move(args.direction, args.duration_ms, args.sprint, active.controller.signal)
+      }
+      this.#assertRunCurrent(active)
+      const after = this.#backend.observationSource().selfPose()
+      const viewport = await this.#readViewport(invocation.runId, active.controller.signal)
+      this.#assertRunCurrent(active)
+      const effect = invocation.name === 'look_relative'
+        ? measuredLookEffect(before, after)
+        : measuredMoveEffect(before, after)
+      await this.#journal.append('body_tool.completed', {
+        actionId, runId: invocation.runId, tool: invocation.name, startedAt,
+        // Internal diagnostics may retain poses; they never cross the model result boundary.
+        internal: { before, after },
+      })
+      this.#assertRunCurrent(active)
+      return {
+        protocol: 'mineintent.d40-tool-result.v1',
+        status: 'completed',
+        effect,
+        viewport,
+      }
+    } catch (error) {
+      if (active.controller.signal.aborted || !this.#scopeMatches(active)) throw error
+      this.#assertRunCurrent(active)
+      const viewport = await this.#readViewport(invocation.runId, active.controller.signal).catch(() => undefined)
+      this.#assertRunCurrent(active)
+      await this.#journal.append('body_tool.failed', {
+        actionId, runId: invocation.runId, tool: invocation.name,
+        summary: error instanceof Error ? error.message : String(error),
+      })
+      this.#assertRunCurrent(active)
+      return {
+        protocol: 'mineintent.d40-tool-result.v1', status: 'failed',
+        summary: error instanceof Error ? error.message.slice(0, 300) : 'tool_failed',
+        ...(viewport ? { viewport } : {}),
+      }
+    } finally {
+      try { if (motor) motor.releaseAll(); else this.#releaseBodyInputs() } catch { /* best effort */ }
+      finally {
+        this.#toolBusy = false
+        try { this.#debug.update({ currentBodyTool: undefined }) } catch { /* cleanup must not wedge the body-tool gate */ }
+      }
+    }
   }
 
   async #handleBackendEvent(event: BackendEventEnvelope): Promise<void> {
+    this.#interruptOnScopeChange(event)
     this.#refreshDebug()
     if (event.kind === 'chat') await this.#handleChat(event as BackendEventEnvelope<ProtocolChatEvent>)
-    if (event.kind === 'self' || event.kind === 'snapshot_changed' || event.kind === 'entity') void this.#considerDanger()
+    if (event.kind === 'self' || event.kind === 'snapshot_changed') this.#considerDanger()
   }
 
   async #handleChat(event: BackendEventEnvelope<ProtocolChatEvent>): Promise<void> {
@@ -190,180 +218,165 @@ export class CompanionRuntime {
       conversationActiveWith: this.#primaryPlayer,
     })
     if (!message?.addressing.addressedToCompanion || !message.sender.isPrimaryPlayer) return
+    this.#abortRunsAndRelease(message.controlIntent === 'safety_stop' ? 'player_safety_stop' : 'new_player_chat')
     const journalEvent = await this.#journal.append('player.chat.received', {
       sourceEventId: message.sourceEventId, sender: message.sender.username, text: message.text,
       controlIntent: message.controlIntent,
     })
     this.#pushRecent(journalEvent.id, journalEvent.type, `${message.sender.username}: ${message.text}`)
+
     if (message.controlIntent === 'safety_stop') {
-      this.#modelAbort?.abort('player_safety_stop')
-      this.#actions.cancelAll('player_safety_stop', true)
-      try { this.#backend.controls().stop() } catch { /* lifecycle race */ }
-      if (this.#activity) this.#activity = { ...this.#activity, status: 'paused' }
-      this.#intent = { kind: 'wait', summary: '遵从玩家明确停止，等待下一步交流' }
-      this.#refreshDebug()
-      this.#speech.schedule({ id: randomUUID(), text: '好，我停下。', timing: 'now', purpose: 'acknowledge', urgency: 'urgent' })
+      this.#speech.schedule({ id: randomUUID(), text: '好，我停下。' })
       await this.#journal.append('companion.safety_stop.applied', { sourceEventId: journalEvent.id })
       return
     }
-    this.#enqueueDecision({ type: 'player_chat', text: message.text, eventId: journalEvent.id })
+    this.#enqueuePlayerDecision(message.sender.username, message.text, journalEvent.id)
   }
 
-  #enqueueDecision(trigger: DecisionContext['trigger']): void {
-    this.#modelAbort?.abort('superseded_by_new_trigger')
+  #enqueuePlayerDecision(username: string, text: string, eventId: string): void {
     const controller = new AbortController()
     this.#modelAbort = controller
     const run = async () => {
-      if (controller.signal.aborted || !this.#started) return
-      await this.#runDecision(trigger, controller)
+      if (!this.#started || controller.signal.aborted) return
+      await this.#runPlayerDecision(username, text, eventId, controller)
     }
     this.#decisionTail = this.#decisionTail.then(run, run).catch(error => this.#recordFailure('model', 'decision_failed', error))
   }
 
-  async #runDecision(trigger: DecisionContext['trigger'], controller: AbortController): Promise<void> {
+  async #runPlayerDecision(username: string, text: string, eventId: string, controller: AbortController): Promise<void> {
     const runId = randomUUID()
     const snapshot = this.#backend.snapshot()
-    const query = [trigger.text, this.#activity?.summary, '上次 共同 经历 地点'].filter(Boolean).join(' ')
-    const memories = (await this.#memory.search(snapshot.world.worldId, query, 5)).map(result => result.record)
-    const observations = await this.#composePassiveObservations(runId, controller.signal)
-    const sources: DebugContextSource[] = [
-      { id: this.#profile.versionId, kind: 'profile', size: this.#profile.content.length },
-      { id: trigger.eventId, kind: trigger.type === 'player_chat' ? 'player' : 'event', size: trigger.text?.length ?? 0 },
-      { id: `snapshot:${snapshot.snapshotRevision}`, kind: 'runtime', size: JSON.stringify(snapshot).length },
-      ...memories.map(memory => ({ id: memory.id, kind: 'memory' as const, size: memory.summary.length })),
-      { id: 'prototype-skills-v1', kind: 'skill_registry', size: 5 },
-    ]
-    this.#debug.update({ observations, decision: { status: 'running', runId, startedAt: new Date().toISOString(), contextSources: sources, retrievedMemoryIds: memories.map(memory => memory.id) } })
-    const context: DecisionContext = {
-      runId, trigger, primaryPlayer: this.#primaryPlayer, profile: this.#profile, snapshot,
-      activity: this.#activity ? structuredClone(this.#activity) : undefined,
-      recentEvents: structuredClone(this.#recentEvents), memories, observations,
-      availableSkills: ['follow_player', 'collect_wood', 'return_to_anchor', 'wait'],
+    const active: ActiveRun = {
+      runId, controller, processSessionId: snapshot.processSessionId,
+      connectionEpoch: snapshot.connectionEpoch, worldId: snapshot.world.worldId,
+      dimension: snapshot.world.dimension,
     }
-    const started = Date.now()
+    this.#activeRun = active
+    let sources: DebugContextSource[] = []
+    let memoryIds: string[] = []
     try {
-      const result = await this.#model.run(context, controller.signal)
-      if (controller.signal.aborted || this.#modelAbort !== controller) return
+      this.#assertRunCurrent(active)
+      const memories = (await this.#memory.search(snapshot.world.worldId, text, 5)).map(result => result.record)
+      memoryIds = memories.map(memory => memory.id)
+      this.#assertRunCurrent(active)
+      const observations = await this.#composePassiveObservations(runId, controller.signal)
+      this.#assertRunCurrent(active)
+      sources = [
+        { id: this.#profile.versionId, kind: 'profile', size: this.#profile.content.length },
+        { id: eventId, kind: 'player', size: text.length },
+        ...memories.map(memory => ({ id: memory.id, kind: 'memory' as const, size: memory.summary.length })),
+      ]
+      this.#debug.update({ observations, decision: {
+        status: 'running', runId, startedAt: new Date().toISOString(), contextSources: sources,
+        retrievedMemoryIds: memoryIds,
+      } })
+      const context: D40DecisionContext = {
+        protocol: 'mineintent.d40-context.v1',
+        player: { username, text },
+        profile: { content: this.#profile.content },
+        world: { dimension: snapshot.world.dimension, ...(snapshot.world.timeOfDay === undefined ? {} : { timeOfDay: snapshot.world.timeOfDay }) },
+        observations,
+        recentEvents: this.#recentEvents.map(({ type, summary }) => ({ type, summary })),
+        memories: memories.map(({ kind, summary, createdAt }) => ({ kind, summary, createdAt })),
+      }
+      const started = Date.now()
+      const result = await this.#model.run({ runId, context }, controller.signal)
+      this.#assertRunCurrent(active)
       await this.#journal.append('model.decision.completed', {
         runId, model: result.model, durationMs: Date.now() - started, usage: result.usage,
-        effects: { speech: Boolean(result.decision.speech), action: result.decision.action?.skill, activity: result.decision.activity.operation, memory: Boolean(result.decision.memory) },
+        effects: { speech: Boolean(result.decision.speech) },
       })
-      this.#debug.update({ decision: { status: 'idle', model: result.model, contextSources: sources, retrievedMemoryIds: memories.map(memory => memory.id) } })
-      await this.#applyDecision(result.decision, trigger)
+      this.#assertRunCurrent(active)
+      this.#debug.update({ decision: {
+        status: 'idle', model: result.model, contextSources: sources, retrievedMemoryIds: memoryIds,
+      } })
+      this.#assertRunCurrent(active)
+      if (result.decision.speech) {
+        this.#speech.schedule({ id: randomUUID(), text: result.decision.speech })
+      }
     } catch (error) {
       if (controller.signal.aborted) return
-      this.#debug.update({ decision: { status: 'failed', runId, contextSources: sources, retrievedMemoryIds: memories.map(memory => memory.id) } })
+      this.#debug.update({ decision: { status: 'failed', runId, contextSources: sources, retrievedMemoryIds: memoryIds } })
       this.#recordFailure('model', 'decision_failed', error)
+    } finally {
+      controller.abort('model_run_finished')
+      this.#releaseBodyInputs()
+      if (this.#activeRun?.controller === controller) this.#activeRun = undefined
+      if (this.#modelAbort === controller) this.#modelAbort = undefined
     }
   }
 
-  async #applyDecision(decision: CompanionDecision, trigger: DecisionContext['trigger']): Promise<void> {
-    this.#attention = { kind: decision.attention.kind, ...(decision.attention.target ? { target: decision.attention.target } : {}) }
-    this.#intent = decision.intent
-    this.#applyActivity(decision)
-    this.#refreshDebug()
-
-    if (!decision.action) {
-      if (decision.speech) this.#speech.schedule({ id: randomUUID(), text: decision.speech, timing: 'now', purpose: 'reply' })
-      if (decision.memory) await this.#writeMemory(decision.memory.kind, decision.memory.summary, [{ kind: 'event', id: trigger.eventId }])
-      if (decision.activity.operation === 'complete') await this.#completeActivity([{ kind: 'event', id: trigger.eventId }])
-      return
-    }
-
-    if (this.#activeCompletions.size) {
-      this.#actions.cancelAll('superseded_by_new_decision', true)
-      try { this.#backend.controls().stop() } catch { /* lifecycle race */ }
-      await Promise.allSettled([...this.#activeCompletions])
-    }
-    const actionId = randomUUID(), groupId = randomUUID()
-    const submitted = await this.#actions.submit({
-      id: groupId, mode: 'atomic_preflight', actions: [{ id: actionId, skill: decision.action.skill, args: decision.action.args,
-        purpose: decision.action.purpose, after: [], onDependencyFailure: 'cancel' }],
-    })
-    if (!submitted.accepted) {
-      this.#recordFailure('action', submitted.rejection.code, submitted.rejection.detail)
-      if (decision.speech) this.#speech.schedule({ id: randomUUID(), text: '我现在做不了这个，先停一下。', timing: 'now', purpose: 'report' })
-      return
-    }
-    this.#debug.update({ currentAction: { id: actionId, skill: decision.action.skill, purpose: decision.action.purpose, startedAt: new Date().toISOString() }, resourceLocks: this.#actions.resources() })
-    this.#speech.actionAccepted(actionId)
-    if (decision.speech) this.#speech.schedule({ id: randomUUID(), text: decision.speech, timing: 'after_actions_accepted', purpose: 'coordinate', dependsOn: [actionId] })
-    if (decision.memory) this.#deferredMemories.set(actionId, { kind: decision.memory.kind, summary: decision.memory.summary, triggerEventId: trigger.eventId })
-    const completion = submitted.completion
-    this.#activeCompletions.add(completion)
-    this.#trackBackground(completion.then(results => this.#handleActionResults(results, trigger)))
-    void completion.then(() => this.#activeCompletions.delete(completion), () => this.#activeCompletions.delete(completion))
-  }
-
-  async #handleActionResults(results: readonly ActionResult[], trigger: DecisionContext['trigger']): Promise<void> {
-    for (const result of results) {
-      const event = await this.#journal.append('action.terminal', result)
-      this.#pushRecent(event.id, event.type, `${result.skill}: ${result.status}${result.verification ? ` (${result.verification.detail})` : ''}`)
-      const speechStatus = result.status === 'completed' ? 'completed' : result.status === 'cancelled' || result.status === 'interrupted' ? 'cancelled' : 'failed'
-      this.#speech.actionTerminal(result.actionId, speechStatus)
-      const candidate = this.#deferredMemories.get(result.actionId)
-      this.#deferredMemories.delete(result.actionId)
-      if (candidate && result.status === 'completed') await this.#writeMemory(candidate.kind, candidate.summary, [
-        { kind: 'event', id: candidate.triggerEventId }, { kind: 'action_result', id: event.id },
-      ])
-      if (result.skill === 'return_to_anchor' && result.status === 'completed' && this.#activity?.status === 'completing') {
-        await this.#completeActivity([{ kind: 'event', id: trigger.eventId }, { kind: 'action_result', id: event.id }])
-      }
-      if (['completed', 'failed', 'timed_out'].includes(result.status)) this.#enqueueDecision({ type: 'action_result', eventId: event.id })
-    }
-  }
-
-  #applyActivity(decision: CompanionDecision): void {
-    const operation = decision.activity.operation
-    if (operation === 'start_wood_collection') {
-      const current = this.#backend.snapshot().self.position
-      this.#activity = { id: randomUUID(), kind: 'wood_collection', status: 'active', summary: decision.activity.summary, anchor: current, startedAt: new Date().toISOString() }
-    } else if (this.#activity && operation === 'pause') this.#activity = { ...this.#activity, status: 'paused', summary: decision.activity.summary }
-    else if (this.#activity && operation === 'resume') this.#activity = { ...this.#activity, status: 'active', summary: decision.activity.summary }
-    else if (this.#activity && operation === 'complete') this.#activity = { ...this.#activity, status: 'completing', summary: decision.activity.summary }
-    else if (this.#activity && operation === 'abandon') this.#activity = { ...this.#activity, status: 'abandoned', summary: decision.activity.summary }
-    else if (this.#activity && operation === 'keep') this.#activity = { ...this.#activity, summary: decision.activity.summary }
-  }
-
-  async #completeActivity(evidence: Array<{ kind: 'event' | 'action_result'; id: string }>): Promise<void> {
-    if (!this.#activity || this.#activity.status === 'completed') return
-    const summary = `与${this.#primaryPlayer}一起收集木材，并回到了活动开始地点。`
-    await this.#writeMemory('episode', summary, evidence)
-    this.#activity = { ...this.#activity, status: 'completed' }
-    this.#refreshDebug()
-  }
-
-  async #writeMemory(kind: MemoryKind, summary: string, evidence: Array<{ kind: 'event' | 'action_result'; id: string }>): Promise<void> {
-    const worldId = this.#backend.snapshot().world.worldId
-    const memory = await this.#memory.remember({ worldId, kind, summary, evidence })
-    await this.#journal.append('memory.record.written', { memoryId: memory.id, kind: memory.kind, evidence: memory.evidence })
-  }
-
-  async #considerDanger(): Promise<void> {
+  #considerDanger(): void {
     if (!this.#started || Date.now() - this.#lastDangerAt < 10_000) return
-    let snapshot, threat
-    try { snapshot = this.#backend.snapshot(); threat = this.#backend.controls().nearestThreat(4) } catch { return }
-    if (snapshot.self.health > 8 && !threat) return
+    let health
+    try { health = this.#backend.snapshot().self.health } catch { return }
+    if (health > 8) return
     this.#lastDangerAt = Date.now()
-    this.#modelAbort?.abort('danger_reflex')
-    this.#actions.cancelAll('danger_reflex', true)
-    try { this.#backend.controls().stop() } catch { /* lifecycle race */ }
-    await Promise.allSettled([...this.#activeCompletions])
-    this.#speech.setPressure('danger')
-    this.#speech.schedule({ id: randomUUID(), text: '有危险，我先退开！', timing: 'now', purpose: 'report', urgency: 'urgent' })
-    const actionId = randomUUID()
-    const submitted = await this.#actions.submit({ id: randomUUID(), mode: 'atomic_preflight', actions: [{
-      id: actionId, skill: 'escape_threat', args: {}, purpose: '远离直接威胁', after: [], onDependencyFailure: 'cancel',
-    }] })
-    if (submitted.accepted) {
-      this.#speech.actionAccepted(actionId)
-      this.#activeCompletions.add(submitted.completion)
-      this.#trackBackground(submitted.completion.then(results => this.#handleActionResults(results, { type: 'danger', eventId: randomUUID() })))
-      void submitted.completion.then(
-        () => { this.#activeCompletions.delete(submitted.completion); this.#speech.setPressure('normal') },
-        () => { this.#activeCompletions.delete(submitted.completion); this.#speech.setPressure('normal') },
-      )
-    } else this.#speech.setPressure('normal')
+    this.#abortRunsAndRelease('danger_reflex')
+    this.#speech.schedule({ id: randomUUID(), text: '我受伤了，先停一下。' })
+  }
+
+  #interruptOnScopeChange(event: BackendEventEnvelope): void {
+    const active = this.#activeRun
+    if (!active || (event.kind !== 'lifecycle' && event.kind !== 'world')) return
+    const envelopeChanged = event.processSessionId !== active.processSessionId ||
+      event.connectionEpoch !== active.connectionEpoch || event.worldId !== active.worldId ||
+      (event.dimension !== undefined && event.dimension !== active.dimension)
+    if (envelopeChanged || !this.#scopeMatches(active)) this.#abortRunsAndRelease('world_scope_changed')
+  }
+
+  #assertRunCurrent(active: ActiveRun): void {
+    if (active.controller.signal.aborted || this.#activeRun !== active || this.#modelAbort !== active.controller) {
+      throw new DOMException('Model run is no longer current', 'AbortError')
+    }
+    if (!this.#scopeMatches(active)) {
+      this.#abortRunsAndRelease('world_scope_changed')
+      throw new DOMException('Minecraft world scope changed', 'AbortError')
+    }
+  }
+
+  #scopeMatches(scope: RunScope): boolean {
+    try {
+      if (this.#backend.state().status !== 'ready') return false
+      const snapshot = this.#backend.snapshot()
+      return snapshot.processSessionId === scope.processSessionId &&
+        snapshot.connectionEpoch === scope.connectionEpoch &&
+        snapshot.world.worldId === scope.worldId && snapshot.world.dimension === scope.dimension
+    } catch { return false }
+  }
+
+  #abortRunsAndRelease(reason: string): void {
+    this.#activeRun?.controller.abort(reason)
+    this.#modelAbort?.abort(reason)
+    this.#releaseBodyInputs()
+  }
+
+  #releaseBodyInputs(): void {
+    try { this.#backend.motor().releaseAll() } catch { /* connection loss or driver cleanup failure */ }
+  }
+
+  async #readViewport(runId: string, signal: AbortSignal): Promise<ViewportValues> {
+    const response = await this.#informationRuntime.query(this.#caller(runId), {
+      interfaceId: 'viewport_information', operation: 'read', schemaRevision: 'viewport-information:5',
+      fields: ['frame', 'standingOnBlock', 'lookedAtBlock', 'visibleEntities', 'visibleBlocks'],
+    }, signal)
+    if (response.protocol !== 'mineintent.information-read.v1') throw new Error(`viewport_read_failed:${response.protocol}`)
+    return response.values as unknown as ViewportValues
+  }
+
+  async #composePassiveObservations(runId: string, signal: AbortSignal): Promise<PassiveObservations> {
+    try { return await composePassiveObservations(this.#informationRuntime, this.#caller(runId), signal) }
+    catch (error) {
+      this.#recordFailure('runtime', 'passive_observations_failed', error)
+      return { omissions: [] }
+    }
+  }
+
+  #caller(runId: string): TrustedInformationCaller {
+    return {
+      principalId: INFORMATION_PRINCIPAL_ID, grantId: INFORMATION_GRANT_ID, purpose: 'companion_context',
+      correlationId: runId, decisionRunId: runId,
+    }
   }
 
   #refreshDebug(): void {
@@ -372,33 +385,25 @@ export class CompanionRuntime {
       const snapshot = this.#backend.snapshot()
       const inventory = new Map<string, number>()
       for (const slot of snapshot.inventory.slots) inventory.set(slot.itemName, (inventory.get(slot.itemName) ?? 0) + slot.count)
-      body = { position: snapshot.self.position, health: snapshot.self.health, food: snapshot.self.food,
-        inventory: [...inventory].map(([itemName, count]) => ({ itemName, count })) }
+      body = {
+        position: snapshot.self.position, health: snapshot.self.health, food: snapshot.self.food,
+        inventory: [...inventory].map(([itemName, count]) => ({ itemName, count })),
+      }
     } catch { /* connection is not ready */ }
-    this.#debug.update({
-      connection: this.#backend.state(), body,
-      attention: this.#attention, activity: this.#activity,
-      intent: this.#intent, resourceLocks: this.#actions.resources(),
-    })
+    this.#debug.update({ connection: this.#backend.state(), body })
   }
 
-  async #composePassiveObservations(runId: string, signal: AbortSignal): Promise<PassiveObservations> {
-    const caller: TrustedInformationCaller = {
-      principalId: INFORMATION_PRINCIPAL_ID, grantId: INFORMATION_GRANT_ID, purpose: 'companion_context',
-      correlationId: runId, decisionRunId: runId,
+  async #waitForSelfChunk(attempts = 20, intervalMs = 100): Promise<void> {
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      try {
+        const position = this.#backend.snapshot().self.position
+        const result = this.#backend.observationSource().readBlock({
+          x: Math.floor(position.x), y: Math.floor(position.y) - 1, z: Math.floor(position.z),
+        })
+        if (result.status !== 'unloaded') return
+      } catch { /* backend not ready */ }
+      await new Promise(resolve => setTimeout(resolve, intervalMs))
     }
-    try {
-      return await composePassiveObservations(this.#informationRuntime, caller, signal)
-    } catch (error) {
-      this.#recordFailure('runtime', 'passive_observations_failed', error)
-      return { omissions: [] }
-    }
-  }
-
-  async #rememberRecent(type: string, summary: string): Promise<{ id: string }> {
-    const event = await this.#journal.append(type, { summary })
-    this.#pushRecent(event.id, type, summary)
-    return event
   }
 
   #pushRecent(id: string, type: string, summary: string): void {
@@ -406,18 +411,57 @@ export class CompanionRuntime {
     if (this.#recentEvents.length > 20) this.#recentEvents.shift()
   }
 
-  #recordFailure(source: 'backend' | 'model' | 'action' | 'memory' | 'runtime', code: string, error: unknown): void {
+  #recordFailure(source: 'backend' | 'model' | 'body_tool' | 'memory' | 'runtime', code: string, error: unknown): void {
     const summary = error instanceof Error ? error.message : String(error)
     this.#debug.failure({ at: new Date().toISOString(), source, code, summary })
     void this.#journal.append(`${source}.failed`, { code, summary })
   }
+}
 
-  #trackBackground(task: Promise<void>): void {
-    const safe = task.catch(error => this.#recordFailure('runtime', 'background_task_failed', error))
-    this.#backgroundTasks.add(safe)
-    void safe.finally(() => this.#backgroundTasks.delete(safe))
+interface PoseSample {
+  position: { x: number; y: number; z: number }
+  yaw: number
+  pitch: number
+}
+
+function measuredLookEffect(before: PoseSample, after: PoseSample) {
+  const yawDegrees = radiansToDegrees(normalizeRadians(before.yaw - after.yaw))
+  const pitchDegrees = radiansToDegrees(before.pitch - after.pitch)
+  return {
+    relativeTurnDegrees: { yaw: withoutNegativeZero(yawDegrees), pitch: withoutNegativeZero(pitchDegrees) },
+    turned: Math.hypot(yawDegrees, pitchDegrees) > LOOK_EFFECT_EPSILON_DEGREES,
   }
 }
+
+function measuredMoveEffect(before: PoseSample, after: PoseSample) {
+  const delta = {
+    x: after.position.x - before.position.x,
+    y: after.position.y - before.position.y,
+    z: after.position.z - before.position.z,
+  }
+  const forward = lookDirection(before.yaw, 0)
+  const right = { x: -forward.z, z: forward.x }
+  const relativeDisplacement: [number, number, number] = [
+    withoutNegativeZero(delta.x * right.x + delta.z * right.z),
+    withoutNegativeZero(delta.y),
+    withoutNegativeZero(delta.x * forward.x + delta.z * forward.z),
+  ]
+  const distance = Math.hypot(delta.x, delta.y, delta.z)
+  return {
+    relativeDisplacement,
+    distance: withoutNegativeZero(distance),
+    movement: distance > MOVE_EFFECT_EPSILON ? 'changed' as const : 'no_effect' as const,
+  }
+}
+
+function normalizeRadians(value: number): number {
+  let normalized = value % (Math.PI * 2)
+  if (normalized > Math.PI) normalized -= Math.PI * 2
+  if (normalized < -Math.PI) normalized += Math.PI * 2
+  return normalized
+}
+function radiansToDegrees(value: number): number { return value * 180 / Math.PI }
+function withoutNegativeZero(value: number): number { return Object.is(value, -0) ? 0 : value }
 
 function withoutPrivateSpeech(event: unknown): unknown {
   if (!event || typeof event !== 'object') return event
@@ -433,14 +477,12 @@ function buildInformationRuntime(backend: MinecraftBackendApi, soundHistory: Sou
   registry.register(new SoundInformationProvider(soundHistory))
   registry.register(new ViewportInformationProvider(new BackendPerceptionPort(backend)))
   registry.seal('1.21.1')
-
   const accessPolicy = new InMemoryInformationAccessPolicy()
   accessPolicy.put({
     id: INFORMATION_GRANT_ID, principalId: INFORMATION_PRINCIPAL_ID, audience: 'companion',
     allowedInterfaces: ['current_status', 'inventory_information', 'sound_information', 'viewport_information'],
     purpose: 'companion_context',
   })
-
   return new InformationRuntime({
     registry, accessPolicy, scopeSource: new BackendInformationScopeSource(backend, randomUUID()),
   })

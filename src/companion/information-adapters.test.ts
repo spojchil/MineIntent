@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { test } from 'node:test'
 import type {
-  BackendEventEnvelope, BackendReady, BackendState, MinecraftBackendApi, MinecraftControlsApi,
+  BackendEventEnvelope, BackendReady, BackendState, MinecraftBackendApi, MinecraftMotorDriverApi,
   MinecraftSnapshotV1, ProtocolObservationSource, Unsubscribe,
 } from '../minecraft/contracts.js'
 import {
@@ -40,7 +40,7 @@ class FakeBackend extends EventEmitter implements MinecraftBackendApi {
       subscribe: () => () => {},
     }
   }
-  controls(): MinecraftControlsApi { throw new Error('not used') }
+  motor(): MinecraftMotorDriverApi { throw new Error('not used') }
   sendChat(): void {}
   emitSound(sourcePosition: { x: number; y: number; z: number }): void {
     this.emit('backend', {
@@ -63,7 +63,7 @@ test('BackendPerceptionPort excludes self from nearby entities and maps block lo
   const nearby = port.nearbyEntities()
   assert.equal(nearby.length, 1)
   assert.equal(nearby[0]!.username, 'Alex')
-  assert.deepEqual(port.blockAt({ x: 0, y: 60, z: 0 }), { name: 'stone', solid: true })
+  assert.deepEqual(port.blockAt({ x: 0, y: 60, z: 0 }), { name: 'stone', visible: true, occludes: true })
   assert.equal(port.blockAt({ x: 0, y: 70, z: 0 }), 'unloaded')
 })
 
