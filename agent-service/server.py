@@ -301,11 +301,20 @@ def model_completion(
     messages: list[dict],
     deadline: float,
     run: DecisionRun | None = None,
+    *,
+    offer_tools: bool = True,
 ) -> dict:
-    body = strict_json_dumps({
-        "model": config["model"], "response_format": {"type": "json_object"},
-        "messages": messages, "tools": D40_TOOLS, "tool_choice": "auto",
-    })
+    # response_format=json_object and tools are mutually exclusive in practice: forcing JSON
+    # output suppresses tool_calls entirely, so the body loop can never run. Worse, the model
+    # then answers the JSON schema anyway and fabricates a successful action it never took.
+    # Tool rounds therefore stay unconstrained; only the final output stage forces JSON.
+    request: dict = {"model": config["model"], "messages": messages}
+    if offer_tools:
+        request["tools"] = D40_TOOLS
+        request["tool_choice"] = "auto"
+    else:
+        request["response_format"] = {"type": "json_object"}
+    body = strict_json_dumps(request)
     parsed = urllib.parse.urlsplit(f"{config['base_url']}/chat/completions")
     if (
         parsed.scheme not in {"http", "https"} or parsed.hostname is None
@@ -444,7 +453,31 @@ def run_tool_loop(
         content = message.get("content")
         if not isinstance(content, str):
             raise RuntimeError("model final content is missing")
-        decision = strict_json_loads(content)
+        try:
+            decision = strict_json_loads(content)
+        except (ValueError, RequestValidationError):
+            # Final output stage: the tool rounds run unconstrained, so the closing turn may be
+            # prose. Ask once more with JSON forced and tools withdrawn, replaying what was said.
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": "只输出该轮决策的严格 JSON，不要解释。"})
+            retry = model_completion(config, messages, deadline, run, offer_tools=False)
+            retry_choices = retry.get("choices") if isinstance(retry, dict) else None
+            retry_message = (
+                retry_choices[0].get("message")
+                if isinstance(retry_choices, list) and retry_choices and isinstance(retry_choices[0], dict)
+                else None
+            )
+            retry_content = retry_message.get("content") if isinstance(retry_message, dict) else None
+            if not isinstance(retry_content, str):
+                raise RuntimeError("model final content is missing")
+            raw_retry_usage = retry.get("usage")
+            if isinstance(raw_retry_usage, dict):
+                for key in usage:
+                    value = raw_retry_usage.get(key)
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                        usage[key] += value
+                        has_usage = True
+            decision = strict_json_loads(retry_content)
         if run is not None:
             run.ensure_active()
         remaining_seconds(deadline)
