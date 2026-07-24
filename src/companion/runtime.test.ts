@@ -165,7 +165,7 @@ class FakeMotor implements MinecraftMotorDriverApi {
   }
 }
 
-async function fixture(t: test.TestContext, options: { gateJournal?: boolean } = {}) {
+async function fixture(t: test.TestContext, options: { gateJournal?: boolean; speechIntervalMs?: number } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'mineintent-runtime-'))
   const backend = new FakeBackend()
   const model = new FakeModel()
@@ -177,7 +177,8 @@ async function fixture(t: test.TestContext, options: { gateJournal?: boolean } =
   const runtime = new CompanionRuntime({
     backend, model, memory,
     journal,
-    profile: { profileId: 'test', versionId: 'profile-1', content: '安静、诚实的朋友。', sourcePath: 'profile.md' }, debug, primaryPlayer: 'Alice', speechIntervalMs: 0,
+    profile: { profileId: 'test', versionId: 'profile-1', content: '安静、诚实的朋友。', sourcePath: 'profile.md' },
+    debug, primaryPlayer: 'Alice', speechIntervalMs: options.speechIntervalMs ?? 0,
   })
   await runtime.start()
   t.after(async () => { await runtime.stop('test'); await rm(directory, { recursive: true, force: true }) })
@@ -239,6 +240,39 @@ test('a new player chat aborts an in-flight move and releases controls', async t
   assert.equal(backend.motorInstance.moving, false)
   assert.ok(backend.motorInstance.releases >= 2)
   assert.equal(model.calls.length, 2)
+})
+
+test('a safety stop invalidates an older chat that is still waiting for its journal entry', async t => {
+  const { backend, model, runtime, journal } = await fixture(t, { gateJournal: true })
+  const gated = journal as GateJournal
+  gated.blockNext('player.chat.received')
+
+  backend.emitChat('Bot，往前走')
+  await gated.blocked()
+  backend.emitChat('Bot，停下')
+  await waitFor(() => backend.messages.includes('好，我停下。'))
+  gated.release()
+
+  await runtime.idle()
+  await new Promise(resolve => setTimeout(resolve, 5))
+  assert.equal(model.calls.length, 0)
+  assert.equal(backend.motorInstance.moving, false)
+})
+
+test('a safety stop cancels unsent segments from an older reply', async t => {
+  const { backend, model } = await fixture(t, { speechIntervalMs: 25 })
+  model.handler = async () => ({
+    decision: { protocol: 'mineintent.d40-decision.v1', speech: '旧'.repeat(300), memory: null },
+    model: 'fake',
+  })
+
+  backend.emitChat('Bot，说一段很长的话')
+  await waitFor(() => backend.messages.length === 1)
+  backend.emitChat('Bot，停下')
+  await waitFor(() => backend.messages.includes('好，我停下。'))
+  await new Promise(resolve => setTimeout(resolve, 40))
+
+  assert.deepEqual(backend.messages, ['旧'.repeat(256), '好，我停下。'])
 })
 
 test('a connection-epoch scope change synchronously aborts the active run and releases movement', async t => {

@@ -51,6 +51,41 @@ test('agent service response is bounded and error text is truncated', async () =
   )
 })
 
+test('aborting a decision notifies the service with the exact run id', async () => {
+  const controller = new AbortController()
+  let decisionStarted!: () => void
+  const started = new Promise<void>(resolve => { decisionStarted = resolve })
+  let cancelBody: unknown
+  let cancelSeen!: () => void
+  const cancelled = new Promise<void>(resolve => { cancelSeen = resolve })
+  const provider = new AgentServiceModelProvider({
+    baseUrl: 'http://127.0.0.1:8765', ...transport,
+    fetch: async (input, init) => {
+      const url = new URL(input)
+      if (url.pathname === '/v1/cancel') {
+        cancelBody = JSON.parse(String(init?.body))
+        assert.equal((init?.headers as Record<string, string>).authorization, `Bearer ${transport.serviceToken}`)
+        cancelSeen()
+        return new Response(JSON.stringify({ cancelled: true }), { status: 200 })
+      }
+      decisionStarted()
+      return await new Promise<Response>((_resolve, reject) => {
+        const requestSignal = init?.signal
+        const abort = (): void => reject(new DOMException('aborted', 'AbortError'))
+        requestSignal?.addEventListener('abort', abort, { once: true })
+        if (requestSignal?.aborted === true) abort()
+      })
+    },
+  })
+
+  const running = provider.run({ runId: 'run-to-cancel', context: context() }, controller.signal)
+  await started
+  controller.abort('new_player_chat')
+  await assert.rejects(running, error => error instanceof DOMException && error.name === 'AbortError')
+  await cancelled
+  assert.deepEqual(cancelBody, { runId: 'run-to-cancel' })
+})
+
 function context(): D40DecisionContext {
   return {
     protocol: 'mineintent.d40-context.v1', player: { username: 'Alex', text: '看看那只羊' },

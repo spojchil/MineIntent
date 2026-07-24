@@ -4,6 +4,7 @@ import { d40DecisionSchema, type D40DecisionContext, type ModelProvider, type Mo
 interface FetchLike { (input: string | URL, init?: RequestInit): Promise<Response> }
 const MAX_RESPONSE_BYTES = 64 * 1_024
 const MAX_ERROR_CHARACTERS = 300
+const CANCEL_TIMEOUT_MS = 2_000
 
 export interface AgentServiceOptions {
   baseUrl: string
@@ -25,6 +26,7 @@ const responseSchema = z.strictObject({
 
 export class AgentServiceModelProvider implements ModelProvider {
   readonly #endpoint: URL
+  readonly #cancelEndpoint: URL
   readonly #serviceToken: string
   readonly #callbackUrl: string
   readonly #callbackToken: string
@@ -32,7 +34,9 @@ export class AgentServiceModelProvider implements ModelProvider {
   readonly #fetch: FetchLike
 
   constructor(options: AgentServiceOptions) {
-    this.#endpoint = new URL('/v1/decide', validateAgentServiceBaseUrl(options.baseUrl))
+    const baseUrl = validateAgentServiceBaseUrl(options.baseUrl)
+    this.#endpoint = new URL('/v1/decide', baseUrl)
+    this.#cancelEndpoint = new URL('/v1/cancel', baseUrl)
     this.#serviceToken = validateToken(options.serviceToken, 'Agent service token', 32)
     this.#callbackUrl = validateLoopbackUrl(options.toolCallbackUrl)
     this.#callbackToken = validateToken(options.toolCallbackToken, 'Tool callback token', 16)
@@ -41,26 +45,57 @@ export class AgentServiceModelProvider implements ModelProvider {
   }
 
   async run(input: { runId: string; context: D40DecisionContext }, signal: AbortSignal): Promise<ModelRunResult> {
-    const response = await this.#fetch(this.#endpoint, {
-      method: 'POST',
-      redirect: 'error',
-      signal: AbortSignal.any([signal, AbortSignal.timeout(this.#timeoutMs)]),
-      headers: {
-        authorization: `Bearer ${this.#serviceToken}`,
-        'content-type': 'application/json',
-        'x-mineintent-tool-executor-url': this.#callbackUrl,
-        'x-mineintent-tool-executor-token': this.#callbackToken,
-      },
-      body: JSON.stringify(input),
-    })
-    const payload = await readBoundedJson(response)
-    if (!response.ok) {
-      const message = payload && typeof payload === 'object' && 'error' in payload
-        ? String(payload.error).slice(0, MAX_ERROR_CHARACTERS)
-        : 'unknown error'
-      throw new Error(`Agent service request failed (${response.status}): ${message}`)
+    signal.throwIfAborted()
+    const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(this.#timeoutMs)])
+    let cancelStarted = false
+    const cancelRun = (): void => {
+      if (cancelStarted) return
+      cancelStarted = true
+      void this.#cancelRun(input.runId)
     }
-    return responseSchema.parse(payload)
+    requestSignal.addEventListener('abort', cancelRun, { once: true })
+    try {
+      const response = await this.#fetch(this.#endpoint, {
+        method: 'POST',
+        redirect: 'error',
+        signal: requestSignal,
+        headers: {
+          authorization: `Bearer ${this.#serviceToken}`,
+          'content-type': 'application/json',
+          'x-mineintent-tool-executor-url': this.#callbackUrl,
+          'x-mineintent-tool-executor-token': this.#callbackToken,
+        },
+        body: JSON.stringify(input),
+      })
+      const payload = await readBoundedJson(response)
+      if (!response.ok) {
+        const message = payload && typeof payload === 'object' && 'error' in payload
+          ? String(payload.error).slice(0, MAX_ERROR_CHARACTERS)
+          : 'unknown error'
+        throw new Error(`Agent service request failed (${response.status}): ${message}`)
+      }
+      return responseSchema.parse(payload)
+    } finally {
+      requestSignal.removeEventListener('abort', cancelRun)
+    }
+  }
+
+  async #cancelRun(runId: string): Promise<void> {
+    try {
+      const response = await this.#fetch(this.#cancelEndpoint, {
+        method: 'POST',
+        redirect: 'error',
+        signal: AbortSignal.timeout(CANCEL_TIMEOUT_MS),
+        headers: {
+          authorization: `Bearer ${this.#serviceToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ runId }),
+      })
+      await response.body?.cancel()
+    } catch {
+      // Cancellation is best-effort here; a newer run also supersedes this run server-side.
+    }
   }
 }
 

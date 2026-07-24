@@ -27,7 +27,7 @@ class ServerTests(unittest.TestCase):
 
         deadlines = []
 
-        def completion(_config, messages, deadline):
+        def completion(_config, messages, deadline, _run=None):
             model_messages.append(json.loads(json.dumps(messages)))
             deadlines.append(deadline)
             return responses.pop(0)
@@ -59,7 +59,7 @@ class ServerTests(unittest.TestCase):
         ]
         executed = []
 
-        def completion(_config, messages, _deadline):
+        def completion(_config, messages, _deadline, _run=None):
             model_messages.append(json.loads(json.dumps(messages)))
             return responses.pop(0)
 
@@ -76,14 +76,17 @@ class ServerTests(unittest.TestCase):
             {"choices": [{"message": {"role": "assistant", "content": '{"protocol":"mineintent.d40-decision.v1","speech":null}'}}]},
         ]
         seen = []
-        with patch.object(server, "model_completion", lambda _config, _messages, _deadline: responses.pop(0)):
+        with patch.object(server, "model_completion", lambda _config, _messages, _deadline, _run=None: responses.pop(0)):
             server.run_tool_loop({"model": "x"}, "run-1", context(), lambda *args: seen.append(args))
         self.assertEqual(seen, [])
 
     def test_request_and_json_are_strict(self):
         self.assertEqual(server.require_request({"runId": "r", "context": context()})[0], "r")
+        self.assertEqual(server.require_cancel_request({"runId": "r"}), "r")
         with self.assertRaises(server.RequestValidationError):
             server.require_request({"runId": "r", "context": context(), "extra": True})
+        with self.assertRaises(server.RequestValidationError):
+            server.require_cancel_request({"runId": "r", "extra": True})
         with self.assertRaises(ValueError):
             server.strict_json_loads('{"x":NaN}')
         with self.assertRaises(server.RequestValidationError):
@@ -103,10 +106,8 @@ class ServerTests(unittest.TestCase):
         with self.assertRaises(server.ConfigError):
             server.load_config(env)
 
-    def test_decide_authentication_happens_before_body_and_busy_check(self):
+    def test_decide_authentication_happens_before_body_validation(self):
         httpd = self._start_server()
-        httpd.decision_lock.acquire()
-        self.addCleanup(lambda: httpd.decision_lock.locked() and httpd.decision_lock.release())
         request = urllib.request.Request(
             f"http://127.0.0.1:{httpd.server_port}/v1/decide",
             data=b"not-json",
@@ -120,7 +121,68 @@ class ServerTests(unittest.TestCase):
         request.add_header("authorization", f"Bearer {SERVICE_TOKEN}")
         with self.assertRaises(urllib.error.HTTPError) as caught:
             urllib.request.urlopen(request, timeout=2)
-        self.assertEqual(caught.exception.code, 429)
+        self.assertEqual(caught.exception.code, 400)
+
+    def test_cancelled_run_does_not_block_its_replacement(self):
+        httpd = self._start_server()
+        old_started = threading.Event()
+        release_old = threading.Event()
+        completion_lock = threading.Lock()
+        completion_count = 0
+
+        def completion(_config, _messages, _deadline, _run=None):
+            nonlocal completion_count
+            with completion_lock:
+                completion_count += 1
+                call_number = completion_count
+            if call_number == 1:
+                old_started.set()
+                self.assertTrue(release_old.wait(2), "old model call was not released")
+            return {"choices": [{"message": {"role": "assistant", "content": json.dumps({
+                "protocol": "mineintent.d40-decision.v1", "speech": None,
+            })}}]}
+
+        old_result = {}
+
+        def request_old():
+            try:
+                with urllib.request.urlopen(self._decision_request(httpd, "run-old"), timeout=3) as response:
+                    old_result["status"] = response.status
+            except urllib.error.HTTPError as error:
+                old_result["status"] = error.code
+
+        with patch.object(server, "model_completion", completion):
+            old_thread = threading.Thread(target=request_old)
+            old_thread.start()
+            self.assertTrue(old_started.wait(1), "old decision did not start")
+
+            cancel_request = urllib.request.Request(
+                f"http://127.0.0.1:{httpd.server_port}/v1/cancel",
+                data=b'{"runId":"run-old"}',
+                method="POST",
+                headers={"authorization": f"Bearer {SERVICE_TOKEN}", "content-type": "application/json"},
+            )
+            with urllib.request.urlopen(cancel_request, timeout=1) as response:
+                self.assertEqual(json.load(response), {"cancelled": True})
+
+            with urllib.request.urlopen(self._decision_request(httpd, "run-new"), timeout=1) as response:
+                self.assertEqual(response.status, 200)
+
+            release_old.set()
+            old_thread.join(2)
+
+        self.assertFalse(old_thread.is_alive())
+        self.assertEqual(old_result["status"], 409)
+
+    def test_late_cancel_for_superseded_id_does_not_cancel_new_run(self):
+        runs = server.DecisionRuns()
+        old = runs.begin("run-old")
+        new = runs.begin("run-new")
+        self.assertIsNotNone(old)
+        self.assertIsNotNone(new)
+        self.assertTrue(old.cancelled.is_set())
+        self.assertFalse(runs.cancel("run-old"))
+        new.ensure_active()
 
     def test_decide_enforces_the_round_deadline(self):
         httpd = self._start_server()
@@ -140,42 +202,106 @@ class ServerTests(unittest.TestCase):
                 urllib.request.urlopen(request, timeout=2)
         self.assertEqual(caught.exception.code, 504)
 
-    def test_model_transport_disables_proxy_and_redirects(self):
-        seen_handlers = []
+    def test_model_transport_connects_directly_to_the_configured_endpoint(self):
+        connections = []
 
-        class Response:
-            def __enter__(self): return self
-            def __exit__(self, *_args): return False
-            def read(self, _limit): return b'{"choices":[]}'
+        class Socket:
+            def settimeout(self, timeout): self.timeout = timeout
 
-        class Opener:
-            def open(self, _request, timeout):
-                self.timeout = timeout
-                return Response()
+        class Connection:
+            def __init__(self, host, port, timeout):
+                self.host, self.port, self.timeout = host, port, timeout
+                self.sock = Socket()
+                connections.append(self)
 
-        def build_opener(*handlers):
-            seen_handlers.extend(handlers)
-            return Opener()
+            def connect(self): pass
+            def request(self, method, path, body, headers):
+                self.request_value = (method, path, body, headers)
+            def getresponse(self):
+                return type("Response", (), {"status": 200, "read": lambda _self, _limit: b'{"choices":[]}'})()
+            def close(self): pass
 
-        with patch.object(server.urllib.request, "build_opener", build_opener):
+        with patch.object(server.http.client, "HTTPSConnection", Connection):
             server.model_completion(
-                {"model": "x", "base_url": "https://api.example.test", "api_key": "secret"},
+                {"model": "x", "base_url": "https://api.example.test/v1", "api_key": "secret"},
                 [],
                 time.monotonic() + 1,
             )
-        self.assertTrue(any(isinstance(handler, urllib.request.ProxyHandler) for handler in seen_handlers))
-        self.assertTrue(any(isinstance(handler, server._NoRedirect) for handler in seen_handlers))
+        self.assertEqual((connections[0].host, connections[0].port), ("api.example.test", None))
+        self.assertEqual(connections[0].request_value[:2], ("POST", "/v1/chat/completions"))
+
+    def test_model_transport_cancellation_closes_a_blocked_upstream(self):
+        upstream_started = threading.Event()
+        release_upstream = threading.Event()
+
+        class UpstreamHandler(server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                self.rfile.read(int(self.headers["content-length"]))
+                upstream_started.set()
+                release_upstream.wait(2)
+                try:
+                    payload = b'{"choices":[]}'
+                    self.send_response(200)
+                    self.send_header("content-length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, _format, *_args): pass
+
+        upstream = server.ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+        upstream.daemon_threads = True
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        self.addCleanup(release_upstream.set)
+
+        run = server.DecisionRun("run-old")
+        result = {}
+
+        def request_model():
+            try:
+                server.model_completion({
+                    "model": "x", "base_url": f"http://127.0.0.1:{upstream.server_port}/v1", "api_key": "secret",
+                }, [], time.monotonic() + 5, run)
+            except Exception as error:  # noqa: BLE001
+                result["error"] = error
+
+        model_thread = threading.Thread(target=request_model)
+        model_thread.start()
+        self.assertTrue(upstream_started.wait(1), "upstream request did not start")
+        run.cancel()
+        model_thread.join(1)
+        release_upstream.set()
+
+        self.assertFalse(model_thread.is_alive(), "cancel did not interrupt the upstream response wait")
+        self.assertIsInstance(result.get("error"), server.RunCancelled)
 
     def _start_server(self):
         httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         httpd.daemon_threads = True
         httpd.config = {"service_token": SERVICE_TOKEN, "model": "x"}
-        httpd.decision_lock = threading.Lock()
+        httpd.decision_runs = server.DecisionRuns()
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(httpd.server_close)
         self.addCleanup(httpd.shutdown)
         return httpd
+
+    def _decision_request(self, httpd, run_id):
+        return urllib.request.Request(
+            f"http://127.0.0.1:{httpd.server_port}/v1/decide",
+            data=json.dumps({"runId": run_id, "context": context()}).encode("utf-8"),
+            method="POST",
+            headers={
+                "authorization": f"Bearer {SERVICE_TOKEN}",
+                "content-type": "application/json",
+                "x-mineintent-tool-executor-url": "http://127.0.0.1:9/v1/d40/tool",
+                "x-mineintent-tool-executor-token": "0123456789abcdef",
+            },
+        )
 
 
 def context():

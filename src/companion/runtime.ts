@@ -88,6 +88,7 @@ export class CompanionRuntime {
   #modelAbort?: AbortController
   #activeRun?: ActiveRun
   #decisionTail = Promise.resolve()
+  #runGeneration = 0
   #toolBusy = false
   #started = false
   #lastDangerAt = 0
@@ -123,9 +124,8 @@ export class CompanionRuntime {
   async stop(reason = 'runtime_stopped'): Promise<void> {
     if (!this.#started) return
     this.#started = false
-    this.#abortRunsAndRelease(reason)
+    this.#invalidateRuns(reason)
     await this.#decisionTail
-    this.#speech.stop(reason)
     this.#unsubscribe?.()
     this.#soundHistory.dispose()
     await this.#backend.stop(reason)
@@ -218,11 +218,14 @@ export class CompanionRuntime {
       conversationActiveWith: this.#primaryPlayer,
     })
     if (!message?.addressing.addressedToCompanion || !message.sender.isPrimaryPlayer) return
-    this.#abortRunsAndRelease(message.controlIntent === 'safety_stop' ? 'player_safety_stop' : 'new_player_chat')
+    const generation = this.#invalidateRuns(
+      message.controlIntent === 'safety_stop' ? 'player_safety_stop' : 'new_player_chat',
+    )
     const journalEvent = await this.#journal.append('player.chat.received', {
       sourceEventId: message.sourceEventId, sender: message.sender.username, text: message.text,
       controlIntent: message.controlIntent,
     })
+    if (!this.#started || generation !== this.#runGeneration) return
     this.#pushRecent(journalEvent.id, journalEvent.type, `${message.sender.username}: ${message.text}`)
 
     if (message.controlIntent === 'safety_stop') {
@@ -230,14 +233,14 @@ export class CompanionRuntime {
       await this.#journal.append('companion.safety_stop.applied', { sourceEventId: journalEvent.id })
       return
     }
-    this.#enqueuePlayerDecision(message.sender.username, message.text, journalEvent.id)
+    this.#enqueuePlayerDecision(message.sender.username, message.text, journalEvent.id, generation)
   }
 
-  #enqueuePlayerDecision(username: string, text: string, eventId: string): void {
+  #enqueuePlayerDecision(username: string, text: string, eventId: string, generation: number): void {
     const controller = new AbortController()
     this.#modelAbort = controller
     const run = async () => {
-      if (!this.#started || controller.signal.aborted) return
+      if (!this.#started || controller.signal.aborted || generation !== this.#runGeneration) return
       await this.#runPlayerDecision(username, text, eventId, controller)
     }
     this.#decisionTail = this.#decisionTail.then(run, run).catch(error => this.#recordFailure('model', 'decision_failed', error))
@@ -312,7 +315,7 @@ export class CompanionRuntime {
     try { health = this.#backend.snapshot().self.health } catch { return }
     if (health > 8) return
     this.#lastDangerAt = Date.now()
-    this.#abortRunsAndRelease('danger_reflex')
+    this.#invalidateRuns('danger_reflex')
     this.#speech.schedule({ id: randomUUID(), text: '我受伤了，先停一下。' })
   }
 
@@ -322,7 +325,7 @@ export class CompanionRuntime {
     const envelopeChanged = event.processSessionId !== active.processSessionId ||
       event.connectionEpoch !== active.connectionEpoch || event.worldId !== active.worldId ||
       (event.dimension !== undefined && event.dimension !== active.dimension)
-    if (envelopeChanged || !this.#scopeMatches(active)) this.#abortRunsAndRelease('world_scope_changed')
+    if (envelopeChanged || !this.#scopeMatches(active)) this.#invalidateRuns('world_scope_changed')
   }
 
   #assertRunCurrent(active: ActiveRun): void {
@@ -330,7 +333,7 @@ export class CompanionRuntime {
       throw new DOMException('Model run is no longer current', 'AbortError')
     }
     if (!this.#scopeMatches(active)) {
-      this.#abortRunsAndRelease('world_scope_changed')
+      this.#invalidateRuns('world_scope_changed')
       throw new DOMException('Minecraft world scope changed', 'AbortError')
     }
   }
@@ -345,10 +348,13 @@ export class CompanionRuntime {
     } catch { return false }
   }
 
-  #abortRunsAndRelease(reason: string): void {
+  #invalidateRuns(reason: string): number {
+    const generation = ++this.#runGeneration
     this.#activeRun?.controller.abort(reason)
     this.#modelAbort?.abort(reason)
+    this.#speech.stop(reason)
     this.#releaseBodyInputs()
+    return generation
   }
 
   #releaseBodyInputs(): void {
