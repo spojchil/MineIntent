@@ -43,7 +43,19 @@ const FRAME: ViewportValues['frame'] = {
   axes: ['right', 'up', 'forward'],
   directions: { ahead: '+forward', right: '+right', behind: '-forward', left: '-right' },
 }
-const VIEW_HALF_ANGLE = 45 * Math.PI / 180
+/**
+ * Vanilla's default FOV slider is 70°, and that slider is the *vertical* field of view. The
+ * horizontal angle is derived from the window aspect ratio rather than hardcoded, so the shape
+ * stays honest if the assumed ratio ever changes: at 16:9 it works out to 102.45° (half 51.22°),
+ * at 4:3 to 86.07°. Sprint and the FOV-effects slider widen this in game; that is deliberately
+ * not modelled, since the companion has no camera of its own to widen.
+ */
+const VERTICAL_FOV_DEGREES = 70
+const ASSUMED_ASPECT_RATIO = 16 / 9
+const VIEW_FRUSTUM = {
+  verticalHalfAngle: (VERTICAL_FOV_DEGREES / 2) * Math.PI / 180,
+  horizontalHalfAngle: Math.atan(Math.tan((VERTICAL_FOV_DEGREES / 2) * Math.PI / 180) * ASSUMED_ASPECT_RATIO),
+} as const
 
 export class ViewportInformationProvider implements InformationProvider<ViewportValues> {
   #revision = 0
@@ -88,7 +100,7 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
       values.lookedAtBlock = block ? { name: block.name, relativePosition: viewRelativePosition(pose, block.position) } : null
     }
     if (request.fields.includes('visibleEntities')) {
-      values.visibleEntities = visibleEntities(this.port, 32, VIEW_HALF_ANGLE, 8).map(entity => ({
+      values.visibleEntities = visibleEntities(this.port, 32, VIEW_FRUSTUM, 8).map(entity => ({
         type: entity.type,
         ...(entity.name ? { name: entity.name } : {}),
         ...(entity.username ? { username: entity.username } : {}),
@@ -99,7 +111,7 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
     }
     if (request.fields.includes('visibleBlocks')) {
       const result = await visibleBlocks(this.port, {
-        horizontalRadius: 32, verticalRadius: 20, maxDistance: 32, halfAngle: VIEW_HALF_ANGLE, limit: 256,
+        horizontalRadius: 32, verticalRadius: 20, maxDistance: 32, frustum: VIEW_FRUSTUM, limit: 256,
       }, signal)
       values.visibleBlocks = {
         blocks: result.blocks.map(block => {

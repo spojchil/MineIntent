@@ -32,11 +32,25 @@ export interface VisibleEntity {
   direction: RelativeDirection
 }
 export interface VisibleBlock { name: string; position: Point3; distance: number }
+
+/**
+ * Half-angles of vanilla's view frustum. Minecraft renders a rectangular frustum, not a cone:
+ * the FOV slider is the *vertical* field of view (GameRenderer hands it to
+ * Matrix4f.perspective, whose first argument is fovy), and the horizontal angle follows from
+ * the window aspect ratio. A single isotropic half-angle is wrong in both directions at once.
+ */
+export interface ViewFrustum {
+  /** Half of the vertical FOV in radians. Vanilla's default slider value of 70° gives 35°. */
+  verticalHalfAngle: number
+  /** Half of the horizontal FOV in radians. At 16:9 this is atan(tan(35°) · 16/9) ≈ 51.22°. */
+  horizontalHalfAngle: number
+}
+
 export interface VisibleBlocksOptions {
   horizontalRadius: number
   verticalRadius: number
   maxDistance: number
-  halfAngle: number
+  frustum: ViewFrustum
   limit: number
 }
 
@@ -45,6 +59,33 @@ const STEP = 0.25
 const YIELD_EVERY_VOXELS = 2_048
 
 interface RayHit { voxel: Point3; name: string }
+
+/** Camera axes for a roll-free first-person view: right stays level, up tilts with pitch. */
+function viewAxes(yaw: number, pitch: number): { right: Point3; up: Point3; forward: Point3 } {
+  const forward = lookDirection(yaw, pitch)
+  const level = lookDirection(yaw, 0)
+  const right = { x: -level.z, y: 0, z: level.x }
+  return { right, up: cross(right, forward), forward }
+}
+
+/**
+ * Rectangular frustum test in camera space, replacing the cone's single dot-product threshold.
+ * Comparing against z · tan(half) keeps it to two multiplies instead of two arctangents.
+ */
+function insideFrustum(
+  axes: { right: Point3; up: Point3; forward: Point3 },
+  delta: Point3,
+  frustum: ViewFrustum,
+): boolean {
+  const depth = dot(delta, axes.forward)
+  if (depth <= 0) return false
+  return Math.abs(dot(delta, axes.right)) <= depth * Math.tan(frustum.horizontalHalfAngle)
+    && Math.abs(dot(delta, axes.up)) <= depth * Math.tan(frustum.verticalHalfAngle)
+}
+
+function cross(a: Point3, b: Point3): Point3 {
+  return { x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x }
+}
 
 export function raycastLookedAtBlock(port: PerceptionPort, maxDistance: number): LookedAtBlock | null {
   const pose = port.selfPose()
@@ -60,8 +101,7 @@ export async function visibleBlocks(
 ): Promise<{ blocks: VisibleBlock[]; truncated: boolean }> {
   const pose = port.selfPose()
   const eye = { x: pose.position.x, y: pose.position.y + EYE_HEIGHT, z: pose.position.z }
-  const facing = lookDirection(pose.yaw, pose.pitch)
-  const cosThreshold = Math.cos(options.halfAngle)
+  const axes = viewAxes(pose.yaw, pose.pitch)
   const selfVoxel = { x: Math.floor(pose.position.x), y: Math.floor(pose.position.y), z: Math.floor(pose.position.z) }
   const candidates: VisibleBlock[] = []
   let scanned = 0
@@ -77,7 +117,8 @@ export async function visibleBlocks(
         const center = { x: voxel.x + 0.5, y: voxel.y + 0.5, z: voxel.z + 0.5 }
         const delta = subtract(center, eye)
         const distance = length(delta)
-        if (distance > options.maxDistance || (distance > 0 && dot(delta, facing) / distance < cosThreshold)) continue
+        if (distance > options.maxDistance) continue
+        if (distance > 0 && !insideFrustum(axes, delta, options.frustum)) continue
         const block = port.blockAt(voxel)
         if (block === 'unloaded' || !block.visible || !hasExposedFace(port, voxel)) continue
         if (!lineReachesVoxel(port, eye, voxel, distance)) continue
@@ -93,19 +134,18 @@ export async function visibleBlocks(
 export function visibleEntities(
   port: PerceptionPort,
   maxDistance: number,
-  halfAngle: number,
+  frustum: ViewFrustum,
   limit: number,
 ): VisibleEntity[] {
   const pose = port.selfPose()
   const eye = { x: pose.position.x, y: pose.position.y + EYE_HEIGHT, z: pose.position.z }
-  const facing = lookDirection(pose.yaw, pose.pitch)
-  const cosThreshold = Math.cos(halfAngle)
+  const axes = viewAxes(pose.yaw, pose.pitch)
   const candidates = port.nearbyEntities().flatMap((entity): VisibleEntity[] => {
     const height = entity.height ?? 1.8
     const center = { x: entity.position.x, y: entity.position.y + height / 2, z: entity.position.z }
     const delta = subtract(center, eye)
     const distance = length(delta)
-    if (distance === 0 || distance > maxDistance || dot(delta, facing) / distance < cosThreshold) return []
+    if (distance === 0 || distance > maxDistance || !insideFrustum(axes, delta, frustum)) return []
     const visible = [0.85, 0.5, 0.15].some(fraction => lineIsClear(port, eye, {
       x: entity.position.x, y: entity.position.y + height * fraction, z: entity.position.z,
     }))
