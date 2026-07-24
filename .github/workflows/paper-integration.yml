@@ -9,7 +9,7 @@ concurrency:
 
 jobs:
   paper:
-    runs-on: [self-hosted, mineintent, paper-ci]
+    runs-on: [self-hosted, Linux, ARM64, mineintent, paper-ci]
     timeout-minutes: 15
     permissions:
       contents: read

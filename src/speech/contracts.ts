@@ -13,7 +13,6 @@ export interface PlayerChatMessage {
   text: string
   verified?: boolean
   addressing: { addressedToCompanion: boolean; evidence: AddressingEvidence[] }
-  controlIntent: 'safety_stop' | 'none'
   world: { worldId: string; dimension?: string; connectionEpoch: number }
 }
 

@@ -80,7 +80,7 @@ test('aborting a decision notifies the service with the exact run id', async () 
 
   const running = provider.run({ runId: 'run-to-cancel', context: context() }, controller.signal)
   await started
-  controller.abort('new_player_chat')
+  controller.abort('world_scope_changed')
   await assert.rejects(running, error => error instanceof DOMException && error.name === 'AbortError')
   await cancelled
   assert.deepEqual(cancelBody, { runId: 'run-to-cancel' })

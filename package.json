@@ -5,9 +5,11 @@
   "private": true,
   "scripts": {
     "check": "tsc --noEmit",
+    "check:docs": "node scripts/check-docs.mjs",
     "dev": "tsx src/main.ts",
     "start": "tsx src/main.ts",
     "test": "tsx --test \"src/**/*.test.ts\"",
+    "test:paper": "tsx src/minecraft/paper-integration.ts",
     "test:paper:ci": "tsx src/integration/paper-ci-integration.ts"
   },
   "keywords": [],

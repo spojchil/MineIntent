@@ -67,9 +67,9 @@ const MOVE_EFFECT_EPSILON = 0.01
 const LOOK_EFFECT_EPSILON_DEGREES = 0.01
 
 /**
- * The D40 runtime intentionally has one model route: an addressed player chat. Startup and
- * danger remain local runtime events, and the only model-visible body surface is two short
- * relative inputs. This is an experiment loop, not a replacement planning architecture.
+ * The D40 runtime intentionally has one model route: an addressed player chat. Chat text has
+ * no privileged control phrases, and the only model-visible body surface is two short relative
+ * inputs. This is an experiment loop, not a replacement planning architecture.
  */
 export class CompanionRuntime {
   readonly #backend: MinecraftBackendApi
@@ -87,11 +87,11 @@ export class CompanionRuntime {
   #unsubscribe?: () => void
   #modelAbort?: AbortController
   #activeRun?: ActiveRun
+  #chatTail = Promise.resolve()
   #decisionTail = Promise.resolve()
   #runGeneration = 0
   #toolBusy = false
   #started = false
-  #lastDangerAt = 0
 
   constructor(options: CompanionRuntimeOptions) {
     this.#backend = options.backend
@@ -113,7 +113,15 @@ export class CompanionRuntime {
     if (this.#started) return
     this.#started = true
     await this.#memory.load()
-    this.#unsubscribe = this.#backend.subscribe(event => { void this.#handleBackendEvent(event) })
+    this.#unsubscribe = this.#backend.subscribe(event => {
+      const handle = () => this.#handleBackendEvent(event)
+      if (event.kind === 'chat') {
+        this.#chatTail = this.#chatTail.then(handle, handle)
+          .catch(error => this.#recordFailure('runtime', 'chat_handler_failed', error))
+      } else {
+        void handle().catch(error => this.#recordFailure('runtime', 'backend_event_failed', error))
+      }
+    })
     await this.#backend.start(this.#abort.signal)
     await this.#waitForSelfChunk()
     this.#refreshDebug()
@@ -125,6 +133,7 @@ export class CompanionRuntime {
     if (!this.#started) return
     this.#started = false
     this.#invalidateRuns(reason)
+    await this.#chatTail
     await this.#decisionTail
     this.#unsubscribe?.()
     this.#soundHistory.dispose()
@@ -134,7 +143,10 @@ export class CompanionRuntime {
     this.#debug.update({ connection: this.#backend.state(), currentBodyTool: undefined })
   }
 
-  async idle(): Promise<void> { await this.#decisionTail }
+  async idle(): Promise<void> {
+    await this.#chatTail
+    await this.#decisionTail
+  }
 
   /** Called only by the authenticated loopback bridge while the matching player-chat run lives. */
   async executeBodyTool(invocation: D40ToolInvocation): Promise<unknown> {
@@ -205,12 +217,14 @@ export class CompanionRuntime {
     this.#interruptOnScopeChange(event)
     this.#refreshDebug()
     if (event.kind === 'chat') await this.#handleChat(event as BackendEventEnvelope<ProtocolChatEvent>)
-    if (event.kind === 'self' || event.kind === 'snapshot_changed') this.#considerDanger()
   }
 
   async #handleChat(event: BackendEventEnvelope<ProtocolChatEvent>): Promise<void> {
     let snapshot
     try { snapshot = this.#backend.snapshot() } catch { return }
+    if (snapshot.processSessionId !== event.processSessionId ||
+      snapshot.connectionEpoch !== event.connectionEpoch || snapshot.world.worldId !== event.worldId ||
+      (event.dimension !== undefined && snapshot.world.dimension !== event.dimension)) return
     const message = interpretPlayerChat(event, {
       companionUsername: snapshot.self.username,
       primaryPlayerUsernames: [this.#primaryPlayer],
@@ -218,29 +232,20 @@ export class CompanionRuntime {
       conversationActiveWith: this.#primaryPlayer,
     })
     if (!message?.addressing.addressedToCompanion || !message.sender.isPrimaryPlayer) return
-    const generation = this.#invalidateRuns(
-      message.controlIntent === 'safety_stop' ? 'player_safety_stop' : 'new_player_chat',
-    )
+    const generation = this.#runGeneration
     const journalEvent = await this.#journal.append('player.chat.received', {
       sourceEventId: message.sourceEventId, sender: message.sender.username, text: message.text,
-      controlIntent: message.controlIntent,
     })
     if (!this.#started || generation !== this.#runGeneration) return
-    this.#pushRecent(journalEvent.id, journalEvent.type, `${message.sender.username}: ${message.text}`)
-
-    if (message.controlIntent === 'safety_stop') {
-      this.#speech.schedule({ id: randomUUID(), text: '好，我停下。' })
-      await this.#journal.append('companion.safety_stop.applied', { sourceEventId: journalEvent.id })
-      return
-    }
     this.#enqueuePlayerDecision(message.sender.username, message.text, journalEvent.id, generation)
   }
 
   #enqueuePlayerDecision(username: string, text: string, eventId: string, generation: number): void {
-    const controller = new AbortController()
-    this.#modelAbort = controller
     const run = async () => {
-      if (!this.#started || controller.signal.aborted || generation !== this.#runGeneration) return
+      if (!this.#started || generation !== this.#runGeneration) return
+      this.#pushRecent(eventId, 'player.chat.received', `${username}: ${text}`)
+      const controller = new AbortController()
+      this.#modelAbort = controller
       await this.#runPlayerDecision(username, text, eventId, controller)
     }
     this.#decisionTail = this.#decisionTail.then(run, run).catch(error => this.#recordFailure('model', 'decision_failed', error))
@@ -309,23 +314,22 @@ export class CompanionRuntime {
     }
   }
 
-  #considerDanger(): void {
-    if (!this.#started || Date.now() - this.#lastDangerAt < 10_000) return
-    let health
-    try { health = this.#backend.snapshot().self.health } catch { return }
-    if (health > 8) return
-    this.#lastDangerAt = Date.now()
-    this.#invalidateRuns('danger_reflex')
-    this.#speech.schedule({ id: randomUUID(), text: '我受伤了，先停一下。' })
-  }
-
   #interruptOnScopeChange(event: BackendEventEnvelope): void {
+    if (event.kind !== 'lifecycle' && event.kind !== 'world') return
+    const lifecycleType = event.kind === 'lifecycle' ? (event.payload as { type?: string }).type : undefined
+    const lifecycleInvalidates = lifecycleType !== undefined && [
+      'connection_requested', 'died', 'respawn_transition_started', 'respawned',
+      'dimension_changed', 'reconnect_scheduled', 'connection_closed', 'faulted', 'stopped',
+    ].includes(lifecycleType)
     const active = this.#activeRun
-    if (!active || (event.kind !== 'lifecycle' && event.kind !== 'world')) return
+    if (!active) {
+      if (lifecycleInvalidates) this.#invalidateRuns('world_scope_changed')
+      return
+    }
     const envelopeChanged = event.processSessionId !== active.processSessionId ||
       event.connectionEpoch !== active.connectionEpoch || event.worldId !== active.worldId ||
       (event.dimension !== undefined && event.dimension !== active.dimension)
-    if (envelopeChanged || !this.#scopeMatches(active)) this.#invalidateRuns('world_scope_changed')
+    if (lifecycleInvalidates || envelopeChanged || !this.#scopeMatches(active)) this.#invalidateRuns('world_scope_changed')
   }
 
   #assertRunCurrent(active: ActiveRun): void {

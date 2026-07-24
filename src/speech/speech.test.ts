@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { BackendEventEnvelope, ProtocolChatEvent } from '../minecraft/contracts.js'
-import { interpretPlayerChat, isUnambiguousSafetyStop } from './chat-input.js'
+import { interpretPlayerChat } from './chat-input.js'
 import { segmentChat, SpeechScheduler } from './speech-scheduler.js'
 
 function chat(text: string, sender = 'spojchil'): BackendEventEnvelope<ProtocolChatEvent> {
@@ -26,13 +26,10 @@ test('chat input records sender, addressing evidence, time and world context', (
   assert.equal(message.occurredAt, '2026-07-12T00:00:00.000Z')
 })
 
-test('control detector only promotes standalone addressed safety stops', () => {
-  assert.equal(interpretPlayerChat(chat('停下'), context)?.controlIntent, 'safety_stop')
-  assert.equal(interpretPlayerChat(chat('如果看见岩浆就停下'), context)?.controlIntent, 'none')
-  assert.equal(interpretPlayerChat(chat('他说“停下”'), context)?.controlIntent, 'none')
-  assert.equal(interpretPlayerChat(chat('停下', 'another-player'), { ...context, onlinePlayerUsernames: ['spojchil', 'another-player', 'MineIntentBot'] })?.controlIntent, 'none')
-  assert.equal(isUnambiguousSafetyStop('MineIntentBot，停一下', 'MineIntentBot'), true)
-  assert.equal(isUnambiguousSafetyStop('等一下', 'MineIntentBot'), true)
+test('stop wording remains ordinary addressed player text', () => {
+  const message = interpretPlayerChat(chat('MineIntentBot，停一下'), context)
+  assert.equal(message?.text, 'MineIntentBot，停一下')
+  assert.equal(message?.addressing.addressedToCompanion, true)
 })
 
 test('segmentChat respects Unicode length and keeps ordered content', () => {

@@ -220,29 +220,33 @@ test('startup is local; player chat runs the two-tool closed loop with measured 
   assertNoForbiddenSpatialKeys(results)
 })
 
-test('a new player chat aborts an in-flight move and releases controls', async t => {
+test('a new player chat waits behind an in-flight turn without taking control from the model', async t => {
   const { backend, model, runtime } = await fixture(t)
   let first = true
   model.handler = async input => {
     if (first) {
       first = false
-      await runtime.executeBodyTool({ runId: input.runId, name: 'move_input', arguments: { direction: 'forward', duration_ms: 1500 } })
+      await runtime.executeBodyTool({ runId: input.runId, name: 'move_input', arguments: { direction: 'forward', duration_ms: 80 } })
+      return { decision: { protocol: 'mineintent.d40-decision.v1', speech: '我先走完这一步。', memory: null }, model: 'fake' }
     }
-    return { decision: { protocol: 'mineintent.d40-decision.v1', speech: '停下来看你。', memory: null }, model: 'fake' }
+    return { decision: { protocol: 'mineintent.d40-decision.v1', speech: '我听见了，再判断是否停下。', memory: null }, model: 'fake' }
   }
   backend.emitChat('Bot，往前走')
   while (!backend.motorInstance.moving) await new Promise(resolve => setTimeout(resolve, 1))
   const releasesBeforeChat = backend.motorInstance.releases
-  backend.emitChat('Bot，看我这边')
-  assert.ok(backend.motorInstance.releases > releasesBeforeChat, 'new chat releases inputs before its first await')
+  backend.emitChat('Bot，停下')
+  await new Promise(resolve => setTimeout(resolve, 15))
+  assert.equal(backend.motorInstance.moving, true)
+  assert.equal(backend.motorInstance.releases, releasesBeforeChat)
   await waitFor(() => model.calls.length === 2)
   await runtime.idle()
   assert.equal(backend.motorInstance.moving, false)
-  assert.ok(backend.motorInstance.releases >= 2)
-  assert.equal(model.calls.length, 2)
+  assert.deepEqual(model.calls.map(call => call.context.player.text), ['Bot，往前走', 'Bot，停下'])
+  assert.equal(model.calls[0]!.context.recentEvents.some(event => event.summary.includes('停下')), false)
+  assert.equal(model.calls[1]!.context.recentEvents.some(event => event.summary.includes('停下')), true)
 })
 
-test('a safety stop invalidates an older chat that is still waiting for its journal entry', async t => {
+test('ordinary player chats preserve arrival order while the first journal write waits', async t => {
   const { backend, model, runtime, journal } = await fixture(t, { gateJournal: true })
   const gated = journal as GateJournal
   gated.blockNext('player.chat.received')
@@ -250,29 +254,32 @@ test('a safety stop invalidates an older chat that is still waiting for its jour
   backend.emitChat('Bot，往前走')
   await gated.blocked()
   backend.emitChat('Bot，停下')
-  await waitFor(() => backend.messages.includes('好，我停下。'))
-  gated.release()
-
-  await runtime.idle()
   await new Promise(resolve => setTimeout(resolve, 5))
   assert.equal(model.calls.length, 0)
-  assert.equal(backend.motorInstance.moving, false)
+  gated.release()
+
+  await waitFor(() => model.calls.length === 2)
+  await runtime.idle()
+  assert.deepEqual(model.calls.map(call => call.context.player.text), ['Bot，往前走', 'Bot，停下'])
 })
 
-test('a safety stop cancels unsent segments from an older reply', async t => {
+test('a newer chat preserves model-authored segments from the earlier turn', async t => {
   const { backend, model } = await fixture(t, { speechIntervalMs: 25 })
-  model.handler = async () => ({
-    decision: { protocol: 'mineintent.d40-decision.v1', speech: '旧'.repeat(300), memory: null },
+  model.handler = async input => ({
+    decision: {
+      protocol: 'mineintent.d40-decision.v1',
+      speech: input.context.player.text.includes('停下') ? '这是模型的回复。' : '旧'.repeat(300),
+      memory: null,
+    },
     model: 'fake',
   })
 
   backend.emitChat('Bot，说一段很长的话')
   await waitFor(() => backend.messages.length === 1)
   backend.emitChat('Bot，停下')
-  await waitFor(() => backend.messages.includes('好，我停下。'))
-  await new Promise(resolve => setTimeout(resolve, 40))
+  await waitFor(() => backend.messages.includes('这是模型的回复。'))
 
-  assert.deepEqual(backend.messages, ['旧'.repeat(256), '好，我停下。'])
+  assert.deepEqual(backend.messages, ['旧'.repeat(256), '旧'.repeat(44), '这是模型的回复。'])
 })
 
 test('a connection-epoch scope change synchronously aborts the active run and releases movement', async t => {
@@ -304,6 +311,35 @@ test('connection_closed aborts even while the last snapshot still has the old sc
   assert.ok(backend.motorInstance.releases > releases)
   await runtime.idle()
   assert.equal(backend.motorInstance.moving, false)
+})
+
+test('a scope change drops chat that is still waiting for its journal write', async t => {
+  const { backend, model, runtime, journal } = await fixture(t, { gateJournal: true })
+  const gated = journal as GateJournal
+  gated.blockNext('player.chat.received')
+
+  backend.emitChat('Bot，旧世界里的消息')
+  await gated.blocked()
+  backend.changeScope({ connectionEpoch: 2 })
+  gated.release()
+
+  await runtime.idle()
+  assert.equal(model.calls.length, 0)
+})
+
+test('connection_closed cancels speech segments even when no model run remains active', async t => {
+  const { backend, model } = await fixture(t, { speechIntervalMs: 25 })
+  model.handler = async () => ({
+    decision: { protocol: 'mineintent.d40-decision.v1', speech: '旧'.repeat(300), memory: null },
+    model: 'fake',
+  })
+
+  backend.emitChat('Bot，说一段很长的话')
+  await waitFor(() => backend.messages.length === 1)
+  backend.closeConnectionWithoutChangingSnapshot()
+  await new Promise(resolve => setTimeout(resolve, 40))
+
+  assert.deepEqual(backend.messages, ['旧'.repeat(256)])
 })
 
 test('release failure cannot wedge the tool gate and sub-epsilon motion is reported without quantization', async t => {
@@ -342,7 +378,7 @@ test('stop aborts and releases synchronously before awaiting the decision tail',
   assert.equal(backend.motorInstance.moving, false)
 })
 
-test('a superseded model result cannot speak after its completion journal await', async t => {
+test('queued player turns preserve both model replies after a delayed completion journal', async t => {
   const { backend, model, runtime, journal } = await fixture(t, { gateJournal: true })
   const gated = journal as GateJournal
   gated.blockNext('model.decision.completed')
@@ -361,7 +397,7 @@ test('a superseded model result cannot speak after its completion journal await'
   await waitFor(() => model.calls.length === 2)
   await runtime.idle()
   await new Promise(resolve => setTimeout(resolve, 5))
-  assert.equal(backend.messages.includes('旧回复'), false)
+  assert.equal(backend.messages.includes('旧回复'), true)
   assert.equal(backend.messages.includes('新回复'), true)
 })
 
