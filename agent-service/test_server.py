@@ -245,7 +245,7 @@ class ServerTests(unittest.TestCase):
                     self.send_header("content-length", str(len(payload)))
                     self.end_headers()
                     self.wfile.write(payload)
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
                     pass
 
             def log_message(self, _format, *_args): pass

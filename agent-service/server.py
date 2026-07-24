@@ -329,18 +329,27 @@ def model_completion(
     connection = connection_type(parsed.hostname, port, timeout=remaining_seconds(deadline))
 
     def cancel_connection() -> None:
-        # Wakes a blocked recv on POSIX. On Windows it does not: Winsock cannot abort a blocking
-        # call already in progress from another thread, and closing the socket does not help
-        # either because http.client holds a makefile() reference to it. There the superseded
-        # thread stays parked until the socket timeout set from the round deadline below, so
-        # cancellation is bounded but not prompt. Making it prompt needs a non-blocking read
-        # loop that polls run.cancelled, which is a larger change than this transport.
         active_socket = connection.sock
-        if active_socket is not None:
+        if active_socket is None:
+            return
+        if os.name == "nt":
+            # HTTPResponse owns a socket.makefile() object, so socket.close() defers closing the
+            # Winsock handle. Detach it and use the descriptor-level socket.close() instead;
+            # os.close() is not valid for Windows socket handles.
             try:
-                active_socket.shutdown(socket.SHUT_RDWR)
+                socket_handle = active_socket.detach()
             except OSError:
-                pass
+                return
+            if socket_handle >= 0:
+                try:
+                    socket.close(socket_handle)
+                except OSError:
+                    pass
+            return
+        try:
+            active_socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
     remove_cancel = run.on_cancel(cancel_connection) if run is not None else lambda: None
     try:
