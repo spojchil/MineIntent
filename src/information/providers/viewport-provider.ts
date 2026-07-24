@@ -63,7 +63,7 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
       visibleBlocks: { description: '可见方块；每项为[名称,右,上,前]，可能截断', valueSchema: visibleBlocksSchema, valueType: 'object', precision: 'inferred', sourceKinds: ['viewport_projection'] },
     },
     scopeDependencies: ['connection', 'world'] as const,
-    limits: { maxFieldsPerRead: 5, maxResultBytes: 32_768, timeoutMs: 5_000 },
+    limits: { maxFieldsPerRead: 5, maxResultBytes: 65_536, timeoutMs: 5_000 },
   }
 
   availability(): ProviderAvailability<ViewportValues> {
@@ -99,7 +99,7 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
     }
     if (request.fields.includes('visibleBlocks')) {
       const result = await visibleBlocks(this.port, {
-        horizontalRadius: 32, verticalRadius: 4, maxDistance: 32, halfAngle: VIEW_HALF_ANGLE, limit: 24,
+        horizontalRadius: 32, verticalRadius: 20, maxDistance: 32, halfAngle: VIEW_HALF_ANGLE, limit: 256,
       }, signal)
       values.visibleBlocks = {
         blocks: result.blocks.map(block => {
