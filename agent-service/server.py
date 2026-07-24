@@ -329,6 +329,12 @@ def model_completion(
     connection = connection_type(parsed.hostname, port, timeout=remaining_seconds(deadline))
 
     def cancel_connection() -> None:
+        # Wakes a blocked recv on POSIX. On Windows it does not: Winsock cannot abort a blocking
+        # call already in progress from another thread, and closing the socket does not help
+        # either because http.client holds a makefile() reference to it. There the superseded
+        # thread stays parked until the socket timeout set from the round deadline below, so
+        # cancellation is bounded but not prompt. Making it prompt needs a non-blocking read
+        # loop that polls run.cancelled, which is a larger change than this transport.
         active_socket = connection.sock
         if active_socket is not None:
             try:
