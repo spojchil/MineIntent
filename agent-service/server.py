@@ -208,6 +208,9 @@ def load_config(env: dict = os.environ) -> dict:
     for name, value in required.items():
         if not value:
             raise ConfigError(f"{name} is required")
+    effort = env.get("MINEINTENT_MODEL_REASONING_EFFORT", "").strip()
+    if effort and effort not in {"low", "medium", "high"}:
+        raise ConfigError("reasoning effort must be low, medium or high")
     try:
         port = int(env.get("MINEINTENT_AGENT_SERVICE_PORT", "8765"))
     except ValueError as error:
@@ -219,7 +222,7 @@ def load_config(env: dict = os.environ) -> dict:
         raise ConfigError("agent service token must be 32-512 printable ASCII characters")
     if hmac.compare_digest(token.encode("utf-8"), required["api_key"].encode("utf-8")):
         raise ConfigError("agent service token must differ from the model API key")
-    return {**required, "port": port}
+    return {**required, "reasoning_effort": effort, "port": port}
 
 
 def authorized(header: str | None, expected_token: str) -> bool:
@@ -309,6 +312,8 @@ def model_completion(
     # then answers the JSON schema anyway and fabricates a successful action it never took.
     # Tool rounds therefore stay unconstrained; only the final output stage forces JSON.
     request: dict = {"model": config["model"], "messages": messages}
+    if config.get("reasoning_effort"):
+        request["reasoning_effort"] = config["reasoning_effort"]
     if offer_tools:
         request["tools"] = D40_TOOLS
         request["tool_choice"] = "auto"
