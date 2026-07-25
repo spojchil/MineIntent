@@ -20,9 +20,8 @@ class ServerTests(unittest.TestCase):
                 "role": "assistant", "content": "", "reasoning_content": "need turn",
                 "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "look_relative", "arguments": '{"yaw_degrees":90,"pitch_degrees":0}'}}],
             }}], "usage": {"prompt_tokens": 10, "completion_tokens": 2}},
-            {"choices": [{"message": {"role": "assistant", "content": json.dumps({
-                "protocol": "mineintent.d40-decision.v1", "speech": "看见了。",
-            }, ensure_ascii=False)}}], "usage": {"prompt_tokens": 20, "completion_tokens": 3}},
+            {"choices": [{"message": {"role": "assistant", "content": "看见了。"}}],
+             "usage": {"prompt_tokens": 20, "completion_tokens": 3}},
         ]
 
         deadlines = []
@@ -55,7 +54,7 @@ class ServerTests(unittest.TestCase):
                 {"id": "one", "function": {"name": "move_input", "arguments": '{"direction":"forward","duration_ms":50}'}},
                 {"id": "two", "function": {"name": "look_relative", "arguments": '{"yaw_degrees":10,"pitch_degrees":0}'}},
             ]}}]},
-            {"choices": [{"message": {"role": "assistant", "content": '{"protocol":"mineintent.d40-decision.v1","speech":null}'}}]},
+            {"choices": [{"message": {"role": "assistant", "content": ""}}]},
         ]
         executed = []
 
@@ -73,12 +72,54 @@ class ServerTests(unittest.TestCase):
             {"choices": [{"message": {"role": "assistant", "tool_calls": [
                 {"id": "bad", "function": {"name": "move_input", "arguments": '{"direction":"forward","duration_ms":5000}'}}
             ]}}]},
-            {"choices": [{"message": {"role": "assistant", "content": '{"protocol":"mineintent.d40-decision.v1","speech":null}'}}]},
+            {"choices": [{"message": {"role": "assistant", "content": ""}}]},
         ]
         seen = []
         with patch.object(server, "model_completion", lambda _config, _messages, _deadline, _run=None: responses.pop(0)):
             server.run_tool_loop({"model": "x"}, "run-1", context(), lambda *args: seen.append(args))
         self.assertEqual(seen, [])
+
+    def test_closing_text_becomes_the_decision_envelope(self):
+        # 标准工具调用的收尾是普通助手文本；信封由本服务构造，不要求模型作者化。
+        self.assertEqual(
+            server.decision_from_closing_text("  走过去了。  "),
+            {"protocol": "mineintent.d40-decision.v1", "speech": "走过去了。"},
+        )
+        for silent in ["", "   ", "\n\t "]:
+            self.assertIsNone(server.decision_from_closing_text(silent)["speech"])
+        with self.assertRaises(RuntimeError):
+            server.decision_from_closing_text("看" * 501)
+
+    def test_closing_text_rejects_a_tool_call_the_provider_failed_to_surface(self):
+        # 两种实测泄漏形式：一家把内部标记原样吐成文本，另一家自造 JSON 字段承载工具调用。
+        # 两者都携带一个真实但未执行的动作；当成话说出去就是伪造成功。
+        leaks = [
+            '{"protocol":"mineintent.d40-decision.v1","speech":null}\n'
+            '<｜｜DSML｜｜tool_calls>\n'
+            '<｜｜DSML｜｜invoke name="look_relative">',
+            '{"protocol":"mineintent.d40-decision.v1","speech":"我先找找。",'
+            '"__tool__":"look_relative","__tool_args__":{"yaw_degrees":90,"pitch_degrees":0}}',
+            "我先 move_input forward 500ms。",
+        ]
+        for leaked in leaks:
+            with self.assertRaises(RuntimeError):
+                server.decision_from_closing_text(leaked)
+
+    def test_closing_text_tolerates_the_old_envelope(self):
+        # 模型出于习惯仍然吐旧信封时不该把 JSON 当成台词念给玩家。
+        self.assertEqual(
+            server.decision_from_closing_text(
+                '{"protocol":"mineintent.d40-decision.v1","speech":"好。"}'
+            )["speech"],
+            "好。",
+        )
+        self.assertIsNone(
+            server.decision_from_closing_text(
+                '{"protocol":"mineintent.d40-decision.v1","speech":null}'
+            )["speech"]
+        )
+        # 不是信封的 JSON 就是普通台词，原样保留。
+        self.assertEqual(server.decision_from_closing_text('{"a":1}')["speech"], '{"a":1}')
 
     def test_request_and_json_are_strict(self):
         self.assertEqual(server.require_request({"runId": "r", "context": context()})[0], "r")
@@ -92,7 +133,7 @@ class ServerTests(unittest.TestCase):
         with self.assertRaises(server.RequestValidationError):
             server.http_tool_executor("https://example.com/tool", "0123456789abcdef")
         with self.assertRaises(RuntimeError):
-            server._validate_decision({"protocol": "mineintent.d40-decision.v1", "speech": None, "memory": None})
+            server.decision_from_closing_text("看" * 501)
 
     def test_config_requires_an_independent_service_token(self):
         env = {

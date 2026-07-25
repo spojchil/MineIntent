@@ -6,6 +6,7 @@ import hmac
 import http.client
 import math
 import os
+import re
 import socket
 import sys
 import threading
@@ -22,6 +23,13 @@ _MAX_JSON_BYTES = 1_048_576
 _MAX_TOOL_RESULT_BYTES = 262_144
 _MAX_TOOL_ROUNDS = 16
 _ROUND_TIMEOUT_S = 180.0
+_DECISION_PROTOCOL = "mineintent.d40-decision.v1"
+_MAX_SPEECH_CHARACTERS = 500
+
+# A tool call the provider failed to lift out of the raw generation and into `tool_calls`. Seen on
+# one endpoint as verbatim internal markup and on another as invented JSON fields; both carry a
+# real action the transport dropped, so the closing text must be checked for them.
+_LEAKED_TOOL_CALL = re.compile(r"look_relative|move_input|DSML|<\s*tool_calls|invoke\s+name=")
 
 # Extension point: a future observed-space navigation tool can be added beside these inputs.
 # It must not silently replace move_input, and it is intentionally not implemented in D40.
@@ -30,12 +38,22 @@ D40_TOOLS = [
         "type": "function",
         "function": {
             "name": "look_relative",
-            "description": "Turn the first-person view briefly, then receive a fresh viewport. Positive yaw is right; positive pitch is down.",
+            "description": (
+                "Turn the first-person view by a relative amount, then receive a fresh viewport. "
+                "Call this when the player refers to something that is not in the current viewport, "
+                "or when you need to face a different direction before moving."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "yaw_degrees": {"type": "number", "minimum": -90, "maximum": 90},
-                    "pitch_degrees": {"type": "number", "minimum": -90, "maximum": 90},
+                    "yaw_degrees": {
+                        "type": "number", "minimum": -90, "maximum": 90,
+                        "description": "Horizontal turn from the current view. Positive turns right, negative turns left.",
+                    },
+                    "pitch_degrees": {
+                        "type": "number", "minimum": -90, "maximum": 90,
+                        "description": "Vertical turn from the current view. Positive looks down, negative looks up.",
+                    },
                 },
                 "required": ["yaw_degrees", "pitch_degrees"],
                 "additionalProperties": False,
@@ -46,13 +64,28 @@ D40_TOOLS = [
         "type": "function",
         "function": {
             "name": "move_input",
-            "description": "Hold one real movement input briefly, release it, then receive actual movement feedback and a fresh viewport.",
+            "description": (
+                "Hold one real movement key briefly, release it, then receive the actual movement "
+                "feedback and a fresh viewport. Call this to close distance on something already "
+                "visible. There is no pathfinding and no jumping: one call covers a few blocks at "
+                "most, obstacles are not handled for you, and the body may still be settling when "
+                "the call returns."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "direction": {"type": "string", "enum": ["forward", "back", "left", "right"]},
-                    "duration_ms": {"type": "integer", "minimum": 50, "maximum": 1500},
-                    "sprint": {"type": "boolean"},
+                    "direction": {
+                        "type": "string", "enum": ["forward", "back", "left", "right"],
+                        "description": "Which movement key to hold, relative to the direction you are currently facing.",
+                    },
+                    "duration_ms": {
+                        "type": "integer", "minimum": 50, "maximum": 1500,
+                        "description": "How long to hold the key. Walking covers roughly one block per 250ms.",
+                    },
+                    "sprint": {
+                        "type": "boolean",
+                        "description": "Hold sprint as well, covering more ground in the same duration.",
+                    },
                 },
                 "required": ["direction", "duration_ms"],
                 "additionalProperties": False,
@@ -304,21 +337,20 @@ def model_completion(
     messages: list[dict],
     deadline: float,
     run: DecisionRun | None = None,
-    *,
-    offer_tools: bool = True,
 ) -> dict:
-    # response_format=json_object and tools are mutually exclusive in practice: forcing JSON
-    # output suppresses tool_calls entirely, so the body loop can never run. Worse, the model
-    # then answers the JSON schema anyway and fabricates a successful action it never took.
-    # Tool rounds therefore stay unconstrained; only the final output stage forces JSON.
-    request: dict = {"model": config["model"], "messages": messages}
+    # Ordinary OpenAI-compatible tool calling: tools are offered on every round and the closing
+    # turn is plain assistant text. `response_format` is deliberately never sent. Asking the model
+    # to author a JSON envelope in a request that also offers tools puts two output contracts in
+    # competition, and measured across seven models on three providers, six then stopped emitting
+    # structured `tool_calls` — arguably correctly, since a tool call is not a JSON object in the
+    # content channel. The envelope is this service's contract with the runtime, so Python builds
+    # it from the closing text rather than making the model produce it.
+    request: dict = {
+        "model": config["model"], "messages": messages,
+        "tools": D40_TOOLS, "tool_choice": "auto",
+    }
     if config.get("reasoning_effort"):
         request["reasoning_effort"] = config["reasoning_effort"]
-    if offer_tools:
-        request["tools"] = D40_TOOLS
-        request["tool_choice"] = "auto"
-    else:
-        request["response_format"] = {"type": "json_object"}
     body = strict_json_dumps(request)
     parsed = urllib.parse.urlsplit(f"{config['base_url']}/chat/completions")
     if (
@@ -473,35 +505,11 @@ def run_tool_loop(
         content = message.get("content")
         if not isinstance(content, str):
             raise RuntimeError("model final content is missing")
-        try:
-            decision = strict_json_loads(content)
-        except (ValueError, RequestValidationError):
-            # Final output stage: the tool rounds run unconstrained, so the closing turn may be
-            # prose. Ask once more with JSON forced and tools withdrawn, replaying what was said.
-            messages.append({"role": "assistant", "content": content})
-            messages.append({"role": "user", "content": "只输出该轮决策的严格 JSON，不要解释。"})
-            retry = model_completion(config, messages, deadline, run, offer_tools=False)
-            retry_choices = retry.get("choices") if isinstance(retry, dict) else None
-            retry_message = (
-                retry_choices[0].get("message")
-                if isinstance(retry_choices, list) and retry_choices and isinstance(retry_choices[0], dict)
-                else None
-            )
-            retry_content = retry_message.get("content") if isinstance(retry_message, dict) else None
-            if not isinstance(retry_content, str):
-                raise RuntimeError("model final content is missing")
-            raw_retry_usage = retry.get("usage")
-            if isinstance(raw_retry_usage, dict):
-                for key in usage:
-                    value = raw_retry_usage.get(key)
-                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                        usage[key] += value
-                        has_usage = True
-            decision = strict_json_loads(retry_content)
+        decision = decision_from_closing_text(content)
         if run is not None:
             run.ensure_active()
         remaining_seconds(deadline)
-        return _validate_decision(decision), usage if has_usage else None
+        return decision, usage if has_usage else None
     raise RuntimeError("tool loop exceeded its round limit")
 
 
@@ -526,15 +534,48 @@ def _validate_tool_arguments(name: str, arguments: dict) -> None:
         raise RequestValidationError("unknown body tool")
 
 
-def _validate_decision(value: object) -> dict:
-    if not isinstance(value, dict) or set(value) != {"protocol", "speech"}:
-        raise RuntimeError("final decision has invalid fields")
-    if value.get("protocol") != "mineintent.d40-decision.v1":
-        raise RuntimeError("final decision protocol is invalid")
-    speech = value.get("speech")
-    if speech is not None and (not isinstance(speech, str) or not speech.strip() or len(speech) > 500):
-        raise RuntimeError("final speech is invalid")
-    return value
+def decision_from_closing_text(content: str) -> dict:
+    """Build the decision envelope from an ordinary closing assistant message.
+
+    The envelope is this service's contract with the Node runtime, not a shape the model is asked
+    to author, so the model's closing turn is plain text and Python owns the structure.
+    """
+    raw = content.strip()
+    # Two independent guards cover the extra-fields leak: `_unwrap_legacy_envelope` refuses any
+    # envelope whose keys are not exactly {protocol, speech}, so the smuggled fields survive to be
+    # seen here, and this check runs on the raw text so it still holds if that ever loosens.
+    if _LEAKED_TOOL_CALL.search(raw):
+        # The model decided to act and the provider failed to surface the call. Reporting this as
+        # speech would hand the player a decision whose action never ran, which is precisely the
+        # fabricated-success failure the experiment exists to catch. Fail loudly instead.
+        raise RuntimeError("closing message carries a tool call that was never executed")
+    speech = _unwrap_legacy_envelope(raw)
+    if not speech:
+        return {"protocol": _DECISION_PROTOCOL, "speech": None}
+    if len(speech) > _MAX_SPEECH_CHARACTERS:
+        # Deliberately an error rather than a truncation: a rambling close is a prompt-following
+        # failure worth measuring, and a sentence cut mid-word is more obviously wrong in chat
+        # than no reply at all.
+        raise RuntimeError("closing message is too long to be one line of speech")
+    return {"protocol": _DECISION_PROTOCOL, "speech": speech}
+
+
+def _unwrap_legacy_envelope(text: str) -> str:
+    """Tolerate a model that still answers with the old decision envelope out of habit."""
+    if not (text.startswith("{") and text.endswith("}")):
+        return text
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return text
+    if not isinstance(parsed, dict) or set(parsed) != {"protocol", "speech"}:
+        return text
+    if parsed.get("protocol") != _DECISION_PROTOCOL:
+        return text
+    speech = parsed.get("speech")
+    if speech is None:
+        return ""
+    return speech.strip() if isinstance(speech, str) else text
 
 
 class Handler(BaseHTTPRequestHandler):
