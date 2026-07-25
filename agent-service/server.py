@@ -413,6 +413,44 @@ def model_completion(
         connection.close()
 
 
+def _non_negative_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def normalize_usage(raw_usage: object) -> dict:
+    """Maps one provider's usage payload onto our four counters.
+
+    All three providers speak OpenAI's wire format but report cache hits in two different places:
+    DeepSeek puts `prompt_cache_hit_tokens` at the top level, while Zhipu and Moonshot follow
+    OpenAI's `prompt_tokens_details.cached_tokens`. Recording the hit count is what turns cache
+    behaviour into something measured instead of argued about, and it matters here more than usual:
+    every provider refuses to cache a prefix below a floor (256 tokens on Moonshot, 512 on Zhipu,
+    64-token units on DeepSeek), so a prompt shaped like ours can hit exactly zero — and without
+    this counter the only other evidence of that is the bill.
+
+    A cache-write counter is not documented for any of the three; it is read anyway because
+    DeepSeek-style proxies do report one, and an absent key simply yields no entry.
+    """
+    if not isinstance(raw_usage, dict):
+        return {}
+    details = raw_usage.get("prompt_tokens_details")
+    details = details if isinstance(details, dict) else {}
+    candidates = {
+        "prompt_tokens": (raw_usage.get("prompt_tokens"),),
+        "completion_tokens": (raw_usage.get("completion_tokens"),),
+        "cache_read_tokens": (raw_usage.get("prompt_cache_hit_tokens"), details.get("cached_tokens")),
+        "cache_write_tokens": (details.get("cache_write_tokens"),),
+    }
+    counters: dict[str, int] = {}
+    for target, sources in candidates.items():
+        for source in sources:
+            value = _non_negative_int(source)
+            if value is not None:
+                counters[target] = value
+                break
+    return counters
+
+
 def run_tool_loop(
     config: dict,
     run_id: str,
@@ -428,8 +466,9 @@ def run_tool_loop(
         {"role": "system", "content": system_prompt()},
         {"role": "user", "content": json.dumps(context, ensure_ascii=False, separators=(",", ":"))},
     ]
-    usage = {"prompt_tokens": 0, "completion_tokens": 0}
-    has_usage = False
+    # Summed across rounds: one run is several requests, and the run's hit rate is only meaningful
+    # against the run's total prompt tokens.
+    usage: dict[str, int] = {}
     closing: str | None = None
     error_summary: str | None = None
     try:
@@ -444,13 +483,8 @@ def run_tool_loop(
             message = choices[0].get("message") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
             if not isinstance(message, dict):
                 raise RuntimeError("model response has no assistant message")
-            raw_usage = payload.get("usage")
-            if isinstance(raw_usage, dict):
-                for key in usage:
-                    value = raw_usage.get(key)
-                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                        usage[key] += value
-                        has_usage = True
+            for key, value in normalize_usage(payload.get("usage")).items():
+                usage[key] = usage.get(key, 0) + value
             tool_calls = message.get("tool_calls")
             if isinstance(tool_calls, list) and tool_calls:
                 replay = {key: message[key] for key in ("role", "content", "reasoning_content", "tool_calls") if key in message}
@@ -493,7 +527,7 @@ def run_tool_loop(
             if run is not None:
                 run.ensure_active()
             remaining_seconds(deadline)
-            return closing, (usage if has_usage else None)
+            return closing, (usage or None)
         raise RuntimeError("tool loop exceeded its round limit")
     except BaseException as error:
         error_summary = f"{type(error).__name__}: {error}"[:300]
@@ -501,7 +535,7 @@ def run_tool_loop(
     finally:
         append_transcript(
             run_id, config.get("model", ""), tools, messages, closing,
-            usage if has_usage else None, error_summary, config.get("transcript_path"),
+            usage or None, error_summary, config.get("transcript_path"),
         )
 
 
@@ -614,6 +648,8 @@ class Handler(BaseHTTPRequestHandler):
                 usage = {
                     "inputTokens": raw_usage.get("prompt_tokens"),
                     "outputTokens": raw_usage.get("completion_tokens"),
+                    "cacheReadTokens": raw_usage.get("cache_read_tokens"),
+                    "cacheWriteTokens": raw_usage.get("cache_write_tokens"),
                 }
                 usage = {
                     key: value for key, value in usage.items()

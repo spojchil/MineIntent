@@ -22,6 +22,8 @@ const responseSchema = z.strictObject({
   usage: z.strictObject({
     inputTokens: z.number().int().nonnegative().optional(),
     outputTokens: z.number().int().nonnegative().optional(),
+    cacheReadTokens: z.number().int().nonnegative().optional(),
+    cacheWriteTokens: z.number().int().nonnegative().optional(),
   }).optional(),
 })
 

@@ -20,7 +20,13 @@ export interface AgentDecisionContext {
  */
 export interface ModelRunResult {
   model: string
-  usage?: { inputTokens?: number; outputTokens?: number }
+  /**
+   * `cacheReadTokens` is the prefix the provider served from its cache. It is reported because our
+   * prompt shape decides it: every provider refuses to cache a prefix under a floor, so a run can
+   * legitimately report zero, and a hit rate is only auditable against `inputTokens` from the same
+   * run. Absent when the provider reported nothing.
+   */
+  usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number }
 }
 export interface ModelProvider {
   run(

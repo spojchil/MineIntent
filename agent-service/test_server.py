@@ -75,6 +75,41 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(tool_result["tool_call_id"], "call-1")
         self.assertIn("sheep", tool_result["content"])
 
+    def test_cache_counters_are_read_from_each_provider_shape_and_summed(self):
+        # DeepSeek reports the hit at the top level; Zhipu and Moonshot use OpenAI's nested details.
+        # Both must land on the same counter, or a hit rate cannot be compared across providers.
+        self.assertEqual(
+            server.normalize_usage({"prompt_tokens": 900, "completion_tokens": 5, "prompt_cache_hit_tokens": 640, "prompt_cache_miss_tokens": 260}),
+            {"prompt_tokens": 900, "completion_tokens": 5, "cache_read_tokens": 640},
+        )
+        self.assertEqual(
+            server.normalize_usage({"prompt_tokens": 900, "prompt_tokens_details": {"cached_tokens": 512, "cache_write_tokens": 388}}),
+            {"prompt_tokens": 900, "cache_read_tokens": 512, "cache_write_tokens": 388},
+        )
+        # A provider below its own caching floor reports zero, which is a finding rather than a gap:
+        # it must survive as 0 and not be dropped the way a missing key is.
+        self.assertEqual(server.normalize_usage({"prompt_tokens_details": {"cached_tokens": 0}}), {"cache_read_tokens": 0})
+        for junk in (None, [], {"prompt_tokens": -1}, {"prompt_tokens": True}, {"prompt_tokens_details": 7}):
+            self.assertEqual(server.normalize_usage(junk), {})
+
+        sink = _Sink()
+        self.addCleanup(sink.dir.cleanup)
+        responses = [
+            {"choices": [{"message": {"role": "assistant", "content": "",
+                                      "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "say", "arguments": "{}"}}]}}],
+             "usage": {"prompt_tokens": 700, "completion_tokens": 4, "prompt_cache_hit_tokens": 0}},
+            {"choices": [{"message": {"role": "assistant", "content": ""}}],
+             "usage": {"prompt_tokens": 1200, "completion_tokens": 6, "prompt_cache_hit_tokens": 704}},
+        ]
+        with patch.object(server, "model_completion", lambda *_a, **_k: responses.pop(0)):
+            _closing, usage = server.run_tool_loop(
+                sink.config(), "run-cache", context(), lambda *_a, **_k: {"status": "queued"}, tools(),
+            )
+        # Round one is a cold write, round two hits the prefix built by round one: the run's own
+        # numbers are what make intra-run reuse visible without a provider dashboard.
+        self.assertEqual(usage, {"prompt_tokens": 1900, "completion_tokens": 10, "cache_read_tokens": 704})
+        self.assertEqual(sink.records()[0]["usage"]["cache_read_tokens"], 704)
+
     def test_parallel_calls_all_execute_in_order(self):
         sink = _Sink()
         self.addCleanup(sink.dir.cleanup)
