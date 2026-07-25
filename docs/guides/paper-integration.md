@@ -2,8 +2,8 @@
 status: reference
 authority: informative
 implementation: partial
-last_verified: 2026-07-23
-applies_to: codex/trustworthy-passive-context@57d438e
+last_verified: 2026-07-25
+applies_to: main@9c46b9f
 ---
 
 # Paper 1.21.1 集成测试
@@ -12,7 +12,9 @@ applies_to: codex/trustworthy-passive-context@57d438e
 
 ## 覆盖范围
 
-下面描述**场景代码会检查什么**，不等于当前分支已经在线跑通验收——最新实验分支仍没有 Actions 或 Paper run：
+下面描述 `main@9c46b9f` 的**场景代码会检查什么**，不等于这些场景已经在当前提交
+在线跑通。D40 实验有七次真实 Paper/模型现场运行，但没有 Actions/Paper CI 运行，
+也没有在归档头上完整重跑：
 
 - Minecraft Backend 连接、死亡、重生和服务端重启后的自动重连
 - 测试客户端移动，以及清除控制状态后的停止
@@ -68,7 +70,7 @@ gh run watch
 本地 Windows Backend 生命周期测试：
 
 ```powershell
-$env:MC_OBSERVER_USERNAMES='spojchil'
+$env:MC_OBSERVER_USERNAMES='你的观察者游戏名'
 pnpm test:paper
 ```
 

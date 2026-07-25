@@ -2,7 +2,7 @@
 status: reference
 authority: informative
 implementation: current
-last_verified: 2026-07-23
+last_verified: 2026-07-25
 ---
 
 # 文档登记表
@@ -63,8 +63,8 @@ last_verified: 2026-07-23
 | 文档 | 状态 / 权威 | 实现 | 来源与用途 |
 |---|---|---|---|
 | [指南入口](./guides/README.md) | reference / informative | current | 分区导航 |
-| [首个同伴原型](./guides/companion-prototype.md) | reference / informative | current | 原 `docs/testing/companion-prototype.md`；PR #31 / `ff6cd0c`，后经 `0927db4` |
-| [Paper 集成](./guides/paper-integration.md) | reference / informative | partial | 原 `docs/testing/paper-integration.md`；PR #30/#31（`f6bd425`/`ff6cd0c`），后经 `0927db4`；最新分支尚无 run |
+| [首个同伴原型](./guides/companion-prototype.md) | reference / informative | current | 原 `docs/testing/companion-prototype.md`；PR #31 / `ff6cd0c`，后经 `0927db4`；当前指南描述 `main@9c46b9f` |
+| [Paper 集成](./guides/paper-integration.md) | reference / informative | partial | 原 `docs/testing/paper-integration.md`；PR #30/#31（`f6bd425`/`ff6cd0c`），后经 `0927db4`；当前指南描述 `main@9c46b9f` 场景代码，D40 尚无 Actions/Paper CI 复跑 |
 | [模型接口参考](./guides/model-interface.md) | reference / informative | current | 原根目录 `MODEL_INTERFACE_REFERENCE.md`；直接提交 `9eb3a16`，无 PR；TypeScript schema 优先 |
 
 ## 来路（为什么走到今天？）

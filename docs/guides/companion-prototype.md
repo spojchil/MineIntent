@@ -2,8 +2,8 @@
 status: reference
 authority: informative
 implementation: current
-last_verified: 2026-07-23
-applies_to: codex/trustworthy-passive-context@57d438e
+last_verified: 2026-07-25
+applies_to: main@9c46b9f
 ---
 
 # 运行同伴原型
