@@ -15,8 +15,9 @@ import {
   type ViewportValues,
 } from '../information/index.js'
 import type { FileMemoryStore } from '../memory/index.js'
+import { ExecutionArbiter, type ExecutionResource } from '../execution/index.js'
 import type {
-  BackendEventEnvelope, MinecraftBackendApi, MotorMoveDirection, ProtocolChatEvent,
+  BackendEventEnvelope, MinecraftBackendApi, ProtocolChatEvent,
 } from '../minecraft/contracts.js'
 import {
   agentToolDefinitions,
@@ -69,18 +70,12 @@ interface ActiveRun extends RunScope {
   /** Journal id of the player chat that started this run; evidence for tool-written memories. */
   chatEventId: string
   sayCount: number
-  /** Movement inputs already used in the current round, so opposing pairs can be refused. */
-  roundMoves: { roundId: number; directions: Set<MotorMoveDirection> }
 }
 
 /** Which resource a tool needs. Locks are per resource, not per tool: `say` and `remember` touch
  * neither the body nor each other, so a body input in flight must not block them. */
-const TOOL_RESOURCE: Record<string, 'body' | 'chat' | 'memory'> = {
+const TOOL_RESOURCE: Record<string, ExecutionResource> = {
   look_relative: 'body', move_input: 'body', say: 'chat', remember: 'memory',
-}
-
-const OPPOSING_DIRECTION: Record<MotorMoveDirection, MotorMoveDirection> = {
-  forward: 'back', back: 'forward', left: 'right', right: 'left',
 }
 
 const MOVE_EFFECT_EPSILON = 0.01
@@ -110,7 +105,7 @@ export class CompanionRuntime {
   #chatTail = Promise.resolve()
   #decisionTail = Promise.resolve()
   #runGeneration = 0
-  readonly #leases = new Map<'body' | 'chat' | 'memory', string>()
+  readonly #execution = new ExecutionArbiter()
   #started = false
 
   constructor(options: CompanionRuntimeOptions) {
@@ -180,15 +175,11 @@ export class CompanionRuntime {
     }
     // A held resource is a fact about the world, so it comes back as a failed result. Throwing here
     // would surface as a bridge 500 and kill the whole run over a transient conflict.
-    if (this.#leases.has(resource)) {
-      return {
-        protocol: TOOL_RESULT_PROTOCOL, status: 'failed',
-        summary: `resource_busy:${resource} is held by ${this.#leases.get(resource)}`,
-      }
+    const acquired = this.#execution.acquire({ resource, runId: active.runId, toolName: invocation.name })
+    if ('code' in acquired) {
+      return { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: acquired.summary }
     }
-    const actionId = randomUUID()
-    const startedAt = new Date().toISOString()
-    this.#leases.set(resource, invocation.name)
+    const { actionId, acquiredAt: startedAt } = acquired.lease
     try {
       if (resource === 'body') {
         this.#debug.update({ currentBodyTool: { id: actionId, tool: invocation.name, purpose: 'agent tool', startedAt } })
@@ -204,29 +195,11 @@ export class CompanionRuntime {
           return await this.#executeRemember(active, invocation, actionId)
       }
     } finally {
-      this.#leases.delete(resource)
+      acquired.release()
       if (resource === 'body') {
         try { this.#debug.update({ currentBodyTool: undefined }) } catch { /* cleanup must not wedge the gate */ }
       }
     }
-  }
-
-  /**
-   * Refuses movement inputs that cancel each other within one model round, and allows the ones a
-   * player really does combine. Same-round is the meaningful unit: the model asked for these
-   * together, so `forward` plus `back` is incoherent while `forward` plus `left` is how anyone
-   * walks diagonally. A separate round is a new decision and starts clean.
-   */
-  #conflictingMove(active: ActiveRun, roundId: number, direction: MotorMoveDirection): string | undefined {
-    if (active.roundMoves.roundId !== roundId) {
-      active.roundMoves = { roundId, directions: new Set() }
-    }
-    const opposing = OPPOSING_DIRECTION[direction]
-    if (active.roundMoves.directions.has(opposing)) {
-      return `opposing_move:${direction} cancels ${opposing} already held this round`
-    }
-    active.roundMoves.directions.add(direction)
-    return undefined
   }
 
   async #executeBodyTool(
@@ -238,9 +211,11 @@ export class CompanionRuntime {
     const name = invocation.name as 'look_relative' | 'move_input'
     if (name === 'move_input') {
       const parsed = moveArgumentsSchema.safeParse(invocation.arguments)
-      const conflict = parsed.success ? this.#conflictingMove(active, invocation.roundId, parsed.data.direction) : undefined
+      const conflict = parsed.success
+        ? this.#execution.admitMove(active.runId, invocation.roundId, parsed.data.direction)
+        : undefined
       if (conflict !== undefined) {
-        return { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: conflict }
+        return { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: conflict.summary }
       }
     }
     let motor: ReturnType<MinecraftBackendApi['motor']> | undefined
@@ -394,7 +369,6 @@ export class CompanionRuntime {
       runId, controller, processSessionId: snapshot.processSessionId,
       connectionEpoch: snapshot.connectionEpoch, worldId: snapshot.world.worldId,
       dimension: snapshot.world.dimension, chatEventId: eventId, sayCount: 0,
-      roundMoves: { roundId: -1, directions: new Set() },
     }
     this.#activeRun = active
     let sources: DebugContextSource[] = []
@@ -442,6 +416,8 @@ export class CompanionRuntime {
       this.#recordFailure('model', 'decision_failed', error)
     } finally {
       controller.abort('model_run_finished')
+      this.#execution.forgetRun(runId)
+      this.#execution.pruneSettledJobs()
       this.#releaseBodyInputs()
       if (this.#activeRun?.controller === controller) this.#activeRun = undefined
       if (this.#modelAbort === controller) this.#modelAbort = undefined
@@ -488,6 +464,8 @@ export class CompanionRuntime {
 
   #invalidateRuns(reason: string): number {
     const generation = ++this.#runGeneration
+    // Scope loss voids every lease and running job, not just the awaited call.
+    this.#execution.invalidate(reason)
     this.#activeRun?.controller.abort(reason)
     this.#modelAbort?.abort(reason)
     this.#speech.stop(reason)
