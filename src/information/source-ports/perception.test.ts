@@ -131,11 +131,11 @@ test('entity scanning yields to the event loop and honors cancellation', async (
 })
 
 test('a scan aborted during a yield stops at that yield, not the next one', async () => {
-  // The production case is a signal that aborts while the scan is parked in `await`: the player's
-  // next message preempts the decision that asked for this scan. Aborting from outside is not the
-  // same test — the abort lands before the scan starts and the entry check takes it — and aborting
-  // during synchronous work is caught by the check *before* the next yield either way. To land
-  // inside the yield window the abort has to be queued from within the scan itself.
+  // The production case is a deadline, scope invalidation, disconnect, or shutdown aborting the
+  // owning run while the scan is parked in `await`. Ordinary player chat is FIFO and does not
+  // preempt it. Aborting before the scan starts only exercises the entry check, while aborting
+  // during synchronous work is caught before the next yield either way. To land inside the yield
+  // window the abort has to be queued from within the scan itself.
   const pose = { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 }
   // Leaves are visible but non-occluding, so no occlusion ray terminates early and every candidate
   // pays for the full distance. This is the most expensive real terrain.

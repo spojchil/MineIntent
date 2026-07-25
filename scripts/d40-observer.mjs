@@ -36,8 +36,9 @@ const SCENE = {
 const PROMPT = process.argv[2] ?? '看看那只羊，然后走过去'
 const RUN_SECONDS = Number(process.argv[3] ?? 90)
 const BOT = env.MINEINTENT_MC_USERNAME ?? 'MineIntentBot'
-// 用专用测试身份，不借用真人玩家名：真人在线时会被顶号，同伴的长期记忆和关系状态
-// 也不该把自动化流量记成真人交互。
+// 操作者应提供专用测试身份，不借用真人玩家名：真人在线时会被顶号，同伴的长期记忆
+// 和关系状态也不该把自动化流量记成真人交互。脚本只能验证该身份与主要玩家配置一致，
+// 无法从用户名本身判断它是否属于真人。
 const TESTER = process.env.MINEINTENT_TEST_PLAYER ?? env.MINEINTENT_TEST_PLAYER ?? 'D40Tester'
 if (env.MINEINTENT_PRIMARY_PLAYER !== TESTER) {
   console.error(`拒绝运行：.env 的 MINEINTENT_PRIMARY_PLAYER=${env.MINEINTENT_PRIMARY_PLAYER}，`

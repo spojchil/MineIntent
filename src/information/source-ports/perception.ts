@@ -77,8 +77,9 @@ interface ScanBudget { work: number }
 /**
  * Yields, checking cancellation on both sides: before, so a scan that is already doomed stops
  * paying, and after, so a signal aborted while the event loop ran does not buy another full
- * quantum of work. The post-yield check is the one that matters in production — that is when the
- * player's next message arrives and preempts the decision that asked for this scan.
+ * quantum of work. The post-yield check matters when the owning run is aborted while the scan is
+ * parked, for example by a deadline, world/connection scope invalidation, disconnect, or
+ * application shutdown. Ordinary player chat is FIFO and does not preempt the active decision.
  *
  * Callers guard this with `budget.work >= YIELD_EVERY_WORK_UNITS` instead of testing inside,
  * because an `async` function allocates a promise and takes a microtask turn on *every* call,
