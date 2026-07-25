@@ -4,7 +4,7 @@ import { CompanionRuntime, loadCompanionProfile } from '../companion/index.js'
 import { JsonlEventJournal } from '../events/index.js'
 import { FileMemoryStore } from '../memory/index.js'
 import { MinecraftBackend } from '../minecraft/index.js'
-import { AgentServiceModelProvider, D40ToolBridgeServer } from '../models/index.js'
+import { AgentServiceModelProvider, ToolBridgeServer } from '../models/index.js'
 import { DebugStateStore, LocalDebugServer } from '../telemetry/index.js'
 import type { AppConfig } from './config.js'
 
@@ -12,23 +12,23 @@ export class MineIntentApp {
   readonly #config: AppConfig
   #runtime?: CompanionRuntime
   #debugServer?: LocalDebugServer
-  #toolBridge?: D40ToolBridgeServer
+  #toolBridge?: ToolBridgeServer
 
   constructor(config: AppConfig) { this.#config = config }
 
   async start(): Promise<{ debugUrl: string }> {
     let runtime: CompanionRuntime | undefined
     let debugServer: LocalDebugServer | undefined
-    let toolBridge: D40ToolBridgeServer | undefined
+    let toolBridge: ToolBridgeServer | undefined
     try {
       const profile = await loadCompanionProfile(this.#config.profileFile)
       const debug = new DebugStateStore()
       const backend = new MinecraftBackend(this.#config.minecraft)
       const memory = new FileMemoryStore(path.join(this.#config.dataDirectory, 'memories.json'))
       const journal = new JsonlEventJournal(path.join(this.#config.dataDirectory, 'events.jsonl'), this.#config.minecraft.worldId, randomUUID())
-      toolBridge = new D40ToolBridgeServer(async invocation => {
+      toolBridge = new ToolBridgeServer(async invocation => {
         if (!runtime) throw new Error('runtime_not_ready')
-        return runtime.executeBodyTool(invocation)
+        return runtime.executeTool(invocation)
       })
       const callback = await toolBridge.start()
       const model = new AgentServiceModelProvider({

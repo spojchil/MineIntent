@@ -10,6 +10,13 @@ import server
 
 SERVICE_TOKEN = "agent-service-test-token-0123456789"
 
+def tools():
+    return [
+        {"type": "function", "function": {"name": "look_relative", "description": "转头", "parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "move_input", "description": "移动", "parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "say", "description": "说话", "parameters": {"type": "object"}}},
+    ]
+
 
 class ServerTests(unittest.TestCase):
     def test_deepseek_replay_preserves_reasoning_and_tool_call_id(self):
@@ -20,13 +27,13 @@ class ServerTests(unittest.TestCase):
                 "role": "assistant", "content": "", "reasoning_content": "need turn",
                 "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "look_relative", "arguments": '{"yaw_degrees":90,"pitch_degrees":0}'}}],
             }}], "usage": {"prompt_tokens": 10, "completion_tokens": 2}},
-            {"choices": [{"message": {"role": "assistant", "content": "看见了。"}}],
+            {"choices": [{"message": {"role": "assistant", "content": ""}}],
              "usage": {"prompt_tokens": 20, "completion_tokens": 3}},
         ]
 
         deadlines = []
 
-        def completion(_config, messages, deadline, _run=None):
+        def completion(_config, messages, deadline, _run=None, tools=None):
             model_messages.append(json.loads(json.dumps(messages)))
             deadlines.append(deadline)
             return responses.pop(0)
@@ -36,8 +43,8 @@ class ServerTests(unittest.TestCase):
             return {"status": "completed", "viewport": {"visibleEntities": [["sheep", 0, 0, 3]]}}
 
         with patch.object(server, "model_completion", completion):
-            decision, usage = server.run_tool_loop({"model": "x"}, "run-1", context(), execute)
-        self.assertEqual(decision["speech"], "看见了。")
+            closing, usage = server.run_tool_loop({"model": "x"}, "run-1", context(), execute, tools())
+        self.assertEqual(closing, "")
         self.assertEqual(usage, {"prompt_tokens": 30, "completion_tokens": 5})
         self.assertEqual(deadlines[0], deadlines[1])
         self.assertEqual(calls, [("run-1", "look_relative", {"yaw_degrees": 90, "pitch_degrees": 0})])
@@ -47,7 +54,7 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(tool_result["tool_call_id"], "call-1")
         self.assertIn("sheep", tool_result["content"])
 
-    def test_parallel_calls_execute_only_first_and_return_failure_for_rest(self):
+    def test_parallel_calls_all_execute_in_order(self):
         model_messages = []
         responses = [
             {"choices": [{"message": {"role": "assistant", "tool_calls": [
@@ -58,16 +65,21 @@ class ServerTests(unittest.TestCase):
         ]
         executed = []
 
-        def completion(_config, messages, _deadline, _run=None):
+        def completion(_config, messages, _deadline, _run=None, tools=None):
             model_messages.append(json.loads(json.dumps(messages)))
             return responses.pop(0)
 
         with patch.object(server, "model_completion", completion):
-            server.run_tool_loop({"model": "x"}, "run-1", context(), lambda *args: executed.append(args) or {"status": "completed"})
-        self.assertEqual(len(executed), 1)
-        self.assertIn("parallel_body_tools_are_not_supported", model_messages[1][-1]["content"])
+            server.run_tool_loop(
+                {"model": "x"}, "run-1", context(),
+                lambda *args: executed.append(args) or {"status": "completed"}, tools(),
+            )
+        # 并行调用不再被预先拒绝：约束在提示词里是建议，失败由工具后端如实回报。
+        self.assertEqual([call[1] for call in executed], ["move_input", "look_relative"])
+        self.assertIn("completed", model_messages[1][-1]["content"])
+        self.assertIn("completed", model_messages[1][-2]["content"])
 
-    def test_invalid_arguments_are_returned_to_model_without_executing(self):
+    def test_arguments_are_forwarded_untouched_for_the_tool_side_to_judge(self):
         responses = [
             {"choices": [{"message": {"role": "assistant", "tool_calls": [
                 {"id": "bad", "function": {"name": "move_input", "arguments": '{"direction":"forward","duration_ms":5000}'}}
@@ -75,65 +87,46 @@ class ServerTests(unittest.TestCase):
             {"choices": [{"message": {"role": "assistant", "content": ""}}]},
         ]
         seen = []
-        with patch.object(server, "model_completion", lambda _config, _messages, _deadline, _run=None: responses.pop(0)):
-            server.run_tool_loop({"model": "x"}, "run-1", context(), lambda *args: seen.append(args))
-        self.assertEqual(seen, [])
+        with patch.object(server, "model_completion", lambda _config, _messages, _deadline, _run=None, tools=None: responses.pop(0)):
+            server.run_tool_loop(
+                {"model": "x"}, "run-1", context(),
+                lambda *args: seen.append(args) or {"status": "failed", "summary": "duration out of range"}, tools(),
+            )
+        # 工具契约归工具侧：agent 不预判参数合法性，越界值也交给后端回真实失败。
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][2], {"direction": "forward", "duration_ms": 5000})
 
-    def test_closing_text_becomes_the_decision_envelope(self):
-        # 标准工具调用的收尾是普通助手文本；信封由本服务构造，不要求模型作者化。
-        self.assertEqual(
-            server.decision_from_closing_text("  走过去了。  "),
-            {"protocol": "mineintent.d40-decision.v1", "speech": "走过去了。"},
-        )
-        for silent in ["", "   ", "\n\t "]:
-            self.assertIsNone(server.decision_from_closing_text(silent)["speech"])
-        with self.assertRaises(RuntimeError):
-            server.decision_from_closing_text("看" * 501)
-
-    def test_closing_text_rejects_a_tool_call_the_provider_failed_to_surface(self):
+    def test_leak_guard_catches_call_shaped_mentions_but_not_prose(self):
         # 两种实测泄漏形式：一家把内部标记原样吐成文本，另一家自造 JSON 字段承载工具调用。
-        # 两者都携带一个真实但未执行的动作；当成话说出去就是伪造成功。
+        # 两者都携带一个真实但未执行的动作，静默丢弃等于伪造成功。
+        names = ["look_relative", "move_input", "say"]
         leaks = [
-            '{"protocol":"mineintent.d40-decision.v1","speech":null}\n'
-            '<｜｜DSML｜｜tool_calls>\n'
-            '<｜｜DSML｜｜invoke name="look_relative">',
-            '{"protocol":"mineintent.d40-decision.v1","speech":"我先找找。",'
-            '"__tool__":"look_relative","__tool_args__":{"yaw_degrees":90,"pitch_degrees":0}}',
-            "我先 move_input forward 500ms。",
+            '好的\n<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name="look_relative">',
+            '{"speech":"我先找找。","__tool__":"look_relative","__tool_args__":{"yaw_degrees":90}}',
+            'look_relative({"yaw_degrees": 45, "pitch_degrees": 0})',
+            '{"name":"move_input","arguments":{"direction":"forward"}}',
         ]
         for leaked in leaks:
-            with self.assertRaises(RuntimeError):
-                server.decision_from_closing_text(leaked)
-
-    def test_closing_text_tolerates_the_old_envelope(self):
-        # 模型出于习惯仍然吐旧信封时不该把 JSON 当成台词念给玩家。
-        self.assertEqual(
-            server.decision_from_closing_text(
-                '{"protocol":"mineintent.d40-decision.v1","speech":"好。"}'
-            )["speech"],
-            "好。",
-        )
-        self.assertIsNone(
-            server.decision_from_closing_text(
-                '{"protocol":"mineintent.d40-decision.v1","speech":null}'
-            )["speech"]
-        )
-        # 不是信封的 JSON 就是普通台词，原样保留。
-        self.assertEqual(server.decision_from_closing_text('{"a":1}')["speech"], '{"a":1}')
+            self.assertTrue(server.leaked_tool_call(leaked, names), leaked)
+        # 收尾文本只进转录、不会被说出去，所以散文式提及不算泄漏。
+        for prose in ["我刚才转了个头。", "move input 这个词很怪。", ""]:
+            self.assertFalse(server.leaked_tool_call(prose, names), prose)
 
     def test_request_and_json_are_strict(self):
-        self.assertEqual(server.require_request({"runId": "r", "context": context()})[0], "r")
+        self.assertEqual(server.require_request({"runId": "r", "context": context(), "tools": tools()})[0], "r")
         self.assertEqual(server.require_cancel_request({"runId": "r"}), "r")
         with self.assertRaises(server.RequestValidationError):
-            server.require_request({"runId": "r", "context": context(), "extra": True})
+            server.require_request({"runId": "r", "context": context()})
+        with self.assertRaises(server.RequestValidationError):
+            server.require_request({"runId": "r", "context": context(), "tools": tools(), "extra": True})
+        with self.assertRaises(server.RequestValidationError):
+            server.require_request({"runId": "r", "context": context(), "tools": [{"type": "function", "function": {"name": "bad name"}}]})
         with self.assertRaises(server.RequestValidationError):
             server.require_cancel_request({"runId": "r", "extra": True})
         with self.assertRaises(ValueError):
             server.strict_json_loads('{"x":NaN}')
         with self.assertRaises(server.RequestValidationError):
             server.http_tool_executor("https://example.com/tool", "0123456789abcdef")
-        with self.assertRaises(RuntimeError):
-            server.decision_from_closing_text("看" * 501)
 
     def test_config_requires_an_independent_service_token(self):
         env = {
@@ -171,7 +164,7 @@ class ServerTests(unittest.TestCase):
         completion_lock = threading.Lock()
         completion_count = 0
 
-        def completion(_config, _messages, _deadline, _run=None):
+        def completion(_config, _messages, _deadline, _run=None, tools=None):
             nonlocal completion_count
             with completion_lock:
                 completion_count += 1
@@ -179,9 +172,7 @@ class ServerTests(unittest.TestCase):
             if call_number == 1:
                 old_started.set()
                 self.assertTrue(release_old.wait(2), "old model call was not released")
-            return {"choices": [{"message": {"role": "assistant", "content": json.dumps({
-                "protocol": "mineintent.d40-decision.v1", "speech": None,
-            })}}]}
+            return {"choices": [{"message": {"role": "assistant", "content": ""}}]}
 
         old_result = {}
 
@@ -229,12 +220,12 @@ class ServerTests(unittest.TestCase):
         httpd = self._start_server()
         request = urllib.request.Request(
             f"http://127.0.0.1:{httpd.server_port}/v1/decide",
-            data=json.dumps({"runId": "run-1", "context": context()}).encode("utf-8"),
+            data=json.dumps({"runId": "run-1", "context": context(), "tools": tools()}).encode("utf-8"),
             method="POST",
             headers={
                 "authorization": f"Bearer {SERVICE_TOKEN}",
                 "content-type": "application/json",
-                "x-mineintent-tool-executor-url": "http://127.0.0.1:9/v1/d40/tool",
+                "x-mineintent-tool-executor-url": "http://127.0.0.1:9/v1/tool",
                 "x-mineintent-tool-executor-token": "0123456789abcdef",
             },
         )
@@ -334,12 +325,12 @@ class ServerTests(unittest.TestCase):
     def _decision_request(self, httpd, run_id):
         return urllib.request.Request(
             f"http://127.0.0.1:{httpd.server_port}/v1/decide",
-            data=json.dumps({"runId": run_id, "context": context()}).encode("utf-8"),
+            data=json.dumps({"runId": run_id, "context": context(), "tools": tools()}).encode("utf-8"),
             method="POST",
             headers={
                 "authorization": f"Bearer {SERVICE_TOKEN}",
                 "content-type": "application/json",
-                "x-mineintent-tool-executor-url": "http://127.0.0.1:9/v1/d40/tool",
+                "x-mineintent-tool-executor-url": "http://127.0.0.1:9/v1/tool",
                 "x-mineintent-tool-executor-token": "0123456789abcdef",
             },
         )
@@ -347,7 +338,7 @@ class ServerTests(unittest.TestCase):
 
 def context():
     return {
-        "protocol": "mineintent.d40-context.v1", "player": {"username": "Alex", "text": "看看羊"},
+        "protocol": "mineintent.agent-context.v1", "player": {"username": "Alex", "text": "看看羊"},
         "profile": {"content": "朋友"}, "world": {"dimension": "overworld"},
         "observations": {"viewport": {"frame": {"axes": ["right", "up", "forward"]}}},
         "recentEvents": [], "memories": [],

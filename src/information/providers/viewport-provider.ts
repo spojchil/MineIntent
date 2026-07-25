@@ -8,6 +8,7 @@ export interface ViewportValues {
   frame: {
     axes: ['right', 'up', 'forward']
     directions: { ahead: '+forward'; right: '+right'; behind: '-forward'; left: '-right' }
+    legend: { visibleEntities: string; visibleBlocks: string }
   }
   standingOnBlock: { name: string; relativePosition: RelativePosition } | null
   lookedAtBlock: { name: string; relativePosition: RelativePosition } | null
@@ -23,6 +24,7 @@ const frameSchema = z.strictObject({
   directions: z.strictObject({
     ahead: z.literal('+forward'), right: z.literal('+right'), behind: z.literal('-forward'), left: z.literal('-right'),
   }),
+  legend: z.strictObject({ visibleEntities: z.string().min(1), visibleBlocks: z.string().min(1) }),
 })
 const blockSchema = z.object({ name: z.string().min(1), relativePosition: relativePositionSchema }).nullable()
 const visibleEntitiesSchema = z.array(z.tuple([z.string().min(1), z.number(), z.number(), z.number()]))
@@ -33,6 +35,12 @@ const visibleBlocksSchema = z.object({
 const FRAME: ViewportValues['frame'] = {
   axes: ['right', 'up', 'forward'],
   directions: { ahead: '+forward', right: '+right', behind: '-forward', left: '-right' },
+  // The tuple legends ride with the data instead of living in the agent prompt, so a schema
+  // change here cannot silently outdate a description in another language and process.
+  legend: {
+    visibleEntities: '[entity_name_or_player, right, up, forward]，按距离从近到远',
+    visibleBlocks: '[block_name, right, up, forward]，同一坐标系，可能截断',
+  },
 }
 /**
  * Vanilla's default FOV slider is 70°, and that slider is the *vertical* field of view. The
@@ -56,7 +64,7 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
   readonly definition: InformationProviderDefinition<ViewportValues> = {
     id: 'viewport_information',
     description: '粗略第一人称视野；所有位置都使用同一量化的[右,上,前]身体相对坐标',
-    schemaRevision: 'viewport-information:6',
+    schemaRevision: 'viewport-information:7',
     audiences: ['companion'] as const,
     fields: {
       frame: { description: '相对坐标与方向图例', valueSchema: frameSchema, valueType: 'object', precision: 'exactly_displayed', sourceKinds: ['viewport_projection'] },

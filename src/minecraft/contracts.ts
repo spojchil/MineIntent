@@ -257,7 +257,7 @@ export interface BackendReady {
 export type MotorMoveDirection = 'forward' | 'back' | 'left' | 'right'
 
 /**
- * The deliberately small physical boundary used by the D40 experiment. These methods are
+ * The deliberately small physical boundary behind the body tools. These methods are
  * player inputs, not navigation or target-specific skills. A future observed-space navigation
  * tool may be built above this boundary, but it must remain a distinct model-visible tool.
  */

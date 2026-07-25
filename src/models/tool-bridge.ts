@@ -1,18 +1,18 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
-import { d40ToolInvocationSchema, type D40ToolInvocation } from './contracts.js'
+import { toolInvocationSchema, type ToolInvocation } from './contracts.js'
 
 const HOST = '127.0.0.1'
-const ROUTE = '/v1/d40/tool'
+const ROUTE = '/v1/tool'
 const MAX_REQUEST_BYTES = 32_768
 const MAX_RESPONSE_BYTES = 262_144
 
 export interface ToolBridgeAddress { url: string; token: string }
 
-export class D40ToolBridgeServer {
+export class ToolBridgeServer {
   readonly #token = randomBytes(32).toString('base64url')
   #server?: Server
-  constructor(private readonly handler: (invocation: D40ToolInvocation) => Promise<unknown>) {}
+  constructor(private readonly handler: (invocation: ToolInvocation) => Promise<unknown>) {}
 
   async start(): Promise<ToolBridgeAddress> {
     if (this.#server) return this.address()
@@ -51,7 +51,7 @@ export class D40ToolBridgeServer {
       let value: unknown
       try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw)) }
       catch { return send(response, 400, { error: 'invalid_json' }) }
-      const invocation = d40ToolInvocationSchema.safeParse(value)
+      const invocation = toolInvocationSchema.safeParse(value)
       if (!invocation.success) return send(response, 400, { error: 'invalid_tool_invocation' })
       send(response, 200, await this.handler(invocation.data))
     } catch (error) {

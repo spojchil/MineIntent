@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { D40ToolBridgeServer } from './tool-bridge.js'
+import { ToolBridgeServer } from './tool-bridge.js'
 
 test('tool bridge is loopback-only, authenticated and forwards strict invocations', async t => {
   let seen: unknown
-  const bridge = new D40ToolBridgeServer(async invocation => { seen = invocation; return { status: 'completed' } })
+  const bridge = new ToolBridgeServer(async invocation => { seen = invocation; return { status: 'completed' } })
   const address = await bridge.start()
   t.after(() => bridge.stop())
   const unauthorized = await fetch(address.url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })

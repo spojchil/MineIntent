@@ -1,5 +1,5 @@
 /**
- * D40 现场观察者：以测试玩家身份进服、发一句话、记录同伴的回复与真实动作轨迹。
+ * 现场观察者：以测试玩家身份进服、发一句话、记录同伴的回复与真实动作轨迹。
  *
  * 它替代的是「人坐在客户端里打字并盯着看」这一环，产出三路证据里的第三路：
  *   1. 服务端控制台  —— 唯一的独立真值（实体坐标、方块查询），由调用方自行采集
@@ -9,7 +9,7 @@
  * 判断「像不像人」仍然需要真人；本脚本只负责让「动没动、走到哪、说了什么」
  * 可复现、可比较。
  *
- * 用法：node scripts/d40-observer.mjs ["要说的话"] [秒数]
+ * 用法：node scripts/live-observer.mjs ["要说的话"] [秒数]
  * 前置：Paper 已运行、agent-service 已运行、同伴已连接，且 .env 的
  *       MINEINTENT_PRIMARY_PLAYER 等于下面的测试身份。
  */
@@ -39,7 +39,7 @@ const BOT = env.MINEINTENT_MC_USERNAME ?? 'MineIntentBot'
 // 操作者应提供专用测试身份，不借用真人玩家名：真人在线时会被顶号，同伴的长期记忆
 // 和关系状态也不该把自动化流量记成真人交互。脚本只能验证该身份与主要玩家配置一致，
 // 无法从用户名本身判断它是否属于真人。
-const TESTER = process.env.MINEINTENT_TEST_PLAYER ?? env.MINEINTENT_TEST_PLAYER ?? 'D40Tester'
+const TESTER = process.env.MINEINTENT_TEST_PLAYER ?? env.MINEINTENT_TEST_PLAYER ?? 'LiveTester'
 if (env.MINEINTENT_PRIMARY_PLAYER !== TESTER) {
   console.error(`拒绝运行：.env 的 MINEINTENT_PRIMARY_PLAYER=${env.MINEINTENT_PRIMARY_PLAYER}，`
     + `但测试身份是 ${TESTER}。同伴只回应主要玩家，两者必须一致；`

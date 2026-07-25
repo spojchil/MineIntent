@@ -1,5 +1,6 @@
 import { z } from 'zod'
-import { d40DecisionSchema, type D40DecisionContext, type ModelProvider, type ModelRunResult } from './contracts.js'
+import type { AgentDecisionContext, ModelProvider, ModelRunResult } from './contracts.js'
+import type { WireToolDefinition } from './agent-tools.js'
 
 interface FetchLike { (input: string | URL, init?: RequestInit): Promise<Response> }
 const MAX_RESPONSE_BYTES = 64 * 1_024
@@ -16,7 +17,7 @@ export interface AgentServiceOptions {
 }
 
 const responseSchema = z.strictObject({
-  decision: d40DecisionSchema,
+  protocol: z.literal('mineintent.agent-run.v1'),
   model: z.string().min(1).max(256),
   usage: z.strictObject({
     inputTokens: z.number().int().nonnegative().optional(),
@@ -44,7 +45,10 @@ export class AgentServiceModelProvider implements ModelProvider {
     this.#fetch = options.fetch ?? fetch
   }
 
-  async run(input: { runId: string; context: D40DecisionContext }, signal: AbortSignal): Promise<ModelRunResult> {
+  async run(
+    input: { runId: string; context: AgentDecisionContext; tools: readonly WireToolDefinition[] },
+    signal: AbortSignal,
+  ): Promise<ModelRunResult> {
     signal.throwIfAborted()
     const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(this.#timeoutMs)])
     let cancelStarted = false

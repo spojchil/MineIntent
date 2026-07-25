@@ -19,7 +19,7 @@ test('debug state is immutable, bounded and redacts sensitive values', () => {
 
 test('local debug server only permits read-only GET routes', async () => {
   const store = new DebugStateStore()
-  store.update({ currentBodyTool: { id: 'body-1', tool: 'move_input', purpose: 'D40 short input', startedAt: new Date(0).toISOString() } })
+  store.update({ currentBodyTool: { id: 'body-1', tool: 'move_input', purpose: 'agent tool', startedAt: new Date(0).toISOString() } })
   const server = new LocalDebugServer(store, 0)
   const address = await server.start()
   try {

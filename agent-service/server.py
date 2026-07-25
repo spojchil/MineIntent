@@ -1,10 +1,13 @@
-"""Loopback OpenAI-compatible transport for the D40 experiment."""
+"""Loopback agent service: the companion agent proper (prompt, model calls, tool loop).
+
+The tool contract arrives with each request from the tool backend; this side owns none of it.
+"""
 from __future__ import annotations
 
-import json
+import hashlib
 import hmac
 import http.client
-import math
+import json
 import os
 import re
 import socket
@@ -23,76 +26,32 @@ _MAX_JSON_BYTES = 1_048_576
 _MAX_TOOL_RESULT_BYTES = 262_144
 _MAX_TOOL_ROUNDS = 16
 _ROUND_TIMEOUT_S = 180.0
-_DECISION_PROTOCOL = "mineintent.d40-decision.v1"
-_MAX_SPEECH_CHARACTERS = 500
+_MAX_TOOLS = 32
+_CONTEXT_PROTOCOL = "mineintent.agent-context.v1"
+_RUN_PROTOCOL = "mineintent.agent-run.v1"
+_TOOL_NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_TRANSCRIPT_FILE = Path(".mineintent") / "agent-transcripts.jsonl"
+_MAX_TRANSCRIPT_CHARS = 2_000_000
 
-# A tool call the provider failed to lift out of the raw generation and into `tool_calls`. Seen on
-# one endpoint as verbatim internal markup and on another as invented JSON fields; both carry a
-# real action the transport dropped, so the closing text must be checked for them.
-_LEAKED_TOOL_CALL = re.compile(r"look_relative|move_input|DSML|<\s*tool_calls|invoke\s+name=")
+# Vendor markup that must never reach `content`: a tool call the provider failed to lift out of
+# the raw generation. Seen live as verbatim internal markup on one endpoint and as invented JSON
+# fields on another; both carry a real action the transport dropped.
+_LEAK_MARKUP = re.compile(r"DSML|<\s*tool_calls|invoke\s+name=|__tool__")
 
-# Extension point: a future observed-space navigation tool can be added beside these inputs.
-# It must not silently replace move_input, and it is intentionally not implemented in D40.
-D40_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "look_relative",
-            "description": (
-                "Turn the first-person view by a relative amount, then receive a fresh viewport. "
-                "Call this when the player refers to something that is not in the current viewport, "
-                "or when you need to face a different direction before moving."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "yaw_degrees": {
-                        "type": "number", "minimum": -90, "maximum": 90,
-                        "description": "Horizontal turn from the current view. Positive turns right, negative turns left.",
-                    },
-                    "pitch_degrees": {
-                        "type": "number", "minimum": -90, "maximum": 90,
-                        "description": "Vertical turn from the current view. Positive looks down, negative looks up.",
-                    },
-                },
-                "required": ["yaw_degrees", "pitch_degrees"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "move_input",
-            "description": (
-                "Hold one real movement key briefly, release it, then receive the actual movement "
-                "feedback and a fresh viewport. Call this to close distance on something already "
-                "visible. There is no pathfinding and no jumping: one call covers a few blocks at "
-                "most, obstacles are not handled for you, and the body may still be settling when "
-                "the call returns."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "direction": {
-                        "type": "string", "enum": ["forward", "back", "left", "right"],
-                        "description": "Which movement key to hold, relative to the direction you are currently facing.",
-                    },
-                    "duration_ms": {
-                        "type": "integer", "minimum": 50, "maximum": 1500,
-                        "description": "How long to hold the key. Walking covers roughly one block per 250ms.",
-                    },
-                    "sprint": {
-                        "type": "boolean",
-                        "description": "Hold sprint as well, covering more ground in the same duration.",
-                    },
-                },
-                "required": ["direction", "duration_ms"],
-                "additionalProperties": False,
-            },
-        },
-    },
-]
+
+def leaked_tool_call(text: str, tool_names: list[str]) -> bool:
+    """True when closing text carries an unexecuted tool call in a high-confidence form.
+
+    Only call-shaped mentions count (quoted as a JSON value, or followed by an argument bracket);
+    the closing text is discarded rather than spoken, so a prose mention of a tool name is noise,
+    not a dropped action.
+    """
+    if _LEAK_MARKUP.search(text):
+        return True
+    if not tool_names:
+        return False
+    names = "|".join(re.escape(name) for name in tool_names)
+    return re.search(rf'"(?:{names})"|(?:{names})\s*[([{{]', text) is not None
 
 
 class ConfigError(RuntimeError):
@@ -274,15 +233,23 @@ def remaining_seconds(deadline: float) -> float:
     return remaining
 
 
-def require_request(value: object) -> tuple[str, dict]:
-    if not isinstance(value, dict) or set(value) != {"runId", "context"}:
-        raise RequestValidationError("request must contain only runId and context")
-    run_id, context = value.get("runId"), value.get("context")
+def require_request(value: object) -> tuple[str, dict, list]:
+    if not isinstance(value, dict) or set(value) != {"runId", "context", "tools"}:
+        raise RequestValidationError("request must contain only runId, context and tools")
+    run_id, context, tools = value.get("runId"), value.get("context"), value.get("tools")
     if not isinstance(run_id, str) or not run_id or len(run_id) > 128:
         raise RequestValidationError("runId is invalid")
-    if not isinstance(context, dict) or context.get("protocol") != "mineintent.d40-context.v1":
+    if not isinstance(context, dict) or context.get("protocol") != _CONTEXT_PROTOCOL:
         raise RequestValidationError("context protocol is invalid")
-    return run_id, context
+    if not isinstance(tools, list) or len(tools) > _MAX_TOOLS:
+        raise RequestValidationError("tools are invalid")
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if (not isinstance(tool, dict) or tool.get("type") != "function"
+                or not isinstance(name, str) or not _TOOL_NAME_PATTERN.fullmatch(name)):
+            raise RequestValidationError("tools are invalid")
+    return run_id, context, tools
 
 
 def require_cancel_request(value: object) -> str:
@@ -337,17 +304,17 @@ def model_completion(
     messages: list[dict],
     deadline: float,
     run: DecisionRun | None = None,
+    tools: list | None = None,
 ) -> dict:
     # Ordinary OpenAI-compatible tool calling: tools are offered on every round and the closing
     # turn is plain assistant text. `response_format` is deliberately never sent. Asking the model
     # to author a JSON envelope in a request that also offers tools puts two output contracts in
     # competition, and measured across seven models on three providers, six then stopped emitting
     # structured `tool_calls` — arguably correctly, since a tool call is not a JSON object in the
-    # content channel. The envelope is this service's contract with the runtime, so Python builds
-    # it from the closing text rather than making the model produce it.
+    # content channel. Speech goes through the `say` tool; the closing text is transcript only.
     request: dict = {
         "model": config["model"], "messages": messages,
-        "tools": D40_TOOLS, "tool_choice": "auto",
+        "tools": tools or [], "tool_choice": "auto",
     }
     if config.get("reasoning_effort"):
         request["reasoning_effort"] = config["reasoning_effort"]
@@ -443,53 +410,57 @@ def run_tool_loop(
     run_id: str,
     context: dict,
     execute_tool,
+    tools: list,
     deadline: float | None = None,
     run: DecisionRun | None = None,
-) -> tuple[dict, dict | None]:
+) -> tuple[str, dict | None]:
     deadline = deadline if deadline is not None else time.monotonic() + _ROUND_TIMEOUT_S
+    tool_names = [tool["function"]["name"] for tool in tools]
     messages = [
         {"role": "system", "content": system_prompt()},
         {"role": "user", "content": json.dumps(context, ensure_ascii=False, separators=(",", ":"))},
     ]
     usage = {"prompt_tokens": 0, "completion_tokens": 0}
     has_usage = False
-    for _round in range(_MAX_TOOL_ROUNDS):
-        if run is not None:
-            run.ensure_active()
-        remaining_seconds(deadline)
-        payload = model_completion(config, messages, deadline, run)
-        if run is not None:
-            run.ensure_active()
-        choices = payload.get("choices") if isinstance(payload, dict) else None
-        message = choices[0].get("message") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
-        if not isinstance(message, dict):
-            raise RuntimeError("model response has no assistant message")
-        raw_usage = payload.get("usage")
-        if isinstance(raw_usage, dict):
-            for key in usage:
-                value = raw_usage.get(key)
-                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                    usage[key] += value
-                    has_usage = True
-        tool_calls = message.get("tool_calls")
-        if isinstance(tool_calls, list) and tool_calls:
-            replay = {key: message[key] for key in ("role", "content", "reasoning_content", "tool_calls") if key in message}
-            replay.setdefault("role", "assistant")
-            messages.append(replay)
-            for index, call in enumerate(tool_calls):
-                call_id = call.get("id") if isinstance(call, dict) else None
-                function = call.get("function") if isinstance(call, dict) else None
-                if not isinstance(call_id, str) or not isinstance(function, dict):
-                    raise RuntimeError("model returned an invalid tool call")
-                if index > 0:
-                    result = {"status": "failed", "summary": "parallel_body_tools_are_not_supported"}
-                else:
+    closing: str | None = None
+    error_summary: str | None = None
+    try:
+        for _round in range(_MAX_TOOL_ROUNDS):
+            if run is not None:
+                run.ensure_active()
+            remaining_seconds(deadline)
+            payload = model_completion(config, messages, deadline, run, tools=tools)
+            if run is not None:
+                run.ensure_active()
+            choices = payload.get("choices") if isinstance(payload, dict) else None
+            message = choices[0].get("message") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
+            if not isinstance(message, dict):
+                raise RuntimeError("model response has no assistant message")
+            raw_usage = payload.get("usage")
+            if isinstance(raw_usage, dict):
+                for key in usage:
+                    value = raw_usage.get(key)
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                        usage[key] += value
+                        has_usage = True
+            tool_calls = message.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                replay = {key: message[key] for key in ("role", "content", "reasoning_content", "tool_calls") if key in message}
+                replay.setdefault("role", "assistant")
+                messages.append(replay)
+                # Every requested call executes, in order. Parallel calls are not pre-rejected:
+                # constraints belong in the prompt as advice, failures belong to the world, and the
+                # tool backend answers invalid or conflicting requests with honest failed results.
+                for call in tool_calls:
+                    call_id = call.get("id") if isinstance(call, dict) else None
+                    function = call.get("function") if isinstance(call, dict) else None
+                    if not isinstance(call_id, str) or not isinstance(function, dict):
+                        raise RuntimeError("model returned an invalid tool call")
                     try:
                         name = function.get("name")
                         arguments = strict_json_loads(function.get("arguments", ""))
                         if not isinstance(name, str) or not isinstance(arguments, dict):
                             raise ValueError("invalid tool call")
-                        _validate_tool_arguments(name, arguments)
                         if run is not None:
                             run.ensure_active()
                         result = execute_tool(run_id, name, arguments, deadline)
@@ -497,85 +468,62 @@ def run_tool_loop(
                             run.ensure_active()
                     except (ValueError, RequestValidationError) as error:
                         result = {"status": "failed", "summary": str(error)[:300]}
-                messages.append({
-                    "role": "tool", "tool_call_id": call_id,
-                    "content": json.dumps(result, ensure_ascii=False, separators=(",", ":")),
-                })
-            continue
-        content = message.get("content")
-        if not isinstance(content, str):
-            raise RuntimeError("model final content is missing")
-        decision = decision_from_closing_text(content)
-        if run is not None:
-            run.ensure_active()
-        remaining_seconds(deadline)
-        return decision, usage if has_usage else None
-    raise RuntimeError("tool loop exceeded its round limit")
+                    messages.append({
+                        "role": "tool", "tool_call_id": call_id,
+                        "content": json.dumps(result, ensure_ascii=False, separators=(",", ":")),
+                    })
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                raise RuntimeError("model final content is missing")
+            closing = content.strip()
+            # Speech went through the say tool during the loop; the closing text is transcript-only.
+            # A call-shaped tool mention in it is a real action the provider dropped, though, and
+            # silently discarding that would be a fabricated success.
+            if leaked_tool_call(closing, tool_names):
+                raise RuntimeError("closing message carries a tool call that was never executed")
+            if run is not None:
+                run.ensure_active()
+            remaining_seconds(deadline)
+            return closing, (usage if has_usage else None)
+        raise RuntimeError("tool loop exceeded its round limit")
+    except BaseException as error:
+        error_summary = f"{type(error).__name__}: {error}"[:300]
+        raise
+    finally:
+        append_transcript(run_id, config.get("model", ""), messages, closing, usage if has_usage else None, error_summary)
 
 
-def _validate_tool_arguments(name: str, arguments: dict) -> None:
-    if name == "look_relative":
-        if set(arguments) != {"yaw_degrees", "pitch_degrees"}:
-            raise RequestValidationError("look_relative arguments are invalid")
-        values = (arguments["yaw_degrees"], arguments["pitch_degrees"])
-        if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or abs(value) > 90 for value in values):
-            raise RequestValidationError("look_relative angles are invalid")
-    elif name == "move_input":
-        if not {"direction", "duration_ms"} <= set(arguments) <= {"direction", "duration_ms", "sprint"}:
-            raise RequestValidationError("move_input arguments are invalid")
-        if arguments["direction"] not in {"forward", "back", "left", "right"}:
-            raise RequestValidationError("move_input direction is invalid")
-        duration = arguments["duration_ms"]
-        if isinstance(duration, bool) or not isinstance(duration, int) or not 50 <= duration <= 1500:
-            raise RequestValidationError("move_input duration is invalid")
-        if "sprint" in arguments and not isinstance(arguments["sprint"], bool):
-            raise RequestValidationError("move_input sprint is invalid")
-    else:
-        raise RequestValidationError("unknown body tool")
+def append_transcript(
+    run_id: str,
+    model: str,
+    messages: list,
+    closing: str | None,
+    usage: dict | None,
+    error_summary: str | None,
+) -> None:
+    """Bounded per-run replay log: exactly what the model saw and said, including on failure.
 
-
-def decision_from_closing_text(content: str) -> dict:
-    """Build the decision envelope from an ordinary closing assistant message.
-
-    The envelope is this service's contract with the Node runtime, not a shape the model is asked
-    to author, so the model's closing turn is plain text and Python owns the structure.
+    This closes the audit gap the live experiment hit — poses were journaled but the model-visible
+    viewport per round was not, so "what did it see at step 7" could only be reconstructed.
+    Diagnostics must never fail the run, hence the blanket OSError swallow.
     """
-    raw = content.strip()
-    # Two independent guards cover the extra-fields leak: `_unwrap_legacy_envelope` refuses any
-    # envelope whose keys are not exactly {protocol, speech}, so the smuggled fields survive to be
-    # seen here, and this check runs on the raw text so it still holds if that ever loosens.
-    if _LEAKED_TOOL_CALL.search(raw):
-        # The model decided to act and the provider failed to surface the call. Reporting this as
-        # speech would hand the player a decision whose action never ran, which is precisely the
-        # fabricated-success failure the experiment exists to catch. Fail loudly instead.
-        raise RuntimeError("closing message carries a tool call that was never executed")
-    speech = _unwrap_legacy_envelope(raw)
-    if not speech:
-        return {"protocol": _DECISION_PROTOCOL, "speech": None}
-    if len(speech) > _MAX_SPEECH_CHARACTERS:
-        # Deliberately an error rather than a truncation: a rambling close is a prompt-following
-        # failure worth measuring, and a sentence cut mid-word is more obviously wrong in chat
-        # than no reply at all.
-        raise RuntimeError("closing message is too long to be one line of speech")
-    return {"protocol": _DECISION_PROTOCOL, "speech": speech}
-
-
-def _unwrap_legacy_envelope(text: str) -> str:
-    """Tolerate a model that still answers with the old decision envelope out of habit."""
-    if not (text.startswith("{") and text.endswith("}")):
-        return text
+    record = {
+        "protocol": "mineintent.agent-transcript.v1", "runId": run_id, "model": model,
+        "endedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "closing": closing, "usage": usage, "error": error_summary, "messages": messages,
+    }
+    line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+    if len(line) > _MAX_TRANSCRIPT_CHARS:
+        record["messages"] = None
+        record["truncated"] = True
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
     try:
-        parsed = json.loads(text)
-    except ValueError:
-        return text
-    if not isinstance(parsed, dict) or set(parsed) != {"protocol", "speech"}:
-        return text
-    if parsed.get("protocol") != _DECISION_PROTOCOL:
-        return text
-    speech = parsed.get("speech")
-    if speech is None:
-        return ""
-    return speech.strip() if isinstance(speech, str) else text
+        _TRANSCRIPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with _TRANSCRIPT_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -612,7 +560,7 @@ class Handler(BaseHTTPRequestHandler):
         run = None
         try:
             remaining_seconds(deadline)
-            run_id, context = require_request(value)
+            run_id, context, tools = require_request(value)
             callback_url = self.headers.get("x-mineintent-tool-executor-url", "")
             callback_token = self.headers.get("x-mineintent-tool-executor-token", "")
             execute_tool = http_tool_executor(callback_url, callback_token)
@@ -620,11 +568,12 @@ class Handler(BaseHTTPRequestHandler):
             if run is None:
                 self._send(409, {"error": "run_already_active"})
                 return
-            decision, raw_usage = run_tool_loop(
+            _closing, raw_usage = run_tool_loop(
                 config,
                 run_id,
                 context,
                 execute_tool,
+                tools,
                 deadline,
                 run,
             )
@@ -639,7 +588,9 @@ class Handler(BaseHTTPRequestHandler):
                     key: value for key, value in usage.items()
                     if isinstance(value, int) and not isinstance(value, bool) and value >= 0
                 }
-            self._send(200, {"decision": decision, "model": config["model"], **({"usage": usage} if usage else {})})
+            # Speech already happened through the say tool while the run lived; the closing text
+            # stays in the transcript. The response reports completion only.
+            self._send(200, {"protocol": _RUN_PROTOCOL, "model": config["model"], **({"usage": usage} if usage else {})})
         except RunCancelled:
             self._send(409, {"error": "run_cancelled"})
         except (RoundDeadlineExceeded, TimeoutError):
@@ -653,6 +604,14 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             if run is not None:
                 decision_runs.finish(run)
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path != "/healthz":
+            self._send(404, {"error": "not_found"})
+            return
+        # startedAt + envSha256 let the caller detect a stale process serving a rotated .env —
+        # a failure mode hit twice live, where SO_REUSEADDR let an old instance keep the port.
+        self._send(200, self.server.health)  # type: ignore[attr-defined]
 
     def log_message(self, format_string: str, *args: object) -> None:
         print(format_string % args, file=sys.stderr)
@@ -685,13 +644,27 @@ class Handler(BaseHTTPRequestHandler):
         return strict_json_loads(raw_request)
 
 
+class AgentHTTPServer(ThreadingHTTPServer):
+    # On Windows SO_REUSEADDR lets a second instance bind the same port and silently share
+    # traffic with a stale one — observed live with an instance still holding a rotated key.
+    # Exclusive bind on nt; POSIX keeps reuse for painless restarts out of TIME_WAIT.
+    allow_reuse_address = os.name != "nt"
+
+
 def main() -> None:
-    _load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+    env_file = Path(__file__).resolve().parents[1] / ".env"
+    _load_dotenv(env_file)
     config = load_config()
-    server = ThreadingHTTPServer(("127.0.0.1", config["port"]), Handler)
+    server = AgentHTTPServer(("127.0.0.1", config["port"]), Handler)
     server.daemon_threads = True
     server.config = config  # type: ignore[attr-defined]
     server.decision_runs = DecisionRuns()  # type: ignore[attr-defined]
+    server.health = {  # type: ignore[attr-defined]
+        "status": "ok",
+        "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "pid": os.getpid(),
+        "envSha256": hashlib.sha256(env_file.read_bytes()).hexdigest() if env_file.is_file() else None,
+    }
     print(f"MineIntent agent service listening on http://127.0.0.1:{config['port']}", file=sys.stderr)
     server.serve_forever()
 

@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto'
-import { z } from 'zod'
 import type { JsonlEventJournal } from '../events/index.js'
 import {
   composePassiveObservations,
@@ -17,7 +16,16 @@ import {
 } from '../information/index.js'
 import type { FileMemoryStore } from '../memory/index.js'
 import type { BackendEventEnvelope, MinecraftBackendApi, ProtocolChatEvent } from '../minecraft/contracts.js'
-import type { D40DecisionContext, D40ToolInvocation, ModelProvider } from '../models/index.js'
+import {
+  agentToolDefinitions,
+  lookArgumentsSchema,
+  moveArgumentsSchema,
+  rememberArgumentsSchema,
+  sayArgumentsSchema,
+  type AgentDecisionContext,
+  type ModelProvider,
+  type ToolInvocation,
+} from '../models/index.js'
 import { interpretPlayerChat, SpeechScheduler } from '../speech/index.js'
 import type { DebugContextSource } from '../telemetry/contracts.js'
 import type { DebugStateStore } from '../telemetry/debug-state.js'
@@ -33,15 +41,7 @@ import type { CompanionProfile } from './profile.js'
 const INFORMATION_GRANT_ID = 'grant-context-composer'
 const INFORMATION_PRINCIPAL_ID = 'context-composer'
 
-const lookArgumentsSchema = z.strictObject({
-  yaw_degrees: z.number().finite().min(-90).max(90),
-  pitch_degrees: z.number().finite().min(-90).max(90),
-})
-const moveArgumentsSchema = z.strictObject({
-  direction: z.enum(['forward', 'back', 'left', 'right']),
-  duration_ms: z.number().int().min(50).max(1_500),
-  sprint: z.boolean().optional(),
-})
+const TOOL_RESULT_PROTOCOL = 'mineintent.tool-result.v1'
 
 export interface CompanionRuntimeOptions {
   backend: MinecraftBackendApi
@@ -61,15 +61,21 @@ interface RunScope {
   dimension: string
 }
 
-interface ActiveRun extends RunScope { runId: string; controller: AbortController }
+interface ActiveRun extends RunScope {
+  runId: string
+  controller: AbortController
+  /** Journal id of the player chat that started this run; evidence for tool-written memories. */
+  chatEventId: string
+  sayCount: number
+}
 
 const MOVE_EFFECT_EPSILON = 0.01
 const LOOK_EFFECT_EPSILON_DEGREES = 0.01
 
 /**
- * The D40 runtime intentionally has one model route: an addressed player chat. Chat text has
- * no privileged control phrases, and the only model-visible body surface is two short relative
- * inputs. This is an experiment loop, not a replacement planning architecture.
+ * The runtime intentionally has one model route: an addressed player chat. Chat text has no
+ * privileged control phrases, and the model-visible surface is the small tool set in
+ * `models/agent-tools.ts` — two short body inputs, `say`, and `remember`.
  */
 export class CompanionRuntime {
   readonly #backend: MinecraftBackendApi
@@ -149,66 +155,131 @@ export class CompanionRuntime {
   }
 
   /** Called only by the authenticated loopback bridge while the matching player-chat run lives. */
-  async executeBodyTool(invocation: D40ToolInvocation): Promise<unknown> {
+  async executeTool(invocation: ToolInvocation): Promise<unknown> {
     const active = this.#activeRun
     if (!active || active.runId !== invocation.runId) throw new Error('tool_run_is_not_active')
     this.#assertRunCurrent(active)
-    if (this.#toolBusy) throw new Error('body_tool_already_running')
+    if (this.#toolBusy) throw new Error('tool_already_running')
     this.#toolBusy = true
     const actionId = randomUUID()
     const startedAt = new Date().toISOString()
+    try {
+      this.#debug.update({ currentBodyTool: { id: actionId, tool: invocation.name, purpose: 'agent tool', startedAt } })
+      this.#assertRunCurrent(active)
+      switch (invocation.name) {
+        case 'look_relative':
+        case 'move_input':
+          return await this.#executeBodyTool(active, invocation.name, invocation.arguments, actionId, startedAt)
+        case 'say':
+          return this.#executeSay(active, invocation.arguments)
+        case 'remember':
+          return await this.#executeRemember(active, invocation.arguments, actionId)
+        default:
+          // An honest unknown-name failure instead of a transport error: the model can recover.
+          return { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: `unknown_tool:${invocation.name.slice(0, 64)}` }
+      }
+    } finally {
+      this.#toolBusy = false
+      try { this.#debug.update({ currentBodyTool: undefined }) } catch { /* cleanup must not wedge the tool gate */ }
+    }
+  }
+
+  async #executeBodyTool(
+    active: ActiveRun,
+    name: 'look_relative' | 'move_input',
+    rawArguments: Record<string, unknown>,
+    actionId: string,
+    startedAt: string,
+  ): Promise<unknown> {
     let motor: ReturnType<MinecraftBackendApi['motor']> | undefined
     try {
-      this.#debug.update({ currentBodyTool: { id: actionId, tool: invocation.name, purpose: 'D40 short input', startedAt } })
-      this.#assertRunCurrent(active)
       motor = this.#backend.motor()
       const before = this.#backend.observationSource().selfPose()
-      if (invocation.name === 'look_relative') {
-        const args = lookArgumentsSchema.parse(invocation.arguments)
+      if (name === 'look_relative') {
+        const args = lookArgumentsSchema.parse(rawArguments)
         await motor.lookRelative(args.yaw_degrees, args.pitch_degrees, active.controller.signal)
       } else {
-        const args = moveArgumentsSchema.parse(invocation.arguments)
+        const args = moveArgumentsSchema.parse(rawArguments)
         await motor.move(args.direction, args.duration_ms, args.sprint, active.controller.signal)
       }
       this.#assertRunCurrent(active)
       const after = this.#backend.observationSource().selfPose()
-      const viewport = await this.#readViewport(invocation.runId, active.controller.signal)
+      const viewport = await this.#readViewport(active.runId, active.controller.signal)
       this.#assertRunCurrent(active)
-      const effect = invocation.name === 'look_relative'
-        ? measuredLookEffect(before, after)
-        : measuredMoveEffect(before, after)
+      const effect = name === 'look_relative' ? measuredLookEffect(before, after) : measuredMoveEffect(before, after)
       await this.#journal.append('body_tool.completed', {
-        actionId, runId: invocation.runId, tool: invocation.name, startedAt,
+        actionId, runId: active.runId, tool: name, startedAt,
         // Internal diagnostics may retain poses; they never cross the model result boundary.
         internal: { before, after },
       })
       this.#assertRunCurrent(active)
-      return {
-        protocol: 'mineintent.d40-tool-result.v1',
-        status: 'completed',
-        effect,
-        viewport,
-      }
+      return { protocol: TOOL_RESULT_PROTOCOL, status: 'completed', effect, viewport }
     } catch (error) {
       if (active.controller.signal.aborted || !this.#scopeMatches(active)) throw error
       this.#assertRunCurrent(active)
-      const viewport = await this.#readViewport(invocation.runId, active.controller.signal).catch(() => undefined)
+      const viewport = await this.#readViewport(active.runId, active.controller.signal).catch(() => undefined)
       this.#assertRunCurrent(active)
       await this.#journal.append('body_tool.failed', {
-        actionId, runId: invocation.runId, tool: invocation.name,
+        actionId, runId: active.runId, tool: name,
         summary: error instanceof Error ? error.message : String(error),
       })
       this.#assertRunCurrent(active)
       return {
-        protocol: 'mineintent.d40-tool-result.v1', status: 'failed',
+        protocol: TOOL_RESULT_PROTOCOL, status: 'failed',
         summary: error instanceof Error ? error.message.slice(0, 300) : 'tool_failed',
         ...(viewport ? { viewport } : {}),
       }
     } finally {
       try { if (motor) motor.releaseAll(); else this.#releaseBodyInputs() } catch { /* best effort */ }
-      finally {
-        this.#toolBusy = false
-        try { this.#debug.update({ currentBodyTool: undefined }) } catch { /* cleanup must not wedge the body-tool gate */ }
+    }
+  }
+
+  /** The only speech channel. Silence is simply this tool never being called during a run. */
+  #executeSay(active: ActiveRun, rawArguments: Record<string, unknown>): unknown {
+    const parsed = sayArgumentsSchema.safeParse(rawArguments)
+    const text = parsed.success ? parsed.data.text.trim() : ''
+    if (!text) {
+      return { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: 'say requires a non-empty text' }
+    }
+    try {
+      this.#speech.schedule({ id: randomUUID(), text })
+    } catch (error) {
+      return {
+        protocol: TOOL_RESULT_PROTOCOL, status: 'failed',
+        summary: error instanceof Error ? error.message.slice(0, 300) : 'say_failed',
+      }
+    }
+    active.sayCount += 1
+    return { protocol: TOOL_RESULT_PROTOCOL, status: 'completed' }
+  }
+
+  async #executeRemember(
+    active: ActiveRun,
+    rawArguments: Record<string, unknown>,
+    actionId: string,
+  ): Promise<unknown> {
+    const parsed = rememberArgumentsSchema.safeParse(rawArguments)
+    const summary = parsed.success ? parsed.data.summary.trim() : ''
+    if (!summary) {
+      return { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: 'remember requires a non-empty summary' }
+    }
+    try {
+      await this.#memory.remember({
+        worldId: active.worldId,
+        kind: 'episode',
+        summary,
+        evidence: [{ kind: 'event', id: active.chatEventId }],
+      })
+      this.#assertRunCurrent(active)
+      // The summary itself stays out of the journal, matching the redaction stance on speech.
+      await this.#journal.append('memory.remembered', { actionId, runId: active.runId, kind: 'episode' })
+      this.#assertRunCurrent(active)
+      return { protocol: TOOL_RESULT_PROTOCOL, status: 'completed' }
+    } catch (error) {
+      if (active.controller.signal.aborted || !this.#scopeMatches(active)) throw error
+      return {
+        protocol: TOOL_RESULT_PROTOCOL, status: 'failed',
+        summary: error instanceof Error ? error.message.slice(0, 300) : 'remember_failed',
       }
     }
   }
@@ -257,7 +328,7 @@ export class CompanionRuntime {
     const active: ActiveRun = {
       runId, controller, processSessionId: snapshot.processSessionId,
       connectionEpoch: snapshot.connectionEpoch, worldId: snapshot.world.worldId,
-      dimension: snapshot.world.dimension,
+      dimension: snapshot.world.dimension, chatEventId: eventId, sayCount: 0,
     }
     this.#activeRun = active
     let sources: DebugContextSource[] = []
@@ -278,8 +349,8 @@ export class CompanionRuntime {
         status: 'running', runId, startedAt: new Date().toISOString(), contextSources: sources,
         retrievedMemoryIds: memoryIds,
       } })
-      const context: D40DecisionContext = {
-        protocol: 'mineintent.d40-context.v1',
+      const context: AgentDecisionContext = {
+        protocol: 'mineintent.agent-context.v1',
         player: { username, text },
         profile: { content: this.#profile.content },
         world: { dimension: snapshot.world.dimension, ...(snapshot.world.timeOfDay === undefined ? {} : { timeOfDay: snapshot.world.timeOfDay }) },
@@ -288,20 +359,17 @@ export class CompanionRuntime {
         memories: memories.map(({ kind, summary, createdAt }) => ({ kind, summary, createdAt })),
       }
       const started = Date.now()
-      const result = await this.#model.run({ runId, context }, controller.signal)
+      // Speech happens through the say tool while the run lives; the result only reports completion.
+      const result = await this.#model.run({ runId, context, tools: agentToolDefinitions() }, controller.signal)
       this.#assertRunCurrent(active)
       await this.#journal.append('model.decision.completed', {
         runId, model: result.model, durationMs: Date.now() - started, usage: result.usage,
-        effects: { speech: Boolean(result.decision.speech) },
+        effects: { sayCalls: active.sayCount },
       })
       this.#assertRunCurrent(active)
       this.#debug.update({ decision: {
         status: 'idle', model: result.model, contextSources: sources, retrievedMemoryIds: memoryIds,
       } })
-      this.#assertRunCurrent(active)
-      if (result.decision.speech) {
-        this.#speech.schedule({ id: randomUUID(), text: result.decision.speech })
-      }
     } catch (error) {
       if (controller.signal.aborted) return
       this.#debug.update({ decision: { status: 'failed', runId, contextSources: sources, retrievedMemoryIds: memoryIds } })
@@ -367,7 +435,7 @@ export class CompanionRuntime {
 
   async #readViewport(runId: string, signal: AbortSignal): Promise<ViewportValues> {
     const response = await this.#informationRuntime.query(this.#caller(runId), {
-      interfaceId: 'viewport_information', operation: 'read', schemaRevision: 'viewport-information:6',
+      interfaceId: 'viewport_information', operation: 'read', schemaRevision: 'viewport-information:7',
       fields: ['frame', 'standingOnBlock', 'lookedAtBlock', 'visibleEntities', 'visibleBlocks'],
     }, signal)
     if (response.protocol !== 'mineintent.information-read.v1') throw new Error(`viewport_read_failed:${response.protocol}`)

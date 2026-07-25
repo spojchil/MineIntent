@@ -56,7 +56,7 @@ async function main(): Promise<void> {
   }
 }
 
-// D40 behavior needs a separate live experiment; this suite keeps reusable Paper/protocol checks.
+// Agent behavior needs a separate live experiment; this suite keeps reusable Paper/protocol checks.
 async function ensureTemplate(): Promise<void> {
   if (existsSync(path.join(templateDirectory, 'world', 'level.dat'))) {
     recorder.record('template', 'setup', 'template_reused', { templateDirectory })

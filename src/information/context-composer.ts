@@ -23,13 +23,13 @@ const READ_PLAN: readonly ReadPlanEntry[] = [
   { interfaceId: 'current_status', schemaRevision: 'current-status:1', fields: ['health', 'food', 'foodSaturation', 'oxygen', 'experienceLevel', 'statusEffects'] },
   { interfaceId: 'inventory_information', schemaRevision: 'inventory-information:1', fields: ['selectedHotbarSlot', 'slots'] },
   { interfaceId: 'sound_information', schemaRevision: 'sound-information:1', fields: ['recentSounds'] },
-  { interfaceId: 'viewport_information', schemaRevision: 'viewport-information:6', fields: ['frame', 'standingOnBlock', 'lookedAtBlock', 'visibleEntities', 'visibleBlocks'] },
+  { interfaceId: 'viewport_information', schemaRevision: 'viewport-information:7', fields: ['frame', 'standingOnBlock', 'lookedAtBlock', 'visibleEntities', 'visibleBlocks'] },
 ]
 
 /**
  * The deterministic, single-shot Context Composer reads a fixed, known-small field set from
  * each passive-observation interface once per decision. It is not a model-facing information
- * tool loop; D40 deliberately keeps observation composition inside the Runtime.
+ * tool loop; observation composition deliberately stays inside the Runtime for now.
  */
 export async function composePassiveObservations(
   runtime: InformationRuntime,
