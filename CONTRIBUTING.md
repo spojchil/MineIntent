@@ -1,12 +1,19 @@
+---
+status: accepted
+authority: normative
+implementation: not-applicable
+last_verified: 2026-07-23
+---
+
 # MineIntent 贡献与开发规范
 
 ## 1. 基本原则
 
-- 以默认分支的代码、测试和已合并 PR 为当前依据。
+- 以当前产品设计、系统设计和已接受 ADR 为实现依据。
 - 优先完成可验证的纵向场景，不先建立没有真实使用者的抽象层。
 - Minecraft 真实状态和程序验证结果高于模型声明。
 - 不提交密钥、玩家私人数据、世界存档、大型服务端文件或第三方研究仓库。
-- 发现现有方向不成立时，在 Issue 或 PR 中说明问题和取舍，不用代码静默改变产品方向。
+- 发现现有设计不成立时先更新设计决定，不用代码静默改变产品方向。
 
 ### 1.1 协作语言
 
@@ -38,7 +45,9 @@
 2. 备选方案与取舍。
 3. 结论，以及被否决的方案。
 
-squash 合并后 `main` 上留下的 `(#NN)` 就是这个决定的引用地址。讨论可以发生在 Issue 或 Draft PR 中；接受后的结论不再另抄一份 ADR 或提案文档。**说不清到能写进 PR 正文的程度，就还不算一个决定。**
+squash 合并后 `main` 上留下的 `(#NN)` 就是这个决定的引用地址。此后引用它，引用 `(#NN)`，不引用任何对话——**说不清到能写进 PR 正文的程度，就还不算一个决定。**
+
+尚未接受的内容进入 [`docs/proposals/`](./docs/proposals/README.md)，具身方向的未决项以[决策登记册](./docs/proposals/embodiment-decision-register.md)里的 `Dxx` 条目为单元。只有改变模型—身体接口本身的根边界决定才另写 ADR 到 `docs/decisions/`；其余以“已合并的 `Dxx`”存在即可。
 
 ## 4. 分支策略
 
@@ -86,7 +95,7 @@ chore: configure CI
 - 关联对应 Issue，并在适用时使用 `Closes #<number>`。
 - 说明目标、方案、验证和影响。
 - 保持范围足够小，便于理解和回滚。
-- 同步更新受到影响的安装、配置、运行、接口或排错说明。
+- 同步更新受到影响的设计、接口和测试文档。
 - 通过所有自动检查。
 
 只有注释、拼写等不改变行为的极小改动可以由维护者直接提交到 `main`。
@@ -98,6 +107,7 @@ chore: configure CI
 ```powershell
 pnpm install --frozen-lockfile
 pnpm check
+pnpm check:docs
 pnpm test
 ```
 
@@ -123,9 +133,26 @@ pnpm test
 
 ## 9. 文档维护
 
-默认分支只维护用户和贡献者实际会用到的说明：安装、配置、运行、验证、排错、接口和贡献流程。文档应描述当前代码，代码或命令改变时在同一 PR 更新。
+文档按读者实际会问的五个问题分区，另有四份被所有分区引用的根文档：
 
-设计推理、实验过程和被否决方案留在对应 Issue、PR 与提交历史中，不在仓库内维护平行的架构、ADR、提案或项目史文档库。`main` 仍只通过合并 PR 变更。
+| 位置 | 回答的问题 |
+|---|---|
+| [`docs/architecture/`](./docs/architecture/README.md) | 系统现在如何运行？目标架构是什么？（当前实况与已接受契约分开标识） |
+| [`docs/decisions/`](./docs/decisions/README.md) | 哪项长期决定被正式接受？ |
+| [`docs/proposals/`](./docs/proposals/README.md) | 现在还在争什么？（未接受方案与已实现但未接受的实验同处一区，靠 `status` 区分） |
+| [`docs/guides/`](./docs/guides/README.md) | 怎么运行和验证？接口是什么形状？（代码 schema 仍优先） |
+| [`docs/history/`](./docs/history/README.md) | 为什么走到今天？（演进、旧里程碑、调研、档案；不参与当前权威解析） |
+
+| 根文档 | 作用 |
+|---|---|
+| [`docs/README.md`](./docs/README.md) | 文档总入口与真相优先级 |
+| [`docs/product-design.md`](./docs/product-design.md) | 产品体验与范围，唯一的产品北极星 |
+| [`docs/current-status.md`](./docs/current-status.md) | 分支、代码能力、测试和 tracker 现实 |
+| [`docs/document-register.md`](./docs/document-register.md) | 逐文件的位置、身份与来源 |
+
+文档按[治理规则](./docs/documentation-policy.md)区分决策状态、权威和实现状态，`pnpm check:docs` 会校验元数据、相对链接和登记完整性。历史材料不再从仓库删除，也不能继续使用未加说明的“当前基线”身份。
+
+**硬规则只有一条：`main` 只通过合并 PR 变更。**其余（顺手更新状态页、登记表和相关设计文档）是习惯，不是门。
 
 ## 10. 安全报告
 

@@ -1,10 +1,18 @@
+---
+status: reference
+authority: informative
+implementation: partial
+last_verified: 2026-07-23
+applies_to: codex/trustworthy-passive-context@57d438e
+---
+
 # Paper 1.21.1 集成测试
 
 普通 PR CI 运行单元和契约测试，不启动 Minecraft。真实 Paper 测试通过手动 GitHub Actions 工作流在仓库专用的 self-hosted runner 上执行。
 
 ## 覆盖范围
 
-当前场景验证：
+下面描述**场景代码会检查什么**，不等于当前分支已经在线跑通验收——最新实验分支仍没有 Actions 或 Paper run：
 
 - Minecraft Backend 连接、死亡、重生和服务端重启后的自动重连
 - 测试客户端移动，以及清除控制状态后的停止

@@ -27,10 +27,25 @@ test('lookDirection matches mineflayer\'s own yaw/pitch-to-direction formula', (
 
 test('relativeBearing classifies target position relative to self facing', () => {
   const self = { x: 0, y: 64, z: 0 }
+  // yaw 0 faces north (-Z). Facing north, east (+X) is on the player's right and west (-X)
+  // on the left — the orientation a player reads off F3 or a compass.
   assert.equal(relativeBearing(0, self, { x: 0, y: 64, z: -5 }), 'ahead')
   assert.equal(relativeBearing(0, self, { x: 0, y: 64, z: 5 }), 'behind')
-  assert.equal(relativeBearing(0, self, { x: -5, y: 64, z: 0 }), 'right')
-  assert.equal(relativeBearing(0, self, { x: 5, y: 64, z: 0 }), 'left')
+  assert.equal(relativeBearing(0, self, { x: -5, y: 64, z: 0 }), 'left')
+  assert.equal(relativeBearing(0, self, { x: 5, y: 64, z: 0 }), 'right')
+})
+
+test('relativeBearing agrees with the rightward axis of lookDirection at every yaw', () => {
+  const self = { x: 0, y: 64, z: 0 }
+  for (const yaw of [0, Math.PI / 2, Math.PI, -Math.PI / 2, 0.7]) {
+    const look = lookDirection(yaw, 0)
+    // Rightward axis: the look vector rotated a quarter turn clockwise in the XZ plane.
+    const rightward = { x: -look.z, z: look.x }
+    const toRight = { x: rightward.x * 5, y: 64, z: rightward.z * 5 }
+    const toLeft = { x: -rightward.x * 5, y: 64, z: -rightward.z * 5 }
+    assert.equal(relativeBearing(yaw, self, toRight), 'right', `yaw ${yaw} rightward`)
+    assert.equal(relativeBearing(yaw, self, toLeft), 'left', `yaw ${yaw} leftward`)
+  }
 })
 
 test('relativeBearing rotates with self yaw', () => {

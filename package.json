@@ -5,6 +5,7 @@
   "private": true,
   "scripts": {
     "check": "tsc --noEmit",
+    "check:docs": "node scripts/check-docs.mjs",
     "dev": "tsx src/main.ts",
     "start": "tsx src/main.ts",
     "test": "tsx --test \"src/**/*.test.ts\"",
@@ -13,7 +14,7 @@
   },
   "keywords": [],
   "author": "",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "packageManager": "pnpm@11.3.0",
   "type": "module",
   "engines": {

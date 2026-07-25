@@ -10,8 +10,16 @@ MineIntent 是一个面向 Minecraft Java Edition 的 AI 同伴项目。
 
 项目已经实现首个纵向原型，但仍是开发者预览，尚不是可供长期日常游玩的成品。
 
+> 默认分支 `main`、可信注视架构实验和后来的 D40 一次性身体 Tool Loop 是三条
+> 不同基线。D40 已用真实模型和 Paper 跑通相对转头与短时移动，但它是实验归档，
+> 尚未成为接受架构。**逐项事实、固定提交、测试结果和 tracker 漂移见
+> [当前项目状态](./docs/current-status.md)**；以下列表描述的是 `main`。
+
 目前已经完成：
 
+- 产品定位与体验设计。
+- 相邻 Agent、AI 伴侣和 Minecraft Bot 项目调研。
+- 事件驱动的持续同伴系统设计。
 - Mineflayer Backend、认知观察边界、受约束动作运行时与聊天调度。
 - “一起收集木材”共同活动的聊天、采集、暂停、危险反射、返回和跨重启记忆闭环。
 - OpenAI-compatible 模型适配器、可编辑自然语言同伴档案与本地持久数据。
@@ -35,13 +43,14 @@ MineIntent 是一个面向 Minecraft Java Edition 的 AI 同伴项目。
 
 ## 文档
 
-- [用户文档入口](./docs/README.md)
-- [运行同伴原型](./docs/guides/companion-prototype.md)
-- [配置 Agent Service](./agent-service/README.md)
-- [运行 Paper 集成测试](./docs/guides/paper-integration.md)
-- [管理本地 Windows Paper 服务端](./mcserver/README.md)
-- [编辑同伴档案](./companion-profile.md)
-- [参与开发](./CONTRIBUTING.md)
+- [文档总入口与真相优先级](./docs/README.md)
+- [当前项目状态](./docs/current-status.md)
+- [产品设计](./docs/product-design.md)
+- [当前系统实况](./docs/architecture/current-system.md)
+- [架构决策记录](./docs/decisions/README.md)
+- [开放提案与具身决策登记册](./docs/proposals/README.md)
+- [项目演进史与早期档案](./docs/history/project-evolution.md)
+- [贡献与文档治理](./CONTRIBUTING.md)
 
 ## 技术基线
 
@@ -60,10 +69,11 @@ MineIntent 是一个面向 Minecraft Java Edition 的 AI 同伴项目。
 pnpm install
 ```
 
-运行类型检查：
+运行类型检查与文档检查：
 
 ```powershell
 pnpm check
+pnpm check:docs
 ```
 
 运行自动单元和契约测试：
@@ -114,8 +124,8 @@ pnpm test:paper
 
 项目采用 GitHub Flow：非琐碎工作通过 Issue 说明目标，在短期分支中实现，由 Pull Request 关联 Issue 并经过自动检查后合并。
 
-`main` 只通过合并 PR 变更。重要设计结论写入对应 PR 的问题、选项、取舍和验证中，由 Issue、PR 与提交历史保留讨论过程。详细规则见 [CONTRIBUTING.md](./CONTRIBUTING.md)。
+硬规则只有一条：`main` 只通过合并 PR 变更。架构或产品方向的结论必须以一个合并的 PR 落地，`main` 上留下的 `(#NN)` 就是它的引用地址。详细规则见 [CONTRIBUTING.md](./CONTRIBUTING.md) 与[文档治理规则](./docs/documentation-policy.md)。
 
 ## 许可证
 
-项目当前未授予开源许可证。在正式确定分发方式前，代码保留所有权利。
+本项目以 [MIT 许可证](./LICENSE)发布。
