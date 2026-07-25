@@ -15,7 +15,9 @@ import {
   type ViewportValues,
 } from '../information/index.js'
 import type { FileMemoryStore } from '../memory/index.js'
-import type { BackendEventEnvelope, MinecraftBackendApi, ProtocolChatEvent } from '../minecraft/contracts.js'
+import type {
+  BackendEventEnvelope, MinecraftBackendApi, MotorMoveDirection, ProtocolChatEvent,
+} from '../minecraft/contracts.js'
 import {
   agentToolDefinitions,
   lookArgumentsSchema,
@@ -67,6 +69,18 @@ interface ActiveRun extends RunScope {
   /** Journal id of the player chat that started this run; evidence for tool-written memories. */
   chatEventId: string
   sayCount: number
+  /** Movement inputs already used in the current round, so opposing pairs can be refused. */
+  roundMoves: { roundId: number; directions: Set<MotorMoveDirection> }
+}
+
+/** Which resource a tool needs. Locks are per resource, not per tool: `say` and `remember` touch
+ * neither the body nor each other, so a body input in flight must not block them. */
+const TOOL_RESOURCE: Record<string, 'body' | 'chat' | 'memory'> = {
+  look_relative: 'body', move_input: 'body', say: 'chat', remember: 'memory',
+}
+
+const OPPOSING_DIRECTION: Record<MotorMoveDirection, MotorMoveDirection> = {
+  forward: 'back', back: 'forward', left: 'right', right: 'left',
 }
 
 const MOVE_EFFECT_EPSILON = 0.01
@@ -96,7 +110,7 @@ export class CompanionRuntime {
   #chatTail = Promise.resolve()
   #decisionTail = Promise.resolve()
   #runGeneration = 0
-  #toolBusy = false
+  readonly #leases = new Map<'body' | 'chat' | 'memory', string>()
   #started = false
 
   constructor(options: CompanionRuntimeOptions) {
@@ -159,47 +173,85 @@ export class CompanionRuntime {
     const active = this.#activeRun
     if (!active || active.runId !== invocation.runId) throw new Error('tool_run_is_not_active')
     this.#assertRunCurrent(active)
-    if (this.#toolBusy) throw new Error('tool_already_running')
-    this.#toolBusy = true
+    const resource = TOOL_RESOURCE[invocation.name]
+    if (resource === undefined) {
+      // An honest unknown-name failure instead of a transport error: the model can recover.
+      return { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: `unknown_tool:${invocation.name.slice(0, 64)}` }
+    }
+    // A held resource is a fact about the world, so it comes back as a failed result. Throwing here
+    // would surface as a bridge 500 and kill the whole run over a transient conflict.
+    if (this.#leases.has(resource)) {
+      return {
+        protocol: TOOL_RESULT_PROTOCOL, status: 'failed',
+        summary: `resource_busy:${resource} is held by ${this.#leases.get(resource)}`,
+      }
+    }
     const actionId = randomUUID()
     const startedAt = new Date().toISOString()
+    this.#leases.set(resource, invocation.name)
     try {
-      this.#debug.update({ currentBodyTool: { id: actionId, tool: invocation.name, purpose: 'agent tool', startedAt } })
+      if (resource === 'body') {
+        this.#debug.update({ currentBodyTool: { id: actionId, tool: invocation.name, purpose: 'agent tool', startedAt } })
+      }
       this.#assertRunCurrent(active)
       switch (invocation.name) {
         case 'look_relative':
         case 'move_input':
-          return await this.#executeBodyTool(active, invocation.name, invocation.arguments, actionId, startedAt)
+          return await this.#executeBodyTool(active, invocation, actionId, startedAt)
         case 'say':
-          return this.#executeSay(active, invocation.arguments)
-        case 'remember':
-          return await this.#executeRemember(active, invocation.arguments, actionId)
+          return this.#executeSay(active, invocation, actionId)
         default:
-          // An honest unknown-name failure instead of a transport error: the model can recover.
-          return { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: `unknown_tool:${invocation.name.slice(0, 64)}` }
+          return await this.#executeRemember(active, invocation, actionId)
       }
     } finally {
-      this.#toolBusy = false
-      try { this.#debug.update({ currentBodyTool: undefined }) } catch { /* cleanup must not wedge the tool gate */ }
+      this.#leases.delete(resource)
+      if (resource === 'body') {
+        try { this.#debug.update({ currentBodyTool: undefined }) } catch { /* cleanup must not wedge the gate */ }
+      }
     }
+  }
+
+  /**
+   * Refuses movement inputs that cancel each other within one model round, and allows the ones a
+   * player really does combine. Same-round is the meaningful unit: the model asked for these
+   * together, so `forward` plus `back` is incoherent while `forward` plus `left` is how anyone
+   * walks diagonally. A separate round is a new decision and starts clean.
+   */
+  #conflictingMove(active: ActiveRun, roundId: number, direction: MotorMoveDirection): string | undefined {
+    if (active.roundMoves.roundId !== roundId) {
+      active.roundMoves = { roundId, directions: new Set() }
+    }
+    const opposing = OPPOSING_DIRECTION[direction]
+    if (active.roundMoves.directions.has(opposing)) {
+      return `opposing_move:${direction} cancels ${opposing} already held this round`
+    }
+    active.roundMoves.directions.add(direction)
+    return undefined
   }
 
   async #executeBodyTool(
     active: ActiveRun,
-    name: 'look_relative' | 'move_input',
-    rawArguments: Record<string, unknown>,
+    invocation: ToolInvocation,
     actionId: string,
     startedAt: string,
   ): Promise<unknown> {
+    const name = invocation.name as 'look_relative' | 'move_input'
+    if (name === 'move_input') {
+      const parsed = moveArgumentsSchema.safeParse(invocation.arguments)
+      const conflict = parsed.success ? this.#conflictingMove(active, invocation.roundId, parsed.data.direction) : undefined
+      if (conflict !== undefined) {
+        return { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: conflict }
+      }
+    }
     let motor: ReturnType<MinecraftBackendApi['motor']> | undefined
     try {
       motor = this.#backend.motor()
       const before = this.#backend.observationSource().selfPose()
       if (name === 'look_relative') {
-        const args = lookArgumentsSchema.parse(rawArguments)
+        const args = lookArgumentsSchema.parse(invocation.arguments)
         await motor.lookRelative(args.yaw_degrees, args.pitch_degrees, active.controller.signal)
       } else {
-        const args = moveArgumentsSchema.parse(rawArguments)
+        const args = moveArgumentsSchema.parse(invocation.arguments)
         await motor.move(args.direction, args.duration_ms, args.sprint, active.controller.signal)
       }
       this.#assertRunCurrent(active)
@@ -208,7 +260,8 @@ export class CompanionRuntime {
       this.#assertRunCurrent(active)
       const effect = name === 'look_relative' ? measuredLookEffect(before, after) : measuredMoveEffect(before, after)
       await this.#journal.append('body_tool.completed', {
-        actionId, runId: active.runId, tool: name, startedAt,
+        actionId, runId: active.runId, toolCallId: invocation.toolCallId, roundId: invocation.roundId,
+        tool: name, startedAt,
         // Internal diagnostics may retain poses; they never cross the model result boundary.
         internal: { before, after },
       })
@@ -220,7 +273,8 @@ export class CompanionRuntime {
       const viewport = await this.#readViewport(active.runId, active.controller.signal).catch(() => undefined)
       this.#assertRunCurrent(active)
       await this.#journal.append('body_tool.failed', {
-        actionId, runId: active.runId, tool: name,
+        actionId, runId: active.runId, toolCallId: invocation.toolCallId, roundId: invocation.roundId,
+        tool: name,
         summary: error instanceof Error ? error.message : String(error),
       })
       this.#assertRunCurrent(active)
@@ -235,14 +289,16 @@ export class CompanionRuntime {
   }
 
   /** The only speech channel. Silence is simply this tool never being called during a run. */
-  #executeSay(active: ActiveRun, rawArguments: Record<string, unknown>): unknown {
-    const parsed = sayArgumentsSchema.safeParse(rawArguments)
+  #executeSay(active: ActiveRun, invocation: ToolInvocation, actionId: string): unknown {
+    const parsed = sayArgumentsSchema.safeParse(invocation.arguments)
     const text = parsed.success ? parsed.data.text.trim() : ''
     if (!text) {
       return { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: 'say requires a non-empty text' }
     }
+    let segments: number
     try {
-      this.#speech.schedule({ id: randomUUID(), text })
+      // actionId doubles as the speech request id so scheduler events correlate with this call.
+      segments = this.#speech.schedule({ id: actionId, text })
     } catch (error) {
       return {
         protocol: TOOL_RESULT_PROTOCOL, status: 'failed',
@@ -250,15 +306,22 @@ export class CompanionRuntime {
       }
     }
     active.sayCount += 1
-    return { protocol: TOOL_RESULT_PROTOCOL, status: 'completed' }
+    void this.#journal.append('say.queued', {
+      actionId, runId: active.runId, toolCallId: invocation.toolCallId, roundId: invocation.roundId,
+      segments, characters: text.length,
+    })
+    // `queued`, not `completed`: the scheduler segments and rate-limits, so the player has not seen
+    // this yet and a later scope change can still cancel it. Reporting completion here would be the
+    // same fabricated success the tool results exist to prevent.
+    return { protocol: TOOL_RESULT_PROTOCOL, status: 'queued', segments }
   }
 
   async #executeRemember(
     active: ActiveRun,
-    rawArguments: Record<string, unknown>,
+    invocation: ToolInvocation,
     actionId: string,
   ): Promise<unknown> {
-    const parsed = rememberArgumentsSchema.safeParse(rawArguments)
+    const parsed = rememberArgumentsSchema.safeParse(invocation.arguments)
     const summary = parsed.success ? parsed.data.summary.trim() : ''
     if (!summary) {
       return { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: 'remember requires a non-empty summary' }
@@ -272,7 +335,9 @@ export class CompanionRuntime {
       })
       this.#assertRunCurrent(active)
       // The summary itself stays out of the journal, matching the redaction stance on speech.
-      await this.#journal.append('memory.remembered', { actionId, runId: active.runId, kind: 'episode' })
+      await this.#journal.append('memory.remembered', {
+        actionId, runId: active.runId, toolCallId: invocation.toolCallId, roundId: invocation.roundId,
+      })
       this.#assertRunCurrent(active)
       return { protocol: TOOL_RESULT_PROTOCOL, status: 'completed' }
     } catch (error) {
@@ -329,6 +394,7 @@ export class CompanionRuntime {
       runId, controller, processSessionId: snapshot.processSessionId,
       connectionEpoch: snapshot.connectionEpoch, worldId: snapshot.world.worldId,
       dimension: snapshot.world.dimension, chatEventId: eventId, sayCount: 0,
+      roundMoves: { roundId: -1, directions: new Set() },
     }
     this.#activeRun = active
     let sources: DebugContextSource[] = []

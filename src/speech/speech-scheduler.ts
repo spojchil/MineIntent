@@ -28,13 +28,15 @@ export class SpeechScheduler {
     if (!Number.isInteger(this.#maxLength) || this.#maxLength < 1) throw new RangeError('maxSegmentLength must be positive')
   }
 
-  schedule(request: SpeechRequest): void {
+  /** Queues the request and returns how many chat segments it became; delivery is asynchronous. */
+  schedule(request: SpeechRequest): number {
     if (!request.id || !request.text.trim()) throw new TypeError('Speech request requires id and text')
     if (this.#queue.some(item => item.request.id === request.id)) throw new Error(`Duplicate speech request: ${request.id}`)
     const segments = segmentChat(request.text, this.#maxLength)
     this.#queue.push({ request: { ...request }, segments, next: 0 })
     this.#onEvent({ type: 'scheduled', requestId: request.id, segments: segments.length })
     this.#pump()
+    return segments.length
   }
 
   stop(reason = 'scheduler_stopped'): void {

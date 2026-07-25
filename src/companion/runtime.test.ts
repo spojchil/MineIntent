@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -14,6 +14,13 @@ import { DebugStateStore } from '../telemetry/index.js'
 import { CompanionRuntime } from './runtime.js'
 
 type ModelInput = { runId: string; context: AgentDecisionContext; tools: readonly WireToolDefinition[] }
+
+let callSequence = 0
+/** 补齐 toolCallId 与 roundId：真实调用总是带着它们，测试不该绕过这条关联链。 */
+function call(runId: string, name: string, args: Record<string, unknown>, roundId = 0) {
+  callSequence += 1
+  return { runId, toolCallId: `call-${callSequence}`, roundId, name, arguments: args }
+}
 
 class FakeModel implements ModelProvider {
   calls: ModelInput[] = []
@@ -182,17 +189,98 @@ async function fixture(t: test.TestContext, options: { gateJournal?: boolean; sp
   })
   await runtime.start()
   t.after(async () => { await runtime.stop('test'); await rm(directory, { recursive: true, force: true }) })
-  return { backend, model, runtime, memory, debug, journal }
+  const journalFile = path.join(directory, 'events.jsonl')
+  const readJournal = async (): Promise<Array<{ type: string; payload: Record<string, unknown> }>> => {
+    await journal.flush()
+    const raw = await readFile(journalFile, 'utf8').catch(() => '')
+    return raw.split('\n').filter(Boolean).map(line => JSON.parse(line))
+  }
+  return { backend, model, runtime, memory, debug, journal, readJournal }
 }
+
+test('say reports queued rather than completed, and journals the whole correlation chain', async t => {
+  const { backend, model, runtime, readJournal } = await fixture(t, { speechIntervalMs: 0 })
+  let result: unknown
+  model.handler = async input => {
+    result = await runtime.executeTool({
+      runId: input.runId, toolCallId: 'call-say-1', roundId: 3, name: 'say',
+      arguments: { text: '好'.repeat(300) },
+    })
+    return { model: 'fake' }
+  }
+  backend.emitChat('Bot，说一段长话')
+  await waitFor(() => model.calls.length === 1)
+  await runtime.idle()
+
+  // schedule() 只入队：分段与最小间隔都在之后发生，所以此刻玩家还没看到任何东西。
+  assert.deepEqual(result, { protocol: 'mineintent.tool-result.v1', status: 'queued', segments: 2 })
+  const events = await readJournal()
+  const queued = events.find(event => event.type === 'say.queued')
+  assert.ok(queued, 'say must leave a journal record')
+  const payload = queued!.payload as { toolCallId: string; roundId: number; segments: number; actionId: string }
+  assert.equal(payload.toolCallId, 'call-say-1')
+  assert.equal(payload.roundId, 3)
+  assert.equal(payload.segments, 2)
+  // actionId 同时是 speech 请求 id，调度器事件才能和这次调用对上。
+  const scheduled = events.find(event => event.type === 'speech.scheduled')
+  assert.equal((scheduled!.payload as { requestId: string }).requestId, payload.actionId)
+})
+
+test('same-round movement refuses an opposing pair but allows a diagonal one', async t => {
+  const { backend, model, runtime } = await fixture(t)
+  const results: unknown[] = []
+  model.handler = async input => {
+    // 同一轮里模型要求同时前进和左移：真人就是这样斜着走。
+    results.push(await runtime.executeTool(call(input.runId, 'move_input', { direction: 'forward', duration_ms: 50 }, 0)))
+    results.push(await runtime.executeTool(call(input.runId, 'move_input', { direction: 'left', duration_ms: 50 }, 0)))
+    // 同一轮里再要求后退，与已按下的 forward 相抵，这不是任何真人的动作。
+    results.push(await runtime.executeTool(call(input.runId, 'move_input', { direction: 'back', duration_ms: 50 }, 0)))
+    // 换一轮就是新的决定，back 重新合法。
+    results.push(await runtime.executeTool(call(input.runId, 'move_input', { direction: 'back', duration_ms: 50 }, 1)))
+    return { model: 'fake' }
+  }
+  backend.emitChat('Bot，走走看')
+  await waitFor(() => model.calls.length === 1)
+  await runtime.idle()
+
+  const statuses = results.map(entry => (entry as { status: string }).status)
+  assert.deepEqual(statuses, ['completed', 'completed', 'failed', 'completed'])
+  const refused = results[2] as { summary: string }
+  assert.match(refused.summary, /opposing_move:back cancels forward/u)
+})
+
+test('a held resource fails the call instead of killing the run, and only blocks its own resource', async t => {
+  const { backend, model, runtime } = await fixture(t)
+  const results: unknown[] = []
+  model.handler = async input => {
+    // 身体占用期间发起第二个身体调用：应得到真实失败，而不是异常。
+    const moving = runtime.executeTool(call(input.runId, 'move_input', { direction: 'forward', duration_ms: 300 }, 0))
+    await waitFor(() => backend.motorInstance.moving)
+    results.push(await runtime.executeTool(call(input.runId, 'look_relative', { yaw_degrees: 5, pitch_degrees: 0 }, 0)))
+    // say 用的是聊天资源，不该被身体挡住——否则「行动前先说一句」就无法实现。
+    results.push(await runtime.executeTool(call(input.runId, 'say', { text: '我先动一下。' }, 0)))
+    results.push(await moving)
+    return { model: 'fake' }
+  }
+  backend.emitChat('Bot，往前走')
+  await waitFor(() => model.calls.length === 1)
+  await runtime.idle()
+
+  assert.equal((results[0] as { status: string }).status, 'failed')
+  assert.match((results[0] as { summary: string }).summary, /resource_busy:body is held by move_input/u)
+  assert.equal((results[1] as { status: string }).status, 'queued')
+  assert.equal((results[2] as { status: string }).status, 'completed')
+  assert.equal(backend.messages.includes('我先动一下。'), true)
+})
 
 test('startup is local; player chat runs the two-tool closed loop with measured effects and no memory write', async t => {
   const { backend, model, runtime, memory } = await fixture(t)
   assert.equal(model.calls.length, 0)
   const results: unknown[] = []
   model.handler = async input => {
-    results.push(await runtime.executeTool({ runId: input.runId, name: 'look_relative', arguments: { yaw_degrees: 90, pitch_degrees: 0 } }))
-    results.push(await runtime.executeTool({ runId: input.runId, name: 'move_input', arguments: { direction: 'forward', duration_ms: 50 } }))
-    results.push(await runtime.executeTool({ runId: input.runId, name: 'say', arguments: { text: '我看到羊了，走近了一点。' } }))
+    results.push(await runtime.executeTool(call(input.runId, 'look_relative', { yaw_degrees: 90, pitch_degrees: 0 })))
+    results.push(await runtime.executeTool(call(input.runId, 'move_input', { direction: 'forward', duration_ms: 50 })))
+    results.push(await runtime.executeTool(call(input.runId, 'say', { text: '我看到羊了，走近了一点。' })))
     return { model: 'fake' }
   }
   backend.emitChat('Bot，看看那只羊，再走过去一点')
@@ -224,11 +312,11 @@ test('a new player chat waits behind an in-flight turn without taking control fr
   model.handler = async input => {
     if (first) {
       first = false
-      await runtime.executeTool({ runId: input.runId, name: 'move_input', arguments: { direction: 'forward', duration_ms: 80 } })
-      await runtime.executeTool({ runId: input.runId, name: 'say', arguments: { text: '我先走完这一步。' } })
+      await runtime.executeTool(call(input.runId, 'move_input', { direction: 'forward', duration_ms: 80 }))
+      await runtime.executeTool(call(input.runId, 'say', { text: '我先走完这一步。' }))
       return { model: 'fake' }
     }
-    await runtime.executeTool({ runId: input.runId, name: 'say', arguments: { text: '我听见了，再判断是否停下。' } })
+    await runtime.executeTool(call(input.runId, 'say', { text: '我听见了，再判断是否停下。' }))
     return { model: 'fake' }
   }
   backend.emitChat('Bot，往前走')
@@ -267,7 +355,7 @@ test('a newer chat preserves model-authored segments from the earlier turn', asy
   const { backend, model, runtime } = await fixture(t, { speechIntervalMs: 25 })
   model.handler = async input => {
     const text = input.context.player.text.includes('停下') ? '这是模型的回复。' : '旧'.repeat(300)
-    await runtime.executeTool({ runId: input.runId, name: 'say', arguments: { text } })
+    await runtime.executeTool(call(input.runId, 'say', { text }))
     return { model: 'fake' }
   }
 
@@ -282,8 +370,8 @@ test('a newer chat preserves model-authored segments from the earlier turn', asy
 test('a connection-epoch scope change synchronously aborts the active run and releases movement', async t => {
   const { backend, model, runtime } = await fixture(t)
   model.handler = async input => {
-    await runtime.executeTool({ runId: input.runId, name: 'move_input', arguments: { direction: 'forward', duration_ms: 1500 } })
-    await runtime.executeTool({ runId: input.runId, name: 'say', arguments: { text: '不应发送' } })
+    await runtime.executeTool(call(input.runId, 'move_input', { direction: 'forward', duration_ms: 1500 }))
+    await runtime.executeTool(call(input.runId, 'say', { text: '不应发送' }))
     return { model: 'fake' }
   }
   backend.emitChat('Bot，往前走')
@@ -299,8 +387,8 @@ test('a connection-epoch scope change synchronously aborts the active run and re
 test('connection_closed aborts even while the last snapshot still has the old scope', async t => {
   const { backend, model, runtime } = await fixture(t)
   model.handler = async input => {
-    await runtime.executeTool({ runId: input.runId, name: 'move_input', arguments: { direction: 'forward', duration_ms: 1500 } })
-    await runtime.executeTool({ runId: input.runId, name: 'say', arguments: { text: '不应发送' } })
+    await runtime.executeTool(call(input.runId, 'move_input', { direction: 'forward', duration_ms: 1500 }))
+    await runtime.executeTool(call(input.runId, 'say', { text: '不应发送' }))
     return { model: 'fake' }
   }
   backend.emitChat('Bot，往前走')
@@ -329,7 +417,7 @@ test('a scope change drops chat that is still waiting for its journal write', as
 test('connection_closed cancels speech segments even when no model run remains active', async t => {
   const { backend, model, runtime } = await fixture(t, { speechIntervalMs: 25 })
   model.handler = async input => {
-    await runtime.executeTool({ runId: input.runId, name: 'say', arguments: { text: '旧'.repeat(300) } })
+    await runtime.executeTool(call(input.runId, 'say', { text: '旧'.repeat(300) }))
     return { model: 'fake' }
   }
 
@@ -346,9 +434,9 @@ test('release failure cannot wedge the tool gate and sub-epsilon motion is repor
   const results: unknown[] = []
   model.handler = async input => {
     backend.motorInstance.releaseFailures = 1
-    results.push(await runtime.executeTool({ runId: input.runId, name: 'look_relative', arguments: { yaw_degrees: 0, pitch_degrees: 0 } }))
+    results.push(await runtime.executeTool(call(input.runId, 'look_relative', { yaw_degrees: 0, pitch_degrees: 0 })))
     backend.motorInstance.nextMoveDelta = { x: 0.0005, y: 0, z: 0 }
-    results.push(await runtime.executeTool({ runId: input.runId, name: 'move_input', arguments: { direction: 'forward', duration_ms: 50 } }))
+    results.push(await runtime.executeTool(call(input.runId, 'move_input', { direction: 'forward', duration_ms: 50 })))
     return { model: 'fake' }
   }
   backend.emitChat('Bot，试着动一点')
@@ -365,7 +453,7 @@ test('release failure cannot wedge the tool gate and sub-epsilon motion is repor
 test('stop aborts and releases synchronously before awaiting the decision tail', async t => {
   const { backend, model, runtime } = await fixture(t)
   model.handler = async input => {
-    await runtime.executeTool({ runId: input.runId, name: 'move_input', arguments: { direction: 'forward', duration_ms: 1500 } })
+    await runtime.executeTool(call(input.runId, 'move_input', { direction: 'forward', duration_ms: 1500 }))
     return { model: 'fake' }
   }
   backend.emitChat('Bot，持续往前')
@@ -383,7 +471,7 @@ test('queued player turns preserve both model replies after a delayed completion
   gated.blockNext('model.decision.completed')
   model.handler = async input => {
     const text = model.calls.length === 1 ? '旧回复' : '新回复'
-    await runtime.executeTool({ runId: input.runId, name: 'say', arguments: { text } })
+    await runtime.executeTool(call(input.runId, 'say', { text }))
     return { model: 'fake' }
   }
   backend.emitChat('Bot，第一句话')

@@ -1,4 +1,6 @@
 import json
+import pathlib
+import tempfile
 import threading
 import time
 import unittest
@@ -10,6 +12,22 @@ import server
 
 SERVICE_TOKEN = "agent-service-test-token-0123456789"
 
+class _Sink:
+    """每个测试用例一份临时 transcript，绝不写真实 .mineintent/。"""
+
+    def __init__(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = pathlib.Path(self.dir.name) / "agent-transcripts.jsonl"
+
+    def config(self, **extra):
+        return {"model": "x", "transcript_path": self.path, **extra}
+
+    def records(self):
+        if not self.path.exists():
+            return []
+        return [json.loads(line) for line in self.path.read_text(encoding="utf-8").splitlines() if line]
+
+
 def tools():
     return [
         {"type": "function", "function": {"name": "look_relative", "description": "转头", "parameters": {"type": "object"}}},
@@ -20,6 +38,8 @@ def tools():
 
 class ServerTests(unittest.TestCase):
     def test_deepseek_replay_preserves_reasoning_and_tool_call_id(self):
+        sink = _Sink()
+        self.addCleanup(sink.dir.cleanup)
         calls = []
         model_messages = []
         responses = [
@@ -38,16 +58,17 @@ class ServerTests(unittest.TestCase):
             deadlines.append(deadline)
             return responses.pop(0)
 
-        def execute(run_id, name, arguments, _deadline):
-            calls.append((run_id, name, arguments))
+        def execute(run_id, name, arguments, _deadline, tool_call_id="", round_id=0):
+            calls.append((run_id, name, arguments, tool_call_id, round_id))
             return {"status": "completed", "viewport": {"visibleEntities": [["sheep", 0, 0, 3]]}}
 
         with patch.object(server, "model_completion", completion):
-            closing, usage = server.run_tool_loop({"model": "x"}, "run-1", context(), execute, tools())
+            closing, usage = server.run_tool_loop(sink.config(), "run-1", context(), execute, tools())
         self.assertEqual(closing, "")
         self.assertEqual(usage, {"prompt_tokens": 30, "completion_tokens": 5})
         self.assertEqual(deadlines[0], deadlines[1])
-        self.assertEqual(calls, [("run-1", "look_relative", {"yaw_degrees": 90, "pitch_degrees": 0})])
+        # 关联链：模型的 tool_call_id 与轮次序号一路传到工具后端（D06）。
+        self.assertEqual(calls, [("run-1", "look_relative", {"yaw_degrees": 90, "pitch_degrees": 0}, "call-1", 0)])
         replay = model_messages[1][-2]
         tool_result = model_messages[1][-1]
         self.assertEqual(replay["reasoning_content"], "need turn")
@@ -55,6 +76,8 @@ class ServerTests(unittest.TestCase):
         self.assertIn("sheep", tool_result["content"])
 
     def test_parallel_calls_all_execute_in_order(self):
+        sink = _Sink()
+        self.addCleanup(sink.dir.cleanup)
         model_messages = []
         responses = [
             {"choices": [{"message": {"role": "assistant", "tool_calls": [
@@ -71,7 +94,7 @@ class ServerTests(unittest.TestCase):
 
         with patch.object(server, "model_completion", completion):
             server.run_tool_loop(
-                {"model": "x"}, "run-1", context(),
+                sink.config(), "run-1", context(),
                 lambda *args: executed.append(args) or {"status": "completed"}, tools(),
             )
         # 并行调用不再被预先拒绝：约束在提示词里是建议，失败由工具后端如实回报。
@@ -80,6 +103,8 @@ class ServerTests(unittest.TestCase):
         self.assertIn("completed", model_messages[1][-2]["content"])
 
     def test_arguments_are_forwarded_untouched_for_the_tool_side_to_judge(self):
+        sink = _Sink()
+        self.addCleanup(sink.dir.cleanup)
         responses = [
             {"choices": [{"message": {"role": "assistant", "tool_calls": [
                 {"id": "bad", "function": {"name": "move_input", "arguments": '{"direction":"forward","duration_ms":5000}'}}
@@ -89,12 +114,59 @@ class ServerTests(unittest.TestCase):
         seen = []
         with patch.object(server, "model_completion", lambda _config, _messages, _deadline, _run=None, tools=None: responses.pop(0)):
             server.run_tool_loop(
-                {"model": "x"}, "run-1", context(),
+                sink.config(), "run-1", context(),
                 lambda *args: seen.append(args) or {"status": "failed", "summary": "duration out of range"}, tools(),
             )
         # 工具契约归工具侧：agent 不预判参数合法性，越界值也交给后端回真实失败。
         self.assertEqual(len(seen), 1)
         self.assertEqual(seen[0][2], {"direction": "forward", "duration_ms": 5000})
+
+    def test_float_arguments_survive_the_json_boundary(self):
+        # 回归：_validate_json 用 math.isfinite 拒 NaN/Inf；漏掉 import math 会让任何浮点请求崩溃。
+        self.assertEqual(server.strict_json_loads(server.strict_json_dumps({"yaw": -30.5})), {"yaw": -30.5})
+        for bad in [float("nan"), float("inf"), float("-inf")]:
+            with self.assertRaises(ValueError):
+                server.strict_json_dumps({"yaw": bad})
+
+    def test_transcript_records_tools_rotates_and_honors_the_data_dir(self):
+        sink = _Sink()
+        self.addCleanup(sink.dir.cleanup)
+        responses = [{"choices": [{"message": {"role": "assistant", "content": "完成"}}]}]
+        with patch.object(server, "model_completion",
+                          lambda _c, _m, _d, _r=None, tools=None: responses.pop(0)):
+            server.run_tool_loop(sink.config(), "run-1", context(), lambda *a: {}, tools())
+        record = sink.records()[-1]
+        # 声称记录模型所见的一切，就必须包含它当时被给了哪些工具。
+        self.assertEqual(record["tools"], ["look_relative", "move_input", "say"])
+        self.assertEqual(len(record["toolSchemas"]), 3)
+        self.assertEqual(record["closing"], "完成")
+        self.assertIsNone(record["error"])
+
+        # 超过文件上限时轮转，而不是无限增长。
+        sink.path.write_text("x" * (server._MAX_TRANSCRIPT_BYTES - 1), encoding="utf-8")
+        server.append_transcript("run-2", "m", tools(), [], "", None, None, sink.path)
+        self.assertTrue(sink.path.with_suffix(sink.path.suffix + ".1").exists())
+        self.assertEqual(len(sink.records()), 1)
+
+        # 数据目录可配，不再写死在当前工作目录。
+        self.assertEqual(
+            server.transcript_path({"MINEINTENT_DATA_DIR": "custom-data"}),
+            pathlib.Path("custom-data") / "agent-transcripts.jsonl",
+        )
+
+    def test_transcript_records_the_run_even_when_it_fails(self):
+        sink = _Sink()
+        self.addCleanup(sink.dir.cleanup)
+
+        def boom(_c, _m, _d, _r=None, tools=None):
+            raise RuntimeError("upstream exploded")
+
+        with patch.object(server, "model_completion", boom):
+            with self.assertRaises(RuntimeError):
+                server.run_tool_loop(sink.config(), "run-1", context(), lambda *a: {}, tools())
+        record = sink.records()[-1]
+        self.assertIn("upstream exploded", record["error"])
+        self.assertIsNone(record["closing"])
 
     def test_leak_guard_catches_call_shaped_mentions_but_not_prose(self):
         # 两种实测泄漏形式：一家把内部标记原样吐成文本，另一家自造 JSON 字段承载工具调用。

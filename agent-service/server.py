@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import http.client
 import json
+import math
 import os
 import re
 import socket
@@ -30,8 +31,9 @@ _MAX_TOOLS = 32
 _CONTEXT_PROTOCOL = "mineintent.agent-context.v1"
 _RUN_PROTOCOL = "mineintent.agent-run.v1"
 _TOOL_NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
-_TRANSCRIPT_FILE = Path(".mineintent") / "agent-transcripts.jsonl"
-_MAX_TRANSCRIPT_CHARS = 2_000_000
+_TRANSCRIPT_NAME = "agent-transcripts.jsonl"
+_MAX_TRANSCRIPT_CHARS = 262_144
+_MAX_TRANSCRIPT_BYTES = 32 * 1_024 * 1_024
 
 # Vendor markup that must never reach `content`: a tool call the provider failed to lift out of
 # the raw generation. Seen live as verbatim internal markup on one endpoint and as invented JSON
@@ -276,9 +278,15 @@ def http_tool_executor(url: str, token: str):
         raise RequestValidationError("tool executor token is invalid")
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
-    def execute(run_id: str, name: str, arguments: dict, deadline: float) -> object:
+    def execute(run_id: str, name: str, arguments: dict, deadline: float,
+                tool_call_id: str = "", round_id: int = 0) -> object:
         request = urllib.request.Request(
-            url, data=strict_json_dumps({"runId": run_id, "name": name, "arguments": arguments}), method="POST",
+            url,
+            data=strict_json_dumps({
+                "runId": run_id, "toolCallId": tool_call_id, "roundId": round_id,
+                "name": name, "arguments": arguments,
+            }),
+            method="POST",
             headers={"authorization": f"Bearer {token}", "content-type": "application/json"},
         )
         try:
@@ -425,7 +433,7 @@ def run_tool_loop(
     closing: str | None = None
     error_summary: str | None = None
     try:
-        for _round in range(_MAX_TOOL_ROUNDS):
+        for round_id in range(_MAX_TOOL_ROUNDS):
             if run is not None:
                 run.ensure_active()
             remaining_seconds(deadline)
@@ -463,7 +471,7 @@ def run_tool_loop(
                             raise ValueError("invalid tool call")
                         if run is not None:
                             run.ensure_active()
-                        result = execute_tool(run_id, name, arguments, deadline)
+                        result = execute_tool(run_id, name, arguments, deadline, call_id, round_id)
                         if run is not None:
                             run.ensure_active()
                     except (ValueError, RequestValidationError) as error:
@@ -491,36 +499,59 @@ def run_tool_loop(
         error_summary = f"{type(error).__name__}: {error}"[:300]
         raise
     finally:
-        append_transcript(run_id, config.get("model", ""), messages, closing, usage if has_usage else None, error_summary)
+        append_transcript(
+            run_id, config.get("model", ""), tools, messages, closing,
+            usage if has_usage else None, error_summary, config.get("transcript_path"),
+        )
+
+
+def transcript_path(env: dict = os.environ) -> Path:
+    """Honors MINEINTENT_DATA_DIR so transcripts land beside the journal, not in the CWD."""
+    directory = env.get("MINEINTENT_DATA_DIR", "").strip()
+    return (Path(directory) if directory else Path(".mineintent")) / _TRANSCRIPT_NAME
 
 
 def append_transcript(
     run_id: str,
     model: str,
+    tools: list,
     messages: list,
     closing: str | None,
     usage: dict | None,
     error_summary: str | None,
+    path: Path | None = None,
 ) -> None:
-    """Bounded per-run replay log: exactly what the model saw and said, including on failure.
+    """Bounded per-run replay log: what the model was offered, saw and said — failures included.
 
-    This closes the audit gap the live experiment hit — poses were journaled but the model-visible
-    viewport per round was not, so "what did it see at step 7" could only be reconstructed.
-    Diagnostics must never fail the run, hence the blanket OSError swallow.
+    This closes the audit gap the live experiment hit: poses were journaled but the model-visible
+    viewport per round was not, so "what did it see at step 7" could only be reconstructed. The
+    tool definitions are recorded too, since a schema change silently alters what the model could
+    have done. Diagnostics must never fail a run, hence the blanket OSError swallow.
+
+    Contents are sensitive — player chat, profile, memories, viewports and reasoning traces — so
+    the file is created 0600 and rotated rather than allowed to grow without bound.
     """
+    target = path if path is not None else transcript_path()
     record = {
         "protocol": "mineintent.agent-transcript.v1", "runId": run_id, "model": model,
         "endedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "tools": [tool.get("function", {}).get("name") for tool in tools if isinstance(tool, dict)],
+        "toolSchemas": tools,
         "closing": closing, "usage": usage, "error": error_summary, "messages": messages,
     }
     line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
     if len(line) > _MAX_TRANSCRIPT_CHARS:
+        # Keep the run auditable even when the replay itself is oversized.
         record["messages"] = None
+        record["toolSchemas"] = None
         record["truncated"] = True
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
     try:
-        _TRANSCRIPT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with _TRANSCRIPT_FILE.open("a", encoding="utf-8") as handle:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() and target.stat().st_size + len(line) > _MAX_TRANSCRIPT_BYTES:
+            target.replace(target.with_suffix(target.suffix + ".1"))
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
             handle.write(line + "\n")
     except OSError:
         pass

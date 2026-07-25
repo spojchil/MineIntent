@@ -29,9 +29,17 @@ export interface ModelProvider {
   ): Promise<ModelRunResult>
 }
 
-/** Names stay an open string: the tool backend answers unknown names with a failed result. */
+/**
+ * Names stay an open string: the tool backend answers unknown names with a failed result.
+ *
+ * `toolCallId` and `roundId` carry the agent-side identity of the call so the internal chain runs
+ * unbroken from the model's tool call through the action to the journal (D06). `roundId` also lets
+ * the arbiter tell "the model asked for these together" from "these are consecutive decisions".
+ */
 export const toolInvocationSchema = z.strictObject({
   runId: z.string().min(1).max(128),
+  toolCallId: z.string().min(1).max(128),
+  roundId: z.number().int().nonnegative(),
   name: z.string().min(1).max(64),
   arguments: z.record(z.string(), z.unknown()),
 })
