@@ -102,7 +102,9 @@ pnpm start
 
 同伴通过游戏聊天与主要玩家交流。默认调试状态位于 `http://127.0.0.1:3211/v1/state`；该接口只有 GET 能力，不提供游戏控制，并会遮盖密钥、令牌和原始私人正文。
 
-决策层（prompt 构造、OpenAI-compatible 调用与结果校验）在 `agent-service/`（Python，仅用标准库），通过本地 HTTP 与 Node 侧的 `CompanionRuntime` 交互，边界见该目录下的 [README](./agent-service/README.md)。Mineflayer 协议驱动、动作执行与编排仍在 Node 侧。模型密钥只从本地 `.env` 读取；`.env` 和运行数据目录 `.mineintent/` 已被 Git 忽略。运行细节见 [首个同伴原型](./docs/guides/companion-prototype.md)。
+分层是一个普通 agent 加一个工具后端：**agent 本体在 `agent-service/`**（Python，仅用标准库）——提示词构造、OpenAI-compatible 调用与结果校验都在那一侧；**TypeScript 实现 agent 调用的工具**——Mineflayer 协议驱动、感知投影与身体输入。选 Python 是因为写 agent 方便，选 TypeScript 是因为工具要贴着 Mineflayer。两边只通过本地 HTTP JSON 交互，边界见 `agent-service/` 下的 [README](./agent-service/README.md)。
+
+Node 同时是进程入口：玩家聊天从游戏侧到达，Node 按事件调用 agent，agent 再通过认证的本地回环取用工具。入口在 Node，编排在 agent 一侧。模型密钥只从本地 `.env` 读取；`.env` 和运行数据目录 `.mineintent/` 已被 Git 忽略。运行细节见 [首个同伴原型](./docs/guides/companion-prototype.md)。
 
 在 `localhost:25565` 已运行受管理的 Paper 1.21.1 离线验证服务器时，可执行 Backend 生命周期集成验收：
 

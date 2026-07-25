@@ -44,8 +44,8 @@ Loop。它们的 `applies_to` 才是适用范围——**文档描述某个分支
 | Information Runtime | 当前但部分 | 契约声明 17 个 interface ID，生产只注册并固定读取其中 4 个；Registry、Access Policy、Help/Read、Ref/Cursor 与预算主体存在，生产 trace 使用默认 no-op sink |
 | model-facing Information tool loop | 不存在 | ToolSession 和适配契约有代码/测试，但可信注视与 D40 都没有把信息读取注册成模型工具 |
 | model-facing body Tool Loop | D40 实验 | 模型可逐轮调用 `look_relative` 或短时 `move_input`，Runtime 返回真实效果和新视口；不在 `main` 或可信注视架构实验中 |
-| Python Agent Service | 两种实验形态 | 可信注视是一次带 `json_object` 的模型调用；D40 是最多 16 轮的身体工具闭环，再产生最终聊天 |
-| `ContextPackageV2` / `CompanionDecisionV2` | 实验实现 | TypeScript schema 是业务权威；严格绑定本轮 context |
+| Python Agent Service | 两种实验形态 | **agent 本体在这一侧**（见下「分层」）；可信注视是一次带 `json_object` 的模型调用，D40 是最多 16 轮的身体工具闭环，再产生最终聊天 |
+| `ContextPackageV2` / `CompanionDecisionV2` | 实验实现 | 仅描述可信注视架构实验；在那一代里模型的单次输出就是命令批，因此 TypeScript 侧的 zod schema 承担业务校验。D40 不使用这两个契约 |
 | Grounding | 实验实现但有限 | 可绑定本轮 viewport block/entity ref；`message_referent` 只验证表达式出现在消息中，随后一律绑定消息发送者，所以“这棵树/那里”也会错误指向说话者 |
 | Behavior Synthesizer | 实验实现但仅一个 operator | 只支持 `self.attention_includes`，即建立视觉共同注意 |
 | Controller / 生产 Motor 路径 | 实验实现但仅注视 | 可渐进转向、有限扫描、取消、超时和结果阶段可见性复查；没有强制感知 revision 前进，底层 Motor 虽有 `dig` 但无生产调用方 |
@@ -60,6 +60,25 @@ Loop。它们的 `applies_to` 才是适用范围——**文档描述某个分支
 | 危险反射 | 最小停止 | 低生命时取消当前模型/行为、释放输入并警告；不会逃跑或防御 |
 | 本地调试接口 | 当前但需视为敏感 | 仅绑定本机且只读；按字段/常见凭证形状脱敏，但供应商错误摘要没有通用 secret scrub |
 | Paper 场景 | 两类证据 | 可信注视场景仍只是确定性模型；D40 在真实 Paper、协议客户端和模型上完成七次现场运行，但缺固定世界副本和逐工具视口日志，尚不能完整复现 |
+
+## 分层
+
+两条实验链路共用同一个分层，先说清它，因为项目内曾有两种互相矛盾的表述。
+
+**Python 侧是 agent 本体**：提示词、模型调用、结果校验，以及 D40 里的工具 schema 和工具
+循环。**TypeScript 侧实现 agent 调用的工具**：Mineflayer 协议驱动、感知投影、身体输入。
+选 Python 是因为写 agent 方便，选 TypeScript 是因为工具要贴着 Mineflayer。
+
+这是一个普通 agent 加一个工具后端，两边只通过
+`src/models/agent-service-client.ts` 这一层本地 HTTP JSON 交互。与其他 agent 的差别主要
+在工具类型和提示词，而不在架构——正如文档问答 agent 与编码 agent 的差别也主要在这两处。
+
+Node 同时是**进程入口**：玩家聊天从游戏侧到达，Node 按事件调用 agent，agent 再通过认证
+的本地回环取用工具。**入口在 Node 不等于编排在 Node**——编排在 agent 一侧。
+
+> 需要注意的表述冲突：可信注视实验分支 `57d438e` 自己的 `README.md` 把 Python 侧写成
+> 「模型传输层」并称「决策协议与业务校验的唯一权威在 TypeScript 侧」。那与本节相反，
+> 也与 `main` 的 `README.md` 相反。以本节和 `main` 为准。
 
 ## 两条实验链路
 
