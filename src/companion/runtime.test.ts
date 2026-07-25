@@ -65,6 +65,7 @@ class FakeBackend implements MinecraftBackendApi {
   position = { x: 0, y: 64, z: 0 }
   yaw = 0
   pitch = 0
+  health = 20
   messages: string[] = []
   motorInstance = new FakeMotor(this)
   subscribers = new Set<(event: BackendEventEnvelope) => void>()
@@ -80,7 +81,7 @@ class FakeBackend implements MinecraftBackendApi {
       protocol: 'mineintent.minecraft.snapshot.v1', snapshotRevision: this.revision, lifecycleRevision: 1,
       capturedAt: new Date().toISOString(), processSessionId: this.processSessionId, connectionEpoch: this.connectionEpoch, connectionAttemptId: 'a',
       world: { worldId: this.worldId, dimension: this.dimension, minecraftVersion: '1.21.1', protocolVersion: 767, gameMode: 'survival', minY: -64, height: 384, timeOfDay: 1000 },
-      self: { entityKey: 'self', username: 'Bot', position: this.position, velocity: { x: 0, y: 0, z: 0 }, yaw: this.yaw, pitch: this.pitch, onGround: true, alive: true, health: 20, food: 20, foodSaturation: 5, effects: [] },
+      self: { entityKey: 'self', username: 'Bot', position: this.position, velocity: { x: 0, y: 0, z: 0 }, yaw: this.yaw, pitch: this.pitch, onGround: true, alive: true, health: this.health, food: 20, foodSaturation: 5, effects: [] },
       inventory: { selectedHotbarSlot: 0, slots: [] },
       trackedPlayers: [{ playerKey: 'alice', username: 'Alice', listed: true, entityTracked: true }],
     }
@@ -103,6 +104,17 @@ class FakeBackend implements MinecraftBackendApi {
   }
   motor() { return this.motorInstance }
   sendChat(message: string) { this.messages.push(message) }
+  /** Mineflayer's `health` event only says "self changed", so the drop has to be found by comparing. */
+  emitSelfChanged(health: number) {
+    this.health = health
+    const event = {
+      protocol: 'mineintent.minecraft.backend-event.v1', id: `self-${this.revision++}`, kind: 'snapshot_changed', occurredAt: new Date().toISOString(),
+      processSessionId: this.processSessionId, connectionEpoch: this.connectionEpoch, connectionAttemptId: 'a', worldId: this.worldId, dimension: this.dimension,
+      payload: { reason: 'self' },
+    } satisfies BackendEventEnvelope
+    for (const listener of this.subscribers) listener(event)
+  }
+
   emitChat(text: string) {
     const event = {
       protocol: 'mineintent.minecraft.backend-event.v1', id: `chat-${this.revision++}`, kind: 'chat', occurredAt: new Date().toISOString(),
@@ -288,7 +300,12 @@ test('startup is local; player chat runs the two-tool closed loop with measured 
   await runtime.idle()
   await new Promise(resolve => setTimeout(resolve, 5))
   assert.equal(model.calls.length, 1)
-  assert.equal(model.calls[0]!.context.observations.viewport?.visibleEntities.length, 0)
+  // The pushed frame carries the pose but never the scan: `visibleBlocks` was the largest item in
+  // the prompt by an order of magnitude, and re-sending it every request is what the tool replaces.
+  const opening = model.calls[0]!.context.frame
+  assert.deepEqual(opening.self, { position: [0, 64, 0], yawDegrees: 0, pitchDegrees: 0 })
+  assert.doesNotMatch(JSON.stringify(opening), /visibleBlocks|visibleEntities/u)
+  assert.equal(model.calls[0]!.context.stable.profile.content.length > 0, true)
   const first = results[0] as { viewport: { visibleEntities: Array<[string, number, number, number]> } }
   // World-absolute: the tuple names where the sheep is, not where it is relative to the body, so
   // the same sheep keeps one identity across the turn and the step that follow.
@@ -331,9 +348,38 @@ test('a new player chat waits behind an in-flight turn without taking control fr
   await waitFor(() => model.calls.length === 2)
   await runtime.idle()
   assert.equal(backend.motorInstance.moving, false)
-  assert.deepEqual(model.calls.map(call => call.context.player.text), ['Bot，往前走', 'Bot，停下'])
-  assert.equal(model.calls[0]!.context.recentEvents.some(event => event.summary.includes('停下')), false)
-  assert.equal(model.calls[1]!.context.recentEvents.some(event => event.summary.includes('停下')), true)
+  assert.deepEqual(model.calls.map(call => call.context.frame.player?.text), ['Bot，往前走', 'Bot，停下'])
+  // The message rides in the frame's `player`, so it is not also replayed as an event: each fact is
+  // stated once, which is what lets a frame be appended instead of a window being re-sent.
+  assert.equal(model.calls[1]!.context.frame.events.some(event => event.summary.includes('停下')), false)
+})
+
+test('damage taken mid-run reaches the model as a frame beside the next tool result', async t => {
+  const { backend, model, runtime } = await fixture(t)
+  const frames: Array<Awaited<ReturnType<typeof runtime.takePendingFrame>>> = []
+  model.handler = async input => {
+    // Hurt while the model is mid-loop. Nothing asked about health, so a pull-only design would
+    // never surface it: the frame channel is the only way this can reach the model at all.
+    backend.emitSelfChanged(13.5)
+    await new Promise(resolve => setTimeout(resolve, 5))
+    await runtime.executeTool(call(input.runId, 'say', { text: '有东西打我。' }))
+    frames.push(await runtime.takePendingFrame(input.runId))
+    // Drained, not a window: a second ask has nothing left to report.
+    frames.push(await runtime.takePendingFrame(input.runId))
+    return { model: 'fake' }
+  }
+
+  backend.emitChat('Bot，跟着我')
+  await waitFor(() => model.calls.length === 1)
+  await runtime.idle()
+
+  const frame = frames[0]
+  assert.equal(frame?.events.length, 1)
+  assert.equal(frame.events[0]!.type, 'self.health.dropped')
+  assert.match(frame.events[0]!.summary, /20 → 13\.5（-6\.5）/u)
+  assert.equal(frame.status?.health, 13.5)
+  assert.equal(frame.player, undefined)
+  assert.equal(frames[1], undefined)
 })
 
 test('ordinary player chats preserve arrival order while the first journal write waits', async t => {
@@ -350,13 +396,13 @@ test('ordinary player chats preserve arrival order while the first journal write
 
   await waitFor(() => model.calls.length === 2)
   await runtime.idle()
-  assert.deepEqual(model.calls.map(call => call.context.player.text), ['Bot，往前走', 'Bot，停下'])
+  assert.deepEqual(model.calls.map(call => call.context.frame.player?.text), ['Bot，往前走', 'Bot，停下'])
 })
 
 test('a newer chat preserves model-authored segments from the earlier turn', async t => {
   const { backend, model, runtime } = await fixture(t, { speechIntervalMs: 25 })
   model.handler = async input => {
-    const text = input.context.player.text.includes('停下') ? '这是模型的回复。' : '旧'.repeat(300)
+    const text = input.context.frame.player?.text.includes('停下') ? '这是模型的回复。' : '旧'.repeat(300)
     await runtime.executeTool(call(input.runId, 'say', { text }))
     return { model: 'fake' }
   }

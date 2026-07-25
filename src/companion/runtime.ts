@@ -26,6 +26,7 @@ import {
   rememberArgumentsSchema,
   sayArgumentsSchema,
   type AgentDecisionContext,
+  type AgentFrame,
   type ModelProvider,
   type ToolInvocation,
 } from '../models/index.js'
@@ -98,7 +99,17 @@ export class CompanionRuntime {
   readonly #soundHistory: SoundHistory
   readonly #informationRuntime: InformationRuntime
   readonly #abort = new AbortController()
-  readonly #recentEvents: Array<{ id: string; type: string; summary: string }> = []
+  /**
+   * Events waiting for the next frame to carry them. Drained rather than kept as a rolling window:
+   * a window has to be re-sent every request to stay current, which is what made the old
+   * `recentEvents` both redundant and hostile to the prompt cache. Drained, each event is stated
+   * once and then lives in the conversation as history.
+   */
+  readonly #pendingEvents: Array<{ type: string; summary: string }> = []
+  #omittedEvents = 0
+  #lastHealth?: number
+  /** Kept for the local debug view, which shows what was read rather than what was sent. */
+  #lastObservations?: PassiveObservations
   #unsubscribe?: () => void
   #modelAbort?: AbortController
   #activeRun?: ActiveRun
@@ -140,8 +151,9 @@ export class CompanionRuntime {
     await this.#backend.start(this.#abort.signal)
     await this.#waitForSelfChunk()
     this.#refreshDebug()
-    const event = await this.#journal.append('companion.started', { summary: '同伴加入世界' })
-    this.#pushRecent(event.id, event.type, '同伴加入世界')
+    await this.#journal.append('companion.started', { summary: '同伴加入世界' })
+    this.#pushPending('companion.started', '同伴加入世界')
+    this.#noticeSelfChanges()
   }
 
   async stop(reason = 'runtime_stopped'): Promise<void> {
@@ -327,6 +339,7 @@ export class CompanionRuntime {
   async #handleBackendEvent(event: BackendEventEnvelope): Promise<void> {
     this.#interruptOnScopeChange(event)
     this.#refreshDebug()
+    if (event.kind === 'self' || event.kind === 'snapshot_changed') this.#noticeSelfChanges()
     if (event.kind === 'chat') await this.#handleChat(event as BackendEventEnvelope<ProtocolChatEvent>)
   }
 
@@ -354,7 +367,8 @@ export class CompanionRuntime {
   #enqueuePlayerDecision(username: string, text: string, eventId: string, generation: number): void {
     const run = async () => {
       if (!this.#started || generation !== this.#runGeneration) return
-      this.#pushRecent(eventId, 'player.chat.received', `${username}: ${text}`)
+      // The message itself rides in the opening frame's `player`, so it is deliberately not also
+      // pushed as an event: each fact is stated once.
       const controller = new AbortController()
       this.#modelAbort = controller
       await this.#runPlayerDecision(username, text, eventId, controller)
@@ -378,25 +392,24 @@ export class CompanionRuntime {
       const memories = (await this.#memory.search(snapshot.world.worldId, text, 5)).map(result => result.record)
       memoryIds = memories.map(memory => memory.id)
       this.#assertRunCurrent(active)
-      const observations = await this.#composePassiveObservations(runId, controller.signal)
+      const frame = await this.#composeFrame(active, controller.signal, { username, text })
       this.#assertRunCurrent(active)
       sources = [
         { id: this.#profile.versionId, kind: 'profile', size: this.#profile.content.length },
         { id: eventId, kind: 'player', size: text.length },
         ...memories.map(memory => ({ id: memory.id, kind: 'memory' as const, size: memory.summary.length })),
       ]
-      this.#debug.update({ observations, decision: {
+      this.#debug.update({ observations: this.#lastObservations, decision: {
         status: 'running', runId, startedAt: new Date().toISOString(), contextSources: sources,
         retrievedMemoryIds: memoryIds,
       } })
       const context: AgentDecisionContext = {
-        protocol: 'mineintent.agent-context.v1',
-        player: { username, text },
-        profile: { content: this.#profile.content },
-        world: { dimension: snapshot.world.dimension, ...(snapshot.world.timeOfDay === undefined ? {} : { timeOfDay: snapshot.world.timeOfDay }) },
-        observations,
-        recentEvents: this.#recentEvents.map(({ type, summary }) => ({ type, summary })),
-        memories: memories.map(({ kind, summary, createdAt }) => ({ kind, summary, createdAt })),
+        protocol: 'mineintent.agent-context.v2',
+        stable: {
+          profile: { content: this.#profile.content },
+          memories: memories.map(({ kind, summary, createdAt }) => ({ kind, summary, createdAt })),
+        },
+        frame,
       }
       const started = Date.now()
       // Speech happens through the say tool while the run lives; the result only reports completion.
@@ -487,8 +500,10 @@ export class CompanionRuntime {
   }
 
   async #composePassiveObservations(runId: string, signal: AbortSignal): Promise<PassiveObservations> {
-    try { return await composePassiveObservations(this.#informationRuntime, this.#caller(runId), signal) }
-    catch (error) {
+    try {
+      this.#lastObservations = await composePassiveObservations(this.#informationRuntime, this.#caller(runId), signal)
+      return this.#lastObservations
+    } catch (error) {
       this.#recordFailure('runtime', 'passive_observations_failed', error)
       return { omissions: [] }
     }
@@ -528,9 +543,73 @@ export class CompanionRuntime {
     }
   }
 
-  #pushRecent(id: string, type: string, summary: string): void {
-    this.#recentEvents.push({ id, type, summary })
-    if (this.#recentEvents.length > 20) this.#recentEvents.shift()
+  #pushPending(type: string, summary: string): void {
+    this.#pendingEvents.push({ type, summary })
+    // Bounded because nothing guarantees a frame is coming: an idle companion could otherwise
+    // accumulate events forever. Dropping the oldest is counted, never hidden.
+    while (this.#pendingEvents.length > 20) {
+      this.#pendingEvents.shift()
+      this.#omittedEvents += 1
+    }
+  }
+
+  #drainEvents(): { events: Array<{ type: string; summary: string }>; omittedEvents?: number } {
+    const events = this.#pendingEvents.splice(0, this.#pendingEvents.length)
+    const omittedEvents = this.#omittedEvents
+    this.#omittedEvents = 0
+    return { events, ...(omittedEvents > 0 ? { omittedEvents } : {}) }
+  }
+
+  /**
+   * Notices the things the model would never ask about. `snapshot_changed` only says "self changed",
+   * so a drop has to be found by comparing: without this the frame channel exists but has no
+   * interrupt to carry, and damage stays invisible until something happens to look at status.
+   */
+  #noticeSelfChanges(): void {
+    let health: number | undefined
+    try { health = this.#backend.snapshot().self.health } catch { return }
+    const previous = this.#lastHealth
+    this.#lastHealth = health
+    if (previous === undefined || health >= previous) return
+    const lost = Math.round((previous - health) * 10) / 10
+    this.#pushPending('self.health.dropped', `受到伤害，生命值 ${previous} → ${health}（-${lost}）`)
+  }
+
+  /** Composes a frame for the tool bridge, but only when there is news that warrants one. */
+  async takePendingFrame(runId: string): Promise<AgentFrame | undefined> {
+    const active = this.#activeRun
+    if (!active || active.runId !== runId || this.#pendingEvents.length === 0) return undefined
+    try { return await this.#composeFrame(active, active.controller.signal) }
+    catch (error) {
+      // A frame is an extra: failing to build one must never fail the tool result it rides with.
+      this.#recordFailure('runtime', 'frame_compose_failed', error)
+      return undefined
+    }
+  }
+
+  async #composeFrame(
+    active: ActiveRun,
+    signal: AbortSignal,
+    player?: { username: string; text: string },
+  ): Promise<AgentFrame> {
+    const observations = await this.#composePassiveObservations(active.runId, signal)
+    const self = observations.viewport?.frame.self
+    let world: AgentFrame['world'] = { dimension: active.dimension }
+    try {
+      const snapshot = this.#backend.snapshot()
+      world = { dimension: snapshot.world.dimension, ...(snapshot.world.timeOfDay === undefined ? {} : { timeOfDay: snapshot.world.timeOfDay }) }
+    } catch { /* connection is not ready; the run scope still names the dimension */ }
+    return {
+      at: new Date().toISOString(),
+      ...(player === undefined ? {} : { player }),
+      world,
+      ...(self === undefined ? {} : { self: { position: self.position, yawDegrees: self.yawDegrees, pitchDegrees: self.pitchDegrees } }),
+      ...(observations.currentStatus === undefined ? {} : { status: observations.currentStatus }),
+      ...(observations.inventory === undefined ? {} : { inventory: observations.inventory }),
+      ...(observations.sound === undefined ? {} : { sound: observations.sound }),
+      ...this.#drainEvents(),
+      omissions: observations.omissions,
+    }
   }
 
   #recordFailure(source: 'backend' | 'model' | 'body_tool' | 'memory' | 'runtime', code: string, error: unknown): void {

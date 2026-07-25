@@ -23,7 +23,10 @@ const READ_PLAN: readonly ReadPlanEntry[] = [
   { interfaceId: 'current_status', schemaRevision: 'current-status:1', fields: ['health', 'food', 'foodSaturation', 'oxygen', 'experienceLevel', 'statusEffects'] },
   { interfaceId: 'inventory_information', schemaRevision: 'inventory-information:1', fields: ['selectedHotbarSlot', 'slots'] },
   { interfaceId: 'sound_information', schemaRevision: 'sound-information:1', fields: ['recentSounds'] },
-  { interfaceId: 'viewport_information', schemaRevision: 'viewport-information:8', fields: ['frame', 'standingOnBlock', 'lookedAtBlock', 'visibleEntities', 'visibleBlocks'] },
+  // Only `frame` — which is the pose and the legend, and costs no scan at all. The scanning fields
+  // are gone from the push on purpose: `visibleBlocks` alone was the largest item in the prompt by
+  // an order of magnitude, and re-sending it every request is exactly what a pulled read replaces.
+  { interfaceId: 'viewport_information', schemaRevision: 'viewport-information:8', fields: ['frame'] },
 ]
 
 /**

@@ -91,8 +91,11 @@ test('aborting a decision notifies the service with the exact run id', async () 
 
 function context(): AgentDecisionContext {
   return {
-    protocol: 'mineintent.agent-context.v1', player: { username: 'Alex', text: '看看那只羊' },
-    profile: { content: '你是伙伴。' }, world: { dimension: 'overworld' }, observations: { omissions: [] },
-    recentEvents: [], memories: [],
+    protocol: 'mineintent.agent-context.v2',
+    stable: { profile: { content: '你是伙伴。' }, memories: [] },
+    frame: {
+      at: '2026-07-25T00:00:00.000Z', player: { username: 'Alex', text: '看看那只羊' },
+      world: { dimension: 'overworld' }, events: [], omissions: [],
+    },
   }
 }

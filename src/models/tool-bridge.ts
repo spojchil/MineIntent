@@ -1,9 +1,11 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
-import { toolInvocationSchema, type ToolInvocation } from './contracts.js'
+import { toolInvocationSchema, type ToolExecution, type ToolInvocation } from './contracts.js'
 
 const HOST = '127.0.0.1'
 const ROUTE = '/v1/tool'
+/** Lets the agent loop tell a result carrying a frame from a bare result. */
+export const TOOL_RESPONSE_PROTOCOL = 'mineintent.tool-response.v1'
 const MAX_REQUEST_BYTES = 32_768
 const MAX_RESPONSE_BYTES = 262_144
 
@@ -12,7 +14,7 @@ export interface ToolBridgeAddress { url: string; token: string }
 export class ToolBridgeServer {
   readonly #token = randomBytes(32).toString('base64url')
   #server?: Server
-  constructor(private readonly handler: (invocation: ToolInvocation) => Promise<unknown>) {}
+  constructor(private readonly handler: (invocation: ToolInvocation) => Promise<ToolExecution>) {}
 
   async start(): Promise<ToolBridgeAddress> {
     if (this.#server) return this.address()
@@ -53,7 +55,14 @@ export class ToolBridgeServer {
       catch { return send(response, 400, { error: 'invalid_json' }) }
       const invocation = toolInvocationSchema.safeParse(value)
       if (!invocation.success) return send(response, 400, { error: 'invalid_tool_invocation' })
-      send(response, 200, await this.handler(invocation.data))
+      // Envelope, not a merge: the frame rides beside the result so the agent loop can append it as
+      // its own conversation entry rather than hiding world news inside a tool's answer.
+      const execution = await this.handler(invocation.data)
+      send(response, 200, {
+        protocol: TOOL_RESPONSE_PROTOCOL,
+        result: execution.result,
+        ...(execution.frame === undefined ? {} : { frame: execution.frame }),
+      })
     } catch (error) {
       send(response, 500, { error: error instanceof Error ? error.message.slice(0, 500) : 'tool_handler_failed' })
     }

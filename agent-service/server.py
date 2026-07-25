@@ -21,14 +21,15 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from prompt import system_prompt
+from prompt import stable_context, system_prompt
 
 _MAX_JSON_BYTES = 1_048_576
 _MAX_TOOL_RESULT_BYTES = 262_144
 _MAX_TOOL_ROUNDS = 16
 _ROUND_TIMEOUT_S = 180.0
 _MAX_TOOLS = 32
-_CONTEXT_PROTOCOL = "mineintent.agent-context.v1"
+_CONTEXT_PROTOCOL = "mineintent.agent-context.v2"
+_TOOL_RESPONSE_PROTOCOL = "mineintent.tool-response.v1"
 _RUN_PROTOCOL = "mineintent.agent-run.v1"
 _TOOL_NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _TRANSCRIPT_NAME = "agent-transcripts.jsonl"
@@ -413,6 +414,19 @@ def model_completion(
         connection.close()
 
 
+def split_tool_response(value: object) -> tuple[object, dict | None]:
+    """Separates a tool's answer from a frame that happened to ride along with it.
+
+    The frame is appended to the conversation as its own entry rather than merged into the result:
+    taking damage has nothing to do with whichever tool was running, and folding it in would teach
+    the model that tools report unrelated news. A response without the envelope is the whole result,
+    which keeps bare-result callers and test doubles working unchanged.
+    """
+    if isinstance(value, dict) and value.get("protocol") == _TOOL_RESPONSE_PROTOCOL:
+        return value.get("result"), value.get("frame")
+    return value, None
+
+
 def _non_negative_int(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
@@ -462,9 +476,12 @@ def run_tool_loop(
 ) -> tuple[str, dict | None]:
     deadline = deadline if deadline is not None else time.monotonic() + _ROUND_TIMEOUT_S
     tool_names = [tool["function"]["name"] for tool in tools]
+    # Static first, volatile last, and nothing volatile ever re-rendered: the system message carries
+    # behaviour plus the slow-changing profile and memory, then the opening frame is appended, then
+    # rounds append after that. Every provider's cache is prefix-only, so the ordering is the design.
     messages = [
-        {"role": "system", "content": system_prompt()},
-        {"role": "user", "content": json.dumps(context, ensure_ascii=False, separators=(",", ":"))},
+        {"role": "system", "content": system_prompt() + stable_context(context.get("stable"))},
+        {"role": "user", "content": json.dumps(context.get("frame", {}), ensure_ascii=False, separators=(",", ":"))},
     ]
     # Summed across rounds: one run is several requests, and the run's hit rate is only meaningful
     # against the run's total prompt tokens.
@@ -493,6 +510,7 @@ def run_tool_loop(
                 # Every requested call executes, in order. Parallel calls are not pre-rejected:
                 # constraints belong in the prompt as advice, failures belong to the world, and the
                 # tool backend answers invalid or conflicting requests with honest failed results.
+                frames: list[dict] = []
                 for call in tool_calls:
                     call_id = call.get("id") if isinstance(call, dict) else None
                     function = call.get("function") if isinstance(call, dict) else None
@@ -505,7 +523,11 @@ def run_tool_loop(
                             raise ValueError("invalid tool call")
                         if run is not None:
                             run.ensure_active()
-                        result = execute_tool(run_id, name, arguments, deadline, call_id, round_id)
+                        result, frame = split_tool_response(
+                            execute_tool(run_id, name, arguments, deadline, call_id, round_id)
+                        )
+                        if isinstance(frame, dict):
+                            frames.append(frame)
                         if run is not None:
                             run.ensure_active()
                     except (ValueError, RequestValidationError) as error:
@@ -514,6 +536,11 @@ def run_tool_loop(
                         "role": "tool", "tool_call_id": call_id,
                         "content": json.dumps(result, ensure_ascii=False, separators=(",", ":")),
                     })
+                # After every tool result of the round, never between them: an assistant message with
+                # tool_calls must be followed by one result per call, and interleaving anything there
+                # breaks the pairing providers validate.
+                for frame in frames:
+                    messages.append({"role": "user", "content": json.dumps(frame, ensure_ascii=False, separators=(",", ":"))})
                 continue
             content = message.get("content")
             if not isinstance(content, str):

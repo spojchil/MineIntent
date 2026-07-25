@@ -55,7 +55,11 @@ test('composePassiveObservations flattens every allowed interface into plain val
   assert.equal(result.currentStatus?.health, 20)
   assert.equal(result.inventory?.selectedHotbarSlot, 0)
   assert.deepEqual(result.sound?.recentSounds, [])
-  assert.equal(result.viewport?.lookedAtBlock, null)
+  // Only the viewport's `frame` is pushed: it is the pose and the legend, and costs no scan. The
+  // scanning fields are pulled with a tool, so they must be absent here rather than merely empty.
+  assert.equal(result.viewport?.frame.coordinates, 'minecraft_world_absolute')
+  assert.equal(result.viewport?.visibleBlocks, undefined)
+  assert.equal(result.viewport?.lookedAtBlock, undefined)
   assert.deepEqual(result.omissions, [])
 })
 

@@ -28,7 +28,10 @@ export class MineIntentApp {
       const journal = new JsonlEventJournal(path.join(this.#config.dataDirectory, 'events.jsonl'), this.#config.minecraft.worldId, randomUUID())
       toolBridge = new ToolBridgeServer(async invocation => {
         if (!runtime) throw new Error('runtime_not_ready')
-        return runtime.executeTool(invocation)
+        const result = await runtime.executeTool(invocation)
+        // Asked after the tool ran, so a frame reports the world the tool left behind — including
+        // anything that happened to the companion while it was busy.
+        return { result, frame: await runtime.takePendingFrame(invocation.runId) }
       })
       const callback = await toolBridge.start()
       const model = new AgentServiceModelProvider({

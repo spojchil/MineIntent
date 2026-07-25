@@ -75,6 +75,53 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(tool_result["tool_call_id"], "call-1")
         self.assertIn("sheep", tool_result["content"])
 
+    def test_stable_content_leads_and_frames_are_appended_never_re_rendered(self):
+        sink = _Sink()
+        self.addCleanup(sink.dir.cleanup)
+        seen = []
+        frame = {"at": "2026-07-25T00:01:00Z", "world": {"dimension": "overworld"},
+                 "events": [{"type": "self.health.dropped", "summary": "受到伤害"}], "omissions": []}
+        responses = [
+            {"choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "say", "arguments": "{}"}},
+                {"id": "c2", "type": "function", "function": {"name": "look_relative", "arguments": "{}"}},
+            ]}}]},
+            {"choices": [{"message": {"role": "assistant", "content": ""}}]},
+        ]
+
+        def completion(_config, messages, _deadline, _run=None, tools=None):
+            seen.append(json.loads(json.dumps(messages)))
+            return responses.pop(0)
+
+        def execute(_run_id, name, _arguments, _deadline, _tool_call_id="", _round_id=0):
+            if name == "say":
+                return {"protocol": "mineintent.tool-response.v1", "result": {"status": "queued"}, "frame": frame}
+            return {"status": "completed"}
+
+        with patch.object(server, "model_completion", completion):
+            server.run_tool_loop(sink.config(), "run-frame", context(), execute, tools())
+
+        system, opening = seen[0][0], seen[0][1]
+        # Slowest-changing content leads, because prefix caching is prefix-only.
+        self.assertEqual(system["role"], "system")
+        self.assertIn("朋友", system["content"])
+        self.assertIn("玩家怕高", system["content"])
+        self.assertEqual(opening["role"], "user")
+        self.assertIn("看看羊", opening["content"])
+        # The world is never restated inside the system message; it only ever arrives as a frame.
+        self.assertNotIn("看看羊", system["content"])
+
+        roles = [message["role"] for message in seen[1]]
+        # Every tool result of the round first, then the frame: an assistant message with tool_calls
+        # must be followed by one result per call, and interleaving there breaks the pairing.
+        self.assertEqual(roles, ["system", "user", "assistant", "tool", "tool", "user"])
+        self.assertEqual(json.loads(seen[1][-1]["content"]), frame)
+        # The envelope is unwrapped: the model sees the tool's answer, not our transport around it.
+        self.assertEqual(json.loads(seen[1][3]["content"]), {"status": "queued"})
+        # Frames already in the conversation are byte-identical on the next round — appended once,
+        # never re-rendered, which is the only reason a volatile frame is free under caching.
+        self.assertEqual(seen[0][:2], seen[1][:2])
+
     def test_cache_counters_are_read_from_each_provider_shape_and_summed(self):
         # DeepSeek reports the hit at the top level; Zhipu and Moonshot use OpenAI's nested details.
         # Both must land on the same counter, or a hit rate cannot be compared across providers.
@@ -445,10 +492,17 @@ class ServerTests(unittest.TestCase):
 
 def context():
     return {
-        "protocol": "mineintent.agent-context.v1", "player": {"username": "Alex", "text": "看看羊"},
-        "profile": {"content": "朋友"}, "world": {"dimension": "overworld"},
-        "observations": {"viewport": {"frame": {"axes": ["right", "up", "forward"]}}},
-        "recentEvents": [], "memories": [],
+        "protocol": "mineintent.agent-context.v2",
+        "stable": {
+            "profile": {"content": "朋友"},
+            "memories": [{"kind": "note", "summary": "玩家怕高", "createdAt": "2026-07-01T00:00:00Z"}],
+        },
+        "frame": {
+            "at": "2026-07-25T00:00:00Z", "player": {"username": "Alex", "text": "看看羊"},
+            "world": {"dimension": "overworld"},
+            "self": {"position": [0, 64, 0], "yawDegrees": 0, "pitchDegrees": 0},
+            "events": [], "omissions": [],
+        },
     }
 
 
