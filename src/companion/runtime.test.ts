@@ -290,7 +290,9 @@ test('startup is local; player chat runs the two-tool closed loop with measured 
   assert.equal(model.calls.length, 1)
   assert.equal(model.calls[0]!.context.observations.viewport?.visibleEntities.length, 0)
   const first = results[0] as { viewport: { visibleEntities: Array<[string, number, number, number]> } }
-  assert.deepEqual(first.viewport.visibleEntities[0], ['sheep', 0, 0, 5])
+  // World-absolute: the tuple names where the sheep is, not where it is relative to the body, so
+  // the same sheep keeps one identity across the turn and the step that follow.
+  assert.deepEqual(first.viewport.visibleEntities[0], ['sheep', 5, 64, 0])
   const lookEffect = (results[0] as { effect: { relativeTurnDegrees: { yaw: number; pitch: number }; turned: boolean } }).effect
   assert.ok(Math.abs(lookEffect.relativeTurnDegrees.yaw - 90) < 1e-9)
   assert.equal(lookEffect.relativeTurnDegrees.pitch, 0)
@@ -485,11 +487,18 @@ test('queued player turns preserve both model replies after a delayed completion
   assert.equal(backend.messages.includes('新回复'), true)
 })
 
+/**
+ * World coordinates are no longer forbidden: a vanilla player reads their own position and the
+ * targeted block off the F3 screen, so absolute positions are not privileged information, and an
+ * integer voxel is the only key stable enough to diff a viewport against. What the boundary still
+ * forbids is *handles* — internal identities the model could otherwise fabricate and hand back as
+ * if it had been given them. Those stay out.
+ */
 function assertNoForbiddenSpatialKeys(value: unknown): void {
   if (Array.isArray(value)) return value.forEach(assertNoForbiddenSpatialKeys)
   if (!value || typeof value !== 'object') return
   for (const [key, child] of Object.entries(value)) {
-    assert.equal(['ref', 'x', 'y', 'z', 'position', 'entityKey', 'worldId'].includes(key), false, `forbidden model key: ${key}`)
+    assert.equal(['ref', 'entityKey', 'entityId', 'worldId'].includes(key), false, `forbidden model key: ${key}`)
     assertNoForbiddenSpatialKeys(child)
   }
 }

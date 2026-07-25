@@ -24,19 +24,27 @@ test('viewport provider satisfies its five-field contract', async () => {
   await assertInformationProviderContract(provider, { context: context(), request: { fields: ['frame', 'standingOnBlock', 'lookedAtBlock', 'visibleEntities', 'visibleBlocks'], page: { limit: 1 } } })
 })
 
-test('entities and blocks share [right, up, forward] with an explicit legend', async () => {
-  const pose = { position: { x: 0, y: 64, z: 0 }, yaw: -Math.PI / 2, pitch: 0 }
-  const provider = new ViewportInformationProvider(new FakePort(
-    pose,
-    new Map([['3,65,0', stone('stone')]]),
-    [{ type: 'sheep', position: { x: 5, y: 64, z: 1 }, height: 1.3 }],
-  ))
-  const result = await provider.read(context(), { fields: ['frame', 'visibleEntities', 'visibleBlocks'], page: { limit: 1 } }, new AbortController().signal)
-  assert.deepEqual(result.values.frame?.axes, ['right', 'up', 'forward'])
-  assert.deepEqual(result.values.visibleEntities?.[0], ['sheep', 1, 0, 5])
-  assert.deepEqual(result.values.visibleBlocks?.blocks[0], ['stone', 0, 1, 3])
-  const serialized = JSON.stringify(result.values)
-  assert.doesNotMatch(serialized, /"(?:ref|x|y|z)":/u)
+test('positions are world-absolute so the same block keeps one key from any stance', async () => {
+  // Absolute coordinates are what make an incremental read possible at all: a body-relative tuple
+  // renames every block the moment the companion moves, so nothing can be diffed against it.
+  const blocks = new Map([['3,65,0', stone('stone')]])
+  const entities = [{ type: 'sheep', position: { x: 5, y: 64, z: 1 }, height: 1.3 }]
+  const first = await new ViewportInformationProvider(new FakePort(
+    { position: { x: 0, y: 64, z: 0 }, yaw: -Math.PI / 2, pitch: 0 }, blocks, entities,
+  )).read(context(), { fields: ['frame', 'visibleEntities', 'visibleBlocks'], page: { limit: 1 } }, new AbortController().signal)
+
+  assert.equal(first.values.frame?.coordinates, 'minecraft_world_absolute')
+  assert.deepEqual(first.values.frame?.self.position, [0, 64, 0])
+  assert.deepEqual(first.values.visibleEntities?.[0], ['sheep', 5, 64, 1])
+  assert.deepEqual(first.values.visibleBlocks?.blocks[0], ['stone', 3, 65, 0])
+  // The legend rides with the data, so a schema change cannot outdate a prompt written elsewhere.
+  assert.match(first.values.frame?.legend.visibleBlocks ?? '', /x, y, z/u)
+
+  // Same world, different stance: the block keeps its key even though the bearing to it changed.
+  const second = await new ViewportInformationProvider(new FakePort(
+    { position: { x: 1, y: 64, z: 1 }, yaw: -Math.PI / 2, pitch: 0 }, blocks, entities,
+  )).read(context(), { fields: ['visibleBlocks'], page: { limit: 1 } }, new AbortController().signal)
+  assert.deepEqual(second.values.visibleBlocks?.blocks[0], ['stone', 3, 65, 0])
 })
 
 test('player tuples use the username as their compact entity label', async () => {
@@ -48,7 +56,7 @@ test('player tuples use the username as their compact entity label', async () =>
 
   const result = await provider.read(context(), { fields: ['visibleEntities'], page: { limit: 1 } }, new AbortController().signal)
 
-  assert.deepEqual(result.values.visibleEntities, [['Alex', 0, 0, 3]])
+  assert.deepEqual(result.values.visibleEntities, [['Alex', 0, 64, -3]])
 })
 
 test('an entities-only read still honors the deadline signal', async () => {

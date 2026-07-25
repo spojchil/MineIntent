@@ -479,7 +479,7 @@ export class CompanionRuntime {
 
   async #readViewport(runId: string, signal: AbortSignal): Promise<ViewportValues> {
     const response = await this.#informationRuntime.query(this.#caller(runId), {
-      interfaceId: 'viewport_information', operation: 'read', schemaRevision: 'viewport-information:7',
+      interfaceId: 'viewport_information', operation: 'read', schemaRevision: 'viewport-information:8',
       fields: ['frame', 'standingOnBlock', 'lookedAtBlock', 'visibleEntities', 'visibleBlocks'],
     }, signal)
     if (response.protocol !== 'mineintent.information-read.v1') throw new Error(`viewport_read_failed:${response.protocol}`)
