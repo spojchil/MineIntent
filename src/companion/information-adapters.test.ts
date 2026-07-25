@@ -63,6 +63,7 @@ test('BackendPerceptionPort excludes self from nearby entities and maps block lo
   const nearby = port.nearbyEntities()
   assert.equal(nearby.length, 1)
   assert.equal(nearby[0]!.username, 'Alex')
+  assert.equal(nearby[0]!.width, 0.6)
   assert.deepEqual(port.blockAt({ x: 0, y: 60, z: 0 }), { name: 'stone', visible: true, occludes: true })
   assert.equal(port.blockAt({ x: 0, y: 70, z: 0 }), 'unloaded')
 })

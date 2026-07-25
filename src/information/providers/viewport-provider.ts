@@ -3,6 +3,7 @@ import type { InformationProvider, InformationProviderContext, InformationProvid
 import { raycastLookedAtBlock, standingOnBlock, viewRelativePosition, visibleBlocks, visibleEntities, type PerceptionPort } from '../source-ports/perception.js'
 
 type RelativePosition = [number, number, number]
+type EntityTuple = [string, number, number, number]
 export interface ViewportValues {
   frame: {
     axes: ['right', 'up', 'forward']
@@ -10,14 +11,8 @@ export interface ViewportValues {
   }
   standingOnBlock: { name: string; relativePosition: RelativePosition } | null
   lookedAtBlock: { name: string; relativePosition: RelativePosition } | null
-  visibleEntities: Array<{
-    type: string
-    name?: string
-    username?: string
-    distanceBand: 'very_near' | 'near' | 'medium' | 'far'
-    direction: 'ahead' | 'right' | 'behind' | 'left'
-    relativePosition: RelativePosition
-  }>
+  /** Compact [entity_name_or_player, right, up, forward] tuples, nearest first. */
+  visibleEntities: EntityTuple[]
   /** Compact [block_name, right, up, forward] tuples, nearest first. */
   visibleBlocks: { blocks: Array<[string, number, number, number]>; truncated: boolean }
 }
@@ -30,11 +25,7 @@ const frameSchema = z.strictObject({
   }),
 })
 const blockSchema = z.object({ name: z.string().min(1), relativePosition: relativePositionSchema }).nullable()
-const visibleEntitiesSchema = z.array(z.object({
-  type: z.string().min(1), name: z.string().min(1).optional(), username: z.string().min(1).optional(),
-  distanceBand: z.enum(['very_near', 'near', 'medium', 'far']),
-  direction: z.enum(['ahead', 'right', 'behind', 'left']), relativePosition: relativePositionSchema,
-}))
+const visibleEntitiesSchema = z.array(z.tuple([z.string().min(1), z.number(), z.number(), z.number()]))
 const visibleBlocksSchema = z.object({
   blocks: z.array(z.tuple([z.string().min(1), z.number(), z.number(), z.number()])), truncated: z.boolean(),
 })
@@ -65,13 +56,13 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
   readonly definition: InformationProviderDefinition<ViewportValues> = {
     id: 'viewport_information',
     description: '粗略第一人称视野；所有位置都使用同一量化的[右,上,前]身体相对坐标',
-    schemaRevision: 'viewport-information:5',
+    schemaRevision: 'viewport-information:6',
     audiences: ['companion'] as const,
     fields: {
       frame: { description: '相对坐标与方向图例', valueSchema: frameSchema, valueType: 'object', precision: 'exactly_displayed', sourceKinds: ['viewport_projection'] },
       standingOnBlock: { description: '脚下可见方块及其[右,上,前]相对位置', valueSchema: blockSchema, valueType: 'object', precision: 'inferred', sourceKinds: ['viewport_projection'] },
       lookedAtBlock: { description: '准星射线首先命中的可见方块及其[右,上,前]相对位置', valueSchema: blockSchema, valueType: 'object', precision: 'inferred', sourceKinds: ['viewport_projection'] },
-      visibleEntities: { description: '通过视锥和遮挡检查的实体；位置为[右,上,前]', valueSchema: visibleEntitiesSchema, valueType: 'array', precision: 'inferred', sourceKinds: ['viewport_projection'] },
+      visibleEntities: { description: '可见实体；每项为[实体名或玩家名,右,上,前]，按距离从近到远', valueSchema: visibleEntitiesSchema, valueType: 'array', precision: 'inferred', sourceKinds: ['viewport_projection'] },
       visibleBlocks: { description: '可见方块；每项为[名称,右,上,前]，可能截断', valueSchema: visibleBlocksSchema, valueType: 'object', precision: 'inferred', sourceKinds: ['viewport_projection'] },
     },
     scopeDependencies: ['connection', 'world'] as const,
@@ -100,14 +91,11 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
       values.lookedAtBlock = block ? { name: block.name, relativePosition: viewRelativePosition(pose, block.position) } : null
     }
     if (request.fields.includes('visibleEntities')) {
-      values.visibleEntities = visibleEntities(this.port, 32, VIEW_FRUSTUM, 8).map(entity => ({
-        type: entity.type,
-        ...(entity.name ? { name: entity.name } : {}),
-        ...(entity.username ? { username: entity.username } : {}),
-        distanceBand: entity.distanceBand,
-        direction: entity.direction,
-        relativePosition: viewRelativePosition(pose, entity.position),
-      }))
+      const entities = await visibleEntities(this.port, 32, VIEW_FRUSTUM, 8, signal)
+      values.visibleEntities = entities.map(entity => {
+        const [right, up, forward] = viewRelativePosition(pose, entity.position)
+        return [entity.username ?? entity.name ?? entity.type, right, up, forward]
+      })
     }
     if (request.fields.includes('visibleBlocks')) {
       const result = await visibleBlocks(this.port, {

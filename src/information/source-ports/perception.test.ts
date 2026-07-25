@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { raycastLookedAtBlock, standingOnBlock, viewRelativePosition, visibleBlocks, visibleEntities } from './perception.js'
+import { YIELD_EVERY_WORK_UNITS, raycastLookedAtBlock, standingOnBlock, viewRelativePosition, visibleBlocks, visibleEntities } from './perception.js'
 import type { PerceptionBlock, PerceptionEntityCandidate, PerceptionPort, PerceptionPose } from './perception.js'
 
 class FakePort implements PerceptionPort {
@@ -64,7 +64,7 @@ test('a non-occluding visible neighbor exposes the block behind transparent mate
   assert.equal(result.blocks.some(block => block.name === 'stone'), true)
 })
 
-test('the view frustum is rectangular, not an isotropic cone', () => {
+test('the view frustum is rectangular, not an isotropic cone', async () => {
   // Both candidates sit 5 blocks ahead at eye height, one displaced sideways by 48° and one
   // raised by 40°. An isotropic cone of any single half-angle either admits both or rejects
   // both; vanilla's 16:9 frustum (51.22° wide, 35° tall) admits only the sideways one. That
@@ -75,21 +75,100 @@ test('the view frustum is rectangular, not an isotropic cone', () => {
   const forward = 5
   const sideways = forward * Math.tan((48 * Math.PI) / 180)
   const raised = forward * Math.tan((40 * Math.PI) / 180)
-  const result = visibleEntities(new FakePort(pose, new Map(), [
+  const result = await visibleEntities(new FakePort(pose, new Map(), [
     { type: 'sheep', position: { x: sideways, y: eyeY - height / 2, z: -forward }, height },
     { type: 'cow', position: { x: 0, y: eyeY + raised - height / 2, z: -forward }, height },
   ]), 32, TEST_FRUSTUM, 8)
   assert.deepEqual(result.map(entity => entity.type), ['sheep'])
 })
 
-test('visible entities exclude behind and occluded candidates', () => {
+test('visible entities exclude behind and occluded candidates', async () => {
   const pose = { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 }
   const entities = [
     { type: 'sheep', position: { x: 2, y: 64, z: -5 }, height: 1.3 },
     { type: 'cow', position: { x: 0, y: 64, z: 5 }, height: 1.4 },
   ]
-  const result = visibleEntities(new FakePort(pose, new Map(), entities), 32, TEST_FRUSTUM, 8)
+  const result = await visibleEntities(new FakePort(pose, new Map(), entities), 32, TEST_FRUSTUM, 8)
   assert.equal(result.length, 1)
   assert.equal(result[0]!.type, 'sheep')
-  assert.equal(result[0]!.direction, 'ahead')
+})
+
+test('an entity remains visible when its hitbox intersects the frustum but its center does not', async () => {
+  const pose = { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 }
+  const sheep = { type: 'sheep', position: { x: 0, y: 64, z: -1 }, width: 0.9, height: 1.3 }
+
+  // At one block away the sheep's center is 44.1° below the crosshair, outside the 35°
+  // vertical half-FOV. Its upper hitbox is still on screen, exactly like the live D40 case.
+  const result = await visibleEntities(new FakePort(pose, new Map(), [sheep]), 32, TEST_FRUSTUM, 8)
+
+  assert.deepEqual(result.map(entity => entity.type), ['sheep'])
+})
+
+test('entity scanning yields to the event loop and honors cancellation', async () => {
+  // Cost scales with tracked entities, not with `limit`: the cap applies after filtering, and an
+  // occluded candidate is the expensive case because it pays for every hitbox sample. A solid
+  // wall with a herd behind it is enough to cross the yield budget several times over.
+  const pose = { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 }
+  const blocks = new Map<string, PerceptionBlock | 'unloaded'>()
+  for (let x = -2; x <= 2; x++) {
+    for (let y = 63; y <= 67; y++) blocks.set(`${x},${y},-3`, opaque('wall'))
+  }
+  const entities: PerceptionEntityCandidate[] = []
+  for (let index = 0; index < 24; index++) {
+    entities.push({ type: 'sheep', position: { x: 0, y: 64, z: -5 - index }, width: 0.9, height: 1.3 })
+  }
+  const port = new FakePort(pose, blocks, entities)
+
+  let timerRan = false
+  setTimeout(() => { timerRan = true }, 0)
+  const result = await visibleEntities(port, 32, TEST_FRUSTUM, 8)
+  assert.deepEqual(result, [], 'the wall hides every candidate')
+  assert.equal(timerRan, true, 'a pending timer must get a turn while the scan is in flight')
+
+  const controller = new AbortController()
+  controller.abort()
+  await assert.rejects(visibleEntities(port, 32, TEST_FRUSTUM, 8, controller.signal))
+})
+
+test('a scan aborted during a yield stops at that yield, not the next one', async () => {
+  // The production case is a signal that aborts while the scan is parked in `await`: the player's
+  // next message preempts the decision that asked for this scan. Aborting from outside is not the
+  // same test — the abort lands before the scan starts and the entry check takes it — and aborting
+  // during synchronous work is caught by the check *before* the next yield either way. To land
+  // inside the yield window the abort has to be queued from within the scan itself.
+  const pose = { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 }
+  // Leaves are visible but non-occluding, so no occlusion ray terminates early and every candidate
+  // pays for the full distance. This is the most expensive real terrain.
+  const leaves: PerceptionBlock = { name: 'oak_leaves', visible: true, occludes: false }
+  class LeafPort implements PerceptionPort {
+    calls = 0
+    constructor(readonly onCall?: (calls: number) => void) {}
+    selfPose() { return pose }
+    revision() { return 1 }
+    // Counted before the hook, and not inside the optional call: `onCall?.(++calls)` skips the
+    // argument entirely when there is no hook, so the uninstrumented port would never count.
+    blockAt() { this.calls++; this.onCall?.(this.calls); return leaves }
+    nearbyEntities() { return [] }
+  }
+  const options = { horizontalRadius: 16, verticalRadius: 8, maxDistance: 16, frustum: TEST_FRUSTUM, limit: 64 }
+
+  const complete = new LeafPort()
+  await visibleBlocks(complete, options)
+  assert.ok(complete.calls > YIELD_EVERY_WORK_UNITS * 8, 'the scene must be big enough to yield repeatedly')
+
+  const controller = new AbortController()
+  // Queued well inside the first quantum, so the abort callback is already waiting in the event
+  // loop when the scan parks, and runs during that first yield rather than before or after it.
+  const interrupted = new LeafPort(calls => {
+    if (calls === 100) setImmediate(() => controller.abort())
+  })
+  await assert.rejects(visibleBlocks(interrupted, options, controller.signal))
+  // A frustum-rejected voxel costs a work unit but no lookup, so one quantum of work is well under
+  // YIELD_EVERY_WORK_UNITS lookups here — roughly 1.3k. Re-checking after the yield is what buys
+  // that: with only the pre-yield check the scan resumes for a second quantum and lands past 3k.
+  assert.ok(
+    interrupted.calls < YIELD_EVERY_WORK_UNITS,
+    `aborted scan did ${interrupted.calls} of ${complete.calls} lookups; it should stop at the yield`
+      + ` the abort landed in, within one ${YIELD_EVERY_WORK_UNITS}-unit quantum`,
+  )
 })

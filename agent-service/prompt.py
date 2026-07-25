@@ -10,6 +10,7 @@ def system_prompt() -> str:
         "look_relative 的正 yaw 向右、负 yaw 向左、正 pitch 向下、负 pitch 向上。"
         "move_input 只按住 forward/back/left/right 之一一小段时间，不会自动寻路，也不会跳跃。"
         "所有 relativePosition 都是 [right, up, forward]；正 right 为右，正 up 为上，正 forward 为前。"
+        "visibleEntities 每项是 [entity_name_or_player, right, up, forward]，按距离从近到远。"
         "visibleBlocks.blocks 每项是 [block_name, right, up, forward]，使用同一坐标系。"
         "如果目标未出现、移动无效果或工具失败，应换一个小动作继续观察，或如实停止。"
         "不能把发出工具调用当作动作成功，也不能生成或管理世界坐标、实体 id、目标 ref。"

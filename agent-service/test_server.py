@@ -34,7 +34,7 @@ class ServerTests(unittest.TestCase):
 
         def execute(run_id, name, arguments, _deadline):
             calls.append((run_id, name, arguments))
-            return {"status": "completed", "viewport": {"visibleEntities": [{"name": "sheep", "relativePosition": [0, 0, 3]}]}}
+            return {"status": "completed", "viewport": {"visibleEntities": [["sheep", 0, 0, 3]]}}
 
         with patch.object(server, "model_completion", completion):
             decision, usage = server.run_tool_loop({"model": "x"}, "run-1", context(), execute)

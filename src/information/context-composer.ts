@@ -23,7 +23,7 @@ const READ_PLAN: readonly ReadPlanEntry[] = [
   { interfaceId: 'current_status', schemaRevision: 'current-status:1', fields: ['health', 'food', 'foodSaturation', 'oxygen', 'experienceLevel', 'statusEffects'] },
   { interfaceId: 'inventory_information', schemaRevision: 'inventory-information:1', fields: ['selectedHotbarSlot', 'slots'] },
   { interfaceId: 'sound_information', schemaRevision: 'sound-information:1', fields: ['recentSounds'] },
-  { interfaceId: 'viewport_information', schemaRevision: 'viewport-information:5', fields: ['frame', 'standingOnBlock', 'lookedAtBlock', 'visibleEntities', 'visibleBlocks'] },
+  { interfaceId: 'viewport_information', schemaRevision: 'viewport-information:6', fields: ['frame', 'standingOnBlock', 'lookedAtBlock', 'visibleEntities', 'visibleBlocks'] },
 ]
 
 /**

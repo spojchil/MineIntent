@@ -33,8 +33,35 @@ test('entities and blocks share [right, up, forward] with an explicit legend', a
   ))
   const result = await provider.read(context(), { fields: ['frame', 'visibleEntities', 'visibleBlocks'], page: { limit: 1 } }, new AbortController().signal)
   assert.deepEqual(result.values.frame?.axes, ['right', 'up', 'forward'])
-  assert.deepEqual(result.values.visibleEntities?.[0]?.relativePosition, [1, 0, 5])
+  assert.deepEqual(result.values.visibleEntities?.[0], ['sheep', 1, 0, 5])
   assert.deepEqual(result.values.visibleBlocks?.blocks[0], ['stone', 0, 1, 3])
   const serialized = JSON.stringify(result.values)
   assert.doesNotMatch(serialized, /"(?:ref|x|y|z)":/u)
+})
+
+test('player tuples use the username as their compact entity label', async () => {
+  const provider = new ViewportInformationProvider(new FakePort(
+    { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 },
+    new Map(),
+    [{ type: 'player', username: 'Alex', position: { x: 0, y: 64, z: -3 }, width: 0.6, height: 1.8 }],
+  ))
+
+  const result = await provider.read(context(), { fields: ['visibleEntities'], page: { limit: 1 } }, new AbortController().signal)
+
+  assert.deepEqual(result.values.visibleEntities, [['Alex', 0, 0, 3]])
+})
+
+test('an entities-only read still honors the deadline signal', async () => {
+  // The declared timeoutMs cannot be enforced by the runtime's Promise.race alone: a synchronous
+  // scan blocks the event loop, so the deadline timer has no chance to fire until it returns.
+  // Every field that scans the world has to observe the signal itself, not just visibleBlocks.
+  const provider = new ViewportInformationProvider(new FakePort(
+    { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 },
+    new Map(),
+    [{ type: 'sheep', position: { x: 0, y: 64, z: -3 }, width: 0.9, height: 1.3 }],
+  ))
+  const controller = new AbortController()
+  controller.abort()
+
+  await assert.rejects(provider.read(context(), { fields: ['visibleEntities'], page: { limit: 1 } }, controller.signal))
 })

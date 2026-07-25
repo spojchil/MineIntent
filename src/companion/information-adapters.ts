@@ -40,6 +40,7 @@ export class BackendPerceptionPort implements PerceptionPort {
         ...(entity.name ? { name: entity.name } : {}),
         ...(entity.username ? { username: entity.username } : {}),
         position: entity.position,
+        width: entity.width,
         height: entity.height,
       }))
   }

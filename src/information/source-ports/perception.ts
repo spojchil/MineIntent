@@ -1,5 +1,5 @@
 import { setImmediate as yieldToEventLoop } from 'node:timers/promises'
-import { lookDirection, relativeBearing, type Point3, type RelativeDirection } from '../geometry.js'
+import { lookDirection, type Point3 } from '../geometry.js'
 
 export interface PerceptionPose { position: Point3; yaw: number; pitch: number }
 export interface PerceptionBlock {
@@ -12,6 +12,7 @@ export interface PerceptionEntityCandidate {
   name?: string
   username?: string
   position: Point3
+  width?: number
   height?: number
 }
 export interface PerceptionPort {
@@ -28,8 +29,6 @@ export interface VisibleEntity {
   username?: string
   position: Point3
   distance: number
-  distanceBand: 'very_near' | 'near' | 'medium' | 'far'
-  direction: RelativeDirection
 }
 export interface VisibleBlock { name: string; position: Point3; distance: number }
 
@@ -56,9 +55,41 @@ export interface VisibleBlocksOptions {
 
 const EYE_HEIGHT = 1.62
 const STEP = 0.25
-const YIELD_EVERY_VOXELS = 2_048
+/**
+ * Work units between yields. Exported because it is the unit of cancellation latency: after a
+ * signal aborts, a scan may do up to one more quantum before it stops, and the tests assert
+ * against that bound rather than a magic number.
+ */
+export const YIELD_EVERY_WORK_UNITS = 2_048
 
 interface RayHit { voxel: Point3; name: string }
+interface AxisAlignedBox { min: Point3; max: Point3 }
+
+/**
+ * Work counter shared by every scan loop and every raycast they fire. Counting only the outer
+ * loop understates the real cost by orders of magnitude: each candidate voxel and each entity
+ * hitbox sample casts a ray whose steps used to be invisible to the yield budget, so a dense
+ * scene could run thousands of blockAt calls between two yields. Rays increment the same counter
+ * and callers yield *between* rays, which bounds uninterrupted work at one raycast.
+ */
+interface ScanBudget { work: number }
+
+/**
+ * Yields, checking cancellation on both sides: before, so a scan that is already doomed stops
+ * paying, and after, so a signal aborted while the event loop ran does not buy another full
+ * quantum of work. The post-yield check is the one that matters in production — that is when the
+ * player's next message arrives and preempts the decision that asked for this scan.
+ *
+ * Callers guard this with `budget.work >= YIELD_EVERY_WORK_UNITS` instead of testing inside,
+ * because an `async` function allocates a promise and takes a microtask turn on *every* call,
+ * and the guard is false for all but one iteration in ~2048 of the hot loop.
+ */
+async function spendBudget(budget: ScanBudget, signal?: AbortSignal): Promise<void> {
+  budget.work = 0
+  signal?.throwIfAborted()
+  await yieldToEventLoop()
+  signal?.throwIfAborted()
+}
 
 /** Camera axes for a roll-free first-person view: right stays level, up tilts with pitch. */
 function viewAxes(yaw: number, pitch: number): { right: Point3; up: Point3; forward: Point3 } {
@@ -104,15 +135,14 @@ export async function visibleBlocks(
   const axes = viewAxes(pose.yaw, pose.pitch)
   const selfVoxel = { x: Math.floor(pose.position.x), y: Math.floor(pose.position.y), z: Math.floor(pose.position.z) }
   const candidates: VisibleBlock[] = []
-  let scanned = 0
+  const budget: ScanBudget = { work: 0 }
+  signal?.throwIfAborted()
 
   for (let dx = -options.horizontalRadius; dx <= options.horizontalRadius; dx++) {
     for (let dz = -options.horizontalRadius; dz <= options.horizontalRadius; dz++) {
       for (let dy = -options.verticalRadius; dy <= options.verticalRadius; dy++) {
-        if (++scanned % YIELD_EVERY_VOXELS === 0) {
-          signal?.throwIfAborted()
-          await yieldToEventLoop()
-        }
+        if (budget.work >= YIELD_EVERY_WORK_UNITS) await spendBudget(budget, signal)
+        budget.work++
         const voxel = { x: selfVoxel.x + dx, y: selfVoxel.y + dy, z: selfVoxel.z + dz }
         const center = { x: voxel.x + 0.5, y: voxel.y + 0.5, z: voxel.z + 0.5 }
         const delta = subtract(center, eye)
@@ -120,8 +150,8 @@ export async function visibleBlocks(
         if (distance > options.maxDistance) continue
         if (distance > 0 && !insideFrustum(axes, delta, options.frustum)) continue
         const block = port.blockAt(voxel)
-        if (block === 'unloaded' || !block.visible || !hasExposedFace(port, voxel)) continue
-        if (!lineReachesVoxel(port, eye, voxel, distance)) continue
+        if (block === 'unloaded' || !block.visible || !hasExposedFace(port, voxel, budget)) continue
+        if (!lineReachesVoxel(port, eye, voxel, distance, budget)) continue
         candidates.push({ name: block.name, position: voxel, distance })
       }
     }
@@ -131,37 +161,116 @@ export async function visibleBlocks(
   return { blocks: candidates.slice(0, options.limit), truncated: candidates.length > options.limit }
 }
 
-export function visibleEntities(
+/**
+ * Cancellable because the cost is driven by how many entities the world is tracking, not by
+ * `limit`: the cap applies after filtering, and every *occluded* candidate pays for all of its
+ * hitbox samples, which is the normal case in a forest or beside a pen. A synchronous version
+ * cannot be interrupted at all — not even the provider's own read deadline can fire, since the
+ * timer has no chance to run until the scan returns.
+ */
+export async function visibleEntities(
   port: PerceptionPort,
   maxDistance: number,
   frustum: ViewFrustum,
   limit: number,
-): VisibleEntity[] {
+  signal?: AbortSignal,
+): Promise<VisibleEntity[]> {
   const pose = port.selfPose()
   const eye = { x: pose.position.x, y: pose.position.y + EYE_HEIGHT, z: pose.position.z }
   const axes = viewAxes(pose.yaw, pose.pitch)
-  const candidates = port.nearbyEntities().flatMap((entity): VisibleEntity[] => {
-    const height = entity.height ?? 1.8
+  const budget: ScanBudget = { work: 0 }
+  const candidates: VisibleEntity[] = []
+  signal?.throwIfAborted()
+  for (const entity of port.nearbyEntities()) {
+    // Counted even when rejected below, so a world tracking thousands of entities still yields.
+    if (budget.work >= YIELD_EVERY_WORK_UNITS) await spendBudget(budget, signal)
+    budget.work++
+    const width = Math.max(entity.width ?? 0.6, 0.01)
+    const height = Math.max(entity.height ?? 1.8, 0.01)
+    const halfWidth = width / 2
+    const bounds: AxisAlignedBox = {
+      min: { x: entity.position.x - halfWidth, y: entity.position.y, z: entity.position.z - halfWidth },
+      max: { x: entity.position.x + halfWidth, y: entity.position.y + height, z: entity.position.z + halfWidth },
+    }
     const center = { x: entity.position.x, y: entity.position.y + height / 2, z: entity.position.z }
-    const delta = subtract(center, eye)
-    const distance = length(delta)
-    if (distance === 0 || distance > maxDistance || !insideFrustum(axes, delta, frustum)) return []
-    const visible = [0.85, 0.5, 0.15].some(fraction => lineIsClear(port, eye, {
-      x: entity.position.x, y: entity.position.y + height * fraction, z: entity.position.z,
-    }))
-    if (!visible) return []
-    return [{
+    const distance = length(subtract(center, eye))
+    if (distanceToBox(eye, bounds) > maxDistance || !boxIntersectsFrustum(axes, eye, bounds, frustum)) continue
+    let visible = pointInsideBox(eye, bounds)
+    for (const point of visible ? [] : boxVisibilitySamples(bounds)) {
+      if (budget.work >= YIELD_EVERY_WORK_UNITS) await spendBudget(budget, signal)
+      const pointDelta = subtract(point, eye)
+      if (insideFrustum(axes, pointDelta, frustum) && lineIsClear(port, eye, point, budget)) {
+        visible = true
+        break
+      }
+    }
+    if (!visible) continue
+    candidates.push({
       type: entity.type,
       ...(entity.name ? { name: entity.name } : {}),
       ...(entity.username ? { username: entity.username } : {}),
       position: entity.position,
       distance,
-      distanceBand: distance <= 2.5 ? 'very_near' : distance <= 8 ? 'near' : distance <= 24 ? 'medium' : 'far',
-      direction: relativeBearing(pose.yaw, pose.position, entity.position),
-    }]
-  })
+    })
+  }
+  signal?.throwIfAborted()
   candidates.sort((left, right) => left.distance - right.distance)
   return candidates.slice(0, limit)
+}
+
+/**
+ * Conservative AABB/frustum rejection. An entity is outside only when all eight hitbox corners
+ * lie beyond the same frustum plane; checking whether any one corner is inside would miss a
+ * frustum passing through the middle of a close or large hitbox.
+ */
+function boxIntersectsFrustum(
+  axes: { right: Point3; up: Point3; forward: Point3 },
+  eye: Point3,
+  bounds: AxisAlignedBox,
+  frustum: ViewFrustum,
+): boolean {
+  const tanHorizontal = Math.tan(frustum.horizontalHalfAngle)
+  const tanVertical = Math.tan(frustum.verticalHalfAngle)
+  const corners = boxCorners(bounds).map(point => {
+    const delta = subtract(point, eye)
+    return { depth: dot(delta, axes.forward), right: dot(delta, axes.right), up: dot(delta, axes.up) }
+  })
+  return ![
+    (point: (typeof corners)[number]) => point.depth <= 0,
+    (point: (typeof corners)[number]) => point.right < -point.depth * tanHorizontal,
+    (point: (typeof corners)[number]) => point.right > point.depth * tanHorizontal,
+    (point: (typeof corners)[number]) => point.up < -point.depth * tanVertical,
+    (point: (typeof corners)[number]) => point.up > point.depth * tanVertical,
+  ].some(outsidePlane => corners.every(outsidePlane))
+}
+
+function boxCorners(bounds: AxisAlignedBox): Point3[] {
+  return [bounds.min.x, bounds.max.x].flatMap(x =>
+    [bounds.min.y, bounds.max.y].flatMap(y =>
+      [bounds.min.z, bounds.max.z].map(z => ({ x, y, z }))))
+}
+
+/** Inset samples avoid treating a ray grazing the ground or an adjacent block as occluded. */
+function boxVisibilitySamples(bounds: AxisAlignedBox): Point3[] {
+  const axisSamples = (minimum: number, maximum: number, fractions: readonly number[]) =>
+    fractions.map(fraction => minimum + (maximum - minimum) * fraction)
+  const xs = axisSamples(bounds.min.x, bounds.max.x, [0.05, 0.5, 0.95])
+  const ys = axisSamples(bounds.min.y, bounds.max.y, [0.15, 0.5, 0.85])
+  const zs = axisSamples(bounds.min.z, bounds.max.z, [0.05, 0.5, 0.95])
+  return xs.flatMap(x => ys.flatMap(y => zs.map(z => ({ x, y, z }))))
+}
+
+function pointInsideBox(point: Point3, bounds: AxisAlignedBox): boolean {
+  return point.x >= bounds.min.x && point.x <= bounds.max.x
+    && point.y >= bounds.min.y && point.y <= bounds.max.y
+    && point.z >= bounds.min.z && point.z <= bounds.max.z
+}
+
+function distanceToBox(point: Point3, bounds: AxisAlignedBox): number {
+  const dx = Math.max(bounds.min.x - point.x, 0, point.x - bounds.max.x)
+  const dy = Math.max(bounds.min.y - point.y, 0, point.y - bounds.max.y)
+  const dz = Math.max(bounds.min.z - point.z, 0, point.z - bounds.max.z)
+  return Math.hypot(dx, dy, dz)
 }
 
 export function standingOnBlock(port: PerceptionPort): { name: string; position: Point3 } | null {
@@ -189,8 +298,10 @@ function firstHit(
   direction: Point3,
   maxDistance: number,
   property: 'visible' | 'occludes',
+  budget?: ScanBudget,
 ): RayHit | 'unloaded' | null {
   for (let distance = STEP; distance <= maxDistance; distance += STEP) {
+    if (budget) budget.work++
     const voxel = {
       x: Math.floor(origin.x + direction.x * distance),
       y: Math.floor(origin.y + direction.y * distance),
@@ -203,27 +314,28 @@ function firstHit(
   return null
 }
 
-function hasExposedFace(port: PerceptionPort, voxel: Point3): boolean {
+function hasExposedFace(port: PerceptionPort, voxel: Point3, budget?: ScanBudget): boolean {
   return [
     [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1],
   ].some(([x, y, z]) => {
+    if (budget) budget.work++
     const block = port.blockAt({ x: voxel.x + x!, y: voxel.y + y!, z: voxel.z + z! })
     return block !== 'unloaded' && !block.occludes
   })
 }
 
-function lineReachesVoxel(port: PerceptionPort, eye: Point3, voxel: Point3, distance: number): boolean {
+function lineReachesVoxel(port: PerceptionPort, eye: Point3, voxel: Point3, distance: number, budget?: ScanBudget): boolean {
   if (distance === 0) return true
   const center = { x: voxel.x + 0.5, y: voxel.y + 0.5, z: voxel.z + 0.5 }
-  const hit = firstHit(port, eye, normalize(subtract(center, eye), distance), distance + STEP, 'occludes')
+  const hit = firstHit(port, eye, normalize(subtract(center, eye), distance), distance + STEP, 'occludes', budget)
   return hit === null || (hit !== 'unloaded' && sameVoxel(hit.voxel, voxel))
 }
 
-function lineIsClear(port: PerceptionPort, origin: Point3, target: Point3): boolean {
+function lineIsClear(port: PerceptionPort, origin: Point3, target: Point3, budget?: ScanBudget): boolean {
   const delta = subtract(target, origin)
   const distance = length(delta)
   if (distance === 0) return true
-  return firstHit(port, origin, normalize(delta, distance), Math.max(0, distance - STEP), 'occludes') === null
+  return firstHit(port, origin, normalize(delta, distance), Math.max(0, distance - STEP), 'occludes', budget) === null
 }
 function subtract(left: Point3, right: Point3): Point3 { return { x: left.x - right.x, y: left.y - right.y, z: left.z - right.z } }
 function dot(left: Point3, right: Point3): number { return left.x * right.x + left.y * right.y + left.z * right.z }

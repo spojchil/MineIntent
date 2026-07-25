@@ -203,8 +203,8 @@ test('startup is local; player chat runs the two-tool closed loop with measured 
   await new Promise(resolve => setTimeout(resolve, 5))
   assert.equal(model.calls.length, 1)
   assert.equal(model.calls[0]!.context.observations.viewport?.visibleEntities.length, 0)
-  const first = results[0] as { viewport: { visibleEntities: Array<{ name?: string }> } }
-  assert.equal(first.viewport.visibleEntities[0]?.name, 'sheep')
+  const first = results[0] as { viewport: { visibleEntities: Array<[string, number, number, number]> } }
+  assert.deepEqual(first.viewport.visibleEntities[0], ['sheep', 0, 0, 5])
   const lookEffect = (results[0] as { effect: { relativeTurnDegrees: { yaw: number; pitch: number }; turned: boolean } }).effect
   assert.ok(Math.abs(lookEffect.relativeTurnDegrees.yaw - 90) < 1e-9)
   assert.equal(lookEffect.relativeTurnDegrees.pitch, 0)
