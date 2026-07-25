@@ -35,12 +35,23 @@ export const rememberArgumentsSchema = z.strictObject({
     .describe('要记住的内容，一两句话说清楚。'),
 })
 
+/** No arguments: there is one way to look, and it always reports the change since the last look. */
+export const viewArgumentsSchema = z.strictObject({})
+
 export interface WireToolDefinition {
   type: 'function'
   function: { name: string; description: string; parameters: Record<string, unknown> }
 }
 
 const TOOLS: ReadonlyArray<{ name: string; description: string; schema: z.ZodType }> = [
+  {
+    name: 'view',
+    description:
+      '看一眼当前视野，返回自上次观察以来的变化：added 是新看到的方块（+），removed 是确认'
+      + '消失的方块（-），实体每次都给全量。转头或移动之后想确认看到了什么就调用。只报告本次'
+      + '真正看清的范围内的变化：转头看不到的东西不算消失，仍然记着。',
+    schema: viewArgumentsSchema,
+  },
   {
     name: 'look_relative',
     description:

@@ -126,11 +126,53 @@ export function raycastLookedAtBlock(port: PerceptionPort, maxDistance: number):
   return hit === null || hit === 'unloaded' ? null : { name: hit.name, position: hit.voxel }
 }
 
+/**
+ * Why a remembered voxel did not appear in a scan. Only `absent` means the block is actually gone;
+ * `present` means it is still there and the scan simply did not list it, which is a disagreement to
+ * stay quiet about rather than report as a removal.
+ */
+export type VoxelVerdict = 'absent' | 'present' | 'out_of_view' | 'occluded' | 'unloaded'
+
+/**
+ * Judges a single remembered voxel against the current stance.
+ *
+ * This is what keeps an incremental read honest. A block missing from a scan has at least five
+ * possible explanations, and only one of them means it is gone: turning the head puts it outside
+ * the frustum, walking can put a wall in front of it, distance and the output cap can push it past
+ * what the scan verified, and an unloaded chunk verifies nothing at all. Reporting every absence as
+ * a removal would tell the model a wall vanished every time the companion looked away.
+ *
+ * The frustum and distance tests are pure arithmetic, so the common case — a head turn — is settled
+ * without touching the world. Only a voxel that is genuinely in view yet missing costs a ray.
+ */
+export function classifyVoxel(
+  port: PerceptionPort,
+  options: VisibleBlocksOptions & { verifiedDistance: number },
+  voxel: Point3,
+  budget?: ScanBudget,
+): VoxelVerdict {
+  const pose = port.selfPose()
+  const eye = { x: pose.position.x, y: pose.position.y + EYE_HEIGHT, z: pose.position.z }
+  const axes = viewAxes(pose.yaw, pose.pitch)
+  const center = { x: voxel.x + 0.5, y: voxel.y + 0.5, z: voxel.z + 0.5 }
+  const delta = subtract(center, eye)
+  const distance = length(delta)
+  // `verifiedDistance` is how far this scan actually looked: with a truncated result that is the
+  // last kept block's distance, not maxDistance. Without it, every step would churn the cap's edge.
+  if (distance > Math.min(options.maxDistance, options.verifiedDistance)) return 'out_of_view'
+  if (distance > 0 && !insideFrustum(axes, delta, options.frustum)) return 'out_of_view'
+  const block = port.blockAt(voxel)
+  if (block === 'unloaded') return 'unloaded'
+  if (!lineReachesVoxel(port, eye, voxel, distance, budget)) return 'occluded'
+  if (!block.visible || !hasExposedFace(port, voxel, budget)) return 'absent'
+  return 'present'
+}
+
 export async function visibleBlocks(
   port: PerceptionPort,
   options: VisibleBlocksOptions,
   signal?: AbortSignal,
-): Promise<{ blocks: VisibleBlock[]; truncated: boolean }> {
+): Promise<{ blocks: VisibleBlock[]; truncated: boolean; verifiedDistance: number }> {
   const pose = port.selfPose()
   const eye = { x: pose.position.x, y: pose.position.y + EYE_HEIGHT, z: pose.position.z }
   const axes = viewAxes(pose.yaw, pose.pitch)
@@ -159,7 +201,15 @@ export async function visibleBlocks(
   }
   signal?.throwIfAborted()
   candidates.sort((left, right) => left.distance - right.distance)
-  return { blocks: candidates.slice(0, options.limit), truncated: candidates.length > options.limit }
+  const blocks = candidates.slice(0, options.limit)
+  // How far the scan can be trusted. Nearest-first means a truncated result is "everything out to
+  // this radius" rather than an arbitrary sample, which is the only reason a cap can be diffed at
+  // all: a voxel beyond it was never examined, so its absence says nothing.
+  const truncated = candidates.length > options.limit
+  const verifiedDistance = truncated && blocks.length > 0
+    ? blocks[blocks.length - 1]!.distance
+    : options.maxDistance
+  return { blocks, truncated, verifiedDistance }
 }
 
 /**

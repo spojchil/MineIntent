@@ -25,7 +25,9 @@ test('agent service receives internal run id, safe context and callback credenti
   // 说话在运行中经 say 工具发生；HTTP 响应只报完成与用量。
   assert.equal(result.model, 'deepseek-chat')
   const sentTools = (body as { tools: Array<{ function: { name: string } }> }).tools
-  assert.deepEqual(sentTools.map(tool => tool.function.name), ['look_relative', 'move_input', 'say', 'remember'])
+  // Order is fixed, not incidental: the tools block sits in the cached prefix, so a reordering
+  // would rewrite it and cost the whole prompt's reuse for no gain.
+  assert.deepEqual(sentTools.map(tool => tool.function.name), ['view', 'look_relative', 'move_input', 'say', 'remember'])
 })
 
 test('agent service rejects non-loopback callbacks and surfaces service errors', async () => {

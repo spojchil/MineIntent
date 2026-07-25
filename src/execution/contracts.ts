@@ -9,8 +9,14 @@
  * path out, so the boundary is the whole point of rebuilding this smaller.
  */
 
-/** Independent resources a tool may need. Locks are per resource, never per tool. */
-export type ExecutionResource = 'body' | 'chat' | 'memory'
+/**
+ * Independent resources a tool may need. Locks are per resource, never per tool.
+ *
+ * `senses` is not about exclusive access to reality — looking twice hurts nobody. It exists because
+ * a viewport scan walks a six-figure number of voxels, so two overlapping ones would compete for the
+ * event loop and make both slower than running them in turn.
+ */
+export type ExecutionResource = 'body' | 'chat' | 'memory' | 'senses'
 
 export type JobState = 'running' | 'completed' | 'failed' | 'cancelled'
 

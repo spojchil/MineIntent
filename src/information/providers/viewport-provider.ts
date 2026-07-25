@@ -27,8 +27,12 @@ export interface ViewportValues {
   lookedAtBlock: { name: string; position: WorldPosition } | null
   /** Compact [entity_name_or_player, x, y, z] tuples, nearest first. */
   visibleEntities: EntityTuple[]
-  /** Compact [block_name, x, y, z] tuples, nearest first. */
-  visibleBlocks: { blocks: Array<[string, number, number, number]>; truncated: boolean }
+  /**
+   * Compact [block_name, x, y, z] tuples, nearest first. `verifiedDistance` is how far this scan can
+   * be trusted: with a truncated result it is the last kept block's distance, and beyond it the scan
+   * looked at nothing, so an absence there proves nothing.
+   */
+  visibleBlocks: { blocks: Array<[string, number, number, number]>; truncated: boolean; verifiedDistance: number }
 }
 
 const worldPositionSchema = z.tuple([z.number(), z.number(), z.number()])
@@ -45,6 +49,7 @@ const blockSchema = z.object({ name: z.string().min(1), position: worldPositionS
 const visibleEntitiesSchema = z.array(z.tuple([z.string().min(1), z.number(), z.number(), z.number()]))
 const visibleBlocksSchema = z.object({
   blocks: z.array(z.tuple([z.string().min(1), z.number(), z.number(), z.number()])), truncated: z.boolean(),
+  verifiedDistance: z.number(),
 })
 
 const LEGEND: ViewportValues['frame']['legend'] = {
@@ -68,6 +73,15 @@ const ASSUMED_ASPECT_RATIO = 16 / 9
 const VIEW_FRUSTUM = {
   verticalHalfAngle: (VERTICAL_FOV_DEGREES / 2) * Math.PI / 180,
   horizontalHalfAngle: Math.atan(Math.tan((VERTICAL_FOV_DEGREES / 2) * Math.PI / 180) * ASSUMED_ASPECT_RATIO),
+} as const
+
+/**
+ * Exported because an incremental read has to judge a remembered voxel against the *same* bounds the
+ * scan used. Two copies of these numbers would let "in view" mean one thing when a block is found
+ * and another when its disappearance is judged, which is exactly how a diff starts lying.
+ */
+export const VIEWPORT_SCAN = {
+  horizontalRadius: 32, verticalRadius: 20, maxDistance: 32, frustum: VIEW_FRUSTUM, limit: 256,
 } as const
 
 export class ViewportInformationProvider implements InformationProvider<ViewportValues> {
@@ -130,9 +144,7 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
       })
     }
     if (request.fields.includes('visibleBlocks')) {
-      const result = await visibleBlocks(this.port, {
-        horizontalRadius: 32, verticalRadius: 20, maxDistance: 32, frustum: VIEW_FRUSTUM, limit: 256,
-      }, signal)
+      const result = await visibleBlocks(this.port, VIEWPORT_SCAN, signal)
       values.visibleBlocks = {
         // Block coordinates are exact integers, which is what makes an incremental read possible:
         // the same block keeps the same key no matter where the companion stands.
@@ -141,6 +153,7 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
           return [block.name, x, y, z]
         }),
         truncated: result.truncated,
+        verifiedDistance: round(result.verifiedDistance, 2),
       }
     }
     return {

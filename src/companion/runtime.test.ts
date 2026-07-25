@@ -354,6 +354,39 @@ test('a new player chat waits behind an in-flight turn without taking control fr
   assert.equal(model.calls[1]!.context.frame.events.some(event => event.summary.includes('停下')), false)
 })
 
+test('looking twice reports the change, not the whole view again', async t => {
+  const { backend, model, runtime } = await fixture(t)
+  const results: unknown[] = []
+  model.handler = async input => {
+    results.push(await runtime.executeTool(call(input.runId, 'view', {})))
+    results.push(await runtime.executeTool(call(input.runId, 'view', {})))
+    return { model: 'fake' }
+  }
+
+  // Tilted down on purpose (raw pitch is up-positive). Looking level at flat ground returns nothing
+  // at all, because a ray to a distant ground block's *centre* enters nearer ground first — a
+  // block's centre is not the surface a player sees. Even straight down finds only ~16 of the 4,225
+  // ground columns in range. That is a real gap in the visibility test, not a fixture quirk.
+  backend.pitch = -0.6
+  backend.emitChat('Bot，看看周围')
+  await waitFor(() => model.calls.length === 1)
+  await runtime.idle()
+
+  type Look = { viewport: { blocks: { added: unknown[]; removed: unknown[]; remembered: number } } }
+  const first = (results[0] as Look).viewport.blocks
+  const second = (results[1] as Look).viewport.blocks
+  // The ground the fake world provides arrives once, as additions.
+  assert.equal(first.added.length > 0, true)
+  assert.deepEqual(first.removed, [])
+  // Nothing moved between the two looks, so the second says nothing at all — that is the saving
+  // the old design threw away by re-sending the full scan with every body tool result.
+  assert.deepEqual(second, { added: [], removed: [], remembered: first.remembered })
+  // Entities are not diffed: they move continuously and have identities, so a positional diff would
+  // render one sheep taking a step as a sheep vanishing and a stranger appearing.
+  const entities = (results[1] as { viewport: { visibleEntities: unknown[] } }).viewport.visibleEntities
+  assert.deepEqual(entities, (results[0] as { viewport: { visibleEntities: unknown[] } }).viewport.visibleEntities)
+})
+
 test('damage taken mid-run reaches the model as a frame beside the next tool result', async t => {
   const { backend, model, runtime } = await fixture(t)
   const frames: Array<Awaited<ReturnType<typeof runtime.takePendingFrame>>> = []

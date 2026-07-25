@@ -9,6 +9,8 @@ import {
   InventoryProvider,
   SoundInformationProvider,
   ViewportInformationProvider,
+  ViewportMirror,
+  VIEWPORT_SCAN,
   lookDirection,
   type PassiveObservations,
   type TrustedInformationCaller,
@@ -76,8 +78,13 @@ interface ActiveRun extends RunScope {
 /** Which resource a tool needs. Locks are per resource, not per tool: `say` and `remember` touch
  * neither the body nor each other, so a body input in flight must not block them. */
 const TOOL_RESOURCE: Record<string, ExecutionResource> = {
-  look_relative: 'body', move_input: 'body', say: 'chat', remember: 'memory',
+  view: 'senses', look_relative: 'body', move_input: 'body', say: 'chat', remember: 'memory',
 }
+
+const BLOCK_DIFF_LEGEND =
+  'added 是本次新看到的方块（+），removed 是确认已经不在的方块（-），每项为 [名称, x, y, z]。'
+  + '只报告本次看清范围内的变化：转头看不到、被挡住、太远或区块未加载的方块不算消失，仍然记着。'
+  + 'unverified 是这次无法判断的记忆数量，remembered 是目前记着的方块总数。'
 
 const MOVE_EFFECT_EPSILON = 0.01
 const LOOK_EFFECT_EPSILON_DEGREES = 0.01
@@ -98,6 +105,7 @@ export class CompanionRuntime {
   readonly #speech: SpeechScheduler
   readonly #soundHistory: SoundHistory
   readonly #informationRuntime: InformationRuntime
+  readonly #perception: BackendPerceptionPort
   readonly #abort = new AbortController()
   /**
    * Events waiting for the next frame to carry them. Drained rather than kept as a rolling window:
@@ -110,6 +118,12 @@ export class CompanionRuntime {
   #lastHealth?: number
   /** Kept for the local debug view, which shows what was read rather than what was sent. */
   #lastObservations?: PassiveObservations
+  /**
+   * What the model has already been told about blocks. Reset at the start of every run because that
+   * is when the conversation restarts: the mirror records what was said, so it must never outlive
+   * the messages it mirrors, or it would suppress `added` for blocks the model no longer knows.
+   */
+  readonly #mirror = new ViewportMirror()
   #unsubscribe?: () => void
   #modelAbort?: AbortController
   #activeRun?: ActiveRun
@@ -132,7 +146,10 @@ export class CompanionRuntime {
       onEvent: event => { void this.#journal.append(`speech.${event.type}`, withoutPrivateSpeech(event)) },
     })
     this.#soundHistory = new SoundHistory(this.#backend)
-    this.#informationRuntime = buildInformationRuntime(this.#backend, this.#soundHistory)
+    // One port for both the provider and the mirror: judging a remembered voxel has to read the
+    // world exactly the way the scan that recorded it did.
+    this.#perception = new BackendPerceptionPort(this.#backend)
+    this.#informationRuntime = buildInformationRuntime(this.#backend, this.#soundHistory, this.#perception)
   }
 
   async start(): Promise<void> {
@@ -198,6 +215,11 @@ export class CompanionRuntime {
       }
       this.#assertRunCurrent(active)
       switch (invocation.name) {
+        case 'view':
+          return {
+            protocol: TOOL_RESULT_PROTOCOL, status: 'completed',
+            viewport: await this.#observeViewport(active.runId, active.controller.signal),
+          }
         case 'look_relative':
         case 'move_input':
           return await this.#executeBodyTool(active, invocation, actionId, startedAt)
@@ -243,7 +265,7 @@ export class CompanionRuntime {
       }
       this.#assertRunCurrent(active)
       const after = this.#backend.observationSource().selfPose()
-      const viewport = await this.#readViewport(active.runId, active.controller.signal)
+      const viewport = await this.#observeViewport(active.runId, active.controller.signal)
       this.#assertRunCurrent(active)
       const effect = name === 'look_relative' ? measuredLookEffect(before, after) : measuredMoveEffect(before, after)
       await this.#journal.append('body_tool.completed', {
@@ -257,7 +279,7 @@ export class CompanionRuntime {
     } catch (error) {
       if (active.controller.signal.aborted || !this.#scopeMatches(active)) throw error
       this.#assertRunCurrent(active)
-      const viewport = await this.#readViewport(active.runId, active.controller.signal).catch(() => undefined)
+      const viewport = await this.#observeViewport(active.runId, active.controller.signal).catch(() => undefined)
       this.#assertRunCurrent(active)
       await this.#journal.append('body_tool.failed', {
         actionId, runId: active.runId, toolCallId: invocation.toolCallId, roundId: invocation.roundId,
@@ -385,6 +407,9 @@ export class CompanionRuntime {
       dimension: snapshot.world.dimension, chatEventId: eventId, sayCount: 0,
     }
     this.#activeRun = active
+    // A new run is a new conversation, so nothing has been said about blocks yet: the first look
+    // legitimately reports everything as new.
+    this.#mirror.clear()
     let sources: DebugContextSource[] = []
     let memoryIds: string[] = []
     try {
@@ -479,6 +504,9 @@ export class CompanionRuntime {
     const generation = ++this.#runGeneration
     // Scope loss voids every lease and running job, not just the awaited call.
     this.#execution.invalidate(reason)
+    // A different world makes remembered voxels meaningless, and keeping them would suppress the
+    // `added` lines that would otherwise describe the new one.
+    this.#mirror.clear()
     this.#activeRun?.controller.abort(reason)
     this.#modelAbort?.abort(reason)
     this.#speech.stop(reason)
@@ -497,6 +525,36 @@ export class CompanionRuntime {
     }, signal)
     if (response.protocol !== 'mineintent.information-read.v1') throw new Error(`viewport_read_failed:${response.protocol}`)
     return response.values as unknown as ViewportValues
+  }
+
+  /**
+   * One look, reported as the change since the last one.
+   *
+   * Blocks are diffed and entities are not, and that asymmetry is the point. A block's integer voxel
+   * is a stable key and blocks mostly do not move, so a diff is nearly free and usually tiny. An
+   * entity moves continuously and has an identity, so diffing one by position would render "the
+   * sheep took a step" as a sheep vanishing and a different sheep appearing — costing more than the
+   * full list it replaced, and losing the continuity that makes it the same sheep.
+   */
+  async #observeViewport(runId: string, signal: AbortSignal): Promise<Record<string, unknown>> {
+    const viewport = await this.#readViewport(runId, signal)
+    const blocks = viewport.visibleBlocks
+    const diff = this.#mirror.diff(this.#perception, VIEWPORT_SCAN, {
+      blocks: (blocks?.blocks ?? []).map(([name, x, y, z]) => ({ name, position: { x, y, z } })),
+      verifiedDistance: blocks?.verifiedDistance ?? VIEWPORT_SCAN.maxDistance,
+    })
+    return {
+      frame: { ...viewport.frame, legend: { ...viewport.frame.legend, blocks: BLOCK_DIFF_LEGEND } },
+      standingOnBlock: viewport.standingOnBlock,
+      lookedAtBlock: viewport.lookedAtBlock,
+      visibleEntities: viewport.visibleEntities,
+      blocks: {
+        added: diff.added, removed: diff.removed,
+        ...(diff.unverified > 0 ? { unverified: diff.unverified } : {}),
+        ...(blocks?.truncated ? { truncated: true } : {}),
+        remembered: this.#mirror.size,
+      },
+    }
   }
 
   async #composePassiveObservations(runId: string, signal: AbortSignal): Promise<PassiveObservations> {
@@ -671,12 +729,16 @@ function withoutPrivateSpeech(event: unknown): unknown {
   return copy
 }
 
-function buildInformationRuntime(backend: MinecraftBackendApi, soundHistory: SoundHistory): InformationRuntime {
+function buildInformationRuntime(
+  backend: MinecraftBackendApi,
+  soundHistory: SoundHistory,
+  perception: BackendPerceptionPort,
+): InformationRuntime {
   const registry = new InformationRegistry()
   registry.register(new CurrentStatusProvider(new BackendSelfVitalsPort(backend)))
   registry.register(new InventoryProvider(new BackendInventoryPort(backend)))
   registry.register(new SoundInformationProvider(soundHistory))
-  registry.register(new ViewportInformationProvider(new BackendPerceptionPort(backend)))
+  registry.register(new ViewportInformationProvider(perception))
   registry.seal('1.21.1')
   const accessPolicy = new InMemoryInformationAccessPolicy()
   accessPolicy.put({
