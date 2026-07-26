@@ -34,20 +34,28 @@ const visibleBlocksSchema = z.object({
 const MAX_LOOK_DISTANCE = 4.5
 const MAX_ENTITY_DISTANCE = 16
 const MAX_ENTITIES = 10
+const VERTICAL_FOV_DEGREES = 70
+const ASSUMED_ASPECT_RATIO = 16 / 9
+const VERTICAL_HALF_ANGLE = (VERTICAL_FOV_DEGREES / 2) * Math.PI / 180
+const VIEW_FRUSTUM = {
+  verticalHalfAngle: VERTICAL_HALF_ANGLE,
+  horizontalHalfAngle: Math.atan(Math.tan(VERTICAL_HALF_ANGLE) * ASSUMED_ASPECT_RATIO),
+} as const
 const VISIBLE_BLOCKS_OPTIONS = {
   horizontalRadius: 32, verticalRadius: 4, maxDistance: 32, // 32 blocks == 2 chunks (chunks are a horizontal 16x16 division only)
-  halfAngle: (35 * Math.PI) / 180, // approximates vanilla's default 70° FOV; a circular cone, not the real rectangular frustum
+  frustum: VIEW_FRUSTUM,
   limit: 24,
-}
+  predicate: 'exposed_face',
+} as const
 
 /**
  * "Reasonable vision" for a standing-still player: what block you're standing on, a precise
  * crosshair-style raycast for what's directly ahead (matching vanilla's targeted-block
  * mechanic), a distance-sorted list of protocol-tracked nearby entities, and a layered-filter
- * approximation of what's visible in front of you (exposed-face check → frustum+distance cull →
- * per-candidate ray occlusion test, using the same DDA stepping as lookedAtBlock). Blocks are
- * treated as solid unit cubes — non-full blocks (stairs, fences, torches, carpets), translucency
- * layering and multi-point corner sampling are known, deliberately deferred refinements, not the
+ * approximation of what's visible in front of you (rectangular frustum+distance cull → reachable
+ * exposed-face test, using the same stepped rays as lookedAtBlock). Visibility and occlusion stay
+ * binary per voxel — partial shapes (stairs, fences, torches, carpets), true translucency layering
+ * and multi-point corner sampling are known, deliberately deferred refinements, not the
  * full FOV/DDA/material system from the shelved viewport design (issue #34/#68).
  */
 export class ViewportInformationProvider implements InformationProvider<ViewportValues> {
@@ -60,7 +68,7 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
   readonly definition: InformationProviderDefinition<ViewportValues> = {
     id: 'viewport_information',
     description: '站立不动时的合理视觉：脚下方块、准星精确指向的方块、附近协议追踪到的实体，以及正前方视野内的方块（分层过滤近似）',
-    schemaRevision: 'viewport-information:4',
+    schemaRevision: 'viewport-information:5',
     audiences: ['companion'] as const,
     fields: {
       standingOnBlock: {
@@ -77,9 +85,9 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
         valueSchema: nearbyEntitySchema, valueType: 'array', precision: 'inferred', sourceKinds: ['viewport_projection'],
       },
       visibleBlocks: {
-        description: '正前方视野锥（约70度）、32格内、经过遮挡判定后仍可见的方块列表；blocks 每项是 ' +
+        description: '正前方矩形视野（垂直约70度、按16:9推导水平角）、32格内、至少一个暴露面无遮挡可达的方块列表；blocks 每项是 ' +
           '[offsetX, offsetY, offsetZ, name] 四元组，坐标是相对自身位置的整数偏移量，不是世界绝对坐标，也不含距离字段' +
-          '（可自行从偏移量估算远近）；按距离由近到远排序，可能被截断（truncated）；非整块方块按整格实心简化处理，是近似值不是精确渲染结果',
+          '（可自行从偏移量估算远近）；按距离由近到远排序，可能被截断（truncated）；遮挡按整格二值化处理，是近似值不是精确渲染结果',
         valueSchema: visibleBlocksSchema, valueType: 'object', precision: 'inferred', sourceKinds: ['viewport_projection'],
       },
     },
@@ -94,7 +102,7 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
   async read(
     context: InformationProviderContext,
     request: ProviderReadRequest<ViewportValues, never, never>,
-    _signal: AbortSignal,
+    signal: AbortSignal,
   ): Promise<ProviderReadResult<ViewportValues, never>> {
     const revision = this.#revisionFor()
     const values: Partial<ViewportValues> = {}
@@ -104,15 +112,24 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
       values.nearbyTrackedEntities = nearbyTrackedEntities(this.#port, MAX_ENTITY_DISTANCE, MAX_ENTITIES)
     }
     if (request.fields.includes('visibleBlocks')) {
-      const result = visibleBlocks(this.#port, VISIBLE_BLOCKS_OPTIONS)
+      const pose = this.#port.selfPose()
+      const selfVoxel = {
+        x: Math.floor(pose.position.x), y: Math.floor(pose.position.y), z: Math.floor(pose.position.z),
+      }
+      const result = await visibleBlocks(this.#port, VISIBLE_BLOCKS_OPTIONS, signal)
       values.visibleBlocks = {
-        blocks: result.blocks.map((block): [number, number, number, string] => [block.offset.x, block.offset.y, block.offset.z, block.name]),
+        blocks: result.blocks.map((block): [number, number, number, string] => [
+          block.position.x - selfVoxel.x,
+          block.position.y - selfVoxel.y,
+          block.position.z - selfVoxel.z,
+          block.name,
+        ]),
         truncated: result.truncated,
       }
     }
     return {
       informationRevision: revision, values, unavailable: [],
-      source: { kind: 'viewport_projection', adapterRevision: 'viewport-provider.v1', sourceRevision: revision, acquisition: 'current_perception' },
+      source: { kind: 'viewport_projection', adapterRevision: 'viewport-provider.v2', sourceRevision: revision, acquisition: 'current_perception' },
       observedAt: context.now, evidenceIds: [],
     }
   }
