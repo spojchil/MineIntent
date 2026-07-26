@@ -102,8 +102,27 @@ const VIEW_FRUSTUM = {
 } as const
 
 export class ViewportInformationProvider implements InformationProvider<ViewportValues> {
+  /**
+   * Counts published projections, not world states.
+   *
+   * A revision earns its name only if equal revisions guarantee equal content, and this one cannot
+   * make that promise. It used to be signed from the pose plus `port.revision()`, which resolves to
+   * the backend's `snapshotRevision` — and that counter advances on the companion's own vitals, held
+   * item, window updates, players joining or leaving, death, dimension change and readiness.
+   * Nothing advances it when a block is placed or broken, or when a mob takes a step. So for the two
+   * fields that dominate this read, a pose held still meant a frozen revision over changing content,
+   * every time rather than occasionally.
+   *
+   * Minting a fresh number per read is honest instead of nearly-right: it never claims two reads
+   * agree. The cost is that the number carries no cache signal, which costs nothing real here —
+   * `acquisition: 'current_perception'` already says this is a fresh sample, and the interface is
+   * unpaginated and issues no refs, so nothing downstream compares two of these for equality.
+   *
+   * A revision that genuinely tracked content would need the backend to subscribe to block updates
+   * and entity movement. That is a real design question — entity movement fires every tick per
+   * entity, so the honest version has an event-storm problem — and it is filed rather than guessed.
+   */
   #revision = 0
-  #lastSignature = ''
   constructor(private readonly port: PerceptionPort) {}
 
   readonly definition: InformationProviderDefinition<ViewportValues> = {
@@ -122,8 +141,14 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
     limits: { maxFieldsPerRead: 5, maxResultBytes: 65_536, timeoutMs: 5_000 },
   }
 
+  /**
+   * Reports the last published projection and does not mint a new one. Availability is the runtime's
+   * probe for whether a held reference is still current, so it has to be free of side effects: a
+   * counter that advanced on being asked would make every reference look stale the moment it was
+   * checked, and two consecutive probes disagree.
+   */
   availability(): ProviderAvailability<ViewportValues> {
-    return { overall: 'available', informationRevision: this.revisionFor(), fields: {} }
+    return { overall: 'available', informationRevision: this.#revision, fields: {} }
   }
 
   async read(
@@ -131,7 +156,7 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
     request: ProviderReadRequest<ViewportValues, never, never>,
     signal: AbortSignal,
   ): Promise<ProviderReadResult<ViewportValues, never>> {
-    const revision = this.revisionFor()
+    const revision = ++this.#revision
     const pose = this.port.selfPose()
     const values: Partial<ViewportValues> = {}
     if (request.fields.includes('frame')) {
@@ -183,15 +208,17 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
     }
     return {
       informationRevision: revision, values, unavailable: [],
-      source: { kind: 'viewport_projection', adapterRevision: 'viewport-provider.v2', sourceRevision: revision, acquisition: 'current_perception' },
+      source: {
+        kind: 'viewport_projection', adapterRevision: 'viewport-provider.v3',
+        // The backend's own counter, kept where it belongs. It is a weak signal about the world —
+        // see the note on `#revision` for what it does and does not advance on — but this is the
+        // field that is meant to describe the source, so it should report the source's number and
+        // not the projection's.
+        sourceRevision: this.port.revision(),
+        acquisition: 'current_perception',
+      },
       observedAt: context.now, evidenceIds: [],
     }
-  }
-
-  private revisionFor(): number {
-    const signature = JSON.stringify({ pose: this.port.selfPose(), sourceRevision: this.port.revision() })
-    if (signature !== this.#lastSignature) { this.#lastSignature = signature; this.#revision++ }
-    return this.#revision
   }
 }
 

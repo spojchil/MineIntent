@@ -93,6 +93,41 @@ test('a read that fills the entity cap says so', async () => {
   assert.equal(result.values.visibleEntities?.truncated, true)
 })
 
+test('a projection never reuses a revision while its content changes underneath', async () => {
+  // The defect this replaces: the revision was signed from the pose plus the backend's
+  // `snapshotRevision`, and that counter has no subscription to blocks or to entity movement. So a
+  // companion standing still watched the world change while its revision sat frozen — not as a race
+  // window but on every read. Both fields are exercised because both were affected.
+  // Same stance and same coordinates as the world-absolute test above, which establishes that this
+  // block and this sheep are both inside the frustum and unoccluded.
+  const blocks = new Map<string, PerceptionBlock>()
+  const entities: PerceptionEntityCandidate[] = [sheep({ x: 5, y: 64, z: 1 })]
+  const port = new FakePort({ position: { x: 0, y: 64, z: 0 }, yaw: -Math.PI / 2, pitch: 0 }, blocks, entities)
+  const provider = new ViewportInformationProvider(port)
+  const read = async () => provider.read(
+    context(), { fields: ['visibleEntities', 'visibleBlocks'], page: { limit: 1 } }, new AbortController().signal,
+  )
+
+  const before = await read()
+  assert.equal(before.values.visibleEntities?.items.length, 1)
+
+  // The pose is deliberately untouched: it is the one input the old signature did cover.
+  entities.push(sheep({ x: 5, y: 64, z: 2 }))
+  const afterEntityAppears = await read()
+  assert.equal(afterEntityAppears.values.visibleEntities?.items.length, 2)
+  assert.notEqual(afterEntityAppears.informationRevision, before.informationRevision)
+
+  blocks.set('3,65,0', stone('stone'))
+  const afterBlockPlaced = await read()
+  assert.deepEqual(afterBlockPlaced.values.visibleBlocks?.blocks, [['stone', 3, 65, 0]])
+  assert.notEqual(afterBlockPlaced.informationRevision, afterEntityAppears.informationRevision)
+
+  // `availability` is the runtime's staleness probe, so asking twice must not itself change the
+  // answer — the fix must not turn a read counter into a side effect of being asked.
+  assert.equal(provider.availability().informationRevision, provider.availability().informationRevision)
+  assert.equal(provider.availability().informationRevision, afterBlockPlaced.informationRevision)
+})
+
 test('an entities-only read still honors the deadline signal', async () => {
   // The declared timeoutMs cannot be enforced by the runtime's Promise.race alone: a synchronous
   // scan blocks the event loop, so the deadline timer has no chance to fire until it returns.
