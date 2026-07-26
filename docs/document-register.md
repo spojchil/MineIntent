@@ -2,7 +2,7 @@
 status: reference
 authority: informative
 implementation: current
-last_verified: 2026-07-24
+last_verified: 2026-07-25
 ---
 
 # 文档登记表
@@ -15,7 +15,7 @@ last_verified: 2026-07-24
 |---|---|---|---|
 | [文档入口](./README.md) | reference / informative | not-applicable | 五分区布局与真相优先级 |
 | [产品设计](./product-design.md) | accepted / normative | not-applicable | 原根目录 `PRODUCT_DESIGN.md`；`078f525` 创建，PR #71 / `4718d85` 扩展长期可信目标 |
-| [当前项目状态](./current-status.md) | reference / informative | current | PR #73 D40 候选分支的代码、测试与未验证边界 |
+| [当前项目状态](./current-status.md) | reference / informative | current | 按代码、PR、Issue 和测试核验 |
 | [文档治理规则](./documentation-policy.md) | accepted / normative | not-applicable | 经 PR #72 接受；硬规则只有“`main` 只通过合并 PR 变更” |
 
 ## 架构（系统现在如何运行？目标架构是什么？）
@@ -63,8 +63,8 @@ last_verified: 2026-07-24
 | 文档 | 状态 / 权威 | 实现 | 来源与用途 |
 |---|---|---|---|
 | [指南入口](./guides/README.md) | reference / informative | current | 分区导航 |
-| [同伴原型](./guides/companion-prototype.md) | reference / informative | current | PR #73 的 D40 运行、取消、调试与已知限制 |
-| [Paper 集成](./guides/paper-integration.md) | reference / informative | partial | PR #30/#31 建立；PR #73 只保留通用协议裁判，真实 D40 尚无 run |
+| [首个同伴原型](./guides/companion-prototype.md) | reference / informative | current | 原 `docs/testing/companion-prototype.md`；PR #31 / `ff6cd0c`，后经 `0927db4`；当前指南描述 `main@9c46b9f` |
+| [Paper 集成](./guides/paper-integration.md) | reference / informative | partial | 原 `docs/testing/paper-integration.md`；PR #30/#31（`f6bd425`/`ff6cd0c`），后经 `0927db4`；当前指南描述 `main@9c46b9f` 场景代码，D40 尚无 Actions/Paper CI 复跑 |
 | [模型接口参考](./guides/model-interface.md) | reference / informative | current | 原根目录 `MODEL_INTERFACE_REFERENCE.md`；直接提交 `9eb3a16`，无 PR；TypeScript schema 优先 |
 
 ## 来路（为什么走到今天？）

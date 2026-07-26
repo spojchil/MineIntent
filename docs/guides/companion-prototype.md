@@ -2,77 +2,79 @@
 status: reference
 authority: informative
 implementation: current
-last_verified: 2026-07-24
+last_verified: 2026-07-25
+applies_to: main@9c46b9f
 ---
 
-# 运行 D40 同伴原型
+# 运行同伴原型
 
-D40 只验证一个最小场景：同伴能否从当前视野出发，通过相对转头和短时按键移动获得新观察，并根据实际结果继续判断或回复。它不是完整 Minecraft Agent。
+当前原型用于本地开发和游戏内验证，还不是可供长期游玩的完整 Minecraft Agent。
 
-## 前提
+## 环境要求
 
-- Node.js 22 或更高版本、pnpm 11.3.0。
-- Python 3.10 或更高版本，无额外 Python 依赖。
-- Minecraft Java Edition / Paper 1.21.1 服务器。
-- 支持 Chat Completions、tool calls 和 `response_format: json_object` 的 OpenAI-compatible 模型接口。
+- Node.js 22 或更高版本、pnpm 11.3.0
+- Python 3.10 或更高版本
+- Minecraft Java Edition 1.21.1 服务器
+- 支持 Chat Completions 与 `response_format: json_object` 的 OpenAI-compatible 模型接口
 
-从 `.env.example` 复制 `.env`，至少填写：
+离线服使用 `MINEINTENT_MC_AUTH=offline`。正版认证使用 `microsoft`，并通过 `MINEINTENT_MC_PROFILES_FOLDER` 指定认证资料目录。
+
+## 配置
+
+复制配置样例：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+至少确认以下值：
 
 ```dotenv
-MINEINTENT_MC_HOST=localhost
+MINEINTENT_MC_HOST=127.0.0.1
 MINEINTENT_MC_PORT=25565
 MINEINTENT_MC_USERNAME=MineIntentBot
 MINEINTENT_PRIMARY_PLAYER=你的游戏名
-MINEINTENT_AGENT_SERVICE_TOKEN=独立生成的本地令牌，至少32字符
 MINEINTENT_MODEL_BASE_URL=https://服务商地址/v1
-MINEINTENT_MODEL_API_KEY=只放在本地的模型密钥
+MINEINTENT_MODEL_API_KEY=只放在本地的密钥
 MINEINTENT_MODEL=模型名
 ```
 
-不要提交 `.env`、密钥、认证目录、玩家私人聊天或世界存档。
+不要提交 `.env`、认证目录、私人聊天、世界存档或运行日志。
 
-## 启动
+## 启动与停止
 
-先启动模型服务：
+先启动决策服务：
 
 ```powershell
 python agent-service/server.py
 ```
 
-再在另一个终端启动 MineIntent：
+再打开另一个终端启动 MineIntent：
 
 ```powershell
 pnpm start
 ```
 
-主要玩家发给同伴的聊天会按顺序进入模型。可以从简单的观察与短移动开始：
+同伴连接服务器后会进行一次启动决策，之后处理配置的主要玩家发送的聊天。当前原型可以尝试跟随玩家、收集附近木材、等待，以及返回共同活动开始的位置；动作是否成功以游戏状态验证为准。
 
-```text
-Bot，看看那只羊
-Bot，往前走一点
-Bot，停下
-```
-
-“停下”只是普通文本：runtime 不识别控制关键词、不直接释放移动键，也不发送固定确认。它会在当前轮次之后原样交给模型；模型可以照做、拒绝、延后，或先处理它从当前观察判断出的危险。断线、死亡/重生、换世界/维度、应用停止和请求超时仍会硬取消已经失效的执行。
-
-`move_input` 只是 50–1500 ms 的短原子输入，当前聊天队列会等待本轮动作和动作后观察完成。十秒移动之类的长动作不属于这个接口；未来应启动独立的后台 action job，让后续模型轮次读取 job 状态并决定是否终止。
+`Ctrl+C` 会取消模型与游戏动作、释放身体资源、停止聊天调度、断开 Minecraft 并刷新本地事件日志。
 
 ## 数据与调试
 
-默认运行数据写入 `.mineintent/`：
+默认运行数据位于 `.mineintent/`：
 
-- `events.jsonl`：运行事件与失败摘要；
-- `memories.json`：之前已存在的原型记忆。D40 会检索它，但不新写模型声称的动作经历。
+- `events.jsonl`：本地运行事件与失败摘要
+- `memories.json`：按世界保存的原型记忆
 
-本地只读调试接口：
+只读调试接口默认监听本机：
 
 ```text
 GET http://127.0.0.1:3211/health
 GET http://127.0.0.1:3211/v1/state
 ```
 
-当前事件日志不是完整 D40 trace：它不保存每轮模型可见视野和工具结果。真人实验需另外记录场景、工具调用、耗时、动作后观察、最终聊天、token 和取消结果。
+接口不提供游戏控制。模型密钥、令牌和完整私人正文不应出现在响应中，但错误日志仍可能包含供应商返回的内容，分享前必须人工检查。
 
 ## 当前限制
 
-没有后台 action job、自动导航、跳跃、挖掘、战斗、GUI 或长期自主。工具循环的轮数和总时间有上限，但真实延迟、token 成本、打断观感和语言真实性仍需重复的 Paper + 真实模型实验。
+当前能力只覆盖原型场景，没有完整生存能力树、成熟战斗、建造、跨维度计划或长期自主规划。明确的停止表达会走本地停止路径；低生命值时也有本地危险反射。两者都是当前 `main` 的实现事实，不代表最终交互设计。
