@@ -134,7 +134,7 @@ export async function visibleBlocks(
   port: PerceptionPort,
   options: VisibleBlocksOptions,
   signal?: AbortSignal,
-): Promise<{ blocks: VisibleBlock[]; truncated: boolean }> {
+): Promise<{ blocks: VisibleBlock[]; truncated: boolean; origin: Point3 }> {
   const pose = port.selfPose()
   const eye: Point3 = { x: pose.position.x, y: pose.position.y + EYE_HEIGHT, z: pose.position.z }
   const axes = viewAxes(pose.yaw, pose.pitch)
@@ -204,7 +204,11 @@ export async function visibleBlocks(
 
   signal?.throwIfAborted()
   candidates.sort((left, right) => left.distance - right.distance)
-  return { blocks: candidates.slice(0, options.limit), truncated: candidates.length > options.limit }
+  return {
+    blocks: candidates.slice(0, options.limit),
+    truncated: candidates.length > options.limit,
+    origin: selfVoxel,
+  }
 }
 
 function isVisibleCandidate(
@@ -232,6 +236,17 @@ const FACE_EPSILON = 0.01
  * the wrong predicate: on flat ground it aims half a block below the surface and hits nearer ground.
  * At most three faces point toward the eye, and trying the squarest one first keeps the common case
  * to one ray.
+ *
+ * `squareness > 0` is a strict test, and the boundary case it excludes is excluded correctly rather
+ * than conservatively. A dot product of exactly zero means the eye lies in that face's own plane, so
+ * the face is edge-on: its projected area is zero and there is nothing to see. The all-transparent
+ * comparison fixture reaches this with an eye at (0, 65.62, 0), which sits on the shared boundary of
+ * (-1,65,-1) and (0,65,-1) — every outward normal there is either negative or exactly zero, so both
+ * voxels are omitted. The centre-ray predicate counts them, which is why the two predicates differ
+ * by two voxels in that fixture; counting a face you are coplanar with is the error, not omitting it.
+ *
+ * The same geometry bites test fixtures: a wall built in the eye's own plane is edge-on and correctly
+ * invisible, so an occlusion fixture placed there passes while testing nothing.
  */
 function exposedFaceReachesEye(port: PerceptionPort, eye: Point3, voxel: Point3, budget: ScanBudget): boolean {
   const center = { x: voxel.x + 0.5, y: voxel.y + 0.5, z: voxel.z + 0.5 }

@@ -112,16 +112,12 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
       values.nearbyTrackedEntities = nearbyTrackedEntities(this.#port, MAX_ENTITY_DISTANCE, MAX_ENTITIES)
     }
     if (request.fields.includes('visibleBlocks')) {
-      const pose = this.#port.selfPose()
-      const selfVoxel = {
-        x: Math.floor(pose.position.x), y: Math.floor(pose.position.y), z: Math.floor(pose.position.z),
-      }
       const result = await visibleBlocks(this.#port, VISIBLE_BLOCKS_OPTIONS, signal)
       values.visibleBlocks = {
         blocks: result.blocks.map((block): [number, number, number, string] => [
-          block.position.x - selfVoxel.x,
-          block.position.y - selfVoxel.y,
-          block.position.z - selfVoxel.z,
+          block.position.x - result.origin.x,
+          block.position.y - result.origin.y,
+          block.position.z - result.origin.z,
           block.name,
         ]),
         truncated: result.truncated,
