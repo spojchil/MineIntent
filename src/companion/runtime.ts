@@ -11,6 +11,7 @@ import {
   ViewportInformationProvider,
   ViewportMirror,
   VIEWPORT_SCAN,
+  EYE_HEIGHT,
   lookDirection,
   type PassiveObservations,
   type TrustedInformationCaller,
@@ -149,7 +150,7 @@ export class CompanionRuntime {
     // One port for both the provider and the mirror: judging a remembered voxel has to read the
     // world exactly the way the scan that recorded it did.
     this.#perception = new BackendPerceptionPort(this.#backend)
-    this.#informationRuntime = buildInformationRuntime(this.#backend, this.#soundHistory, this.#perception)
+    this.#informationRuntime = buildInformationRuntime(this.#backend, this.#soundHistory, this.#perception, this.#mirror)
   }
 
   async start(): Promise<void> {
@@ -535,13 +536,19 @@ export class CompanionRuntime {
    * entity moves continuously and has an identity, so diffing one by position would render "the
    * sheep took a step" as a sheep vanishing and a different sheep appearing — costing more than the
    * full list it replaced, and losing the continuity that makes it the same sheep.
+   *
+   * The comparison happens inside the scan, not here: the provider was handed the mirror, so what
+   * comes back already says which remembered voxels were proven empty. This only folds that in.
    */
   async #observeViewport(runId: string, signal: AbortSignal): Promise<Record<string, unknown>> {
     const viewport = await this.#readViewport(runId, signal)
     const blocks = viewport.visibleBlocks
-    const diff = this.#mirror.diff(this.#perception, VIEWPORT_SCAN, {
-      blocks: (blocks?.blocks ?? []).map(([name, x, y, z]) => ({ name, position: { x, y, z } })),
-      verifiedDistance: blocks?.verifiedDistance ?? VIEWPORT_SCAN.maxDistance,
+    const self = viewport.frame.self.position
+    const diff = this.#mirror.fold({
+      blocks: (blocks?.blocks ?? []).map(([name, x, y, z]) => ({ name, position: { x, y, z }, distance: 0 })),
+      vanished: (blocks?.vanished ?? []).map(([name, x, y, z]) => ({ name, position: { x, y, z } })),
+      eye: { x: self[0], y: self[1] + EYE_HEIGHT, z: self[2] },
+      reach: VIEWPORT_SCAN.maxDistance,
     })
     return {
       frame: { ...viewport.frame, legend: { ...viewport.frame.legend, blocks: BLOCK_DIFF_LEGEND } },
@@ -733,12 +740,13 @@ function buildInformationRuntime(
   backend: MinecraftBackendApi,
   soundHistory: SoundHistory,
   perception: BackendPerceptionPort,
+  remembered: ViewportMirror,
 ): InformationRuntime {
   const registry = new InformationRegistry()
   registry.register(new CurrentStatusProvider(new BackendSelfVitalsPort(backend)))
   registry.register(new InventoryProvider(new BackendInventoryPort(backend)))
   registry.register(new SoundInformationProvider(soundHistory))
-  registry.register(new ViewportInformationProvider(perception))
+  registry.register(new ViewportInformationProvider(perception, remembered))
   registry.seal('1.21.1')
   const accessPolicy = new InMemoryInformationAccessPolicy()
   accessPolicy.put({

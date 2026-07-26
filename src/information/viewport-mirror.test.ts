@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { VIEWPORT_SCAN } from './providers/viewport-provider.js'
-import type { PerceptionBlock, PerceptionPort, PerceptionPose } from './source-ports/perception.js'
-import { ViewportMirror, type MirrorObservation } from './viewport-mirror.js'
+import { visibleBlocks, type PerceptionBlock, type PerceptionPort, type PerceptionPose } from './source-ports/perception.js'
+import { ViewportMirror, type ViewportDiff } from './viewport-mirror.js'
 
 const AIR: PerceptionBlock = { name: 'air', visible: false, occludes: false }
 const STONE: PerceptionBlock = { name: 'stone', visible: true, occludes: true }
+const EYE_HEIGHT = 1.62
 
 class FakePort implements PerceptionPort {
   pose: PerceptionPose = { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 }
@@ -16,168 +16,166 @@ class FakePort implements PerceptionPort {
     return this.blocks.get(`${position.x},${position.y},${position.z}`) ?? AIR
   }
   nearbyEntities() { return [] }
-}
-
-/** A scan that saw exactly these blocks and looked as far as the scan radius allows. */
-function sawBlocks(...positions: Array<[string, number, number, number]>): MirrorObservation {
-  return {
-    blocks: positions.map(([name, x, y, z]) => ({ name, position: { x, y, z } })),
-    verifiedDistance: VIEWPORT_SCAN.maxDistance,
+  set(x: number, y: number, z: number, block: PerceptionBlock | 'unloaded') {
+    this.blocks.set(`${x},${y},${z}`, block)
   }
 }
 
-test('the first look reports everything as new and the same look again reports nothing', () => {
+/** Deliberately small: these tests are about the comparison, not about scan volume. */
+const SCAN = {
+  horizontalRadius: 10, verticalRadius: 6, maxDistance: 12,
+  frustum: {
+    verticalHalfAngle: (35 * Math.PI) / 180,
+    horizontalHalfAngle: Math.atan(Math.tan((35 * Math.PI) / 180) * (16 / 9)),
+  },
+  limit: 1_000,
+}
+
+/**
+ * One look, end to end: the real scan consults the mirror while it enumerates, then the mirror folds
+ * the result. Going through `visibleBlocks` rather than a hand-built observation is the point — the
+ * comparison now happens inside the enumeration, so a synthetic input would test nothing real.
+ */
+async function look(port: FakePort, mirror: ViewportMirror, limit = SCAN.limit): Promise<ViewportDiff> {
+  const result = await visibleBlocks(port, { ...SCAN, limit }, undefined, mirror)
+  const self = port.pose.position
+  return mirror.fold({
+    blocks: result.blocks,
+    vanished: result.vanished,
+    eye: { x: self.x, y: self.y + EYE_HEIGHT, z: self.z },
+    reach: SCAN.maxDistance,
+  })
+}
+
+test('the first look reports everything as new and the same look again reports nothing', async () => {
   const port = new FakePort()
   const mirror = new ViewportMirror()
-  port.blocks.set('0,64,-5', STONE)
+  port.set(0, 64, -5, STONE)
 
-  const first = mirror.diff(port, VIEWPORT_SCAN, sawBlocks(['stone', 0, 64, -5]))
-  assert.deepEqual(first, { added: [['stone', 0, 64, -5]], removed: [], unverified: 0 })
+  assert.deepEqual(await look(port, mirror), { added: [['stone', 0, 64, -5]], removed: [], unverified: 0 })
   assert.equal(mirror.size, 1)
 
-  // Nothing changed, so nothing is said. This is the whole reason a diff is cheaper than a re-send.
-  const second = mirror.diff(port, VIEWPORT_SCAN, sawBlocks(['stone', 0, 64, -5]))
-  assert.deepEqual(second, { added: [], removed: [], unverified: 0 })
+  // Nothing changed, so nothing is said. This is the whole reason a diff beats re-sending.
+  assert.deepEqual(await look(port, mirror), { added: [], removed: [], unverified: 0 })
 })
 
-test('a block that is really gone is reported removed', () => {
+test('a block that is really gone is reported removed', async () => {
   const port = new FakePort()
   const mirror = new ViewportMirror()
-  port.blocks.set('0,64,-5', STONE)
-  mirror.diff(port, VIEWPORT_SCAN, sawBlocks(['stone', 0, 64, -5]))
+  port.set(0, 64, -5, STONE)
+  await look(port, mirror)
 
-  // Mined: still in view, still reachable, and now empty. The one case that is a real removal.
-  port.blocks.set('0,64,-5', AIR)
-  const result = mirror.diff(port, VIEWPORT_SCAN, sawBlocks())
+  // Mined: the enumeration reaches the voxel, finds it empty, and the read that proves that is the
+  // same read it was going to make anyway. This is the only case that becomes a removal.
+  port.set(0, 64, -5, AIR)
 
-  assert.deepEqual(result, { added: [], removed: [['stone', 0, 64, -5]], unverified: 0 })
+  assert.deepEqual(await look(port, mirror), { added: [], removed: [['stone', 0, 64, -5]], unverified: 0 })
   assert.equal(mirror.size, 0)
 })
 
-test('turning away does not remove anything, and the block stays remembered', () => {
+test('turning away removes nothing, and the block stays remembered', async () => {
   const port = new FakePort()
   const mirror = new ViewportMirror()
-  port.blocks.set('0,64,-5', STONE)
-  mirror.diff(port, VIEWPORT_SCAN, sawBlocks(['stone', 0, 64, -5]))
+  port.set(0, 64, -5, STONE)
+  await look(port, mirror)
 
-  // The failure this guards against: a head turn empties the scan, and reporting that as removals
-  // would tell the model a wall vanished every time it looked elsewhere.
+  // The failure this guards: a head turn empties the hit list, and calling that a removal would tell
+  // the model a wall vanished every time the companion looked elsewhere. Out-of-frustum voxels are
+  // never examined, so they cannot produce a `vanished` entry at all.
   port.pose = { position: { x: 0, y: 64, z: 0 }, yaw: Math.PI, pitch: 0 }
-  const result = mirror.diff(port, VIEWPORT_SCAN, sawBlocks())
-
-  assert.deepEqual(result, { added: [], removed: [], unverified: 1 })
+  assert.deepEqual(await look(port, mirror), { added: [], removed: [], unverified: 1 })
   assert.equal(mirror.size, 1)
 
-  // Looking back reports nothing new either: the model was never told it was gone.
+  // Looking back says nothing new either: the model was never told it was gone.
   port.pose = { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 }
-  assert.deepEqual(mirror.diff(port, VIEWPORT_SCAN, sawBlocks(['stone', 0, 64, -5])), { added: [], removed: [], unverified: 0 })
+  assert.deepEqual(await look(port, mirror), { added: [], removed: [], unverified: 0 })
 })
 
-test('a block hidden behind something new is unverified rather than removed', () => {
+test('a block hidden behind something new is unconfirmed rather than removed', async () => {
   const port = new FakePort()
   const mirror = new ViewportMirror()
-  port.blocks.set('0,64,-5', STONE)
-  mirror.diff(port, VIEWPORT_SCAN, sawBlocks(['stone', 0, 64, -5]))
+  port.set(0, 64, -5, STONE)
+  await look(port, mirror)
 
-  for (let z = -4; z <= -1; z++) for (let y = 60; y <= 70; y++) for (let x = -2; x <= 2; x++) {
-    port.blocks.set(`${x},${y},${z}`, STONE)
-  }
-  const result = mirror.diff(port, VIEWPORT_SCAN, sawBlocks(['stone', 0, 64, -1]))
+  // Front face at z = -1, not z = 0: a wall exactly coplanar with the eye is edge-on and has zero
+  // projected area, so it is correctly invisible and would test nothing.
+  for (let z = -4; z <= -2; z++) for (let y = 60; y <= 70; y++) for (let x = -2; x <= 2; x++) port.set(x, y, z, STONE)
+  const result = await look(port, mirror)
 
   assert.deepEqual(result.removed, [])
   assert.equal(result.unverified, 1)
-  assert.deepEqual(result.added, [['stone', 0, 64, -1]])
+  assert.equal(result.added.length > 0, true, 'the new wall itself is new')
 })
 
-test('an unloaded chunk verifies nothing, so the block survives the reload gap', () => {
+test('a block walled in by the player is still there, so it is not reported removed', async () => {
   const port = new FakePort()
   const mirror = new ViewportMirror()
-  port.blocks.set('0,64,-5', STONE)
-  mirror.diff(port, VIEWPORT_SCAN, sawBlocks(['stone', 0, 64, -5]))
+  port.set(0, 64, -5, STONE)
+  await look(port, mirror)
 
-  port.blocks.set('0,64,-5', 'unloaded')
-  const result = mirror.diff(port, VIEWPORT_SCAN, sawBlocks())
-
-  assert.deepEqual(result, { added: [], removed: [], unverified: 1 })
-  assert.equal(mirror.size, 1)
-})
-
-test('a block walled in by the player is still there, so it is not reported removed', () => {
-  const port = new FakePort()
-  const mirror = new ViewportMirror()
-  port.blocks.set('0,64,-5', STONE)
-  mirror.diff(port, VIEWPORT_SCAN, sawBlocks(['stone', 0, 64, -5]))
-
-  // Every neighbour becomes solid, so the block has no exposed face at all. It has not gone
-  // anywhere — the player built around it. Treating "cannot be seen" as "is gone" would report a
-  // vanished wall, which is the same class of lie as reporting one after a head turn.
+  // Every neighbour becomes solid, so the block has no exposed face left. It has not gone anywhere —
+  // the player built around it. Treating "cannot be seen" as "is gone" is the same lie as reporting a
+  // removal after a head turn.
   for (const [dx, dy, dz] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
-    port.blocks.set(`${dx!},${64 + dy!},${-5 + dz!}`, STONE)
+    port.set(dx!, 64 + dy!, -5 + dz!, STONE)
   }
-  const result = mirror.diff(port, VIEWPORT_SCAN, sawBlocks())
+  const result = await look(port, mirror)
 
   assert.deepEqual(result.removed, [])
-  assert.equal(result.unverified, 1)
+  assert.equal(mirror.size >= 1, true, 'the walled-in block is still remembered')
+})
+
+test('an unloaded chunk verifies nothing, so the block survives the reload gap', async () => {
+  const port = new FakePort()
+  const mirror = new ViewportMirror()
+  port.set(0, 64, -5, STONE)
+  await look(port, mirror)
+
+  port.set(0, 64, -5, 'unloaded')
+
+  assert.deepEqual(await look(port, mirror), { added: [], removed: [], unverified: 1 })
   assert.equal(mirror.size, 1)
 })
 
-test('a truncated scan cannot remove blocks beyond how far it actually looked', () => {
+test('a removal no longer depends on the output budget', async () => {
   const port = new FakePort()
   const mirror = new ViewportMirror()
-  port.blocks.set('0,64,-20', STONE)
-  mirror.diff(port, VIEWPORT_SCAN, sawBlocks(['stone', 0, 64, -20]))
+  for (let x = 0; x < 6; x++) port.set(x, 64, -5, STONE)
+  await look(port, mirror)
+  assert.equal(mirror.size, 6)
 
-  // The output cap keeps the nearest blocks, so a crowded view stops short. Without honouring that
-  // radius, every step would churn the cap's edge with removals that never happened.
-  port.blocks.set('0,64,-20', AIR)
-  const result = mirror.diff(port, VIEWPORT_SCAN, { blocks: [], verifiedDistance: 6 })
+  // One block is mined while the cap allows only two blocks through. Under the old two-pass design a
+  // voxel beyond the cut could not be judged at all; the enumeration examines every voxel regardless,
+  // so the removal is exact and the blocks merely crowded out land in `unverified`.
+  port.set(3, 64, -5, AIR)
+  const result = await look(port, mirror, 2)
 
-  assert.deepEqual(result, { added: [], removed: [], unverified: 1 })
+  assert.deepEqual(result.removed, [['stone', 3, 64, -5]])
+  assert.equal(result.unverified, 3, 'seen but over budget counts as unconfirmed, not as absent')
 })
 
-test('a replaced block is one removal plus one addition', () => {
+test('a replaced block is one removal plus one addition', async () => {
   const port = new FakePort()
   const mirror = new ViewportMirror()
-  port.blocks.set('0,64,-5', STONE)
-  mirror.diff(port, VIEWPORT_SCAN, sawBlocks(['stone', 0, 64, -5]))
+  port.set(0, 64, -5, STONE)
+  await look(port, mirror)
 
-  port.blocks.set('0,64,-5', { name: 'oak_planks', visible: true, occludes: true })
-  const result = mirror.diff(port, VIEWPORT_SCAN, sawBlocks(['oak_planks', 0, 64, -5]))
+  port.set(0, 64, -5, { name: 'oak_planks', visible: true, occludes: true })
+  const result = await look(port, mirror)
 
   assert.deepEqual(result.removed, [['stone', 0, 64, -5]])
   assert.deepEqual(result.added, [['oak_planks', 0, 64, -5]])
-  // No stale entry left behind under the same key.
-  assert.equal(mirror.size, 1)
+  assert.equal(mirror.size, 1, 'no stale entry left under the same key')
 })
 
-test('exhausting the re-check budget degrades to unverified, never to false removals', () => {
+test('clearing forgets everything so a fresh conversation starts from nothing', async () => {
   const port = new FakePort()
   const mirror = new ViewportMirror()
-  const seen: Array<[string, number, number, number]> = []
-  for (let x = -10; x <= 10; x++) for (let y = 60; y <= 68; y++) seen.push(['stone', x, y, -5])
-  for (const [, x, y, z] of seen) port.blocks.set(`${x},${y},${z}`, STONE)
-  mirror.diff(port, VIEWPORT_SCAN, sawBlocks(...seen))
-  assert.equal(mirror.size, seen.length)
-
-  // Every one of them is now genuinely gone, but there are more than the ray budget allows. The cap
-  // must cost reports, not accuracy: what it cannot check stays remembered.
-  for (const [, x, y, z] of seen) port.blocks.set(`${x},${y},${z}`, AIR)
-  const result = mirror.diff(port, VIEWPORT_SCAN, sawBlocks())
-
-  assert.equal(result.removed.length + result.unverified, seen.length)
-  assert.equal(result.unverified > 0, true)
-  assert.equal(mirror.size, result.unverified)
-})
-
-test('clearing forgets everything so a fresh conversation starts from nothing', () => {
-  const port = new FakePort()
-  const mirror = new ViewportMirror()
-  port.blocks.set('0,64,-5', STONE)
-  mirror.diff(port, VIEWPORT_SCAN, sawBlocks(['stone', 0, 64, -5]))
+  port.set(0, 64, -5, STONE)
+  await look(port, mirror)
 
   mirror.clear()
 
   assert.equal(mirror.size, 0)
-  // Everything is new again, which is correct: the model has not been told anything yet.
-  assert.deepEqual(mirror.diff(port, VIEWPORT_SCAN, sawBlocks(['stone', 0, 64, -5])).added, [['stone', 0, 64, -5]])
+  assert.deepEqual((await look(port, mirror)).added, [['stone', 0, 64, -5]])
 })

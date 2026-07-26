@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import type { InformationProvider, InformationProviderContext, InformationProviderDefinition, ProviderAvailability, ProviderReadRequest, ProviderReadResult } from '../contracts/index.js'
-import { raycastLookedAtBlock, standingOnBlock, visibleBlocks, visibleEntities, type PerceptionPort } from '../source-ports/perception.js'
+import { raycastLookedAtBlock, standingOnBlock, visibleBlocks, visibleEntities, type PerceptionPort, type RememberedBlocks } from '../source-ports/perception.js'
 import type { Point3 } from '../geometry.js'
 
 type WorldPosition = [number, number, number]
@@ -28,11 +28,18 @@ export interface ViewportValues {
   /** Compact [entity_name_or_player, x, y, z] tuples, nearest first. */
   visibleEntities: EntityTuple[]
   /**
-   * Compact [block_name, x, y, z] tuples, nearest first. `verifiedDistance` is how far this scan can
-   * be trusted: with a truncated result it is the last kept block's distance, and beyond it the scan
-   * looked at nothing, so an absence there proves nothing.
+   * Compact [block_name, x, y, z] tuples, nearest first.
+   *
+   * `vanished` is the other half of one pass over the world: voxels this scan proved empty that the
+   * caller's memory claimed were occupied. It is produced during the same enumeration, so it costs no
+   * extra reads, and it is not subject to `truncated` — the cap decides what is reported, not what
+   * was examined.
    */
-  visibleBlocks: { blocks: Array<[string, number, number, number]>; truncated: boolean; verifiedDistance: number }
+  visibleBlocks: {
+    blocks: Array<[string, number, number, number]>
+    truncated: boolean
+    vanished: Array<[string, number, number, number]>
+  }
 }
 
 const worldPositionSchema = z.tuple([z.number(), z.number(), z.number()])
@@ -47,9 +54,9 @@ const frameSchema = z.strictObject({
 })
 const blockSchema = z.object({ name: z.string().min(1), position: worldPositionSchema }).nullable()
 const visibleEntitiesSchema = z.array(z.tuple([z.string().min(1), z.number(), z.number(), z.number()]))
+const blockTupleSchema = z.tuple([z.string().min(1), z.number(), z.number(), z.number()])
 const visibleBlocksSchema = z.object({
-  blocks: z.array(z.tuple([z.string().min(1), z.number(), z.number(), z.number()])), truncated: z.boolean(),
-  verifiedDistance: z.number(),
+  blocks: z.array(blockTupleSchema), truncated: z.boolean(), vanished: z.array(blockTupleSchema),
 })
 
 const LEGEND: ViewportValues['frame']['legend'] = {
@@ -90,7 +97,12 @@ export const VIEWPORT_SCAN = {
 export class ViewportInformationProvider implements InformationProvider<ViewportValues> {
   #revision = 0
   #lastSignature = ''
-  constructor(private readonly port: PerceptionPort) {}
+  /**
+   * `remembered` is consulted during the scan rather than after it. Judging whether a remembered
+   * block is gone needs exactly the reads the scan already performs, so doing it afterwards means
+   * doing them twice.
+   */
+  constructor(private readonly port: PerceptionPort, private readonly remembered?: RememberedBlocks) {}
 
   readonly definition: InformationProviderDefinition<ViewportValues> = {
     id: 'viewport_information',
@@ -147,7 +159,7 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
       })
     }
     if (request.fields.includes('visibleBlocks')) {
-      const result = await visibleBlocks(this.port, VIEWPORT_SCAN, signal)
+      const result = await visibleBlocks(this.port, VIEWPORT_SCAN, signal, this.remembered)
       values.visibleBlocks = {
         // Block coordinates are exact integers, which is what makes an incremental read possible:
         // the same block keeps the same key no matter where the companion stands.
@@ -156,7 +168,10 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
           return [block.name, x, y, z]
         }),
         truncated: result.truncated,
-        verifiedDistance: round(result.verifiedDistance, 2),
+        vanished: result.vanished.map(block => {
+          const [x, y, z] = voxel(block.position)
+          return [block.name, x, y, z] as [string, number, number, number]
+        }),
       }
     }
     return {

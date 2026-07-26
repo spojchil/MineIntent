@@ -73,7 +73,8 @@ export interface VisibleBlocksOptions {
   predicate?: VisibilityPredicate
 }
 
-const EYE_HEIGHT = 1.62
+/** Vanilla's eye offset above the feet. Exported so callers cannot keep a second copy that drifts. */
+export const EYE_HEIGHT = 1.62
 const STEP = 0.25
 /**
  * Work units between yields. Exported because it is the unit of cancellation latency: after a
@@ -147,62 +148,44 @@ export function raycastLookedAtBlock(port: PerceptionPort, maxDistance: number):
 }
 
 /**
- * Why a remembered voxel did not appear in a scan. Only `absent` means the block is actually gone.
- * `occluded` covers both "something is in front of it" and "it has been walled in" — a buried block
- * is still there, so it must not be reported as a removal. `present` means it is there and visible
- * and the scan simply did not list it, which is a disagreement to stay quiet about.
+ * Read-only view of what the caller has already been told, consulted while the scan runs.
+ *
+ * The scan visits every voxel in the candidate box anyway, and at each one it already knows whether
+ * the voxel is in view, what occupies it and whether it is visible. Asking about memory *there* costs
+ * nothing. Asking afterwards — which is what this replaced — means re-deriving all of it per
+ * remembered voxel: a second frustum test, a second `blockAt`, often a second ray, plus a cap on how
+ * many of those re-checks are affordable.
  */
-export type VoxelVerdict = 'absent' | 'present' | 'out_of_view' | 'occluded' | 'unloaded'
+export interface RememberedBlocks {
+  recall(voxel: Point3): string | undefined
+}
 
-/**
- * Judges a single remembered voxel against the current stance.
- *
- * This is what keeps an incremental read honest. A block missing from a scan has at least five
- * possible explanations, and only one of them means it is gone: turning the head puts it outside
- * the frustum, walking can put a wall in front of it, distance and the output cap can push it past
- * what the scan verified, and an unloaded chunk verifies nothing at all. Reporting every absence as
- * a removal would tell the model a wall vanished every time the companion looked away.
- *
- * The frustum and distance tests are pure arithmetic, so the common case — a head turn — is settled
- * without touching the world. Only a voxel that is genuinely in view yet missing costs a ray.
- */
-export function classifyVoxel(
-  port: PerceptionPort,
-  options: VisibleBlocksOptions & { verifiedDistance: number },
-  voxel: Point3,
-  budget?: ScanBudget,
-): VoxelVerdict {
-  const pose = port.selfPose()
-  const eye = { x: pose.position.x, y: pose.position.y + EYE_HEIGHT, z: pose.position.z }
-  const axes = viewAxes(pose.yaw, pose.pitch)
-  const center = { x: voxel.x + 0.5, y: voxel.y + 0.5, z: voxel.z + 0.5 }
-  const delta = subtract(center, eye)
-  const distance = length(delta)
-  // `verifiedDistance` is how far this scan actually looked: with a truncated result that is the
-  // last kept block's distance, not maxDistance. Without it, every step would churn the cap's edge.
-  if (distance > Math.min(options.maxDistance, options.verifiedDistance)) return 'out_of_view'
-  if (distance > 0 && !insideFrustum(axes, delta, options.frustum)) return 'out_of_view'
-  const block = port.blockAt(voxel)
-  if (block === 'unloaded') return 'unloaded'
-  // The only removal there is: nothing occupies the voxel any more.
-  if (!block.visible) return 'absent'
-  // Still there, just not seen this time — walled in, or something moved in front of it. Both mean
-  // "not verified empty", and both must stay quiet. Reporting a buried block as gone would tell the
-  // model a wall vanished when the player merely built around it.
-  if (!isVisibleCandidate(port, eye, voxel, distance, options.predicate, budget)) return 'occluded'
-  return 'present'
+export interface VisibleBlocksResult {
+  /** Capped at `options.limit`, nearest first. */
+  blocks: VisibleBlock[]
+  truncated: boolean
+  /**
+   * Voxels this scan proved empty that `remembered` claimed were occupied — the only honest removals.
+   *
+   * Not subject to `limit`: the cap decides what is *reported*, not what was examined. Every voxel
+   * inside the frustum gets a verdict either way, which is why an incremental read no longer needs a
+   * "how far did this scan verify" radius, and why a removal is exact rather than budget-dependent.
+   */
+  vanished: Array<{ name: string; position: Point3 }>
 }
 
 export async function visibleBlocks(
   port: PerceptionPort,
   options: VisibleBlocksOptions,
   signal?: AbortSignal,
-): Promise<{ blocks: VisibleBlock[]; truncated: boolean; verifiedDistance: number }> {
+  remembered?: RememberedBlocks,
+): Promise<VisibleBlocksResult> {
   const pose = port.selfPose()
   const eye = { x: pose.position.x, y: pose.position.y + EYE_HEIGHT, z: pose.position.z }
   const axes = viewAxes(pose.yaw, pose.pitch)
   const selfVoxel = { x: Math.floor(pose.position.x), y: Math.floor(pose.position.y), z: Math.floor(pose.position.z) }
   const candidates: VisibleBlock[] = []
+  const vanished: VisibleBlocksResult['vanished'] = []
   const budget: ScanBudget = { work: 0 }
   signal?.throwIfAborted()
 
@@ -218,7 +201,14 @@ export async function visibleBlocks(
         if (distance > options.maxDistance) continue
         if (distance > 0 && !insideFrustum(axes, delta, options.frustum)) continue
         const block = port.blockAt(voxel)
-        if (block === 'unloaded' || !block.visible) continue
+        if (block === 'unloaded') continue
+        if (!block.visible) {
+          // Examined and empty. If the caller remembered something here, this is the single case that
+          // justifies saying it is gone — and the read that proves it has already happened.
+          const forgotten = remembered?.recall(voxel)
+          if (forgotten !== undefined) vanished.push({ name: forgotten, position: voxel })
+          continue
+        }
         if (!isVisibleCandidate(port, eye, voxel, distance, options.predicate, budget)) continue
         candidates.push({ name: block.name, position: voxel, distance })
       }
@@ -226,15 +216,14 @@ export async function visibleBlocks(
   }
   signal?.throwIfAborted()
   candidates.sort((left, right) => left.distance - right.distance)
-  const blocks = candidates.slice(0, options.limit)
-  // How far the scan can be trusted. Nearest-first means a truncated result is "everything out to
-  // this radius" rather than an arbitrary sample, which is the only reason a cap can be diffed at
-  // all: a voxel beyond it was never examined, so its absence says nothing.
-  const truncated = candidates.length > options.limit
-  const verifiedDistance = truncated && blocks.length > 0
-    ? blocks[blocks.length - 1]!.distance
-    : options.maxDistance
-  return { blocks, truncated, verifiedDistance }
+  // Nearest-first, so a truncated result is "everything out to some radius" rather than an arbitrary
+  // sample. The cap bounds only what is reported: `vanished` above already covers every voxel the
+  // enumeration examined, so a removal never depends on how much output there was room for.
+  return {
+    blocks: candidates.slice(0, options.limit),
+    truncated: candidates.length > options.limit,
+    vanished,
+  }
 }
 
 /**
