@@ -45,12 +45,29 @@ export interface ViewFrustum {
   horizontalHalfAngle: number
 }
 
+/**
+ * Which test decides that a candidate block is actually visible.
+ *
+ * `block_centre` casts one ray at the block's centre and accepts only if that ray reaches it. It is
+ * the original test and it is wrong in a way that is easy to miss: **a block's centre is not the
+ * surface a player sees.** A distant ground block's centre sits below the surface, so the ray enters
+ * nearer ground first and the block is judged occluded — looking level across flat ground therefore
+ * reports no ground at all.
+ *
+ * `exposed_face` asks the question a player's eye actually answers: is any face of this block both
+ * uncovered and reachable. Only faces the eye is on the outer side of can qualify, which is at most
+ * three, so it also reads fewer neighbours than the separate exposure check the centre test needs.
+ */
+export type VisibilityPredicate = 'block_centre' | 'exposed_face'
+
 export interface VisibleBlocksOptions {
   horizontalRadius: number
   verticalRadius: number
   maxDistance: number
   frustum: ViewFrustum
   limit: number
+  /** Defaults to `block_centre` so existing callers keep their current behaviour. */
+  predicate?: VisibilityPredicate
 }
 
 const EYE_HEIGHT = 1.62
@@ -127,9 +144,10 @@ export function raycastLookedAtBlock(port: PerceptionPort, maxDistance: number):
 }
 
 /**
- * Why a remembered voxel did not appear in a scan. Only `absent` means the block is actually gone;
- * `present` means it is still there and the scan simply did not list it, which is a disagreement to
- * stay quiet about rather than report as a removal.
+ * Why a remembered voxel did not appear in a scan. Only `absent` means the block is actually gone.
+ * `occluded` covers both "something is in front of it" and "it has been walled in" — a buried block
+ * is still there, so it must not be reported as a removal. `present` means it is there and visible
+ * and the scan simply did not list it, which is a disagreement to stay quiet about.
  */
 export type VoxelVerdict = 'absent' | 'present' | 'out_of_view' | 'occluded' | 'unloaded'
 
@@ -163,8 +181,12 @@ export function classifyVoxel(
   if (distance > 0 && !insideFrustum(axes, delta, options.frustum)) return 'out_of_view'
   const block = port.blockAt(voxel)
   if (block === 'unloaded') return 'unloaded'
-  if (!lineReachesVoxel(port, eye, voxel, distance, budget)) return 'occluded'
-  if (!block.visible || !hasExposedFace(port, voxel, budget)) return 'absent'
+  // The only removal there is: nothing occupies the voxel any more.
+  if (!block.visible) return 'absent'
+  // Still there, just not seen this time — walled in, or something moved in front of it. Both mean
+  // "not verified empty", and both must stay quiet. Reporting a buried block as gone would tell the
+  // model a wall vanished when the player merely built around it.
+  if (!isVisibleCandidate(port, eye, voxel, distance, options.predicate, budget)) return 'occluded'
   return 'present'
 }
 
@@ -193,8 +215,8 @@ export async function visibleBlocks(
         if (distance > options.maxDistance) continue
         if (distance > 0 && !insideFrustum(axes, delta, options.frustum)) continue
         const block = port.blockAt(voxel)
-        if (block === 'unloaded' || !block.visible || !hasExposedFace(port, voxel, budget)) continue
-        if (!lineReachesVoxel(port, eye, voxel, distance, budget)) continue
+        if (block === 'unloaded' || !block.visible) continue
+        if (!isVisibleCandidate(port, eye, voxel, distance, options.predicate, budget)) continue
         candidates.push({ name: block.name, position: voxel, distance })
       }
     }
@@ -363,6 +385,69 @@ function firstHit(
     if (block[property]) return { voxel, name: block.name }
   }
   return null
+}
+
+/** Dispatches the two candidate-based predicates. Both see the same candidate, so they are comparable. */
+function isVisibleCandidate(
+  port: PerceptionPort,
+  eye: Point3,
+  voxel: Point3,
+  distance: number,
+  predicate: VisibilityPredicate | undefined,
+  budget?: ScanBudget,
+): boolean {
+  if (predicate === 'exposed_face') return exposedFaceReachesEye(port, eye, voxel, budget)
+  return hasExposedFace(port, voxel, budget) && lineReachesVoxel(port, eye, voxel, distance, budget)
+}
+
+const FACE_NORMALS: readonly Point3[] = [
+  { x: 1, y: 0, z: 0 }, { x: -1, y: 0, z: 0 },
+  { x: 0, y: 1, z: 0 }, { x: 0, y: -1, z: 0 },
+  { x: 0, y: 0, z: 1 }, { x: 0, y: 0, z: -1 },
+]
+/** Nudges the aim past the face plane so the target sits in the neighbouring air, not on the boundary. */
+const FACE_EPSILON = 0.01
+
+/**
+ * Is any face of this block both uncovered and reachable from the eye?
+ *
+ * This replaces "can a ray reach the block's centre", which asks about a point buried inside the
+ * block rather than about anything a player can see. Aiming at a face centre instead means the
+ * segment terminates on the surface, so it never has to penetrate half a block of solid material to
+ * count as a hit.
+ *
+ * Only faces the eye is on the outer side of are considered — at most three of six — and they are
+ * tried squarest-first, because the face a viewer is most nearly perpendicular to is the one most
+ * likely unobstructed. Flat ground seen from above therefore succeeds on its first cast, where the
+ * centre test spends a full-length ray and then fails.
+ *
+ * Known approximation: `lineIsClear` stops one step short of the target, so an occluder inside that
+ * final step is not seen. The voxel holding the target has already been confirmed non-occluding,
+ * which covers the ordinary case but not a partially-filled neighbour.
+ */
+function exposedFaceReachesEye(port: PerceptionPort, eye: Point3, voxel: Point3, budget?: ScanBudget): boolean {
+  const centre = { x: voxel.x + 0.5, y: voxel.y + 0.5, z: voxel.z + 0.5 }
+  const candidates: Array<{ target: Point3; squareness: number }> = []
+  for (const normal of FACE_NORMALS) {
+    const face = { x: centre.x + normal.x / 2, y: centre.y + normal.y / 2, z: centre.z + normal.z / 2 }
+    const toEye = subtract(eye, face)
+    const reach = length(toEye)
+    // The eye is on the face itself: nothing can be between them.
+    if (reach === 0) return true
+    const squareness = dot(normal, toEye) / reach
+    if (squareness <= 0) continue
+    if (budget) budget.work++
+    const neighbour = port.blockAt({ x: voxel.x + normal.x, y: voxel.y + normal.y, z: voxel.z + normal.z })
+    if (neighbour === 'unloaded' || neighbour.occludes) continue
+    candidates.push({
+      target: {
+        x: face.x + normal.x * FACE_EPSILON, y: face.y + normal.y * FACE_EPSILON, z: face.z + normal.z * FACE_EPSILON,
+      },
+      squareness,
+    })
+  }
+  candidates.sort((left, right) => right.squareness - left.squareness)
+  return candidates.some(candidate => lineIsClear(port, eye, candidate.target, budget))
 }
 
 function hasExposedFace(port: PerceptionPort, voxel: Point3, budget?: ScanBudget): boolean {

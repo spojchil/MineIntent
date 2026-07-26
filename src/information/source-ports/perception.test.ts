@@ -172,3 +172,63 @@ test('a scan aborted during a yield stops at that yield, not the next one', asyn
       + ` the abort landed in, within one ${YIELD_EVERY_WORK_UNITS}-unit quantum`,
   )
 })
+
+/**
+ * The 开阔平地 fixture from the scan experiment: `y <= 63` is a solid opaque half-space and the
+ * player stands at `y = 64`. Only the `y = 63` layer has an exposed face (upward), which makes the
+ * correct answer computable in closed form rather than borrowed from another implementation.
+ */
+function flatGround(pitch: number): FakePort {
+  const blocks = new Map<string, PerceptionBlock | 'unloaded'>()
+  for (let x = -40; x <= 40; x++) for (let z = -40; z <= 40; z++) for (let y = 44; y <= 63; y++) {
+    blocks.set(`${x},${y},${z}`, opaque('grass_block'))
+  }
+  return new FakePort({ position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch }, blocks)
+}
+
+const SCAN = {
+  horizontalRadius: 32, verticalRadius: 20, maxDistance: 32,
+  // 70° vertical FOV at 16:9, matching the viewport provider.
+  frustum: { verticalHalfAngle: (35 * Math.PI) / 180, horizontalHalfAngle: Math.atan(Math.tan((35 * Math.PI) / 180) * (16 / 9)) },
+  limit: 100_000,
+}
+
+test('the block-centre predicate reports no ground at all when looking level across flat ground', async () => {
+  // The defect stated plainly: a ray aimed at a distant ground block's *centre* enters nearer ground
+  // first, because the centre sits half a block below the surface a player actually sees.
+  const level = await visibleBlocks(flatGround(0), SCAN)
+  assert.equal(level.blocks.length, 0)
+
+  // It is not that nothing is visible — the same world with the same predicate finds ground once the
+  // gaze tilts down far enough that the rays stop grazing. So the predicate is pose-dependent in a
+  // way the world is not, which is exactly what makes an incremental read hard to trust.
+  const down = await visibleBlocks(flatGround(-1.2), SCAN)
+  assert.equal(down.blocks.length > 0, true)
+})
+
+test('the exposed-face predicate finds the ground, and only ground that is really in view', async () => {
+  const port = flatGround(0)
+  const result = await visibleBlocks(port, { ...SCAN, predicate: 'exposed_face' })
+
+  assert.equal(result.blocks.length > 200, true, `expected hundreds of surfaces, got ${result.blocks.length}`)
+
+  // Oracle written independently of the implementation: the eye sits 1.62 above the top-face plane,
+  // every top face is reachable because a ray descending to y=64 never dips below it, so a face is
+  // visible exactly when it is inside the frustum and within range.
+  //
+  // Bounds are checked against the face with a block of slack on purpose. Culling runs against the
+  // voxel *centre*, half a block lower, so the two disagree slightly at the frustum edge — see
+  // scripts/visibility-predicate-comparison.ts, where matching the reference points takes recall
+  // from an apparent 98.7% to an exact 100%.
+  const eye = { x: 0, y: 64 + 1.62, z: 0 }
+  for (const block of result.blocks) {
+    assert.equal(block.position.y, 63, 'only the surface layer has an exposed face')
+    const face = { x: block.position.x + 0.5, y: 64, z: block.position.z + 0.5 }
+    const delta = { x: face.x - eye.x, y: face.y - eye.y, z: face.z - eye.z }
+    const depth = -delta.z // yaw 0 looks along -Z, pitch 0 keeps the axis level
+    assert.equal(depth > 0, true, 'nothing behind the camera')
+    assert.equal(Math.hypot(delta.x, delta.y, delta.z) <= SCAN.maxDistance + 1, true, 'within range')
+    assert.equal(Math.abs(delta.x) <= depth * Math.tan(SCAN.frustum.horizontalHalfAngle) + 1e-9, true, 'inside horizontal FOV')
+    assert.equal(Math.abs(delta.y) <= depth * Math.tan(SCAN.frustum.verticalHalfAngle) + 1e-9, true, 'inside vertical FOV')
+  }
+})

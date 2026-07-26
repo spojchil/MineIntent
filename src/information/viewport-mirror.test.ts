@@ -102,6 +102,25 @@ test('an unloaded chunk verifies nothing, so the block survives the reload gap',
   assert.equal(mirror.size, 1)
 })
 
+test('a block walled in by the player is still there, so it is not reported removed', () => {
+  const port = new FakePort()
+  const mirror = new ViewportMirror()
+  port.blocks.set('0,64,-5', STONE)
+  mirror.diff(port, VIEWPORT_SCAN, sawBlocks(['stone', 0, 64, -5]))
+
+  // Every neighbour becomes solid, so the block has no exposed face at all. It has not gone
+  // anywhere — the player built around it. Treating "cannot be seen" as "is gone" would report a
+  // vanished wall, which is the same class of lie as reporting one after a head turn.
+  for (const [dx, dy, dz] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
+    port.blocks.set(`${dx!},${64 + dy!},${-5 + dz!}`, STONE)
+  }
+  const result = mirror.diff(port, VIEWPORT_SCAN, sawBlocks())
+
+  assert.deepEqual(result.removed, [])
+  assert.equal(result.unverified, 1)
+  assert.equal(mirror.size, 1)
+})
+
 test('a truncated scan cannot remove blocks beyond how far it actually looked', () => {
   const port = new FakePort()
   const mirror = new ViewportMirror()
