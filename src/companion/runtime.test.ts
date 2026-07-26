@@ -306,10 +306,13 @@ test('startup is local; player chat runs the two-tool closed loop with measured 
   assert.deepEqual(opening.self, { position: [0, 64, 0], yawDegrees: 0, pitchDegrees: 0 })
   assert.doesNotMatch(JSON.stringify(opening), /visibleBlocks|visibleEntities/u)
   assert.equal(model.calls[0]!.context.stable.profile.content.length > 0, true)
-  const first = results[0] as { viewport: { visibleEntities: Array<[string, number, number, number]> } }
-  // World-absolute: the tuple names where the sheep is, not where it is relative to the body, so
+  const first = results[0] as {
+    viewport: { visibleEntities: { items: Array<Record<string, unknown>>; truncated: boolean } }
+  }
+  // World-absolute: the entry names where the sheep is, not where it is relative to the body, so
   // the same sheep keeps one identity across the turn and the step that follow.
-  assert.deepEqual(first.viewport.visibleEntities[0], ['sheep', 5, 64, 0])
+  assert.deepEqual(first.viewport.visibleEntities.items[0], { type: 'sheep', position: [5, 64, 0] })
+  assert.equal(first.viewport.visibleEntities.truncated, false)
   const lookEffect = (results[0] as { effect: { relativeTurnDegrees: { yaw: number; pitch: number }; turned: boolean } }).effect
   assert.ok(Math.abs(lookEffect.relativeTurnDegrees.yaw - 90) < 1e-9)
   assert.equal(lookEffect.relativeTurnDegrees.pitch, 0)

@@ -4,7 +4,26 @@ import { raycastLookedAtBlock, standingOnBlock, visibleBlocks, visibleEntities, 
 import type { Point3 } from '../geometry.js'
 
 type WorldPosition = [number, number, number]
-type EntityTuple = [string, number, number, number]
+
+/**
+ * Three facts kept apart instead of collapsed into one label.
+ *
+ * The previous single string was `username ?? name ?? type`, which made a player called `sheep`
+ * indistinguishable from a sheep — and that is not a cosmetic collision, since one of them is
+ * someone to talk to. Keeping `player` as its own optional field means its presence *is* the
+ * answer to "is this a person", with no sentinel value to misread.
+ *
+ * None of this widens what the companion may know. A vanilla player reads a species off the model
+ * and a name off the nameplate above it; the entity's handles — `entityKey`, `uuid`, the protocol
+ * id — stay behind the port, as they do everywhere else.
+ */
+interface VisibleEntityView {
+  /** Vanilla entity type: `sheep`, `creeper`, `item`. Players are `player`. */
+  type: string
+  /** A player's name, present only for players — so having it also says this is one. */
+  player?: string
+  position: WorldPosition
+}
 
 /**
  * Absolute world coordinates, not body-relative ones.
@@ -25,8 +44,8 @@ export interface ViewportValues {
   }
   standingOnBlock: { name: string; position: WorldPosition } | null
   lookedAtBlock: { name: string; position: WorldPosition } | null
-  /** Compact [entity_name_or_player, x, y, z] tuples, nearest first. */
-  visibleEntities: EntityTuple[]
+  /** Nearest first, and bounded: `truncated` says whether farther entities were left out. */
+  visibleEntities: { items: VisibleEntityView[]; truncated: boolean }
   /** Compact [block_name, x, y, z] tuples, nearest first. */
   visibleBlocks: { blocks: Array<[string, number, number, number]>; truncated: boolean }
 }
@@ -42,7 +61,14 @@ const frameSchema = z.strictObject({
   legend: z.strictObject({ visibleEntities: z.string().min(1), visibleBlocks: z.string().min(1) }),
 })
 const blockSchema = z.object({ name: z.string().min(1), position: worldPositionSchema }).nullable()
-const visibleEntitiesSchema = z.array(z.tuple([z.string().min(1), z.number(), z.number(), z.number()]))
+const visibleEntitiesSchema = z.object({
+  items: z.array(z.strictObject({
+    type: z.string().min(1),
+    player: z.string().min(1).optional(),
+    position: worldPositionSchema,
+  })),
+  truncated: z.boolean(),
+})
 const visibleBlocksSchema = z.object({
   blocks: z.array(z.tuple([z.string().min(1), z.number(), z.number(), z.number()])), truncated: z.boolean(),
 })
@@ -50,11 +76,16 @@ const visibleBlocksSchema = z.object({
 const LEGEND: ViewportValues['frame']['legend'] = {
   // Legends ride with the data instead of living in the agent prompt, so a schema change here
   // cannot silently outdate a description written in another language and process.
-  visibleEntities: '[entity_name_or_player, x, y, z]，Minecraft 世界绝对坐标，按距离从近到远',
+  visibleEntities: 'items 每项为 {type, player?, position}：type 是原版实体类型（玩家为 player），'
+    + 'player 只有玩家才有，position 是 Minecraft 世界绝对坐标。按距离从近到远，'
+    + 'truncated 为真表示更远处还有实体没列出',
   // Nearest-first is part of the contract, not an implementation detail: the cap keeps the closest
   // blocks, so a truncated read is "everything out to some radius" rather than an arbitrary sample.
   visibleBlocks: '[block_name, x, y, z]，同一坐标系的整数体素，按距离从近到远，可能截断',
 }
+
+/** How many entities a read reports. Named because `truncated` is only meaningful against it. */
+const ENTITY_LIMIT = 8
 
 /**
  * Vanilla's default FOV slider is 70°, and that slider is the *vertical* field of view. The
@@ -78,13 +109,13 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
   readonly definition: InformationProviderDefinition<ViewportValues> = {
     id: 'viewport_information',
     description: '粗略第一人称视野；所有位置都使用 Minecraft 世界绝对坐标，方块为整数体素',
-    schemaRevision: 'viewport-information:8',
+    schemaRevision: 'viewport-information:9',
     audiences: ['companion'] as const,
     fields: {
       frame: { description: '本次观察的姿态与坐标系图例', valueSchema: frameSchema, valueType: 'object', precision: 'exactly_displayed', sourceKinds: ['viewport_projection'] },
       standingOnBlock: { description: '脚下可见方块及其绝对体素坐标', valueSchema: blockSchema, valueType: 'object', precision: 'inferred', sourceKinds: ['viewport_projection'] },
       lookedAtBlock: { description: '准星射线首先命中的可见方块及其绝对体素坐标', valueSchema: blockSchema, valueType: 'object', precision: 'inferred', sourceKinds: ['viewport_projection'] },
-      visibleEntities: { description: '可见实体；每项为[实体名或玩家名,x,y,z]，按距离从近到远', valueSchema: visibleEntitiesSchema, valueType: 'array', precision: 'inferred', sourceKinds: ['viewport_projection'] },
+      visibleEntities: { description: '可见实体；items 每项为{type,player?,position}，按距离从近到远，truncated 表示更远处还有未列出的', valueSchema: visibleEntitiesSchema, valueType: 'object', precision: 'inferred', sourceKinds: ['viewport_projection'] },
       visibleBlocks: { description: '可见方块；每项为[名称,x,y,z]整数体素，按距离从近到远，可能截断', valueSchema: visibleBlocksSchema, valueType: 'object', precision: 'inferred', sourceKinds: ['viewport_projection'] },
     },
     scopeDependencies: ['connection', 'world'] as const,
@@ -123,11 +154,18 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
       values.lookedAtBlock = block ? { name: block.name, position: voxel(block.position) } : null
     }
     if (request.fields.includes('visibleEntities')) {
-      const entities = await visibleEntities(this.port, 32, VIEW_FRUSTUM, 8, signal)
-      values.visibleEntities = entities.map(entity => {
-        const [x, y, z] = roundPosition(entity.position)
-        return [entity.username ?? entity.name ?? entity.type, x, y, z]
-      })
+      const result = await visibleEntities(this.port, 32, VIEW_FRUSTUM, ENTITY_LIMIT, signal)
+      values.visibleEntities = {
+        items: result.entities.map(entity => ({
+          // `name` is the registry species (`sheep`), while `type` is the library's broad category
+          // (`mob`, `object`). The species is what a player would say, so it leads; the category is
+          // only a fallback for an entity the registry did not recognise.
+          type: entity.name ?? entity.type,
+          ...(entity.username === undefined ? {} : { player: entity.username }),
+          position: roundPosition(entity.position),
+        })),
+        truncated: result.truncated,
+      }
     }
     if (request.fields.includes('visibleBlocks')) {
       const result = await visibleBlocks(this.port, {

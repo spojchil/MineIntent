@@ -12,6 +12,15 @@ class FakePort implements PerceptionPort {
   nearbyEntities() { return this.entities }
 }
 const stone = (name: string): PerceptionBlock => ({ name, visible: true, occludes: true })
+/**
+ * Shaped like what the library actually hands over, not like the field names suggest: `type` is a
+ * broad category (`mob`, `object`, `player`) and `name` is the registry species. A fixture that put
+ * `sheep` in `type` would pass even if the provider read the two fields the wrong way round.
+ */
+const sheep = (position: { x: number; y: number; z: number }): PerceptionEntityCandidate =>
+  ({ type: 'mob', name: 'sheep', position, width: 0.9, height: 1.3 })
+const player = (username: string, position: { x: number; y: number; z: number }): PerceptionEntityCandidate =>
+  ({ type: 'player', name: 'player', username, position, width: 0.6, height: 1.8 })
 const context = () => ({
   now: new Date().toISOString(),
   scope: { processSessionId: 's', connectionState: 'play' as const, connectionEpoch: 1, uiRevision: 0, capturedAt: new Date().toISOString() },
@@ -28,14 +37,14 @@ test('positions are world-absolute so the same block keeps one key from any stan
   // Absolute coordinates are what make an incremental read possible at all: a body-relative tuple
   // renames every block the moment the companion moves, so nothing can be diffed against it.
   const blocks = new Map([['3,65,0', stone('stone')]])
-  const entities = [{ type: 'sheep', position: { x: 5, y: 64, z: 1 }, height: 1.3 }]
+  const entities = [sheep({ x: 5, y: 64, z: 1 })]
   const first = await new ViewportInformationProvider(new FakePort(
     { position: { x: 0, y: 64, z: 0 }, yaw: -Math.PI / 2, pitch: 0 }, blocks, entities,
   )).read(context(), { fields: ['frame', 'visibleEntities', 'visibleBlocks'], page: { limit: 1 } }, new AbortController().signal)
 
   assert.equal(first.values.frame?.coordinates, 'minecraft_world_absolute')
   assert.deepEqual(first.values.frame?.self.position, [0, 64, 0])
-  assert.deepEqual(first.values.visibleEntities?.[0], ['sheep', 5, 64, 1])
+  assert.deepEqual(first.values.visibleEntities?.items[0], { type: 'sheep', position: [5, 64, 1] })
   assert.deepEqual(first.values.visibleBlocks?.blocks[0], ['stone', 3, 65, 0])
   // The legend rides with the data, so a schema change cannot outdate a prompt written elsewhere.
   assert.match(first.values.frame?.legend.visibleBlocks ?? '', /x, y, z/u)
@@ -47,16 +56,41 @@ test('positions are world-absolute so the same block keeps one key from any stan
   assert.deepEqual(second.values.visibleBlocks?.blocks[0], ['stone', 3, 65, 0])
 })
 
-test('player tuples use the username as their compact entity label', async () => {
+test('a player named after a mob stays distinguishable from that mob', async () => {
+  // The collision that motivated splitting the label: one of these is someone to talk to. Under a
+  // single `username ?? name ?? type` string both read as `sheep`, and no amount of context tells
+  // the model which it was looking at.
   const provider = new ViewportInformationProvider(new FakePort(
     { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 },
     new Map(),
-    [{ type: 'player', username: 'Alex', position: { x: 0, y: 64, z: -3 }, width: 0.6, height: 1.8 }],
+    [player('sheep', { x: 0, y: 64, z: -3 }), sheep({ x: 1, y: 64, z: -5 })],
   ))
 
   const result = await provider.read(context(), { fields: ['visibleEntities'], page: { limit: 1 } }, new AbortController().signal)
 
-  assert.deepEqual(result.values.visibleEntities, [['Alex', 0, 64, -3]])
+  assert.deepEqual(result.values.visibleEntities, {
+    items: [
+      { type: 'player', player: 'sheep', position: [0, 64, -3] },
+      { type: 'sheep', position: [1, 64, -5] },
+    ],
+    truncated: false,
+  })
+  // `player` is absent rather than empty on a mob, so its presence alone answers "is this a person".
+  assert.equal('player' in result.values.visibleEntities!.items[1]!, false)
+})
+
+test('a read that fills the entity cap says so', async () => {
+  // Eight entries with no flag cannot be told from "there were only eight". The provider owns this
+  // limit, so the flag has to survive the provider's own mapping, not just the scan's.
+  const crowd = Array.from({ length: 9 }, (_unused, index) => sheep({ x: 0, y: 64, z: -2 - index }))
+  const provider = new ViewportInformationProvider(new FakePort(
+    { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 }, new Map(), crowd,
+  ))
+
+  const result = await provider.read(context(), { fields: ['visibleEntities'], page: { limit: 1 } }, new AbortController().signal)
+
+  assert.equal(result.values.visibleEntities?.items.length, 8)
+  assert.equal(result.values.visibleEntities?.truncated, true)
 })
 
 test('an entities-only read still honors the deadline signal', async () => {

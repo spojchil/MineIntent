@@ -79,7 +79,7 @@ test('the view frustum is rectangular, not an isotropic cone', async () => {
     { type: 'sheep', position: { x: sideways, y: eyeY - height / 2, z: -forward }, height },
     { type: 'cow', position: { x: 0, y: eyeY + raised - height / 2, z: -forward }, height },
   ]), 32, TEST_FRUSTUM, 8)
-  assert.deepEqual(result.map(entity => entity.type), ['sheep'])
+  assert.deepEqual(result.entities.map(entity => entity.type), ['sheep'])
 })
 
 test('visible entities exclude behind and occluded candidates', async () => {
@@ -89,8 +89,9 @@ test('visible entities exclude behind and occluded candidates', async () => {
     { type: 'cow', position: { x: 0, y: 64, z: 5 }, height: 1.4 },
   ]
   const result = await visibleEntities(new FakePort(pose, new Map(), entities), 32, TEST_FRUSTUM, 8)
-  assert.equal(result.length, 1)
-  assert.equal(result[0]!.type, 'sheep')
+  assert.equal(result.entities.length, 1)
+  assert.equal(result.entities[0]!.type, 'sheep')
+  assert.equal(result.truncated, false, 'a candidate the frustum rejected is not a truncated one')
 })
 
 test('an entity remains visible when its hitbox intersects the frustum but its center does not', async () => {
@@ -101,7 +102,27 @@ test('an entity remains visible when its hitbox intersects the frustum but its c
   // vertical half-FOV. Its upper hitbox is still on screen, exactly like the live D40 case.
   const result = await visibleEntities(new FakePort(pose, new Map(), [sheep]), 32, TEST_FRUSTUM, 8)
 
-  assert.deepEqual(result.map(entity => entity.type), ['sheep'])
+  assert.deepEqual(result.entities.map(entity => entity.type), ['sheep'])
+})
+
+test('the entity cap reports truncation and drops the farthest, never the nearest', async () => {
+  // Absence from a capped list means "farther than the ones listed", not "not there". The flag is
+  // what separates those, and it has to survive the same sort that decides who gets dropped.
+  const pose = { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 }
+  const herd: PerceptionEntityCandidate[] = []
+  for (let index = 0; index < 5; index++) {
+    herd.push({ type: `sheep-${index}`, position: { x: 0, y: 64, z: -2 - index }, width: 0.9, height: 1.3 })
+  }
+  // Handed to the scan farthest-first, so passing this cannot be an artefact of input order.
+  const reversed = [...herd].reverse()
+
+  const capped = await visibleEntities(new FakePort(pose, new Map(), reversed), 32, TEST_FRUSTUM, 3)
+  assert.deepEqual(capped.entities.map(entity => entity.type), ['sheep-0', 'sheep-1', 'sheep-2'])
+  assert.equal(capped.truncated, true)
+
+  const exact = await visibleEntities(new FakePort(pose, new Map(), reversed), 32, TEST_FRUSTUM, 5)
+  assert.equal(exact.entities.length, 5)
+  assert.equal(exact.truncated, false, 'a list that happens to fill the cap exactly is not truncated')
 })
 
 test('entity scanning yields to the event loop and honors cancellation', async () => {
@@ -122,7 +143,7 @@ test('entity scanning yields to the event loop and honors cancellation', async (
   let timerRan = false
   setTimeout(() => { timerRan = true }, 0)
   const result = await visibleEntities(port, 32, TEST_FRUSTUM, 8)
-  assert.deepEqual(result, [], 'the wall hides every candidate')
+  assert.deepEqual(result, { entities: [], truncated: false }, 'the wall hides every candidate')
   assert.equal(timerRan, true, 'a pending timer must get a turn while the scan is in flight')
 
   const controller = new AbortController()

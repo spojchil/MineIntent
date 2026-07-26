@@ -33,6 +33,12 @@ export interface VisibleEntity {
 export interface VisibleBlock { name: string; position: Point3; distance: number }
 
 /**
+ * Bounded like the block result, and for the same reason: a caller cannot tell "eight entities are
+ * nearby" from "the nearest eight of many" by looking at a list of eight.
+ */
+export interface VisibleEntitiesResult { entities: VisibleEntity[]; truncated: boolean }
+
+/**
  * Half-angles of vanilla's view frustum. Minecraft renders a rectangular frustum, not a cone:
  * the FOV slider is the *vertical* field of view (GameRenderer hands it to
  * Matrix4f.perspective, whose first argument is fovy), and the horizontal angle follows from
@@ -175,7 +181,7 @@ export async function visibleEntities(
   frustum: ViewFrustum,
   limit: number,
   signal?: AbortSignal,
-): Promise<VisibleEntity[]> {
+): Promise<VisibleEntitiesResult> {
   const pose = port.selfPose()
   const eye = { x: pose.position.x, y: pose.position.y + EYE_HEIGHT, z: pose.position.z }
   const axes = viewAxes(pose.yaw, pose.pitch)
@@ -216,7 +222,8 @@ export async function visibleEntities(
   }
   signal?.throwIfAborted()
   candidates.sort((left, right) => left.distance - right.distance)
-  return candidates.slice(0, limit)
+  // Nearest-first before slicing, so what the cap drops is always the farthest.
+  return { entities: candidates.slice(0, limit), truncated: candidates.length > limit }
 }
 
 /**

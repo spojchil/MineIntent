@@ -26,7 +26,7 @@ const READ_PLAN: readonly ReadPlanEntry[] = [
   // Only `frame` — which is the pose and the legend, and costs no scan at all. The scanning fields
   // are gone from the push on purpose: `visibleBlocks` alone was the largest item in the prompt by
   // an order of magnitude, and re-sending it every request is exactly what a pulled read replaces.
-  { interfaceId: 'viewport_information', schemaRevision: 'viewport-information:8', fields: ['frame'] },
+  { interfaceId: 'viewport_information', schemaRevision: 'viewport-information:9', fields: ['frame'] },
 ]
 
 /**
