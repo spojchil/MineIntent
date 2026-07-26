@@ -184,6 +184,64 @@ class ServerTests(unittest.TestCase):
         self.assertIn("completed", model_messages[1][-1]["content"])
         self.assertIn("completed", model_messages[1][-2]["content"])
 
+    def test_truncated_and_filtered_completions_fail_instead_of_closing_the_run(self):
+        # 被长度截断的 content 是半句话，被过滤的是空壳；两者都不能当正常收尾交给玩家。
+        for reason in ["length", "content_filter", "insufficient_system_resource", "unexpected_code"]:
+            sink = _Sink()
+            self.addCleanup(sink.dir.cleanup)
+            response = {"choices": [{
+                "finish_reason": reason,
+                "message": {"role": "assistant", "content": "我看到那边有一只"},
+            }]}
+            with patch.object(server, "model_completion", lambda *_a, **_k: response):
+                with self.assertRaises(RuntimeError) as caught:
+                    server.run_tool_loop(sink.config(), "run-1", context(), lambda *a: {}, tools())
+            self.assertIn(reason, str(caught.exception))
+            # 失败要可审计：转录里留下原因，而不是静默丢弃。
+            self.assertIn(reason, sink.records()[-1]["error"])
+
+    def test_reported_and_absent_finish_reasons_that_mean_a_real_ending_are_accepted(self):
+        # 三家供应商对这个字段不一致，缺省和 null 都出现过；为一个没人依赖的字段失败整轮是错的。
+        for reason in ["stop", "tool_calls", "function_call", None]:
+            self.assertIsNone(server.accept_finish_reason(reason))
+        for reason in ["length", "", 7, {"code": "length"}]:
+            self.assertIsNotNone(server.accept_finish_reason(reason))
+
+    def test_tool_calls_are_capped_per_round_and_per_run(self):
+        def one_round(count):
+            return {"choices": [{"message": {"role": "assistant", "tool_calls": [
+                {"id": f"call-{index}", "function": {"name": "say", "arguments": '{"text":"hi"}'}}
+                for index in range(count)
+            ]}}]}
+
+        sink = _Sink()
+        self.addCleanup(sink.dir.cleanup)
+        executed = []
+        over_round = one_round(server._MAX_TOOL_CALLS_PER_ROUND + 1)
+        with patch.object(server, "model_completion", lambda *_a, **_k: over_round):
+            with self.assertRaises(RuntimeError) as caught:
+                server.run_tool_loop(
+                    sink.config(), "run-1", context(),
+                    lambda *args: executed.append(args) or {"status": "completed"}, tools(),
+                )
+        self.assertIn("in one round", str(caught.exception))
+        # 超限的一轮里一个调用都不执行：身体动作是真实时间，不能先做一半再报错。
+        self.assertEqual(executed, [])
+
+        sink = _Sink()
+        self.addCleanup(sink.dir.cleanup)
+        executed = []
+        full_round = one_round(server._MAX_TOOL_CALLS_PER_ROUND)
+        with patch.object(server, "model_completion", lambda *_a, **_k: full_round):
+            with self.assertRaises(RuntimeError) as caught:
+                server.run_tool_loop(
+                    sink.config(), "run-2", context(),
+                    lambda *args: executed.append(args) or {"status": "completed"}, tools(),
+                )
+        # 每轮都合法，累计不合法：_MAX_TOOL_ROUNDS 单独拦不住这条。
+        self.assertIn("run limit", str(caught.exception))
+        self.assertEqual(len(executed), server._MAX_TOOL_CALLS_PER_RUN)
+
     def test_arguments_are_forwarded_untouched_for_the_tool_side_to_judge(self):
         sink = _Sink()
         self.addCleanup(sink.dir.cleanup)

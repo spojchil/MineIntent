@@ -59,7 +59,8 @@ const TOOLS: ReadonlyArray<{ name: string; description: string; schema: z.ZodTyp
   {
     name: 'say',
     description:
-      '在游戏聊天框对玩家说一句话，玩家立刻能看到。想说话时调用；不需要说、或想保持沉默时，'
+      '把一句话交给聊天发送队列。返回只表示已排队，不表示玩家已经看到：长句会被切成几条依次发出，'
+      + '发送有间隔，离开当前世界会取消未发出的部分。想说话时调用；不需要说、或想保持沉默时，'
       + '不调用即可。动作要花时间，行动前先简短说一句往往更自然。',
     schema: sayArgumentsSchema,
   },

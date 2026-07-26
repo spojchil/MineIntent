@@ -26,6 +26,11 @@ from prompt import stable_context, system_prompt
 _MAX_JSON_BYTES = 1_048_576
 _MAX_TOOL_RESULT_BYTES = 262_144
 _MAX_TOOL_ROUNDS = 16
+# Rounds are not the only way a run can grow: one assistant message may carry many calls, and each
+# is executed. A body input is real time in the world, so the count of executed calls needs its own
+# ceiling rather than inheriting the HTTP size limit as an accidental one.
+_MAX_TOOL_CALLS_PER_ROUND = 8
+_MAX_TOOL_CALLS_PER_RUN = 32
 _ROUND_TIMEOUT_S = 180.0
 _MAX_TOOLS = 32
 _CONTEXT_PROTOCOL = "mineintent.agent-context.v2"
@@ -40,6 +45,28 @@ _MAX_TRANSCRIPT_BYTES = 32 * 1_024 * 1_024
 # the raw generation. Seen live as verbatim internal markup on one endpoint and as invented JSON
 # fields on another; both carry a real action the transport dropped.
 _LEAK_MARKUP = re.compile(r"DSML|<\s*tool_calls|invoke\s+name=|__tool__")
+
+# The only terminations that mean "the model finished saying what it meant to say". Everything else
+# — `length`, `content_filter`, a provider's own resource codes, anything unrecognised — produced a
+# message that was cut short by something other than the model, so treating it as a normal close
+# would hand the player a half-sentence or drop a call. An allowlist rather than a denylist because
+# the failure mode of a missed code is silent, and the three providers do not agree on the set.
+_ACCEPTED_FINISH_REASONS = frozenset({"stop", "tool_calls", "function_call"})
+
+
+def accept_finish_reason(reason: object) -> str | None:
+    """Returns a failure summary when a completion did not end on its own terms, else None.
+
+    A missing or null reason is accepted: it is what a provider sends when it declines to report
+    one, and refusing those would fail runs over a field no request depends on.
+    """
+    if reason is None:
+        return None
+    if not isinstance(reason, str) or not reason:
+        return f"model completion reported an invalid finish_reason: {reason!r}"
+    if reason in _ACCEPTED_FINISH_REASONS:
+        return None
+    return f"model completion ended on finish_reason={reason}"
 
 
 def leaked_tool_call(text: str, tool_names: list[str]) -> bool:
@@ -488,6 +515,7 @@ def run_tool_loop(
     usage: dict[str, int] = {}
     closing: str | None = None
     error_summary: str | None = None
+    executed_calls = 0
     try:
         for round_id in range(_MAX_TOOL_ROUNDS):
             if run is not None:
@@ -497,13 +525,28 @@ def run_tool_loop(
             if run is not None:
                 run.ensure_active()
             choices = payload.get("choices") if isinstance(payload, dict) else None
-            message = choices[0].get("message") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
+            choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
+            message = choice.get("message") if choice is not None else None
             if not isinstance(message, dict):
                 raise RuntimeError("model response has no assistant message")
             for key, value in normalize_usage(payload.get("usage")).items():
                 usage[key] = usage.get(key, 0) + value
+            # Checked before anything in the message is acted on: a truncated or filtered completion
+            # can carry both half-written call arguments and half-written closing text.
+            rejection = accept_finish_reason(choice.get("finish_reason"))
+            if rejection is not None:
+                raise RuntimeError(rejection)
             tool_calls = message.get("tool_calls")
             if isinstance(tool_calls, list) and tool_calls:
+                if len(tool_calls) > _MAX_TOOL_CALLS_PER_ROUND:
+                    raise RuntimeError(
+                        f"model requested {len(tool_calls)} tool calls in one round, over the limit of {_MAX_TOOL_CALLS_PER_ROUND}"
+                    )
+                if executed_calls + len(tool_calls) > _MAX_TOOL_CALLS_PER_RUN:
+                    raise RuntimeError(
+                        f"model exceeded the run limit of {_MAX_TOOL_CALLS_PER_RUN} tool calls"
+                    )
+                executed_calls += len(tool_calls)
                 replay = {key: message[key] for key in ("role", "content", "reasoning_content", "tool_calls") if key in message}
                 replay.setdefault("role", "assistant")
                 messages.append(replay)

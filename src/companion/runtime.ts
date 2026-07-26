@@ -634,6 +634,12 @@ function measuredLookEffect(before: PoseSample, after: PoseSample) {
   }
 }
 
+/**
+ * Says which frame it measured in, in place. The viewport declares every position it reports as
+ * `minecraft_world_absolute`, and a model that carries that legend across to an action result would
+ * read this triple as a world offset. It is not one: it is resolved against the pre-move facing, so
+ * the same displacement means different things depending on where the companion was looking.
+ */
 function measuredMoveEffect(before: PoseSample, after: PoseSample) {
   const delta = {
     x: after.position.x - before.position.x,
@@ -649,6 +655,8 @@ function measuredMoveEffect(before: PoseSample, after: PoseSample) {
   ]
   const distance = Math.hypot(delta.x, delta.y, delta.z)
   return {
+    coordinates: 'body_relative_before_move' as const,
+    legend: 'relativeDisplacement 是 [右, 上, 前] 三个格数，相对移动前的朝向，不是世界绝对坐标',
     relativeDisplacement,
     distance: withoutNegativeZero(distance),
     movement: distance > MOVE_EFFECT_EPSILON ? 'changed' as const : 'no_effect' as const,
