@@ -71,10 +71,29 @@ export interface VisibleBlocksOptions {
    * the old test; it reports no ground at all when looking level across flat ground.
    */
   predicate?: VisibilityPredicate
+  /** Filled in when supplied. Optional because it exists to be measured, not to be depended on. */
+  metrics?: ScanMetrics
+}
+
+/**
+ * Where a scan's work went.
+ *
+ * `voxelsExamined` is the number the earlier experiment could not see: raw `blockAt` counts hide the
+ * fixed outer loop, which pays coordinate construction plus a distance and frustum test for every
+ * voxel in the candidate box whether or not the world is ever touched. Reporting it is what makes
+ * section culling verifiable instead of merely plausible.
+ */
+export interface ScanMetrics {
+  sectionsTested: number
+  sectionsSkipped: number
+  voxelsExamined: number
 }
 
 /** Vanilla's eye offset above the feet. Exported so callers cannot keep a second copy that drifts. */
 export const EYE_HEIGHT = 1.62
+/** Minecraft's own vertical division of a chunk, so a section here is a section the server has too. */
+const SECTION_SIZE = 16
+const sectionOf = (value: number): number => Math.floor(value / SECTION_SIZE)
 const STEP = 0.25
 /**
  * Work units between yields. Exported because it is the unit of cancellation latency: after a
@@ -189,12 +208,32 @@ export async function visibleBlocks(
   const budget: ScanBudget = { work: 0 }
   signal?.throwIfAborted()
 
-  for (let dx = -options.horizontalRadius; dx <= options.horizontalRadius; dx++) {
-    for (let dz = -options.horizontalRadius; dz <= options.horizontalRadius; dz++) {
-      for (let dy = -options.verticalRadius; dy <= options.verticalRadius; dy++) {
+  // Sections first. The frustum is a forward wedge, so most of a cube-shaped candidate box can never
+  // contain a visible voxel — the whole half behind the camera, plus the corners. Rejecting a section
+  // costs one box test and skips up to 4,096 voxels' worth of coordinate construction, distance and
+  // frustum arithmetic. Both section tests are conservative in the safe direction: a voxel centre
+  // inside the frustum is a point inside its section's box, so a section holding one is never culled.
+  const lowest = { x: selfVoxel.x - options.horizontalRadius, y: selfVoxel.y - options.verticalRadius, z: selfVoxel.z - options.horizontalRadius }
+  const highest = { x: selfVoxel.x + options.horizontalRadius, y: selfVoxel.y + options.verticalRadius, z: selfVoxel.z + options.horizontalRadius }
+  for (let sx = sectionOf(lowest.x); sx <= sectionOf(highest.x); sx++) {
+  for (let sz = sectionOf(lowest.z); sz <= sectionOf(highest.z); sz++) {
+  for (let sy = sectionOf(lowest.y); sy <= sectionOf(highest.y); sy++) {
+    const bounds = {
+      min: { x: sx * SECTION_SIZE, y: sy * SECTION_SIZE, z: sz * SECTION_SIZE },
+      max: { x: sx * SECTION_SIZE + SECTION_SIZE, y: sy * SECTION_SIZE + SECTION_SIZE, z: sz * SECTION_SIZE + SECTION_SIZE },
+    }
+    if (options.metrics) options.metrics.sectionsTested += 1
+    if (distanceToBox(eye, bounds) > options.maxDistance || !boxIntersectsFrustum(axes, eye, bounds, options.frustum)) {
+      if (options.metrics) options.metrics.sectionsSkipped += 1
+      continue
+    }
+    for (let x = Math.max(bounds.min.x, lowest.x); x <= Math.min(bounds.max.x - 1, highest.x); x++) {
+      for (let z = Math.max(bounds.min.z, lowest.z); z <= Math.min(bounds.max.z - 1, highest.z); z++) {
+        for (let y = Math.max(bounds.min.y, lowest.y); y <= Math.min(bounds.max.y - 1, highest.y); y++) {
         if (budget.work >= YIELD_EVERY_WORK_UNITS) await spendBudget(budget, signal)
         budget.work++
-        const voxel = { x: selfVoxel.x + dx, y: selfVoxel.y + dy, z: selfVoxel.z + dz }
+        if (options.metrics) options.metrics.voxelsExamined += 1
+        const voxel = { x, y, z }
         const center = { x: voxel.x + 0.5, y: voxel.y + 0.5, z: voxel.z + 0.5 }
         const delta = subtract(center, eye)
         const distance = length(delta)
@@ -211,9 +250,10 @@ export async function visibleBlocks(
         }
         if (!isVisibleCandidate(port, eye, voxel, distance, options.predicate, budget)) continue
         candidates.push({ name: block.name, position: voxel, distance })
+        }
       }
     }
-  }
+  }}}
   signal?.throwIfAborted()
   candidates.sort((left, right) => left.distance - right.distance)
   // Nearest-first, so a truncated result is "everything out to some radius" rather than an arbitrary

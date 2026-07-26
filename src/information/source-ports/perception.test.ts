@@ -208,9 +208,18 @@ test('the block-centre predicate reports no ground at all when looking level acr
 
 test('the exposed-face predicate finds the ground, and only ground that is really in view', async () => {
   const port = flatGround(0)
-  const result = await visibleBlocks(port, { ...SCAN, predicate: 'exposed_face' })
+  const metrics = { sectionsTested: 0, sectionsSkipped: 0, voxelsExamined: 0 }
+  const result = await visibleBlocks(port, { ...SCAN, predicate: 'exposed_face', metrics })
 
-  assert.equal(result.blocks.length > 200, true, `expected hundreds of surfaces, got ${result.blocks.length}`)
+  // Exact, not "hundreds": the closed-form count below is the whole point, and pinning it means any
+  // future change to section culling that quietly loses a surface fails here rather than in the wild.
+  assert.equal(result.blocks.length, 900)
+
+  // Culling really ran, and the two assertions only hold together: skipping sections must shrink the
+  // outer loop without changing what the scan finds.
+  const boxVolume = (2 * SCAN.horizontalRadius + 1) ** 2 * (2 * SCAN.verticalRadius + 1)
+  assert.equal(metrics.voxelsExamined < boxVolume / 2, true, `${metrics.voxelsExamined} of ${boxVolume}`)
+  assert.equal(metrics.sectionsSkipped > 0, true)
 
   // Oracle written independently of the implementation: the eye sits 1.62 above the top-face plane,
   // every top face is reachable because a ray descending to y=64 never dips below it, so a face is

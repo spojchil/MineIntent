@@ -13,7 +13,7 @@
  *
  *   npx tsx scripts/visibility-predicate-comparison.ts
  */
-import { visibleBlocks, type PerceptionBlock, type PerceptionPort, type PerceptionPose, type VisibilityPredicate } from '../src/information/source-ports/perception.js'
+import { visibleBlocks, type PerceptionBlock, type PerceptionPort, type PerceptionPose, type ScanMetrics, type VisibilityPredicate } from '../src/information/source-ports/perception.js'
 
 const EYE_HEIGHT = 1.62
 const AIR: PerceptionBlock = { name: 'air', visible: false, occludes: false }
@@ -106,8 +106,9 @@ async function main(): Promise<void> {
     const expected = fixture.oracle?.(eye)
     for (const predicate of PREDICATES) {
       const port = new CountingPort(pose(fixture.pitch), fixture.lookup)
+      const metrics: ScanMetrics = { sectionsTested: 0, sectionsSkipped: 0, voxelsExamined: 0 }
       const started = process.hrtime.bigint()
-      const result = await visibleBlocks(port, { ...SCAN, predicate })
+      const result = await visibleBlocks(port, { ...SCAN, predicate, metrics })
       const ms = Number(process.hrtime.bigint() - started) / 1e6
       const recall = expected === undefined ? '—'
         : expected === 0 ? (result.blocks.length === 0 ? '100%' : `假阳 ${result.blocks.length}`)
@@ -119,14 +120,16 @@ async function main(): Promise<void> {
         (expected === undefined ? '—' : String(expected)).padStart(7),
         recall.padStart(9),
         String(port.reads).padStart(10),
-        String(port.distinct.size).padStart(8),
-        `${ms.toFixed(0)}ms`.padStart(8),
+        `${metrics.voxelsExamined}`.padStart(9),
+        `${metrics.sectionsSkipped}/${metrics.sectionsTested}`.padStart(8),
+        `${ms.toFixed(0)}ms`.padStart(7),
       ].join(''))
     }
   }
   console.log(
-    '夹具'.padEnd(22) + '判据'.padEnd(15) + '报告数'.padStart(6) + '基准真值'.padStart(7)
-    + '召回'.padStart(9) + 'blockAt'.padStart(10) + '不同体素'.padStart(7) + '耗时'.padStart(8),
+    '夹具'.padEnd(22) + '判据'.padEnd(15) + '报告数'.padStart(6) + '真值'.padStart(7)
+    + '召回'.padStart(9) + 'blockAt'.padStart(10) + '遍历体素'.padStart(7)
+    + 'section剔除'.padStart(6) + '耗时'.padStart(7),
   )
   for (const row of rows) console.log(row)
 }
