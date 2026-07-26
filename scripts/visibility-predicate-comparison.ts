@@ -97,7 +97,7 @@ const FIXTURES: Fixture[] = [
   { name: '全透明体', pitch: 0, lookup: () => glass },
 ]
 
-const PREDICATES: VisibilityPredicate[] = ['block_centre', 'exposed_face']
+const PREDICATES: VisibilityPredicate[] = ['block_centre', 'exposed_face']  // both stated; neither relies on the default
 
 async function main(): Promise<void> {
   const rows: string[] = []

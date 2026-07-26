@@ -82,6 +82,9 @@ const VIEW_FRUSTUM = {
  */
 export const VIEWPORT_SCAN = {
   horizontalRadius: 32, verticalRadius: 20, maxDistance: 32, frustum: VIEW_FRUSTUM, limit: 256,
+  // Stated rather than defaulted: which predicate ran decides what a missing block means, so
+  // reading it here should not require knowing a default elsewhere.
+  predicate: 'exposed_face',
 } as const
 
 export class ViewportInformationProvider implements InformationProvider<ViewportValues> {

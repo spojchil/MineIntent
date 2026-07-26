@@ -196,13 +196,13 @@ const SCAN = {
 test('the block-centre predicate reports no ground at all when looking level across flat ground', async () => {
   // The defect stated plainly: a ray aimed at a distant ground block's *centre* enters nearer ground
   // first, because the centre sits half a block below the surface a player actually sees.
-  const level = await visibleBlocks(flatGround(0), SCAN)
+  const level = await visibleBlocks(flatGround(0), { ...SCAN, predicate: 'block_centre' })
   assert.equal(level.blocks.length, 0)
 
   // It is not that nothing is visible — the same world with the same predicate finds ground once the
   // gaze tilts down far enough that the rays stop grazing. So the predicate is pose-dependent in a
   // way the world is not, which is exactly what makes an incremental read hard to trust.
-  const down = await visibleBlocks(flatGround(-1.2), SCAN)
+  const down = await visibleBlocks(flatGround(-1.2), { ...SCAN, predicate: 'block_centre' })
   assert.equal(down.blocks.length > 0, true)
 })
 

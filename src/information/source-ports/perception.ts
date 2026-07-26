@@ -66,7 +66,10 @@ export interface VisibleBlocksOptions {
   maxDistance: number
   frustum: ViewFrustum
   limit: number
-  /** Defaults to `block_centre` so existing callers keep their current behaviour. */
+  /**
+   * Defaults to `exposed_face`. `block_centre` is kept only so the comparison harness can still run
+   * the old test; it reports no ground at all when looking level across flat ground.
+   */
   predicate?: VisibilityPredicate
 }
 
@@ -396,8 +399,10 @@ function isVisibleCandidate(
   predicate: VisibilityPredicate | undefined,
   budget?: ScanBudget,
 ): boolean {
-  if (predicate === 'exposed_face') return exposedFaceReachesEye(port, eye, voxel, budget)
-  return hasExposedFace(port, voxel, budget) && lineReachesVoxel(port, eye, voxel, distance, budget)
+  if (predicate === 'block_centre') {
+    return hasExposedFace(port, voxel, budget) && lineReachesVoxel(port, eye, voxel, distance, budget)
+  }
+  return exposedFaceReachesEye(port, eye, voxel, budget)
 }
 
 const FACE_NORMALS: readonly Point3[] = [

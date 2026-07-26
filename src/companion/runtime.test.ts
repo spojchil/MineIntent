@@ -363,11 +363,8 @@ test('looking twice reports the change, not the whole view again', async t => {
     return { model: 'fake' }
   }
 
-  // Tilted down on purpose (raw pitch is up-positive). Looking level at flat ground returns nothing
-  // at all, because a ray to a distant ground block's *centre* enters nearer ground first — a
-  // block's centre is not the surface a player sees. Even straight down finds only ~16 of the 4,225
-  // ground columns in range. That is a real gap in the visibility test, not a fixture quirk.
-  backend.pitch = -0.6
+  // No tilt needed any more: the exposed-face predicate sees ground at a level gaze, which the
+  // centre-ray predicate could not (it returned nothing at all across flat ground).
   backend.emitChat('Bot，看看周围')
   await waitFor(() => model.calls.length === 1)
   await runtime.idle()
@@ -380,7 +377,10 @@ test('looking twice reports the change, not the whole view again', async t => {
   assert.deepEqual(first.removed, [])
   // Nothing moved between the two looks, so the second says nothing at all — that is the saving
   // the old design threw away by re-sending the full scan with every body tool result.
-  assert.deepEqual(second, { added: [], removed: [], remembered: first.remembered })
+  // `truncated` is now permanently set on an open outdoor view: a correct predicate finds far more
+  // than the 256 cap, which the old one never came close to. That is a budget question, not a bug.
+  assert.deepEqual(second, { added: [], removed: [], truncated: true, remembered: first.remembered })
+  assert.equal(first.remembered, 256)
   // Entities are not diffed: they move continuously and have identities, so a positional diff would
   // render one sheep taking a step as a sheep vanishing and a stranger appearing.
   const entities = (results[1] as { viewport: { visibleEntities: unknown[] } }).viewport.visibleEntities
