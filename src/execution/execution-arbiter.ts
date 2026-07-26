@@ -6,8 +6,6 @@ const OPPOSING_DIRECTION: Record<string, string> = {
   forward: 'back', back: 'forward', left: 'right', right: 'left',
 }
 
-interface RoundMoves { roundId: number; directions: Set<string> }
-
 interface Job {
   jobId: string
   resource: ExecutionResource
@@ -29,7 +27,6 @@ interface Job {
 export class ExecutionArbiter {
   readonly #leases = new Map<ExecutionResource, ResourceLease>()
   readonly #jobs = new Map<string, Job>()
-  readonly #roundMoves = new Map<string, RoundMoves>()
   #epoch = 0
 
   /** Bumped by the entry layer on scope loss; every lease and job from an older epoch is void. */
@@ -42,7 +39,6 @@ export class ExecutionArbiter {
       }
     }
     this.#leases.clear()
-    this.#roundMoves.clear()
   }
 
   get epoch(): number { return this.#epoch }
@@ -82,19 +78,13 @@ export class ExecutionArbiter {
   }
 
   /**
-   * Judges whether a movement input contradicts one the model already asked for in this round.
+   * Applies the existing same-round movement policy to state owned by the round host.
    *
-   * Same-round is the meaningful unit: those calls arrived in one model response, so the model
-   * meant them together. `forward` plus `left` is how anyone walks diagonally; `forward` plus
-   * `back` is not an action any player performs. A different round is a new decision and starts
-   * from a clean slate.
+   * Why opposing directions are refused while orthogonal ones are admitted is deliberately not
+   * decided here (issue #98). This method preserves that predicate while moving its ledger into the
+   * object whose lifetime defines the reset boundary.
    */
-  admitMove(runId: string, roundId: number, direction: string): ExecutionRefusal | undefined {
-    const current = this.#roundMoves.get(runId)
-    const round = current !== undefined && current.roundId === roundId
-      ? current
-      : { roundId, directions: new Set<string>() }
-    this.#roundMoves.set(runId, round)
+  admitMove(round: { directions: Set<string> }, direction: string): ExecutionRefusal | undefined {
     const opposing = OPPOSING_DIRECTION[direction]
     if (opposing !== undefined && round.directions.has(opposing)) {
       return {
@@ -105,9 +95,6 @@ export class ExecutionArbiter {
     round.directions.add(direction)
     return undefined
   }
-
-  /** Forgets per-round movement state for a finished run so the map cannot grow unbounded. */
-  forgetRun(runId: string): void { this.#roundMoves.delete(runId) }
 
   /**
    * Registers continuous work that outlives the call which started it. The agent gets a handle

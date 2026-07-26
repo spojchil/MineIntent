@@ -71,7 +71,22 @@ interface ActiveRun extends RunScope {
   /** Journal id of the player chat that started this run; evidence for tool-written memories. */
   chatEventId: string
   sayCount: number
+  round?: ActiveRound
 }
+
+/**
+ * One model response that contains tool calls. It is born on the response's first call because a
+ * response without calls never reaches this process. Its identity, scope and movement ledger all
+ * die with the owning run; keeping any of them elsewhere would let middle-layer knowledge outlive
+ * the context it mirrors.
+ */
+interface ActiveRound extends RunScope {
+  roundId: string
+  runId: string
+  directions: Set<string>
+}
+
+type HostedToolInvocation = Omit<ToolInvocation, 'round'> & { roundId: string }
 
 /** Which resource a tool needs. Locks are per resource, not per tool: `say` and `remember` touch
  * neither the body nor each other, so a body input in flight must not block them. */
@@ -176,20 +191,29 @@ export class CompanionRuntime {
   }
 
   /** Called only by the authenticated loopback bridge while the matching player-chat run lives. */
-  async executeTool(invocation: ToolInvocation): Promise<unknown> {
+  async executeTool(invocation: ToolInvocation): Promise<{ roundId: string; result: unknown }> {
     const active = this.#activeRun
     if (!active || active.runId !== invocation.runId) throw new Error('tool_run_is_not_active')
     this.#assertRunCurrent(active)
+    const round = this.#roundFor(active, invocation.round)
+    const { round: _declaration, ...call } = invocation
+    const hosted: HostedToolInvocation = { ...call, roundId: round.roundId }
     const resource = TOOL_RESOURCE[invocation.name]
     if (resource === undefined) {
       // An honest unknown-name failure instead of a transport error: the model can recover.
-      return { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: `unknown_tool:${invocation.name.slice(0, 64)}` }
+      return {
+        roundId: round.roundId,
+        result: { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: `unknown_tool:${invocation.name.slice(0, 64)}` },
+      }
     }
     // A held resource is a fact about the world, so it comes back as a failed result. Throwing here
     // would surface as a bridge 500 and kill the whole run over a transient conflict.
     const acquired = this.#execution.acquire({ resource, runId: active.runId, toolName: invocation.name })
     if ('code' in acquired) {
-      return { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: acquired.summary }
+      return {
+        roundId: round.roundId,
+        result: { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: acquired.summary },
+      }
     }
     const { actionId, acquiredAt: startedAt } = acquired.lease
     try {
@@ -197,15 +221,19 @@ export class CompanionRuntime {
         this.#debug.update({ currentBodyTool: { id: actionId, tool: invocation.name, purpose: 'agent tool', startedAt } })
       }
       this.#assertRunCurrent(active)
+      let result: unknown
       switch (invocation.name) {
         case 'look_relative':
         case 'move_input':
-          return await this.#executeBodyTool(active, invocation, actionId, startedAt)
+          result = await this.#executeBodyTool(active, round, hosted, actionId, startedAt)
+          break
         case 'say':
-          return this.#executeSay(active, invocation, actionId)
+          result = this.#executeSay(active, hosted, actionId)
+          break
         default:
-          return await this.#executeRemember(active, invocation, actionId)
+          result = await this.#executeRemember(active, hosted, actionId)
       }
+      return { roundId: round.roundId, result }
     } finally {
       acquired.release()
       if (resource === 'body') {
@@ -216,7 +244,8 @@ export class CompanionRuntime {
 
   async #executeBodyTool(
     active: ActiveRun,
-    invocation: ToolInvocation,
+    round: ActiveRound,
+    invocation: HostedToolInvocation,
     actionId: string,
     startedAt: string,
   ): Promise<unknown> {
@@ -224,7 +253,7 @@ export class CompanionRuntime {
     if (name === 'move_input') {
       const parsed = moveArgumentsSchema.safeParse(invocation.arguments)
       const conflict = parsed.success
-        ? this.#execution.admitMove(active.runId, invocation.roundId, parsed.data.direction)
+        ? this.#execution.admitMove(round, parsed.data.direction)
         : undefined
       if (conflict !== undefined) {
         return { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: conflict.summary }
@@ -276,7 +305,7 @@ export class CompanionRuntime {
   }
 
   /** The only speech channel. Silence is simply this tool never being called during a run. */
-  #executeSay(active: ActiveRun, invocation: ToolInvocation, actionId: string): unknown {
+  #executeSay(active: ActiveRun, invocation: HostedToolInvocation, actionId: string): unknown {
     const parsed = sayArgumentsSchema.safeParse(invocation.arguments)
     const text = parsed.success ? parsed.data.text.trim() : ''
     if (!text) {
@@ -305,7 +334,7 @@ export class CompanionRuntime {
 
   async #executeRemember(
     active: ActiveRun,
-    invocation: ToolInvocation,
+    invocation: HostedToolInvocation,
     actionId: string,
   ): Promise<unknown> {
     const parsed = rememberArgumentsSchema.safeParse(invocation.arguments)
@@ -429,7 +458,7 @@ export class CompanionRuntime {
       this.#recordFailure('model', 'decision_failed', error)
     } finally {
       controller.abort('model_run_finished')
-      this.#execution.forgetRun(runId)
+      active.round = undefined
       this.#execution.pruneSettledJobs()
       this.#releaseBodyInputs()
       if (this.#activeRun?.controller === controller) this.#activeRun = undefined
@@ -465,6 +494,29 @@ export class CompanionRuntime {
     }
   }
 
+  /**
+   * Opens a round only when the agent loop's first tool call declares one. The UUID rides back on
+   * that call's existing response, so later calls can echo it without another network turn; a
+   * response with no tools creates no host at all.
+   */
+  #roundFor(active: ActiveRun, declaration: ToolInvocation['round']): ActiveRound {
+    if ('new' in declaration) {
+      const round: ActiveRound = {
+        roundId: randomUUID(), runId: active.runId, directions: new Set<string>(),
+        processSessionId: active.processSessionId, connectionEpoch: active.connectionEpoch,
+        worldId: active.worldId, dimension: active.dimension,
+      }
+      active.round = round
+      return round
+    }
+    const round = active.round
+    if (round === undefined || round.roundId !== declaration.id || round.runId !== active.runId) {
+      throw new Error('tool_round_is_not_active')
+    }
+    if (!sameScope(round, active)) throw new Error('tool_round_scope_is_not_active')
+    return round
+  }
+
   #scopeMatches(scope: RunScope): boolean {
     try { if (this.#backend.state().status !== 'ready') return false } catch { return false }
     const current = this.#currentScope()
@@ -476,7 +528,10 @@ export class CompanionRuntime {
     // Scope loss voids every lease and running job, not just the awaited call.
     this.#forgetPendingFacts()
     this.#execution.invalidate(reason)
-    this.#activeRun?.controller.abort(reason)
+    if (this.#activeRun) {
+      this.#activeRun.round = undefined
+      this.#activeRun.controller.abort(reason)
+    }
     this.#modelAbort?.abort(reason)
     this.#speech.stop(reason)
     this.#releaseBodyInputs()

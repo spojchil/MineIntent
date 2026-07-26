@@ -60,6 +60,8 @@ export interface AgentDecisionContext {
  * teach the model that tools report unrelated news.
  */
 export interface ToolExecution {
+  /** Middle-layer identity returned to the agent loop as opaque transport metadata. */
+  roundId: string
   result: unknown
   frame?: AgentFrame
 }
@@ -88,14 +90,18 @@ export interface ModelProvider {
 /**
  * Names stay an open string: the tool backend answers unknown names with a failed result.
  *
- * `toolCallId` and `roundId` carry the agent-side identity of the call so the internal chain runs
- * unbroken from the model's tool call through the action to the journal (D06). `roundId` also lets
- * the arbiter tell "the model asked for these together" from "these are consecutive decisions".
+ * `toolCallId` carries the model-side identity of the call so the internal chain runs unbroken
+ * from the model's tool call through the action to the journal (D06). The agent loop declares the
+ * first call in a response as a new round, but it cannot name that round: the middle layer returns
+ * the identity and the loop only echoes that opaque value on the remaining calls.
  */
 export const toolInvocationSchema = z.strictObject({
   runId: z.string().min(1).max(128),
   toolCallId: z.string().min(1).max(128),
-  roundId: z.number().int().nonnegative(),
+  round: z.union([
+    z.strictObject({ new: z.literal(true) }),
+    z.strictObject({ id: z.string().min(1).max(128) }),
+  ]),
   name: z.string().min(1).max(64),
   arguments: z.record(z.string(), z.unknown()),
 })
