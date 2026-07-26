@@ -105,7 +105,7 @@ export class CompanionRuntime {
    * `recentEvents` both redundant and hostile to the prompt cache. Drained, each event is stated
    * once and then lives in the conversation as history.
    */
-  readonly #pendingEvents: Array<{ type: string; summary: string }> = []
+  readonly #pendingEvents: Array<{ type: string; summary: string; scope?: RunScope }> = []
   #omittedEvents = 0
   #lastHealth?: number
   /** Kept for the local debug view, which shows what was read rather than what was sent. */
@@ -466,18 +466,15 @@ export class CompanionRuntime {
   }
 
   #scopeMatches(scope: RunScope): boolean {
-    try {
-      if (this.#backend.state().status !== 'ready') return false
-      const snapshot = this.#backend.snapshot()
-      return snapshot.processSessionId === scope.processSessionId &&
-        snapshot.connectionEpoch === scope.connectionEpoch &&
-        snapshot.world.worldId === scope.worldId && snapshot.world.dimension === scope.dimension
-    } catch { return false }
+    try { if (this.#backend.state().status !== 'ready') return false } catch { return false }
+    const current = this.#currentScope()
+    return current !== undefined && sameScope(current, scope)
   }
 
   #invalidateRuns(reason: string): number {
     const generation = ++this.#runGeneration
     // Scope loss voids every lease and running job, not just the awaited call.
+    this.#forgetPendingFacts()
     this.#execution.invalidate(reason)
     this.#activeRun?.controller.abort(reason)
     this.#modelAbort?.abort(reason)
@@ -543,8 +540,19 @@ export class CompanionRuntime {
     }
   }
 
+  /**
+   * Stamps the scope the fact was observed in, at the moment it is observed.
+   *
+   * Not cleared on invalidation instead, which was the other candidate: invalidation is a reaction,
+   * so a fact pushed between the world actually changing and the runtime noticing would survive the
+   * sweep. Stamping cannot have that gap — an event either carries the scope it was seen in or it is
+   * unattributable, and both are decided here rather than later.
+   *
+   * A missing scope means the snapshot was unreadable, which is itself a reason not to replay the
+   * fact into whatever world comes next.
+   */
   #pushPending(type: string, summary: string): void {
-    this.#pendingEvents.push({ type, summary })
+    this.#pendingEvents.push({ type, summary, scope: this.#currentScope() })
     // Bounded because nothing guarantees a frame is coming: an idle companion could otherwise
     // accumulate events forever. Dropping the oldest is counted, never hidden.
     while (this.#pendingEvents.length > 20) {
@@ -553,11 +561,51 @@ export class CompanionRuntime {
     }
   }
 
-  #drainEvents(): { events: Array<{ type: string; summary: string }>; omittedEvents?: number } {
-    const events = this.#pendingEvents.splice(0, this.#pendingEvents.length)
+  #currentScope(): RunScope | undefined {
+    try {
+      const snapshot = this.#backend.snapshot()
+      return {
+        processSessionId: snapshot.processSessionId,
+        connectionEpoch: snapshot.connectionEpoch,
+        worldId: snapshot.world.worldId,
+        dimension: snapshot.world.dimension,
+      }
+    } catch { return undefined }
+  }
+
+  /**
+   * Drains only what belongs to this run's world. "受到伤害" from the world before a dimension change
+   * is not news in the world after it — it is a statement about somewhere the companion no longer is,
+   * and the model has no way to tell that from a fresh injury.
+   *
+   * Facts from another scope are dropped rather than held: there is no run that could ever be the
+   * right audience for them. They are counted into `omittedEvents` for the same reason the size cap
+   * is — the model is told that something was left out, never quietly given less.
+   */
+  #drainEvents(scope: RunScope): { events: Array<{ type: string; summary: string }>; omittedEvents?: number } {
+    const pending = this.#pendingEvents.splice(0, this.#pendingEvents.length)
+    const events: Array<{ type: string; summary: string }> = []
+    for (const entry of pending) {
+      if (entry.scope !== undefined && sameScope(entry.scope, scope)) {
+        events.push({ type: entry.type, summary: entry.summary })
+      } else {
+        this.#omittedEvents += 1
+      }
+    }
     const omittedEvents = this.#omittedEvents
     this.#omittedEvents = 0
     return { events, ...(omittedEvents > 0 ? { omittedEvents } : {}) }
+  }
+
+  /**
+   * Forgets facts and baselines belonging to a world the companion has left. The health baseline
+   * matters as much as the queue: kept across a respawn it compares 20 against the 0 from dying, and
+   * kept across a dimension change it turns any ordinary difference into a phantom injury.
+   */
+  #forgetPendingFacts(): void {
+    this.#pendingEvents.length = 0
+    this.#omittedEvents = 0
+    this.#lastHealth = undefined
   }
 
   /**
@@ -607,7 +655,7 @@ export class CompanionRuntime {
       ...(observations.currentStatus === undefined ? {} : { status: observations.currentStatus }),
       ...(observations.inventory === undefined ? {} : { inventory: observations.inventory }),
       ...(observations.sound === undefined ? {} : { sound: observations.sound }),
-      ...this.#drainEvents(),
+      ...this.#drainEvents(active),
       omissions: observations.omissions,
     }
   }
@@ -617,6 +665,17 @@ export class CompanionRuntime {
     this.#debug.failure({ at: new Date().toISOString(), source, code, summary })
     void this.#journal.append(`${source}.failed`, { code, summary })
   }
+}
+
+/**
+ * One definition of "the same world", used by every check that needs one. Two places that must
+ * agree about scope identity is the same defect shape as two places that must agree about where a
+ * player's eyes are.
+ */
+function sameScope(left: RunScope, right: RunScope): boolean {
+  return left.processSessionId === right.processSessionId &&
+    left.connectionEpoch === right.connectionEpoch &&
+    left.worldId === right.worldId && left.dimension === right.dimension
 }
 
 interface PoseSample {

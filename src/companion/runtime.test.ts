@@ -123,6 +123,15 @@ class FakeBackend implements MinecraftBackendApi {
     } satisfies BackendEventEnvelope
     for (const listener of this.subscribers) listener(event)
   }
+  /** The envelope carries the world the sound happened in, which is what the history has to keep. */
+  emitSound(payload: { soundName: string; sourcePosition: { x: number; y: number; z: number } }) {
+    const event = {
+      protocol: 'mineintent.minecraft.backend-event.v1', id: `sound-${this.revision++}`, kind: 'sound', occurredAt: new Date().toISOString(),
+      processSessionId: this.processSessionId, connectionEpoch: this.connectionEpoch, connectionAttemptId: 'a', worldId: this.worldId, dimension: this.dimension,
+      payload: { ...payload, volume: 1, pitch: 1 },
+    } satisfies BackendEventEnvelope
+    for (const listener of this.subscribers) listener(event)
+  }
   changeScope(change: { connectionEpoch?: number; worldId?: string; dimension?: string }) {
     if (change.connectionEpoch !== undefined) this.connectionEpoch = change.connectionEpoch
     if (change.worldId !== undefined) this.worldId = change.worldId
@@ -383,6 +392,58 @@ test('damage taken mid-run reaches the model as a frame beside the next tool res
   assert.equal(frame.status?.health, 13.5)
   assert.equal(frame.player, undefined)
   assert.equal(frames[1], undefined)
+})
+
+test('a fact observed in one world never reaches a run in another', async t => {
+  const { backend, model, runtime } = await fixture(t)
+
+  // Hurt in the overworld, with nothing yet asking for a frame — the queue holds it.
+  backend.emitSelfChanged(13.5)
+  await new Promise(resolve => setTimeout(resolve, 5))
+
+  backend.changeScope({ dimension: 'the_nether' })
+  await new Promise(resolve => setTimeout(resolve, 5))
+
+  backend.emitChat('Bot，这是哪')
+  await waitFor(() => model.calls.length === 1)
+  await runtime.idle()
+
+  // "受到伤害，生命值 20 → 13.5" is a statement about somewhere the companion no longer is, and the
+  // model has no way to tell a replayed injury from a fresh one.
+  const frame = model.calls[0]!.context.frame
+  assert.deepEqual(frame.events, [])
+  assert.equal(frame.world.dimension, 'the_nether')
+
+  // The health baseline goes with it: kept across the change, the next comparison is against a
+  // number from the previous world and invents an injury that never happened.
+  backend.emitSelfChanged(13.5)
+  await new Promise(resolve => setTimeout(resolve, 5))
+  backend.emitChat('Bot，还好吗')
+  await waitFor(() => model.calls.length === 2)
+  await runtime.idle()
+  assert.deepEqual(model.calls[1]!.context.frame.events, [])
+})
+
+test('sounds heard before a world change are not replayed with their old distance and bearing', async t => {
+  const { backend, model, runtime } = await fixture(t)
+
+  backend.emitSound({ soundName: 'entity.zombie.ambient', sourcePosition: { x: 3, y: 64, z: 0 } })
+  await new Promise(resolve => setTimeout(resolve, 5))
+  backend.emitChat('Bot，你听到了吗')
+  await waitFor(() => model.calls.length === 1)
+  await runtime.idle()
+  // Established first, so the second half cannot pass by the sound never having been recorded.
+  assert.equal(model.calls[0]!.context.frame.sound?.recentSounds.length, 1)
+
+  backend.changeScope({ dimension: 'the_nether' })
+  await new Promise(resolve => setTimeout(resolve, 5))
+  backend.emitChat('Bot，现在呢')
+  await waitFor(() => model.calls.length === 2)
+  await runtime.idle()
+
+  // A stored sound is a distance and a bearing measured from where the companion stood. After the
+  // change both describe a place that no longer exists, and the entry itself does not say so.
+  assert.deepEqual(model.calls[1]!.context.frame.sound?.recentSounds, [])
 })
 
 test('ordinary player chats preserve arrival order while the first journal write waits', async t => {
