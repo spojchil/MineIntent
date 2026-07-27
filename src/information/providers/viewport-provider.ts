@@ -100,6 +100,14 @@ const VIEW_FRUSTUM = {
   verticalHalfAngle: (VERTICAL_FOV_DEGREES / 2) * Math.PI / 180,
   horizontalHalfAngle: Math.atan(Math.tan((VERTICAL_FOV_DEGREES / 2) * Math.PI / 180) * ASSUMED_ASPECT_RATIO),
 } as const
+const VISIBLE_BLOCKS_OPTIONS = {
+  horizontalRadius: 32,
+  verticalRadius: 20,
+  maxDistance: 32,
+  frustum: VIEW_FRUSTUM,
+  limit: 256,
+  predicate: 'exposed_face',
+} as const
 
 export class ViewportInformationProvider implements InformationProvider<ViewportValues> {
   /**
@@ -128,14 +136,14 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
   readonly definition: InformationProviderDefinition<ViewportValues> = {
     id: 'viewport_information',
     description: '粗略第一人称视野；所有位置都使用 Minecraft 世界绝对坐标，方块为整数体素',
-    schemaRevision: 'viewport-information:9',
+    schemaRevision: 'viewport-information:10',
     audiences: ['companion'] as const,
     fields: {
       frame: { description: '本次观察的姿态与坐标系图例', valueSchema: frameSchema, valueType: 'object', precision: 'exactly_displayed', sourceKinds: ['viewport_projection'] },
       standingOnBlock: { description: '脚下可见方块及其绝对体素坐标', valueSchema: blockSchema, valueType: 'object', precision: 'inferred', sourceKinds: ['viewport_projection'] },
       lookedAtBlock: { description: '准星射线首先命中的可见方块及其绝对体素坐标', valueSchema: blockSchema, valueType: 'object', precision: 'inferred', sourceKinds: ['viewport_projection'] },
       visibleEntities: { description: '可见实体；items 每项为{type,player?,position}，按距离从近到远，truncated 表示更远处还有未列出的', valueSchema: visibleEntitiesSchema, valueType: 'object', precision: 'inferred', sourceKinds: ['viewport_projection'] },
-      visibleBlocks: { description: '可见方块；每项为[名称,x,y,z]整数体素，按距离从近到远，可能截断', valueSchema: visibleBlocksSchema, valueType: 'object', precision: 'inferred', sourceKinds: ['viewport_projection'] },
+      visibleBlocks: { description: '可见方块（朝观察者的暴露面无遮挡可达）；每项为[名称,x,y,z]整数体素，按距离从近到远，可能截断', valueSchema: visibleBlocksSchema, valueType: 'object', precision: 'inferred', sourceKinds: ['viewport_projection'] },
     },
     scopeDependencies: ['connection', 'world'] as const,
     limits: { maxFieldsPerRead: 5, maxResultBytes: 65_536, timeoutMs: 5_000 },
@@ -193,9 +201,7 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
       }
     }
     if (request.fields.includes('visibleBlocks')) {
-      const result = await visibleBlocks(this.port, {
-        horizontalRadius: 32, verticalRadius: 20, maxDistance: 32, frustum: VIEW_FRUSTUM, limit: 256,
-      }, signal)
+      const result = await visibleBlocks(this.port, VISIBLE_BLOCKS_OPTIONS, signal)
       values.visibleBlocks = {
         // Block coordinates are exact integers, which is what makes an incremental read possible:
         // the same block keeps the same key no matter where the companion stands.
