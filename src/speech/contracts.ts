@@ -13,7 +13,6 @@ export interface PlayerChatMessage {
   text: string
   verified?: boolean
   addressing: { addressedToCompanion: boolean; evidence: AddressingEvidence[] }
-  controlIntent: 'safety_stop' | 'none'
   world: { worldId: string; dimension?: string; connectionEpoch: number }
 }
 
@@ -24,17 +23,9 @@ export interface ChatInputContext {
   conversationActiveWith?: string
 }
 
-export type SpeechTiming = 'now' | 'after_actions_accepted' | 'after_action_terminal'
-export type SpeechPurpose = 'reply' | 'acknowledge' | 'coordinate' | 'report' | 'social' | 'ask'
-
 export interface SpeechRequest {
   id: string
   text: string
-  timing: SpeechTiming
-  purpose: SpeechPurpose
-  dependsOn?: readonly string[]
-  terminalCondition?: 'completed' | 'failed' | 'cancelled' | 'any'
-  urgency?: 'normal' | 'urgent'
 }
 
 export type SpeechEvent =

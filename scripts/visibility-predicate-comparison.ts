@@ -38,6 +38,7 @@ class CountingPort implements PerceptionPort {
     private readonly lookup: (position: PerceptionPose['position']) => PerceptionBlock | 'unloaded',
   ) {}
   selfPose() { return this.pose }
+  revision() { return 1 }
   blockAt(position: PerceptionPose['position']) {
     this.reads++
     return this.lookup(position)

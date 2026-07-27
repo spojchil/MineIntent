@@ -3,18 +3,12 @@ import path from 'node:path'
 import { copyFileSync, existsSync, rmSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import mineflayer, { type Bot } from 'mineflayer'
-import { randomUUID } from 'node:crypto'
-import { CompanionRuntime } from '../companion/runtime.js'
-import { JsonlEventJournal } from '../events/journal.js'
-import { FileMemoryStore } from '../memory/memory-store.js'
 import type { BackendEventEnvelope, BackendLifecyclePayload } from '../minecraft/contracts.js'
 import { defaultMinecraftBackendConfig } from '../minecraft/config.js'
 import { MinecraftBackend } from '../minecraft/minecraft-backend.js'
-import { DebugStateStore } from '../telemetry/debug-state.js'
 import { JsonlIntegrationRecorder } from './recorder.js'
 import { PaperProcessServer } from './paper-process-server.js'
 import { PaperScenarioRunner } from './scenario-runner.js'
-import { PrototypeScenarioModel } from './prototype-scenario-model.js'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
 const runId = process.env.GITHUB_RUN_ID ?? `local-${Date.now()}`
@@ -49,8 +43,6 @@ async function main(): Promise<void> {
     try { results.push(...await behaviorScenarios(bot)) }
     finally { bot.quit('integration_complete') }
 
-    results.push(await companionPrototypeScenario())
-
     assert.equal(results.every(result => result.status === 'passed'), true, JSON.stringify(results))
   } finally {
     if (backend && backend.state().status !== 'stopped') await backend.stop('suite_cleanup')
@@ -64,113 +56,7 @@ async function main(): Promise<void> {
   }
 }
 
-async function companionPrototypeScenario() {
-  const runner = new PaperScenarioRunner(recorder)
-  const companionName = 'IntentBotCI', playerName = 'IntentPlayerCI'
-  const dataDirectory = path.join(recorder.directory, 'prototype-data')
-  const memoryFile = path.join(dataDirectory, 'memories.json')
-  let player: Bot | undefined
-  let runtime: CompanionRuntime | undefined
-  let backend: MinecraftBackend | undefined
-  return runner.run({
-    name: 'companion-v0.1-vertical-slice', timeoutMs: 240_000,
-    setup: async ctx => {
-      player = await connectBot(playerName)
-      server.send(`execute at ${playerName} run fill ~-8 ~-1 ~-8 ~12 ~-1 ~8 minecraft:stone`)
-      server.send(`execute at ${playerName} run fill ~-8 ~ ~-8 ~12 ~5 ~8 minecraft:air`)
-      for (let index = 3; index <= 9; index++) server.send(`execute at ${playerName} run setblock ~${index} ~ ~ minecraft:oak_log`)
-      await waitUntil(() => player!.blockAt(player!.entity.position.offset(0, -1, 0).floored())?.name === 'stone', 10_000, 'prototype platform')
-      ctx.record('setup', 'prototype_fixture_ready', { playerName, companionName, logCount: 7 })
-    },
-    run: async ctx => {
-      const messages: string[] = []
-      player!.on('chat', (sender, message) => { if (sender === companionName) messages.push(message) })
-      const firstModel = new PrototypeScenarioModel()
-      const first = createPrototypeRuntime(companionName, playerName, firstModel, memoryFile, dataDirectory, 'first')
-      runtime = first.runtime; backend = first.backend
-      await runtime.start()
-      server.send(`tp ${companionName} ${player!.entity.position.x} ${player!.entity.position.y} ${player!.entity.position.z + 1}`)
-      await waitUntil(() => distance(backend!.snapshot().self.position, player!.entity.position) < 3, 10_000, 'companion fixture teleport')
-      await waitUntil(() => messages.some(message => message.includes('我来了')), 10_000, 'natural greeting')
-
-      player!.chat('一起收集些木头吧')
-      await waitUntil(() => first.debug.snapshot().currentAction?.skill === 'collect_wood', 15_000, 'wood collection action')
-      const activityAnchor = runtime.activity()?.anchor
-      assert.ok(activityAnchor)
-      player!.chat('等一下')
-      await waitUntil(() => runtime!.activity()?.status === 'paused' && !first.debug.snapshot().currentAction, 15_000, 'deterministic pause')
-      await waitUntil(() => messages.some(message => message.includes('停下')), 5_000, 'pause acknowledgement')
-      ctx.record('assertion', 'pause_verified', { wood: woodCount(backend.snapshot()) })
-
-      const woodBeforeResume = woodCount(backend.snapshot())
-      player!.chat('继续吧')
-      await waitUntil(() => woodCount(backend!.snapshot()) >= woodBeforeResume + 2, 60_000, 'verified wood pickup after resume')
-      ctx.record('assertion', 'resume_and_pickup_verified', { before: woodBeforeResume, after: woodCount(backend.snapshot()) })
-
-      server.send(`damage ${companionName} 13`)
-      await waitUntil(() => messages.some(message => message.includes('有危险')), 15_000, 'danger warning')
-      server.send(`effect give ${companionName} minecraft:instant_health 1 5 true`)
-      await waitUntil(() => backend!.snapshot().self.health > 8, 10_000, 'companion healed')
-      ctx.record('assertion', 'danger_response_verified', { health: backend.snapshot().self.health })
-
-      player!.chat('够了，我们回刚才那里吧')
-      await waitUntil(() => runtime!.activity()?.status === 'completed', 90_000, 'activity completion')
-      assert.equal(distance(backend.snapshot().self.position, activityAnchor) <= 3, true)
-      const memories = await new FileMemoryStore(memoryFile).list('paper-ci-v0.1')
-      assert.equal(memories.length, 1)
-      assert.equal(memories[0]!.evidence.some(evidence => evidence.kind === 'action_result'), true)
-      ctx.record('assertion', 'first_session_verified', { wood: woodCount(backend.snapshot()), memoryId: memories[0]!.id })
-
-      await runtime.stop('prototype_restart')
-      runtime = undefined; backend = undefined
-      await delay(500)
-
-      const secondModel = new PrototypeScenarioModel()
-      const second = createPrototypeRuntime(companionName, playerName, secondModel, memoryFile, dataDirectory, 'second')
-      runtime = second.runtime; backend = second.backend
-      await runtime.start()
-      server.send(`tp ${companionName} ${player!.entity.position.x} ${player!.entity.position.y} ${player!.entity.position.z + 1}`)
-      await waitUntil(() => secondModel.contexts[0]?.memories.length === 1, 15_000, 'startup memory retrieval')
-      const messageStart = messages.length
-      player!.chat('上次我们做了什么？')
-      await waitUntil(() => messages.slice(messageStart).some(message => message.includes('上次我们一起收集了木材')), 20_000, 'cross-session memory answer')
-      assert.equal(second.debug.snapshot().decision?.retrievedMemoryIds.includes(memories[0]!.id), true)
-      ctx.record('assertion', 'restart_memory_verified', { memoryId: memories[0]!.id, debug: second.debug.snapshot() })
-    },
-    cleanup: async ctx => {
-      if (runtime) await runtime.stop('prototype_cleanup')
-      runtime = undefined; backend = undefined
-      player?.quit('prototype_complete'); player = undefined
-      server.send('kill @e[type=minecraft:item]')
-      ctx.record('cleanup', 'prototype_clients_stopped', {})
-    },
-  })
-}
-
-function createPrototypeRuntime(
-  companionName: string,
-  playerName: string,
-  model: PrototypeScenarioModel,
-  memoryFile: string,
-  dataDirectory: string,
-  session: string,
-) {
-  const backend = new MinecraftBackend({
-    worldId: 'paper-ci-v0.1', server: { host: '127.0.0.1', port, version: '1.21.1' },
-    identity: { username: companionName, auth: 'offline' }, ...defaultMinecraftBackendConfig,
-    timeouts: { connectMs: 10_000, loginMs: 20_000, spawnMs: 60_000, stopMs: 5_000 },
-    reconnect: { ...defaultMinecraftBackendConfig.reconnect, initialDelayMs: 250, maxDelayMs: 1_000 },
-  })
-  const debug = new DebugStateStore()
-  const runtime = new CompanionRuntime({
-    backend, model, memory: new FileMemoryStore(memoryFile),
-    journal: new JsonlEventJournal(path.join(dataDirectory, `events-${session}.jsonl`), 'paper-ci-v0.1', randomUUID()),
-    profile: { profileId: 'ci-companion', versionId: 'ci-v1', content: '你是可靠、自然且诚实的 Minecraft 伙伴。', sourcePath: 'ci-profile' },
-    debug, primaryPlayer: playerName, speechIntervalMs: 100,
-  })
-  return { runtime, backend, debug }
-}
-
+// Agent behavior needs a separate live experiment; this suite keeps reusable Paper/protocol checks.
 async function ensureTemplate(): Promise<void> {
   if (existsSync(path.join(templateDirectory, 'world', 'level.dat'))) {
     recorder.record('template', 'setup', 'template_reused', { templateDirectory })
@@ -287,8 +173,6 @@ async function connectBot(name: string): Promise<Bot> {
 }
 
 function lifecycleType(event: BackendEventEnvelope): string | undefined { return event.kind === 'lifecycle' ? (event.payload as BackendLifecyclePayload).type : undefined }
-function woodCount(snapshot: ReturnType<MinecraftBackend['snapshot']>): number { return snapshot.inventory.slots.filter(slot => slot.itemName.endsWith('_log') || slot.itemName.endsWith('_stem')).reduce((sum, slot) => sum + slot.count, 0) }
-function distance(left: { x: number; y: number; z: number }, right: { x: number; y: number; z: number }): number { return Math.hypot(left.x - right.x, left.y - right.y, left.z - right.z) }
 async function waitFor(events: BackendEventEnvelope[], predicate: (event: BackendEventEnvelope) => boolean, description: string, timeout = 30_000) { return waitUntil(() => events.find(predicate), timeout, description) }
 async function waitUntil<T>(predicate: () => T | undefined | false, timeoutMs: number, description: string): Promise<T> { const start = Date.now(); while (Date.now() - start < timeoutMs) { const value = predicate(); if (value) return value; await delay(25) } throw new Error(`Timed out waiting for ${description}`) }
 function delay(ms: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, ms)) }

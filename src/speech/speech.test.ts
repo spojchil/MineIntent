@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { BackendEventEnvelope, ProtocolChatEvent } from '../minecraft/contracts.js'
-import { interpretPlayerChat, isUnambiguousSafetyStop } from './chat-input.js'
+import { interpretPlayerChat } from './chat-input.js'
 import { segmentChat, SpeechScheduler } from './speech-scheduler.js'
 
 function chat(text: string, sender = 'spojchil'): BackendEventEnvelope<ProtocolChatEvent> {
@@ -26,13 +26,10 @@ test('chat input records sender, addressing evidence, time and world context', (
   assert.equal(message.occurredAt, '2026-07-12T00:00:00.000Z')
 })
 
-test('control detector only promotes standalone addressed safety stops', () => {
-  assert.equal(interpretPlayerChat(chat('停下'), context)?.controlIntent, 'safety_stop')
-  assert.equal(interpretPlayerChat(chat('如果看见岩浆就停下'), context)?.controlIntent, 'none')
-  assert.equal(interpretPlayerChat(chat('他说“停下”'), context)?.controlIntent, 'none')
-  assert.equal(interpretPlayerChat(chat('停下', 'another-player'), { ...context, onlinePlayerUsernames: ['spojchil', 'another-player', 'MineIntentBot'] })?.controlIntent, 'none')
-  assert.equal(isUnambiguousSafetyStop('MineIntentBot，停一下', 'MineIntentBot'), true)
-  assert.equal(isUnambiguousSafetyStop('等一下', 'MineIntentBot'), true)
+test('stop wording remains ordinary addressed player text', () => {
+  const message = interpretPlayerChat(chat('MineIntentBot，停一下'), context)
+  assert.equal(message?.text, 'MineIntentBot，停一下')
+  assert.equal(message?.addressing.addressedToCompanion, true)
 })
 
 test('segmentChat respects Unicode length and keeps ordered content', () => {
@@ -41,7 +38,7 @@ test('segmentChat respects Unicode length and keeps ordered content', () => {
   assert.equal(segments.join('').replaceAll(' ', ''), '这是第一句话。这是第二句话，需要被安全分开。')
 })
 
-test('scheduler waits for accepted actions, rate limits, and preserves segment order', async () => {
+test('scheduler rate limits and preserves segment order', async () => {
   const sent: string[] = []
   const events: string[] = []
   const scheduler = new SpeechScheduler({ send: message => sent.push(message) }, {
@@ -49,28 +46,25 @@ test('scheduler waits for accepted actions, rate limits, and preserves segment o
     minimumIntervalMs: 5,
     onEvent: event => events.push(`${event.type}:${'requestId' in event ? event.requestId : ''}`),
   })
-  scheduler.schedule({ id: 'promise', text: '我去拿一些木头回来', timing: 'after_actions_accepted', purpose: 'coordinate', dependsOn: ['collect'] })
-  await wait(10)
-  assert.deepEqual(sent, [])
-  scheduler.actionAccepted('collect')
+  scheduler.schedule({ id: 'reply', text: '我去拿一些木头回来' })
   await wait(30)
   assert.equal(sent.join(''), '我去拿一些木头回来')
-  assert.equal(events[0], 'scheduled:promise')
+  assert.equal(events[0], 'scheduled:reply')
   scheduler.stop()
 })
 
-test('scheduler delays normal speech under pressure and can cancel unsent speech', async () => {
+test('scheduler stop cancels queued speech before it is sent', async () => {
   const sent: string[] = []
-  const scheduler = new SpeechScheduler({ send: message => sent.push(message) }, { minimumIntervalMs: 0 })
-  scheduler.setPressure('danger')
-  scheduler.schedule({ id: 'social', text: '这里风景不错', timing: 'now', purpose: 'social' })
+  const events: string[] = []
+  const scheduler = new SpeechScheduler({ send: message => sent.push(message) }, {
+    minimumIntervalMs: 0,
+    onEvent: event => events.push(event.type),
+  })
+  scheduler.schedule({ id: 'reply', text: '这里风景不错' })
+  scheduler.stop('test_stopped')
   await wait(5)
   assert.deepEqual(sent, [])
-  assert.equal(scheduler.cancel('social', 'context_changed'), true)
-  scheduler.setPressure('normal')
-  await wait(5)
-  assert.deepEqual(sent, [])
-  scheduler.stop()
+  assert.deepEqual(events, ['scheduled', 'cancelled'])
 })
 
 function wait(ms: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, ms)) }

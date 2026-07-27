@@ -1,17 +1,16 @@
 import type { PassiveObservations } from '../information/index.js'
 import type { BackendState, Vec3Value } from '../minecraft/contracts.js'
-import type { BodyResource } from '../actions/contracts.js'
 
 export interface DebugFailureSummary {
   at: string
-  source: 'backend' | 'model' | 'action' | 'memory' | 'runtime'
+  source: 'backend' | 'model' | 'body_tool' | 'memory' | 'runtime'
   code: string
   summary: string
 }
 
 export interface DebugContextSource {
   id: string
-  kind: 'runtime' | 'event' | 'profile' | 'memory' | 'player' | 'skill_registry' | 'summary'
+  kind: 'runtime' | 'event' | 'profile' | 'memory' | 'player' | 'summary'
   size: number
 }
 
@@ -26,11 +25,7 @@ export interface CompanionDebugState {
     food: number
     inventory: Array<{ itemName: string; count: number }>
   }
-  attention?: { kind: string; target?: string }
-  activity?: { id: string; kind: string; status: string; summary: string; anchor?: Vec3Value }
-  intent?: { kind: string; summary: string }
-  currentAction?: { id: string; skill: string; purpose: string; startedAt: string }
-  resourceLocks: Readonly<Record<BodyResource, string | undefined>>
+  currentBodyTool?: { id: string; tool: string; purpose: string; startedAt: string }
   recentFailures: readonly DebugFailureSummary[]
   observations?: PassiveObservations
   decision?: {

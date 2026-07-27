@@ -8,28 +8,21 @@ MineIntent 是一个面向 Minecraft Java Edition 的 AI 同伴项目。
 
 ## 当前状态
 
-项目已经实现首个纵向原型，但仍是开发者预览，尚不是可供长期日常游玩的成品。
+项目仍处于开发实验期，尚不是可供长期日常游玩的成品。
 
-> 默认分支 `main`、可信注视架构实验和后来的 D40 一次性身体 Tool Loop 是三条
-> 不同基线。D40 已用真实模型和 Paper 跑通相对转头与短时移动，但它是实验归档，
-> 尚未成为接受架构。**逐项事实、固定提交、测试结果和 tracker 漂移见
-> [当前项目状态](./docs/current-status.md)**；以下列表描述的是 `main`。
+模型通过标准 OpenAI 兼容的工具调用与世界交互：相对转头、短时按键移动、说话、写入长期记忆。
+说话本身就是一个工具，因此沉默只是没有调用它。身体动作停在键鼠层级——没有寻路，也没有预先编排的动作序列，
+每次动作后要从新的观察重新判断。
 
-目前已经完成：
+模型会看到世界绝对坐标，但拿不到实体 ID、entity key 或任何内部句柄。这个分界依据的是原版玩家标准：
+F3 界面会显示玩家自身坐标和准星所指方块，其余可以推导，所以坐标不是特权信息；而句柄是模型能凭空编造、
+再当作"你给我的"交回来的东西。
 
-- 产品定位与体验设计。
-- 相邻 Agent、AI 伴侣和 Minecraft Bot 项目调研。
-- 事件驱动的持续同伴系统设计。
-- Mineflayer Backend、认知观察边界、受约束动作运行时与聊天调度。
-- “一起收集木材”共同活动的聊天、采集、暂停、危险反射、返回和跨重启记忆闭环。
-- OpenAI-compatible 模型适配器、可编辑自然语言同伴档案与本地持久数据。
-- 只绑定本机、只读且脱敏的同伴调试状态接口。
-- 基于持久基准世界副本的 Paper 1.21.1 self-hosted 集成测试。
-- 站立不动时的被动信息接口：生命/饥饿/氧气/经验/药水效果、背包内容、最近声音（相对方向与距离）、正前方合理视觉（视线方块与附近协议追踪实体）；同伴据此如实回答玩家提问，不臆造未观察到的信息。
+> **逐项事实、固定提交、测试结果见 [当前项目状态](./docs/current-status.md)**。
+> 该文档与若干架构说明仍描述本次合并之前的 `main`，更新由 issue #90 跟踪。
 
-当前原型用来验证最小同伴闭环：玩家与 AI 通过游戏聊天形成“共同收集木材”的活动，AI 能参与、接受中途调整、处理简单意外、验证真实结果，并在重启后记住共同经历。它还没有完整生存能力树、成熟战斗或长期自主规划。
-
-真实 Paper 1.21.1 测试的本地与 self-hosted CI 用法见 [Paper 集成测试](./docs/guides/paper-integration.md)。
+它还没有导航、跳跃、挖掘、战斗、GUI 或长期自主能力，也还不会在没有玩家发言时主动做任何事。
+自动测试覆盖协议、取消、资源释放和动作后观察；真人 + Paper + 真实模型的场景仍需重复运行。
 
 ## 核心原则
 
@@ -46,7 +39,7 @@ MineIntent 是一个面向 Minecraft Java Edition 的 AI 同伴项目。
 - [文档总入口与真相优先级](./docs/README.md)
 - [当前项目状态](./docs/current-status.md)
 - [产品设计](./docs/product-design.md)
-- [当前系统实况](./docs/architecture/current-system.md)
+- [旧可信注视实验实况](./docs/architecture/current-system.md)
 - [架构决策记录](./docs/decisions/README.md)
 - [开放提案与具身决策登记册](./docs/proposals/README.md)
 - [项目演进史与早期档案](./docs/history/project-evolution.md)
@@ -56,6 +49,7 @@ MineIntent 是一个面向 Minecraft Java Edition 的 AI 同伴项目。
 
 - Node.js 22 或更高版本。
 - TypeScript、ESM、pnpm。
+- Python 3，用于当前模型服务。
 - Mineflayer 作为第一版 Minecraft Backend。
 - Minecraft Java Edition 1.21.1 测试服务器。
 
@@ -82,9 +76,9 @@ pnpm check:docs
 pnpm test
 ```
 
-## 运行首个同伴原型
+## 运行 D40 原型
 
-复制配置样例并填写主要玩家名、模型服务地址、模型名和密钥：
+复制配置样例，填写主要玩家名、模型服务地址、模型名和密钥，并为 Node 与 Python 之间的本地调用生成一个独立的 `MINEINTENT_AGENT_SERVICE_TOKEN`：
 
 ```powershell
 Copy-Item .env.example .env
@@ -100,9 +94,9 @@ python agent-service/server.py
 pnpm start
 ```
 
-同伴通过游戏聊天与主要玩家交流。默认调试状态位于 `http://127.0.0.1:3211/v1/state`；该接口只有 GET 能力，不提供游戏控制，并会遮盖密钥、令牌和原始私人正文。
+主要玩家发给同伴的聊天按顺序进入模型；runtime 不识别“停下”等控制口令，也不生成固定台词。是否照做、拒绝或先完成更安全的动作，由模型结合当前观察决定。只有断线、换世界/维度、应用停止或请求超时等客观失效条件会取消模型轮次和身体输入。默认只读调试状态位于 `http://127.0.0.1:3211/v1/state`。
 
-决策层（prompt 构造、OpenAI-compatible 调用与结果校验）在 `agent-service/`（Python，仅用标准库），通过本地 HTTP 与 Node 侧的 `CompanionRuntime` 交互，边界见该目录下的 [README](./agent-service/README.md)。Mineflayer 协议驱动、动作执行与编排仍在 Node 侧。模型密钥只从本地 `.env` 读取；`.env` 和运行数据目录 `.mineintent/` 已被 Git 忽略。运行细节见 [首个同伴原型](./docs/guides/companion-prototype.md)。
+模型密钥只从本地 `.env` 读取；`.env` 和运行数据目录 `.mineintent/` 已被 Git 忽略。Agent Service 的接口和取消语义见 [agent-service/README.md](./agent-service/README.md)，完整运行说明见 [同伴原型](./docs/guides/companion-prototype.md)。
 
 在 `localhost:25565` 已运行受管理的 Paper 1.21.1 离线验证服务器时，可执行 Backend 生命周期集成验收：
 

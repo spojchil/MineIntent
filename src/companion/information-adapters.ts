@@ -21,6 +21,8 @@ export class BackendPerceptionPort implements PerceptionPort {
     return this.backend.observationSource().selfPose()
   }
 
+  revision(): number { return this.backend.snapshot().snapshotRevision }
+
   blockAt(position: PerceptionPose['position']): ReturnType<PerceptionPort['blockAt']> {
     const result = this.backend.observationSource().readBlock(position)
     if (result.status !== 'loaded') return 'unloaded'
@@ -38,14 +40,24 @@ export class BackendPerceptionPort implements PerceptionPort {
         ...(entity.name ? { name: entity.name } : {}),
         ...(entity.username ? { username: entity.username } : {}),
         position: entity.position,
+        width: entity.width,
+        height: entity.height,
       }))
   }
 }
 
 const SOUND_HISTORY_CAPACITY = 20
 
+/** Where a sound was heard from. Kept beside the observation, never inside it: it is bookkeeping. */
+interface SoundScope {
+  processSessionId: string
+  connectionEpoch: number
+  worldId: string
+  dimension?: string
+}
+
 export class SoundHistory implements SoundHistoryPort {
-  readonly #entries: SoundObservation[] = []
+  readonly #entries: Array<{ observation: SoundObservation; scope: SoundScope }> = []
   readonly #unsubscribe: Unsubscribe
   #revision = 0
 
@@ -53,8 +65,23 @@ export class SoundHistory implements SoundHistoryPort {
     this.#unsubscribe = backend.subscribe((event) => { if (event.kind === 'sound') this.#record(event) })
   }
 
+  /**
+   * Only sounds heard in the world the companion is in now.
+   *
+   * A stored sound is not a name and a timestamp — it is a distance and a bearing, both measured
+   * against where the companion stood when it heard the sound. Replayed after a dimension change or
+   * a reconnect, those two numbers describe a place that no longer exists, and nothing in the entry
+   * says so. Filtering on read rather than clearing on a lifecycle event because the buffer has no
+   * way to know it missed one; comparing against the live snapshot cannot go stale.
+   */
   recent(limit: number): readonly SoundObservation[] {
-    return this.#entries.slice(-limit).reverse()
+    const scope = this.#scope()
+    if (scope === undefined) return []
+    return this.#entries
+      .filter(entry => sameSoundScope(entry.scope, scope))
+      .slice(-limit)
+      .reverse()
+      .map(entry => entry.observation)
   }
 
   revision(): number { return this.#revision }
@@ -74,10 +101,40 @@ export class SoundHistory implements SoundHistoryPort {
       pitch: payload.pitch,
       observedAt: event.occurredAt,
     }
-    this.#entries.push(observation)
+    // From the envelope, not from the snapshot: the envelope says where the sound happened, while
+    // the snapshot only says where the companion is by the time the handler runs.
+    this.#entries.push({
+      observation,
+      scope: {
+        processSessionId: event.processSessionId,
+        connectionEpoch: event.connectionEpoch,
+        worldId: event.worldId,
+        ...(event.dimension === undefined ? {} : { dimension: event.dimension }),
+      },
+    })
     if (this.#entries.length > SOUND_HISTORY_CAPACITY) this.#entries.shift()
     this.#revision++
   }
+
+  #scope(): SoundScope | undefined {
+    try {
+      const snapshot = this.backend.snapshot()
+      return {
+        processSessionId: snapshot.processSessionId,
+        connectionEpoch: snapshot.connectionEpoch,
+        worldId: snapshot.world.worldId,
+        dimension: snapshot.world.dimension,
+      }
+    } catch { return undefined }
+  }
+}
+
+/** An absent dimension on the event does not contradict the current one — the envelope omits it. */
+function sameSoundScope(entry: SoundScope, current: SoundScope): boolean {
+  return entry.processSessionId === current.processSessionId &&
+    entry.connectionEpoch === current.connectionEpoch &&
+    entry.worldId === current.worldId &&
+    (entry.dimension === undefined || entry.dimension === current.dimension)
 }
 
 const CONNECTED_STATUSES = new Set(['connecting', 'logging_in', 'spawning', 'ready', 'dead'])

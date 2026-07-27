@@ -1,50 +1,102 @@
 import { z } from 'zod'
 import type { PassiveObservations } from '../information/index.js'
-import type { MinecraftSnapshotV1 } from '../minecraft/contracts.js'
-import type { MemoryRecord } from '../memory/contracts.js'
 import type { CompanionProfile } from '../companion/profile.js'
+import type { WireToolDefinition } from './agent-tools.js'
 
-const actionSchema = z.discriminatedUnion('skill', [
-  z.strictObject({ skill: z.literal('follow_player'), args: z.strictObject({ range: z.number().min(2).max(8).default(3) }), purpose: z.string().min(1).max(200) }),
-  z.strictObject({ skill: z.literal('collect_wood'), args: z.strictObject({ count: z.number().int().min(1).max(16), maxDistance: z.number().int().min(8).max(64).default(32) }), purpose: z.string().min(1).max(200) }),
-  z.strictObject({ skill: z.literal('return_to_anchor'), args: z.strictObject({}), purpose: z.string().min(1).max(200) }),
-  z.strictObject({ skill: z.literal('wait'), args: z.strictObject({ durationSeconds: z.number().int().min(1).max(120) }), purpose: z.string().min(1).max(200) }),
-])
-
-export const companionDecisionSchema = z.strictObject({
-  protocol: z.literal('mineintent.companion-decision.v1'),
-  speech: z.string().trim().min(1).max(500).nullable(),
-  attention: z.strictObject({ kind: z.string().min(1).max(64), target: z.string().max(128).nullable() }),
-  activity: z.strictObject({
-    operation: z.enum(['keep', 'start_wood_collection', 'pause', 'resume', 'complete', 'abandon']),
-    summary: z.string().trim().min(1).max(300),
-  }),
-  intent: z.strictObject({ kind: z.string().min(1).max(64), summary: z.string().trim().min(1).max(300) }),
-  action: actionSchema.nullable(),
-  memory: z.strictObject({ kind: z.enum(['episode', 'place', 'commitment', 'player_preference']), summary: z.string().trim().min(1).max(1_000) }).nullable(),
-})
-
-export type CompanionDecision = z.infer<typeof companionDecisionSchema>
-
-export interface DecisionContext {
-  runId: string
-  trigger: { type: 'startup' | 'player_chat' | 'action_result' | 'danger'; text?: string; eventId: string }
-  primaryPlayer: string
-  profile: CompanionProfile
-  snapshot: MinecraftSnapshotV1
-  activity?: { id: string; kind: string; status: string; summary: string; anchor?: { x: number; y: number; z: number } }
-  recentEvents: Array<{ id: string; type: string; summary: string }>
-  memories: MemoryRecord[]
-  observations: PassiveObservations
-  availableSkills: readonly string[]
+/**
+ * One appended observation of the world.
+ *
+ * Frames are the only way volatile state enters the conversation, and they enter it by being
+ * *appended* — never re-rendered. That distinction is the whole design: under prefix caching a
+ * timestamp appended once costs nothing, while the same timestamp re-rendered into the system
+ * prompt on every request moves the entire prompt out of cache. So an older frame is never edited
+ * or dropped while the conversation it belongs to is live; it stays a true record of what was
+ * observed then, and `at` tells the model which frame is newest.
+ *
+ * The viewport is deliberately absent. It is the one observation large enough to dominate the
+ * prompt, and the model pulls it with a tool when it wants to look.
+ */
+export interface AgentFrame {
+  at: string
+  /** Present on the frame that opens a run: the message that caused it. */
+  player?: { username: string; text: string }
+  world: { dimension: string; timeOfDay?: number }
+  self?: { position: [number, number, number]; yawDegrees: number; pitchDegrees: number }
+  status?: PassiveObservations['currentStatus']
+  inventory?: PassiveObservations['inventory']
+  sound?: PassiveObservations['sound']
+  /**
+   * What happened since the previous frame. This is the channel for everything the model would
+   * never think to ask about — a pull-only design cannot report damage, because nothing tells the
+   * model there is damage to look up.
+   */
+  events: Array<{ type: string; summary: string }>
+  /** Set when the pending-event buffer overflowed. Staying silent about that would be a lie. */
+  omittedEvents?: number
+  omissions: PassiveObservations['omissions']
 }
 
+/**
+ * What one request offers the model, split by how fast it changes rather than by topic.
+ *
+ * `stable` is rendered into the system message and `frame` is appended after it, because prefix
+ * caching is prefix-only: whatever changes first invalidates everything after it. Profile changes
+ * on the order of days and memory on the order of tool calls, while the world changes every tick.
+ */
+export interface AgentDecisionContext {
+  protocol: 'mineintent.agent-context.v2'
+  stable: {
+    profile: Pick<CompanionProfile, 'content'>
+    memories: Array<{ kind: string; summary: string; createdAt: string }>
+  }
+  frame: AgentFrame
+}
+
+/**
+ * A tool answer, plus the frame the world produced while the tool ran, if there is one.
+ *
+ * The frame travels beside the result rather than inside it: an event like taking damage has
+ * nothing to do with whichever tool happened to be running, and folding it into the result would
+ * teach the model that tools report unrelated news.
+ */
+export interface ToolExecution {
+  result: unknown
+  frame?: AgentFrame
+}
+
+/**
+ * Completion report for one agent run. Speech is not part of it: talking happens through the
+ * `say` tool while the run is still going, and silence is simply the absence of a `say` call.
+ */
 export interface ModelRunResult {
-  decision: CompanionDecision
   model: string
-  usage?: { inputTokens?: number; outputTokens?: number }
+  /**
+   * `cacheReadTokens` is the prefix the provider served from its cache. It is reported because our
+   * prompt shape decides it: every provider refuses to cache a prefix under a floor, so a run can
+   * legitimately report zero, and a hit rate is only auditable against `inputTokens` from the same
+   * run. Absent when the provider reported nothing.
+   */
+  usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number }
+}
+export interface ModelProvider {
+  run(
+    input: { runId: string; context: AgentDecisionContext; tools: readonly WireToolDefinition[] },
+    signal: AbortSignal,
+  ): Promise<ModelRunResult>
 }
 
-export interface ModelProvider {
-  run(context: DecisionContext, signal: AbortSignal): Promise<ModelRunResult>
-}
+/**
+ * Names stay an open string: the tool backend answers unknown names with a failed result.
+ *
+ * `toolCallId` and `roundId` carry the agent-side identity of the call so the internal chain runs
+ * unbroken from the model's tool call through the action to the journal (D06). `roundId` also lets
+ * the arbiter tell "the model asked for these together" from "these are consecutive decisions".
+ */
+export const toolInvocationSchema = z.strictObject({
+  runId: z.string().min(1).max(128),
+  toolCallId: z.string().min(1).max(128),
+  roundId: z.number().int().nonnegative(),
+  name: z.string().min(1).max(64),
+  arguments: z.record(z.string(), z.unknown()),
+})
+export type ToolInvocation = z.infer<typeof toolInvocationSchema>

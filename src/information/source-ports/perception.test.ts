@@ -1,7 +1,20 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { YIELD_EVERY_WORK_UNITS, raycastLookedAtBlock, standingOnBlock, visibleBlocks } from './perception.js'
-import type { PerceptionBlock, PerceptionPort, PerceptionPose, VisibleBlocksOptions } from './perception.js'
+import {
+  YIELD_EVERY_WORK_UNITS,
+  raycastLookedAtBlock,
+  standingOnBlock,
+  viewRelativePosition,
+  visibleBlocks,
+  visibleEntities,
+} from './perception.js'
+import type {
+  PerceptionBlock,
+  PerceptionEntityCandidate,
+  PerceptionPort,
+  PerceptionPose,
+  VisibleBlocksOptions,
+} from './perception.js'
 
 const AIR: PerceptionBlock = { name: 'air', visible: false, occludes: false }
 const opaque = (name: string): PerceptionBlock => ({ name, visible: true, occludes: true })
@@ -11,14 +24,16 @@ class FakePerceptionPort implements PerceptionPort {
   constructor(
     public pose: PerceptionPose,
     private readonly blocks: Map<string, PerceptionBlock | 'unloaded'> = new Map(),
+    private readonly entities: PerceptionEntityCandidate[] = [],
     private readonly fallback?: (position: PerceptionPose['position']) => PerceptionBlock | 'unloaded',
   ) {}
   selfPose(): PerceptionPose { return this.pose }
+  revision() { return 1 }
   blockAt(position: PerceptionPose['position']): PerceptionBlock | 'unloaded' {
     const key = `${position.x},${position.y},${position.z}`
     return this.blocks.get(key) ?? this.fallback?.(position) ?? AIR
   }
-  nearbyEntities() { return [] }
+  nearbyEntities() { return this.entities }
 }
 
 const TEST_FRUSTUM = {
@@ -33,6 +48,11 @@ const DEFAULT_OPTIONS: VisibleBlocksOptions = {
   limit: 24,
   predicate: 'exposed_face',
 }
+
+test('view-relative position uses [right, up, forward]', () => {
+  const pose = { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 }
+  assert.deepEqual(viewRelativePosition(pose, { x: 5, y: 66, z: -3 }), [5, 2, 3])
+})
 
 test('visibleBlocks includes an exposed, unoccluded block directly ahead', async () => {
   const pose: PerceptionPose = { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 }
@@ -111,6 +131,7 @@ test('a dense scan yields to the event loop and stops at the yield where it is a
     calls = 0
     constructor(private readonly onCall?: (calls: number) => void) {}
     selfPose() { return pose }
+    revision() { return 1 }
     blockAt() {
       this.calls++
       this.onCall?.(this.calls)
@@ -178,9 +199,93 @@ test('raycastLookedAtBlock sees transparent blocks while standingOnBlock rejects
     ['0,65,-3', opaque('stone')],
     ['0,63,0', opaque('grass_block')],
   ]))
-  assert.equal(raycastLookedAtBlock(port, 4.5)?.name, 'glass')
-  assert.deepEqual(standingOnBlock(port), { name: 'grass_block' })
+  assert.deepEqual(raycastLookedAtBlock(port, 4.5), { name: 'glass', position: { x: 0, y: 65, z: -2 } })
+  assert.deepEqual(standingOnBlock(port), { name: 'grass_block', position: { x: 0, y: 63, z: 0 } })
   assert.equal(standingOnBlock(new FakePerceptionPort(pose)), null)
+})
+
+test('the entity view frustum is rectangular, not an isotropic cone', async () => {
+  // Both candidates sit 5 blocks ahead at eye height, one displaced sideways by 48° and one
+  // raised by 40°. Vanilla's 16:9 frustum admits only the sideways one.
+  const pose = { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 }
+  const eyeY = 64 + 1.62
+  const height = 1.3
+  const forward = 5
+  const sideways = forward * Math.tan((48 * Math.PI) / 180)
+  const raised = forward * Math.tan((40 * Math.PI) / 180)
+  const result = await visibleEntities(new FakePerceptionPort(pose, new Map(), [
+    { type: 'sheep', position: { x: sideways, y: eyeY - height / 2, z: -forward }, height },
+    { type: 'cow', position: { x: 0, y: eyeY + raised - height / 2, z: -forward }, height },
+  ]), 32, TEST_FRUSTUM, 8)
+  assert.deepEqual(result.entities.map(entity => entity.type), ['sheep'])
+})
+
+test('visible entities exclude candidates behind the camera', async () => {
+  const pose = { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 }
+  const entities = [
+    { type: 'sheep', position: { x: 2, y: 64, z: -5 }, height: 1.3 },
+    { type: 'cow', position: { x: 0, y: 64, z: 5 }, height: 1.4 },
+  ]
+  const result = await visibleEntities(new FakePerceptionPort(pose, new Map(), entities), 32, TEST_FRUSTUM, 8)
+  assert.equal(result.entities.length, 1)
+  assert.equal(result.entities[0]!.type, 'sheep')
+  assert.equal(result.truncated, false, 'a candidate the frustum rejected is not a truncated one')
+})
+
+test('an entity remains visible when its hitbox intersects the frustum but its center does not', async () => {
+  const pose = { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 }
+  const sheep = { type: 'sheep', position: { x: 0, y: 64, z: -1 }, width: 0.9, height: 1.3 }
+
+  // At one block away the sheep's center is 44.1° below the crosshair, outside the 35°
+  // vertical half-FOV. Its upper hitbox is still on screen, exactly like the live D40 case.
+  const result = await visibleEntities(new FakePerceptionPort(pose, new Map(), [sheep]), 32, TEST_FRUSTUM, 8)
+
+  assert.deepEqual(result.entities.map(entity => entity.type), ['sheep'])
+})
+
+test('the entity cap reports truncation and drops the farthest, never the nearest', async () => {
+  // Absence from a capped list means "farther than the ones listed", not "not there". The flag is
+  // what separates those, and it has to survive the same sort that decides who gets dropped.
+  const pose = { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 }
+  const herd: PerceptionEntityCandidate[] = []
+  for (let index = 0; index < 5; index++) {
+    herd.push({ type: `sheep-${index}`, position: { x: 0, y: 64, z: -2 - index }, width: 0.9, height: 1.3 })
+  }
+  // Handed to the scan farthest-first, so passing this cannot be an artefact of input order.
+  const reversed = [...herd].reverse()
+
+  const capped = await visibleEntities(new FakePerceptionPort(pose, new Map(), reversed), 32, TEST_FRUSTUM, 3)
+  assert.deepEqual(capped.entities.map(entity => entity.type), ['sheep-0', 'sheep-1', 'sheep-2'])
+  assert.equal(capped.truncated, true)
+
+  const exact = await visibleEntities(new FakePerceptionPort(pose, new Map(), reversed), 32, TEST_FRUSTUM, 5)
+  assert.equal(exact.entities.length, 5)
+  assert.equal(exact.truncated, false, 'a list that happens to fill the cap exactly is not truncated')
+})
+
+test('entity scanning yields to the event loop and honors cancellation', async () => {
+  // Cost scales with tracked entities, not with `limit`: the cap applies after filtering, and an
+  // occluded candidate is the expensive case because it pays for every hitbox sample.
+  const pose = { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 }
+  const blocks = new Map<string, PerceptionBlock | 'unloaded'>()
+  for (let x = -2; x <= 2; x++) {
+    for (let y = 63; y <= 67; y++) blocks.set(`${x},${y},-3`, opaque('wall'))
+  }
+  const entities: PerceptionEntityCandidate[] = []
+  for (let index = 0; index < 24; index++) {
+    entities.push({ type: 'sheep', position: { x: 0, y: 64, z: -5 - index }, width: 0.9, height: 1.3 })
+  }
+  const port = new FakePerceptionPort(pose, blocks, entities)
+
+  let timerRan = false
+  setTimeout(() => { timerRan = true }, 0)
+  const result = await visibleEntities(port, 32, TEST_FRUSTUM, 8)
+  assert.deepEqual(result, { entities: [], truncated: false }, 'the wall hides every candidate')
+  assert.equal(timerRan, true, 'a pending timer must get a turn while the scan is in flight')
+
+  const controller = new AbortController()
+  controller.abort()
+  await assert.rejects(visibleEntities(port, 32, TEST_FRUSTUM, 8, controller.signal))
 })
 
 /** Solid opaque half-space with its sole exposed layer at y=63. */
@@ -188,6 +293,7 @@ function flatGround(pitch: number): FakePerceptionPort {
   return new FakePerceptionPort(
     { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch },
     new Map(),
+    [],
     position => position.y <= 63 ? opaque('grass_block') : AIR,
   )
 }

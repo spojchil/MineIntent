@@ -1,85 +1,53 @@
-"""Builds the system prompt and user message sent to the OpenAI-compatible model.
+"""System prompt for the companion agent.
 
-Mirrors src/models/openai-compatible.ts systemPrompt/decisionJsonTemplate/modelContext so
-prompt behaviour does not change when the Node provider is swapped for this service.
+Deliberately free of tool mechanics: how each tool works, its bounds and its parameter
+conventions live in the tool schemas the tool backend sends with every request, and the
+observation payload describes its own tuple formats in its `frame` field. This prompt only
+carries who the companion is and how it should behave.
 """
 from __future__ import annotations
 
-import json
 
-_DECISION_JSON_TEMPLATE = json.dumps(
-    {
-        "protocol": "mineintent.companion-decision.v1",
-        "speech": None,
-        "attention": {"kind": "environment", "target": None},
-        "activity": {"operation": "keep", "summary": "等待玩家一起游玩"},
-        "intent": {"kind": "observe", "summary": "留意玩家和周围环境"},
-        "action": None,
-        "memory": None,
-    },
-    ensure_ascii=False,
-    indent=2,
-) + (
-    "\n activity.operation 只能取一个值：keep、start_wood_collection、pause、resume、complete、abandon。"
-    "speech、attention.target、action、memory 可以为 JSON null；不要输出带竖线的枚举说明字符串。\n"
-    "action 非 null 时只能是以下之一：" + json.dumps(
-        [
-            {"skill": "follow_player", "args": {"range": 3}, "purpose": "行动目的"},
-            {"skill": "collect_wood", "args": {"count": 4, "maxDistance": 32}, "purpose": "行动目的"},
-            {"skill": "return_to_anchor", "args": {}, "purpose": "行动目的"},
-            {"skill": "wait", "args": {"durationSeconds": 10}, "purpose": "行动目的"},
-        ],
-        ensure_ascii=False,
-    ) + "\n"
-    "memory 非 null 时必须是 {\"kind\":\"episode|place|commitment|player_preference\",\"summary\":\"有证据支持的记忆\"}。"
-)
+def stable_context(stable: object) -> str:
+    """Renders the slowest-changing content into the system message, ahead of everything volatile.
+
+    Prefix caching is prefix-only: whatever changes first moves everything after it out of the
+    cache. The profile changes on the order of days and memory on the order of tool calls, while the
+    world changes every tick — so these belong here at the front and the world belongs in an
+    appended frame at the tail. Nothing here is re-rendered per round, which is the point.
+    """
+    if not isinstance(stable, dict):
+        return ""
+    sections: list[str] = []
+    profile = stable.get("profile")
+    content = profile.get("content") if isinstance(profile, dict) else None
+    if isinstance(content, str) and content.strip():
+        sections.append("## 你的档案\n" + content.strip())
+    memories = stable.get("memories")
+    lines = []
+    if isinstance(memories, list):
+        for memory in memories:
+            if not isinstance(memory, dict):
+                continue
+            summary = memory.get("summary")
+            if isinstance(summary, str) and summary.strip():
+                kind = memory.get("kind") if isinstance(memory.get("kind"), str) else "memory"
+                created = memory.get("createdAt") if isinstance(memory.get("createdAt"), str) else ""
+                lines.append(f"- {summary.strip()}（{kind}{'，' + created if created else ''}）")
+    if lines:
+        sections.append("## 你记得的事\n" + "\n".join(lines))
+    return ("\n\n" + "\n\n".join(sections)) if sections else ""
 
 
-def system_prompt(profile_content: str) -> str:
+def system_prompt() -> str:
     return (
-        f"你是 Minecraft 世界里的 AI 同伴。以下是可编辑同伴档案：\n\n{profile_content}\n\n"
-        "你必须只输出符合 mineintent.companion-decision.v1 的 JSON 对象。你与玩家共同游玩，不是任务机器人。"
-        "语言要简短自然；语言承诺必须与 action 一致，不能虚报成功。没有必要行动时 action 为 null。"
-        "start_wood_collection 会记录出发地点；“够了/回刚才那里”应 complete 并选择 return_to_anchor。"
-        "只有真实聊天、动作结果或已有记忆支持时才提出 memory，否则为 null。明确暂停优先。"
-        "玩家问生命值、饥饿、氧气、经验、药水效果、背包、脚下方块、准星指向、附近声音或附近实体时，"
-        "直接用 currentStatus/inventory/sound/viewport 里的真实数值回答，不要编造；"
-        "viewport.lookedAtBlock 是准星精确指向的方块（原版 block_interaction_range 概念），"
-        "不是一片视野范围；为 null 是很常见、正常的情况（准星没对准任何实心方块），"
-        "如实说“正前方没看到方块”即可，不要当成故障或编造一个方块。"
-        "viewport.visibleBlocks.blocks 是正前方视野内经过遮挡判定后确实可见的方块列表，按距离由近到远排列；"
-        "每一项是 [offsetX, offsetY, offsetZ, name] 四元组（不是键值对象），坐标是相对自身的整数偏移量"
-        "（例如 offsetZ=-3 大致是前方3格），不是世界坐标，也没有单独的距离字段——需要的话自己用偏移量估算远近；"
-        "回答时按偏移量描述相对位置，不要当成精确坐标；列表为空是正常的（比如正对着空地），"
-        "truncated 为 true 时说明视野内还有更多方块没列出。"
-        "字段缺失或在 observationOmissions 中出现时，如实说当前不知道，不要假装看到了。"
-        "这些数据只反映站立不动时能得知的情况，不代表你能移动、点击或打开界面查看更多。"
-        "字段固定为 protocol,speech,attention,activity,intent,action,memory；不要 Markdown。"
-        "必须严格使用以下 JSON 结构；所有对象必须保持为对象，不能简写成字符串：\n" + _DECISION_JSON_TEMPLATE
+        "你是 Minecraft 世界中的长期 AI 同伴，不是任务交付机器人。"
+        "根据玩家这次说的话和当前观察决定做什么；观察数据的坐标与元组格式见数据自带的 frame 字段。"
+        "对话中会不时追加一条观察帧，报告你的状态和期间发生的事；最新的一条才是现状，旧帧只是当时的记录。"
+        "动作类工具一轮最多调用一个，等它返回的新视野再判断下一步；不要预先编排动作序列。"
+        "对玩家说话只通过 say 工具；不调用 say 就是保持沉默。"
+        "动作要花时间，行动前先用 say 简短回应往往更自然，但不要为说而说。"
+        "如果目标未出现、移动无效果或工具失败，应换一个小动作继续观察，或如实停止。"
+        "不能把发出工具调用当作动作成功，也不能生成或管理世界坐标、实体 id、目标 ref。"
+        "全部做完后直接结束回合，不要在最后输出台词、总结或解释。"
     )
-
-
-def model_context(context: dict) -> dict:
-    snapshot = context["snapshot"]
-    observations = context.get("observations") or {}
-    return {
-        "protocol": "mineintent.decision-context.v1",
-        "runId": context["runId"],
-        "trigger": context["trigger"],
-        "primaryPlayer": context["primaryPlayer"],
-        "world": {
-            "worldId": snapshot["world"]["worldId"],
-            "dimension": snapshot["world"]["dimension"],
-            "timeOfDay": snapshot["world"].get("timeOfDay"),
-        },
-        "currentStatus": observations.get("currentStatus"),
-        "inventory": observations.get("inventory"),
-        "sound": observations.get("sound"),
-        "viewport": observations.get("viewport"),
-        "observationOmissions": observations.get("omissions", []),
-        "trackedPlayers": snapshot["trackedPlayers"],
-        "activity": context.get("activity") or None,
-        "recentEvents": context["recentEvents"],
-        "retrievedMemories": context["memories"],
-        "availableSkills": context["availableSkills"],
-    }

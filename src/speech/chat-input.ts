@@ -1,10 +1,6 @@
 import type { BackendEventEnvelope, ProtocolChatEvent } from '../minecraft/contracts.js'
 import type { ChatInputContext, PlayerChatMessage } from './contracts.js'
 
-const STOP_ZH = /^(?:请)?(?:你)?(?:先)?(?:停下|停一下|等一下|等等|先等等|别动|不要动|停止|住手)(?:吧|！|!|。|\.)?$/u
-const STOP_EN = /^(?:please\s+)?(?:stop|hold on|wait|freeze)(?:\s+now)?[!.]?$/iu
-const AMBIGUOUS_PREFIX = /^(?:如果|要是|假如|when|if|unless|等.+再)/iu
-
 export function interpretPlayerChat(
   event: BackendEventEnvelope<ProtocolChatEvent>,
   context: ChatInputContext,
@@ -29,19 +25,8 @@ export function interpretPlayerChat(
     text: event.payload.plainText,
     ...(event.payload.verified === undefined ? {} : { verified: event.payload.verified }),
     addressing: { addressedToCompanion: addressed, evidence: evidence.length ? evidence : ['not_addressed'] },
-    controlIntent: isPrimaryPlayer && addressed && isUnambiguousSafetyStop(event.payload.plainText, context.companionUsername)
-      ? 'safety_stop' : 'none',
     world: { worldId: event.worldId, ...(event.dimension ? { dimension: event.dimension } : {}), connectionEpoch: event.connectionEpoch },
   }
-}
-
-export function isUnambiguousSafetyStop(text: string, companionUsername?: string): boolean {
-  let normalized = text.trim().replace(/^[@＠]/u, '')
-  if (companionUsername && mentionsName(normalized, companionUsername)) {
-    normalized = normalized.replace(new RegExp(`^${escapeRegex(companionUsername)}[，,:：\s]*`, 'iu'), '').trim()
-  }
-  if (AMBIGUOUS_PREFIX.test(normalized) || /[“”"']/.test(normalized)) return false
-  return STOP_ZH.test(normalized) || STOP_EN.test(normalized)
 }
 
 function equalName(a: string | undefined, b: string): boolean { return a?.toLocaleLowerCase() === b.toLocaleLowerCase() }

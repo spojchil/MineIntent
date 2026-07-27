@@ -23,13 +23,16 @@ const READ_PLAN: readonly ReadPlanEntry[] = [
   { interfaceId: 'current_status', schemaRevision: 'current-status:1', fields: ['health', 'food', 'foodSaturation', 'oxygen', 'experienceLevel', 'statusEffects'] },
   { interfaceId: 'inventory_information', schemaRevision: 'inventory-information:1', fields: ['selectedHotbarSlot', 'slots'] },
   { interfaceId: 'sound_information', schemaRevision: 'sound-information:1', fields: ['recentSounds'] },
-  { interfaceId: 'viewport_information', schemaRevision: 'viewport-information:5', fields: ['standingOnBlock', 'lookedAtBlock', 'nearbyTrackedEntities', 'visibleBlocks'] },
+  // Only `frame` — which is the pose and the legend, and costs no scan at all. The scanning fields
+  // are gone from the push on purpose: `visibleBlocks` alone was the largest item in the prompt by
+  // an order of magnitude, and re-sending it every request is exactly what a pulled read replaces.
+  { interfaceId: 'viewport_information', schemaRevision: 'viewport-information:10', fields: ['frame'] },
 ]
 
 /**
- * The deterministic, single-shot Context Composer: reads a fixed, known-small field set from
- * each passive-observation interface once per decision. Not a model-facing tool loop — see
- * docs/architecture/information-runtime.md section 15 for why that was dropped.
+ * The deterministic, single-shot Context Composer reads a fixed, known-small field set from
+ * each passive-observation interface once per decision. It is not a model-facing information
+ * tool loop; observation composition deliberately stays inside the Runtime for now.
  */
 export async function composePassiveObservations(
   runtime: InformationRuntime,

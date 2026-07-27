@@ -2,7 +2,7 @@
 status: reference
 authority: informative
 implementation: not-applicable
-last_verified: 2026-07-23
+last_verified: 2026-07-24
 ---
 
 # MineIntent 文档入口
@@ -13,7 +13,7 @@ last_verified: 2026-07-23
 
 1. [当前项目状态](./current-status.md)：代码现在到底能做什么，哪些只是实验。
 2. [产品设计](./product-design.md)：项目为何存在，以及长期不应丢失的体验目标。
-3. [当前系统实况](./architecture/current-system.md)：最新实验分支的真实运行链路。
+3. [旧可信注视实验实况](./architecture/current-system.md)：只描述其 `applies_to` 指定的 `57d438e` 分支，不是 D40 运行链。
 4. [架构决策记录](./decisions/README.md)：已经接受、仍在提议或实现已漂移的长期决定。
 5. [开放提案](./proposals/README.md)：尚未形成决定的矛盾、反思和候选接口。
 6. [项目演进史](./history/project-evolution.md)：理解项目为何从 v0.1 走到现在。
@@ -53,11 +53,10 @@ last_verified: 2026-07-23
 
 ## 当前最重要的阅读警告
 
-- 默认分支 `main` 与最新实验分支并不相同。
-- v0.1 曾经完成采木、跟随和 Action Runtime 闭环，但最新实验分支已经删除这些实现。
-- ADR 0003 仍然是 accepted，最新实验实现却没有独立 Action Runtime；这是显式漂移，不是已经解决的替代设计。
-- ADR 0005 仍是 proposed，尽管部分协议驱动和 Motor 边界已经被实现。
-- `Information → Grounding → Behavior → Motor` 已跑通可信注视实验；把它替换成模型工具循环目前只是候选方案。
-- GitHub v0.2/v0.3 Issue 状态没有吸收 2026-07-21 至 2026-07-23 的直接提交和分支实验。
+- 默认分支 `main@8ab08fd` 不包含 D40；PR #73 仍是 Draft 实验。
+- PR #73 用 `look_relative` / `move_input` 工具循环取代生产 Action/Skill 链，但尚未形成真人 + Paper + 真实模型的可重复证据。
+- `architecture/current-system.md`、`guides/model-interface.md` 和可信注视提案仍是旧 `57d438e` 实验的记录，不描述 D40。
+- ADR 0003 仍然 accepted，而 D40 候选实现没有独立 Action Runtime；这仍是待证据解决的实现漂移。
+- GitHub v0.2/v0.3 Issue 与 milestone 还没有吸收 D40 方向。
 
 这些事实会在[当前项目状态](./current-status.md)和[具身决策登记册](./proposals/embodiment-decision-register.md)中继续维护。
