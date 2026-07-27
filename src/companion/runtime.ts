@@ -76,14 +76,12 @@ interface ActiveRun extends RunScope {
 
 /**
  * One model response that contains tool calls. It is born on the response's first call because a
- * response without calls never reaches this process. Its identity, scope and movement ledger all
- * die with the owning run; keeping any of them elsewhere would let middle-layer knowledge outlive
- * the context it mirrors.
+ * response without calls never reaches this process. Its identity and scope die with the owning
+ * run; keeping either elsewhere would let middle-layer knowledge outlive the context it mirrors.
  */
 interface ActiveRound extends RunScope {
   roundId: string
   runId: string
-  directions: Set<string>
 }
 
 type HostedToolInvocation = Omit<ToolInvocation, 'round'> & { roundId: string }
@@ -225,7 +223,7 @@ export class CompanionRuntime {
       switch (invocation.name) {
         case 'look_relative':
         case 'move_input':
-          result = await this.#executeBodyTool(active, round, hosted, actionId, startedAt)
+          result = await this.#executeBodyTool(active, hosted, actionId, startedAt)
           break
         case 'say':
           result = this.#executeSay(active, hosted, actionId)
@@ -244,21 +242,11 @@ export class CompanionRuntime {
 
   async #executeBodyTool(
     active: ActiveRun,
-    round: ActiveRound,
     invocation: HostedToolInvocation,
     actionId: string,
     startedAt: string,
   ): Promise<unknown> {
     const name = invocation.name as 'look_relative' | 'move_input'
-    if (name === 'move_input') {
-      const parsed = moveArgumentsSchema.safeParse(invocation.arguments)
-      const conflict = parsed.success
-        ? this.#execution.admitMove(round, parsed.data.direction)
-        : undefined
-      if (conflict !== undefined) {
-        return { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: conflict.summary }
-      }
-    }
     let motor: ReturnType<MinecraftBackendApi['motor']> | undefined
     try {
       motor = this.#backend.motor()
@@ -268,7 +256,7 @@ export class CompanionRuntime {
         await motor.lookRelative(args.yaw_degrees, args.pitch_degrees, active.controller.signal)
       } else {
         const args = moveArgumentsSchema.parse(invocation.arguments)
-        await motor.move(args.direction, args.duration_ms, args.sprint, active.controller.signal)
+        await motor.move(args.directions, args.duration_ms, args.sprint, active.controller.signal)
       }
       this.#assertRunCurrent(active)
       const after = this.#backend.observationSource().selfPose()
@@ -502,7 +490,7 @@ export class CompanionRuntime {
   #roundFor(active: ActiveRun, declaration: ToolInvocation['round']): ActiveRound {
     if ('new' in declaration) {
       const round: ActiveRound = {
-        roundId: randomUUID(), runId: active.runId, directions: new Set<string>(),
+        roundId: randomUUID(), runId: active.runId,
         processSessionId: active.processSessionId, connectionEpoch: active.connectionEpoch,
         worldId: active.worldId, dimension: active.dimension,
       }

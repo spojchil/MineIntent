@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { AgentServiceModelProvider } from './agent-service-client.js'
-import { agentToolDefinitions } from './agent-tools.js'
+import { agentToolDefinitions, moveArgumentsSchema } from './agent-tools.js'
 import type { AgentDecisionContext } from './contracts.js'
 
 const transport = {
@@ -26,6 +26,34 @@ test('agent service receives internal run id, safe context and callback credenti
   assert.equal(result.model, 'deepseek-chat')
   const sentTools = (body as { tools: Array<{ function: { name: string } }> }).tools
   assert.deepEqual(sentTools.map(tool => tool.function.name), ['look_relative', 'move_input', 'say', 'remember'])
+})
+
+test('move tool exposes one simultaneous key set and explains opposing-key cancellation', () => {
+  const move = agentToolDefinitions().find(tool => tool.function.name === 'move_input')
+  assert.ok(move)
+  const parameters = move.function.parameters as {
+    properties: {
+      directions: Record<string, unknown>
+      duration_ms: Record<string, unknown>
+    }
+    required: string[]
+  }
+  assert.deepEqual(parameters.required, ['directions', 'duration_ms'])
+  assert.deepEqual(parameters.properties.directions, {
+    description: '同时按住的移动键，方向相对当前朝向；斜走时把两个键放在这里。',
+    minItems: 1,
+    maxItems: 4,
+    type: 'array',
+    items: { type: 'string', enum: ['forward', 'back', 'left', 'right'] },
+    uniqueItems: true,
+  })
+  assert.match(move.function.description, /前后键或左右键同时按会互相抵消/u)
+  assert.equal(moveArgumentsSchema.safeParse({
+    directions: ['forward', 'back'], duration_ms: 50,
+  }).success, true)
+  assert.equal(moveArgumentsSchema.safeParse({
+    directions: ['forward', 'forward'], duration_ms: 50,
+  }).success, false)
 })
 
 test('agent service rejects non-loopback callbacks and surfaces service errors', async () => {

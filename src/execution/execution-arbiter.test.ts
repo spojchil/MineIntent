@@ -60,33 +60,6 @@ test('a stale release after invalidation cannot evict the lease that replaced it
   assert.equal(arbiter.leaseFor('body')?.runId, 'new')
 })
 
-test('same-round movement refuses opposing pairs and admits diagonal ones', () => {
-  const arbiter = new ExecutionArbiter()
-  const round = { directions: new Set<string>() }
-  assert.equal(arbiter.admitMove(round, 'forward'), undefined)
-  // Diagonal: exactly what a player does holding W and A together.
-  assert.equal(arbiter.admitMove(round, 'left'), undefined)
-
-  const refused = arbiter.admitMove(round, 'back')
-  assert.equal(refused?.code, 'opposing_move')
-  assert.match(refused!.summary, /back cancels forward/u)
-
-  // A distinct host is a new decision: the model saw the result and may legitimately reverse.
-  assert.equal(arbiter.admitMove({ directions: new Set<string>() }, 'back'), undefined)
-})
-
-test('movement history belongs to the supplied round host', () => {
-  const arbiter = new ExecutionArbiter()
-  const first = { directions: new Set<string>() }
-  const second = { directions: new Set<string>() }
-  arbiter.admitMove(first, 'forward')
-
-  // There is no arbiter-owned run/round lookup left: distinct hosts cannot contaminate each other.
-  assert.equal(arbiter.admitMove(second, 'back'), undefined)
-  assert.deepEqual([...first.directions], ['forward'])
-  assert.deepEqual([...second.directions], ['back'])
-})
-
 test('a job hands back a handle immediately and reports its outcome later', () => {
   const arbiter = new ExecutionArbiter()
   const job = arbiter.startJob({ resource: 'body', runId: 'r', toolName: 'move_input' })

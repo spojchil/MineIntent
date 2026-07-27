@@ -1,11 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { ExecutionRefusal, ExecutionResource, JobOutcome, JobState, ResourceLease } from './contracts.js'
 
-/** Movement inputs that cancel each other when the model asks for them in the same round. */
-const OPPOSING_DIRECTION: Record<string, string> = {
-  forward: 'back', back: 'forward', left: 'right', right: 'left',
-}
-
 interface Job {
   jobId: string
   resource: ExecutionResource
@@ -75,25 +70,6 @@ export class ExecutionArbiter {
         if (this.#leases.get(input.resource) === lease) this.#leases.delete(input.resource)
       },
     }
-  }
-
-  /**
-   * Applies the existing same-round movement policy to state owned by the round host.
-   *
-   * Why opposing directions are refused while orthogonal ones are admitted is deliberately not
-   * decided here (issue #98). This method preserves that predicate while moving its ledger into the
-   * object whose lifetime defines the reset boundary.
-   */
-  admitMove(round: { directions: Set<string> }, direction: string): ExecutionRefusal | undefined {
-    const opposing = OPPOSING_DIRECTION[direction]
-    if (opposing !== undefined && round.directions.has(opposing)) {
-      return {
-        code: 'opposing_move',
-        summary: `opposing_move:${direction} cancels ${opposing} already held this round`,
-      }
-    }
-    round.directions.add(direction)
-    return undefined
   }
 
   /**

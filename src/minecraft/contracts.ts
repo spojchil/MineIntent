@@ -255,6 +255,7 @@ export interface BackendReady {
 }
 
 export type MotorMoveDirection = 'forward' | 'back' | 'left' | 'right'
+export type MotorMoveDirections = readonly MotorMoveDirection[]
 
 /**
  * The deliberately small physical boundary behind the body tools. These methods are
@@ -263,7 +264,12 @@ export type MotorMoveDirection = 'forward' | 'back' | 'left' | 'right'
  */
 export interface MinecraftMotorDriverApi {
   lookRelative(yawDegrees: number, pitchDegrees: number, signal: AbortSignal): Promise<void>
-  move(direction: MotorMoveDirection, durationMs: number, sprint: boolean | undefined, signal: AbortSignal): Promise<void>
+  move(
+    directions: MotorMoveDirections,
+    durationMs: number,
+    sprint: boolean | undefined,
+    signal: AbortSignal,
+  ): Promise<void>
   releaseAll(): void
 }
 
