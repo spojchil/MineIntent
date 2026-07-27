@@ -36,7 +36,18 @@ class FakeBackend extends EventEmitter implements MinecraftBackendApi {
         { entityKey: 'self', protocolEntityId: 0, type: 'player', username: 'Bot', position: this.position, velocity: { x: 0, y: 0, z: 0 }, yaw: 0, pitch: 0, width: 0.6, height: 1.8, onGround: true, equipment: [], valid: true },
         { entityKey: '1:alex', protocolEntityId: 1, type: 'player', username: 'Alex', position: { x: 0, y: 64, z: 3 }, velocity: { x: 0, y: 0, z: 0 }, yaw: 0, pitch: 0, width: 0.6, height: 1.8, onGround: true, equipment: [], valid: true },
       ],
-      readBlock: (position) => position.y === 60 ? { status: 'loaded', block: { position, name: 'stone', stateId: 1, properties: {}, collisionShapes: [], transparentHint: false, boundingBox: 'block' } } : { status: 'unloaded' },
+      readBlock: (position) => {
+        if (position.y === 60) {
+          return { status: 'loaded', block: { position, name: 'stone', stateId: 1, properties: {}, collisionShapes: [], transparentHint: false, boundingBox: 'block' } }
+        }
+        if (position.y === 61) {
+          return { status: 'loaded', block: { position, name: 'glass', stateId: 2, properties: {}, collisionShapes: [], transparentHint: true, boundingBox: 'block' } }
+        }
+        if (position.y === 62) {
+          return { status: 'loaded', block: { position, name: 'cave_air', stateId: 3, properties: {}, collisionShapes: [], transparentHint: true, boundingBox: 'empty' } }
+        }
+        return { status: 'unloaded' }
+      },
       subscribe: () => () => {},
     }
   }
@@ -65,6 +76,8 @@ test('BackendPerceptionPort excludes self from nearby entities and maps block lo
   assert.equal(nearby[0]!.username, 'Alex')
   assert.equal(nearby[0]!.width, 0.6)
   assert.deepEqual(port.blockAt({ x: 0, y: 60, z: 0 }), { name: 'stone', visible: true, occludes: true })
+  assert.deepEqual(port.blockAt({ x: 0, y: 61, z: 0 }), { name: 'glass', visible: true, occludes: false })
+  assert.deepEqual(port.blockAt({ x: 0, y: 62, z: 0 }), { name: 'cave_air', visible: false, occludes: false })
   assert.equal(port.blockAt({ x: 0, y: 70, z: 0 }), 'unloaded')
 })
 
