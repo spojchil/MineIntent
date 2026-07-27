@@ -4,11 +4,20 @@ import type { PerceptionBlock, PerceptionEntityCandidate, PerceptionPort, Percep
 import { assertInformationProviderContract } from '../testing/provider-contract.js'
 import { ViewportInformationProvider } from './viewport-provider.js'
 
+const AIR: PerceptionBlock = { name: 'air', visible: false, occludes: false }
+
 class FakePort implements PerceptionPort {
-  constructor(public pose: PerceptionPose, readonly blocks = new Map<string, PerceptionBlock>(), readonly entities: PerceptionEntityCandidate[] = []) {}
+  constructor(
+    public pose: PerceptionPose,
+    readonly blocks = new Map<string, PerceptionBlock>(),
+    readonly entities: PerceptionEntityCandidate[] = [],
+    readonly fallback?: (position: PerceptionPose['position']) => PerceptionBlock | 'unloaded',
+  ) {}
   selfPose() { return this.pose }
   revision() { return 1 }
-  blockAt(position: PerceptionPose['position']) { return this.blocks.get(`${position.x},${position.y},${position.z}`) ?? { name: 'air', visible: false, occludes: false } }
+  blockAt(position: PerceptionPose['position']) {
+    return this.blocks.get(`${position.x},${position.y},${position.z}`) ?? this.fallback?.(position) ?? AIR
+  }
   nearbyEntities() { return this.entities }
 }
 const stone = (name: string): PerceptionBlock => ({ name, visible: true, occludes: true })
@@ -54,6 +63,26 @@ test('positions are world-absolute so the same block keeps one key from any stan
     { position: { x: 1, y: 64, z: 1 }, yaw: -Math.PI / 2, pitch: 0 }, blocks, entities,
   )).read(context(), { fields: ['visibleBlocks'], page: { limit: 1 } }, new AbortController().signal)
   assert.deepEqual(second.values.visibleBlocks?.blocks[0], ['stone', 3, 65, 0])
+})
+
+test('viewport provider selects the exposed-face predicate for level flat ground', async () => {
+  const provider = new ViewportInformationProvider(new FakePort(
+    { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0 },
+    new Map(),
+    [],
+    position => position.y <= 63 ? stone('grass_block') : AIR,
+  ))
+  const result = await provider.read(
+    context(),
+    { fields: ['visibleBlocks'], page: { limit: 1 } },
+    new AbortController().signal,
+  )
+
+  assert.equal(result.values.visibleBlocks?.truncated, true)
+  assert.equal(result.values.visibleBlocks?.blocks.length, 256)
+  assert.equal(result.values.visibleBlocks?.blocks.every(
+    ([name, , y]) => name === 'grass_block' && y === 63,
+  ), true)
 })
 
 test('a player named after a mob stays distinguishable from that mob', async () => {
