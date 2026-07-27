@@ -308,6 +308,19 @@ test('say reports queued rather than completed, and journals the whole correlati
   assert.equal((scheduled!.payload as { requestId: string }).requestId, payload.actionId)
 })
 
+test('the model sees exactly the contracts registered for dispatch', async t => {
+  const { backend, model, runtime } = await fixture(t)
+  backend.emitChat('Bot，你能做什么？')
+  await waitFor(() => model.calls.length === 1)
+  await runtime.idle()
+
+  const tools = model.calls[0]!.tools
+  assert.deepEqual(tools.map(tool => tool.function.name), [
+    'look_relative', 'move_input', 'say', 'remember',
+  ])
+  assert.match(tools.find(tool => tool.function.name === 'move_input')!.function.description, /前后键或左右键同时按会互相抵消/u)
+})
+
 test('a key set moves diagonally, while opposing keys execute and report no effect', async t => {
   const { backend, model, runtime } = await fixture(t)
   const results: unknown[] = []

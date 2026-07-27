@@ -1,7 +1,12 @@
 import { z } from 'zod'
 import type { PassiveObservations } from '../information/index.js'
 import type { CompanionProfile } from '../companion/profile.js'
-import type { WireToolDefinition } from './agent-tools.js'
+
+/** Model-provider wire shape; the implementing capability owns the actual contents. */
+export interface WireToolDefinition {
+  type: 'function'
+  function: { name: string; description: string; parameters: Record<string, unknown> }
+}
 
 /**
  * One appended observation of the world.
