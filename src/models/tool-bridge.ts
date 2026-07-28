@@ -60,6 +60,7 @@ export class ToolBridgeServer {
       const execution = await this.handler(invocation.data)
       send(response, 200, {
         protocol: TOOL_RESPONSE_PROTOCOL,
+        roundId: execution.roundId,
         result: execution.result,
         ...(execution.frame === undefined ? {} : { frame: execution.frame }),
       })

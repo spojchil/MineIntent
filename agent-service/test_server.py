@@ -36,6 +36,13 @@ def tools():
     ]
 
 
+def hosted(result, round_id="round-from-host", frame=None):
+    response = {"protocol": "mineintent.tool-response.v1", "roundId": round_id, "result": result}
+    if frame is not None:
+        response["frame"] = frame
+    return response
+
+
 class ServerTests(unittest.TestCase):
     def test_deepseek_replay_preserves_reasoning_and_tool_call_id(self):
         sink = _Sink()
@@ -58,17 +65,17 @@ class ServerTests(unittest.TestCase):
             deadlines.append(deadline)
             return responses.pop(0)
 
-        def execute(run_id, name, arguments, _deadline, tool_call_id="", round_id=0):
-            calls.append((run_id, name, arguments, tool_call_id, round_id))
-            return {"status": "completed", "viewport": {"visibleEntities": [["sheep", 0, 0, 3]]}}
+        def execute(run_id, name, arguments, _deadline, tool_call_id="", round_declaration=None):
+            calls.append((run_id, name, arguments, tool_call_id, round_declaration))
+            return hosted({"status": "completed", "viewport": {"visibleEntities": [["sheep", 0, 0, 3]]}})
 
         with patch.object(server, "model_completion", completion):
             closing, usage = server.run_tool_loop(sink.config(), "run-1", context(), execute, tools())
         self.assertEqual(closing, "")
         self.assertEqual(usage, {"prompt_tokens": 30, "completion_tokens": 5})
         self.assertEqual(deadlines[0], deadlines[1])
-        # 关联链：模型的 tool_call_id 与轮次序号一路传到工具后端（D06）。
-        self.assertEqual(calls, [("run-1", "look_relative", {"yaw_degrees": 90, "pitch_degrees": 0}, "call-1", 0)])
+        # Python only declares the boundary; the tool host, not this loop, supplies its identity.
+        self.assertEqual(calls, [("run-1", "look_relative", {"yaw_degrees": 90, "pitch_degrees": 0}, "call-1", {"new": True})])
         replay = model_messages[1][-2]
         tool_result = model_messages[1][-1]
         self.assertEqual(replay["reasoning_content"], "need turn")
@@ -93,10 +100,13 @@ class ServerTests(unittest.TestCase):
             seen.append(json.loads(json.dumps(messages)))
             return responses.pop(0)
 
-        def execute(_run_id, name, _arguments, _deadline, _tool_call_id="", _round_id=0):
+        declarations = []
+
+        def execute(_run_id, name, _arguments, _deadline, _tool_call_id="", round_declaration=None):
+            declarations.append(round_declaration)
             if name == "say":
-                return {"protocol": "mineintent.tool-response.v1", "result": {"status": "queued"}, "frame": frame}
-            return {"status": "completed"}
+                return hosted({"status": "queued"}, "round-frame", frame)
+            return hosted({"status": "completed"}, "round-frame")
 
         with patch.object(server, "model_completion", completion):
             server.run_tool_loop(sink.config(), "run-frame", context(), execute, tools())
@@ -118,9 +128,36 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(json.loads(seen[1][-1]["content"]), frame)
         # The envelope is unwrapped: the model sees the tool's answer, not our transport around it.
         self.assertEqual(json.loads(seen[1][3]["content"]), {"status": "queued"})
+        self.assertEqual(declarations, [{"new": True}, {"id": "round-frame"}])
+        self.assertNotIn("round-frame", json.dumps(seen[1]))
         # Frames already in the conversation are byte-identical on the next round — appended once,
         # never re-rendered, which is the only reason a volatile frame is free under caching.
         self.assertEqual(seen[0][:2], seen[1][:2])
+
+    def test_executor_round_identity_is_required_and_cannot_change_mid_response(self):
+        response = {"choices": [{"message": {"role": "assistant", "tool_calls": [
+            {"id": "c1", "function": {"name": "say", "arguments": "{}"}},
+        ]}}]}
+        sink = _Sink()
+        self.addCleanup(sink.dir.cleanup)
+        missing = {"protocol": "mineintent.tool-response.v1", "result": {"status": "queued"}}
+        with patch.object(server, "model_completion", lambda *_a, **_k: response):
+            with self.assertRaisesRegex(RuntimeError, "no round id"):
+                server.run_tool_loop(sink.config(), "run-missing", context(), lambda *_a: missing, tools())
+
+        responses = [{"choices": [{"message": {"role": "assistant", "tool_calls": [
+            {"id": "c1", "function": {"name": "say", "arguments": "{}"}},
+            {"id": "c2", "function": {"name": "say", "arguments": "{}"}},
+        ]}}]}]
+        returned_ids = iter(["round-a", "round-b"])
+        sink = _Sink()
+        self.addCleanup(sink.dir.cleanup)
+        with patch.object(server, "model_completion", lambda *_a, **_k: responses.pop(0)):
+            with self.assertRaisesRegex(RuntimeError, "changed the active round id"):
+                server.run_tool_loop(
+                    sink.config(), "run-changed", context(),
+                    lambda *_a: hosted({"status": "queued"}, next(returned_ids)), tools(),
+                )
 
     def test_cache_counters_are_read_from_each_provider_shape_and_summed(self):
         # DeepSeek reports the hit at the top level; Zhipu and Moonshot use OpenAI's nested details.
@@ -150,7 +187,7 @@ class ServerTests(unittest.TestCase):
         ]
         with patch.object(server, "model_completion", lambda *_a, **_k: responses.pop(0)):
             _closing, usage = server.run_tool_loop(
-                sink.config(), "run-cache", context(), lambda *_a, **_k: {"status": "queued"}, tools(),
+                sink.config(), "run-cache", context(), lambda *_a, **_k: hosted({"status": "queued"}), tools(),
             )
         # Round one is a cold write, round two hits the prefix built by round one: the run's own
         # numbers are what make intra-run reuse visible without a provider dashboard.
@@ -177,7 +214,7 @@ class ServerTests(unittest.TestCase):
         with patch.object(server, "model_completion", completion):
             server.run_tool_loop(
                 sink.config(), "run-1", context(),
-                lambda *args: executed.append(args) or {"status": "completed"}, tools(),
+                lambda *args: executed.append(args) or hosted({"status": "completed"}), tools(),
             )
         # 并行调用不再被预先拒绝：约束在提示词里是建议，失败由工具后端如实回报。
         self.assertEqual([call[1] for call in executed], ["move_input", "look_relative"])
@@ -222,7 +259,7 @@ class ServerTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as caught:
                 server.run_tool_loop(
                     sink.config(), "run-1", context(),
-                    lambda *args: executed.append(args) or {"status": "completed"}, tools(),
+                    lambda *args: executed.append(args) or hosted({"status": "completed"}), tools(),
                 )
         self.assertIn("in one round", str(caught.exception))
         # 超限的一轮里一个调用都不执行：身体动作是真实时间，不能先做一半再报错。
@@ -236,7 +273,7 @@ class ServerTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as caught:
                 server.run_tool_loop(
                     sink.config(), "run-2", context(),
-                    lambda *args: executed.append(args) or {"status": "completed"}, tools(),
+                    lambda *args: executed.append(args) or hosted({"status": "completed"}), tools(),
                 )
         # 每轮都合法，累计不合法：_MAX_TOOL_ROUNDS 单独拦不住这条。
         self.assertIn("run limit", str(caught.exception))
@@ -255,7 +292,7 @@ class ServerTests(unittest.TestCase):
         with patch.object(server, "model_completion", lambda _config, _messages, _deadline, _run=None, tools=None: responses.pop(0)):
             server.run_tool_loop(
                 sink.config(), "run-1", context(),
-                lambda *args: seen.append(args) or {"status": "failed", "summary": "duration out of range"}, tools(),
+                lambda *args: seen.append(args) or hosted({"status": "failed", "summary": "duration out of range"}), tools(),
             )
         # 工具契约归工具侧：agent 不预判参数合法性，越界值也交给后端回真实失败。
         self.assertEqual(len(seen), 1)

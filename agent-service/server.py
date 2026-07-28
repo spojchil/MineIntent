@@ -307,11 +307,12 @@ def http_tool_executor(url: str, token: str):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
     def execute(run_id: str, name: str, arguments: dict, deadline: float,
-                tool_call_id: str = "", round_id: int = 0) -> object:
+                tool_call_id: str = "", round_declaration: dict | None = None) -> object:
         request = urllib.request.Request(
             url,
             data=strict_json_dumps({
-                "runId": run_id, "toolCallId": tool_call_id, "roundId": round_id,
+                "runId": run_id, "toolCallId": tool_call_id,
+                "round": round_declaration if round_declaration is not None else {"new": True},
                 "name": name, "arguments": arguments,
             }),
             method="POST",
@@ -441,17 +442,19 @@ def model_completion(
         connection.close()
 
 
-def split_tool_response(value: object) -> tuple[object, dict | None]:
-    """Separates a tool's answer from a frame that happened to ride along with it.
+def split_tool_response(value: object) -> tuple[object, dict | None, str | None]:
+    """Separates model-visible data from opaque executor transport metadata.
 
     The frame is appended to the conversation as its own entry rather than merged into the result:
     taking damage has nothing to do with whichever tool was running, and folding it in would teach
-    the model that tools report unrelated news. A response without the envelope is the whole result,
-    which keeps bare-result callers and test doubles working unchanged.
+    the model that tools report unrelated news. The round id is likewise never shown to the model;
+    the loop only echoes it to the executor on later calls in the same assistant response.
     """
     if isinstance(value, dict) and value.get("protocol") == _TOOL_RESPONSE_PROTOCOL:
-        return value.get("result"), value.get("frame")
-    return value, None
+        round_id = value.get("roundId")
+        valid_round_id = round_id if isinstance(round_id, str) and 0 < len(round_id) <= 128 else None
+        return value.get("result"), value.get("frame"), valid_round_id
+    return value, None, None
 
 
 def _non_negative_int(value: object) -> int | None:
@@ -517,7 +520,7 @@ def run_tool_loop(
     error_summary: str | None = None
     executed_calls = 0
     try:
-        for round_id in range(_MAX_TOOL_ROUNDS):
+        for _ in range(_MAX_TOOL_ROUNDS):
             if run is not None:
                 run.ensure_active()
             remaining_seconds(deadline)
@@ -554,6 +557,10 @@ def run_tool_loop(
                 # constraints belong in the prompt as advice, failures belong to the world, and the
                 # tool backend answers invalid or conflicting requests with honest failed results.
                 frames: list[dict] = []
+                # This loop knows a new model response began, but that fact is not an identity. The
+                # executor names the round on the first existing tool response; later calls merely
+                # carry that opaque name back, so opening it costs no extra network turn.
+                round_id: str | None = None
                 for call in tool_calls:
                     call_id = call.get("id") if isinstance(call, dict) else None
                     function = call.get("function") if isinstance(call, dict) else None
@@ -566,9 +573,15 @@ def run_tool_loop(
                             raise ValueError("invalid tool call")
                         if run is not None:
                             run.ensure_active()
-                        result, frame = split_tool_response(
-                            execute_tool(run_id, name, arguments, deadline, call_id, round_id)
+                        declaration = {"new": True} if round_id is None else {"id": round_id}
+                        result, frame, response_round_id = split_tool_response(
+                            execute_tool(run_id, name, arguments, deadline, call_id, declaration)
                         )
+                        if response_round_id is None:
+                            raise RuntimeError("tool executor response has no round id")
+                        if round_id is not None and response_round_id != round_id:
+                            raise RuntimeError("tool executor changed the active round id")
+                        round_id = response_round_id
                         if isinstance(frame, dict):
                             frames.append(frame)
                         if run is not None:

@@ -62,26 +62,29 @@ test('a stale release after invalidation cannot evict the lease that replaced it
 
 test('same-round movement refuses opposing pairs and admits diagonal ones', () => {
   const arbiter = new ExecutionArbiter()
-  assert.equal(arbiter.admitMove('r', 0, 'forward'), undefined)
+  const round = { directions: new Set<string>() }
+  assert.equal(arbiter.admitMove(round, 'forward'), undefined)
   // Diagonal: exactly what a player does holding W and A together.
-  assert.equal(arbiter.admitMove('r', 0, 'left'), undefined)
+  assert.equal(arbiter.admitMove(round, 'left'), undefined)
 
-  const refused = arbiter.admitMove('r', 0, 'back')
+  const refused = arbiter.admitMove(round, 'back')
   assert.equal(refused?.code, 'opposing_move')
   assert.match(refused!.summary, /back cancels forward/u)
 
-  // A new round is a new decision: the model saw the result and may legitimately reverse.
-  assert.equal(arbiter.admitMove('r', 1, 'back'), undefined)
+  // A distinct host is a new decision: the model saw the result and may legitimately reverse.
+  assert.equal(arbiter.admitMove({ directions: new Set<string>() }, 'back'), undefined)
 })
 
-test('per-round state is scoped per run and forgotten when the run ends', () => {
+test('movement history belongs to the supplied round host', () => {
   const arbiter = new ExecutionArbiter()
-  arbiter.admitMove('run-a', 0, 'forward')
-  // Another run's round 0 is unrelated; sharing the map across runs would refuse valid moves.
-  assert.equal(arbiter.admitMove('run-b', 0, 'back'), undefined)
+  const first = { directions: new Set<string>() }
+  const second = { directions: new Set<string>() }
+  arbiter.admitMove(first, 'forward')
 
-  arbiter.forgetRun('run-a')
-  assert.equal(arbiter.admitMove('run-a', 0, 'back'), undefined)
+  // There is no arbiter-owned run/round lookup left: distinct hosts cannot contaminate each other.
+  assert.equal(arbiter.admitMove(second, 'back'), undefined)
+  assert.deepEqual([...first.directions], ['forward'])
+  assert.deepEqual([...second.directions], ['back'])
 })
 
 test('a job hands back a handle immediately and reports its outcome later', () => {
@@ -110,7 +113,6 @@ test('scope loss voids every lease and running job in one step', () => {
   const held = arbiter.acquire({ resource: 'body', runId: 'r', toolName: 'move_input' })
   assert.ok(!('code' in held))
   const job = arbiter.startJob({ resource: 'body', runId: 'r', toolName: 'move_input' })
-  arbiter.admitMove('r', 0, 'forward')
   const before = arbiter.epoch
 
   arbiter.invalidate('world_scope_changed')
@@ -119,8 +121,6 @@ test('scope loss voids every lease and running job in one step', () => {
   assert.equal(arbiter.leaseFor('body'), undefined)
   assert.equal(job.state, 'cancelled')
   assert.equal(job.controller.signal.aborted, true)
-  // Round history is void too: the pre-invalidation forward no longer constrains anything.
-  assert.equal(arbiter.admitMove('r', 0, 'back'), undefined)
 })
 
 test('settled jobs are pruned while running ones survive to be reported', () => {
