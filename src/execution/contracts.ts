@@ -10,7 +10,7 @@
  */
 
 /** Independent resources a tool may need. Locks are per resource, never per tool. */
-export type ExecutionResource = 'body' | 'chat' | 'memory'
+export type ExecutionResource = 'body' | 'chat' | 'memory' | 'viewport'
 
 export type JobState = 'running' | 'completed' | 'failed' | 'cancelled'
 

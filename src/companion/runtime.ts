@@ -40,6 +40,7 @@ import { createLookRelativeCapability } from './capabilities/look-relative.js'
 import { createMoveInputCapability } from './capabilities/move-input.js'
 import { createRememberCapability } from './capabilities/remember.js'
 import { createSayCapability } from './capabilities/say.js'
+import { createViewCapability } from './capabilities/view.js'
 
 const INFORMATION_GRANT_ID = 'grant-context-composer'
 const INFORMATION_PRINCIPAL_ID = 'context-composer'
@@ -84,7 +85,7 @@ interface ActiveRound extends RunScope {
 /**
  * The runtime intentionally has one model route: an addressed player chat. Chat text has no
  * privileged control phrases, and the model-visible surface is the small tool set in
- * the capability registry — two short body inputs, `say`, and `remember`.
+ * the capability registry — two short body inputs, `view`, `say`, and `remember`.
  */
 export class CompanionRuntime {
   readonly #backend: MinecraftBackendApi
@@ -138,6 +139,7 @@ export class CompanionRuntime {
     this.#capabilities = new ToolCapabilityRegistry([
       createLookRelativeCapability(this.#backend, this.#journal, readViewport, releaseBodyInputs),
       createMoveInputCapability(this.#backend, this.#journal, readViewport, releaseBodyInputs),
+      createViewCapability(readViewport),
       createSayCapability(this.#speech, this.#journal, runId => {
         const active = this.#activeRun
         if (!active || active.runId !== runId) throw new Error('tool_run_is_not_active')

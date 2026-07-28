@@ -316,9 +316,38 @@ test('the model sees exactly the contracts registered for dispatch', async t => 
 
   const tools = model.calls[0]!.tools
   assert.deepEqual(tools.map(tool => tool.function.name), [
-    'look_relative', 'move_input', 'say', 'remember',
+    'look_relative', 'move_input', 'view', 'say', 'remember',
   ])
   assert.match(tools.find(tool => tool.function.name === 'move_input')!.function.description, /前后键或左右键同时按会互相抵消/u)
+  assert.match(tools.find(tool => tool.function.name === 'view')!.function.description, /看一眼/u)
+})
+
+test('view returns visible blocks without moving or turning the body', async t => {
+  const { backend, model, runtime } = await fixture(t)
+  let result: unknown
+  const positionBefore = { ...backend.position }
+  const yawBefore = backend.yaw
+  const pitchBefore = backend.pitch
+  model.handler = async input => {
+    const round = new TestToolRound(runtime, input.runId)
+    result = await round.execute('view', {})
+    return { model: 'fake' }
+  }
+
+  backend.emitChat('Bot，你眼前有什么？')
+  await waitFor(() => model.calls.length === 1)
+  await runtime.idle()
+
+  const viewport = (result as {
+    status: string
+    viewport: { visibleBlocks: { blocks: Array<[string, number, number, number]> } }
+  }).viewport
+  assert.equal((result as { status: string }).status, 'completed')
+  assert.ok(viewport.visibleBlocks.blocks.some(([name]) => name === 'grass_block'))
+  assert.deepEqual(backend.position, positionBefore)
+  assert.equal(backend.yaw, yawBefore)
+  assert.equal(backend.pitch, pitchBefore)
+  assert.deepEqual(backend.motorInstance.moveCalls, [])
 })
 
 test('a key set moves diagonally, while opposing keys execute and report no effect', async t => {
@@ -414,6 +443,9 @@ test('a held resource fails the call instead of killing the run, and only blocks
     const moving = round.execute('move_input', { directions: ['forward'], duration_ms: 300 })
     await waitFor(() => backend.motorInstance.moving)
     results.push(await round.execute('look_relative', { yaw_degrees: 5, pitch_degrees: 0 }))
+    // Scanning has its own physical resource. Looking without moving must remain possible while the
+    // body is occupied, even though a second scan at the same time would contend for the event loop.
+    results.push(await round.execute('view', {}))
     // say 用的是聊天资源，不该被身体挡住——否则「行动前先说一句」就无法实现。
     results.push(await round.execute('say', { text: '我先动一下。' }))
     results.push(await moving)
@@ -425,8 +457,12 @@ test('a held resource fails the call instead of killing the run, and only blocks
 
   assert.equal((results[0] as { status: string }).status, 'failed')
   assert.match((results[0] as { summary: string }).summary, /resource_busy:body is held by move_input/u)
-  assert.equal((results[1] as { status: string }).status, 'queued')
-  assert.equal((results[2] as { status: string }).status, 'completed')
+  assert.equal((results[1] as { status: string }).status, 'completed')
+  assert.ok((results[1] as {
+    viewport: { visibleBlocks: { blocks: unknown[] } }
+  }).viewport.visibleBlocks.blocks.length > 0)
+  assert.equal((results[2] as { status: string }).status, 'queued')
+  assert.equal((results[3] as { status: string }).status, 'completed')
   assert.equal(backend.messages.includes('我先动一下。'), true)
 })
 
