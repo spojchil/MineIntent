@@ -9,22 +9,16 @@ import {
   InventoryProvider,
   SoundInformationProvider,
   ViewportInformationProvider,
-  lookDirection,
   type PassiveObservations,
   type TrustedInformationCaller,
   type ViewportValues,
 } from '../information/index.js'
 import type { FileMemoryStore } from '../memory/index.js'
-import { ExecutionArbiter, type ExecutionResource } from '../execution/index.js'
+import { ExecutionArbiter } from '../execution/index.js'
 import type {
   BackendEventEnvelope, MinecraftBackendApi, ProtocolChatEvent,
 } from '../minecraft/contracts.js'
 import {
-  agentToolDefinitions,
-  lookArgumentsSchema,
-  moveArgumentsSchema,
-  rememberArgumentsSchema,
-  sayArgumentsSchema,
   type AgentDecisionContext,
   type AgentFrame,
   type ModelProvider,
@@ -41,11 +35,14 @@ import {
   SoundHistory,
 } from './information-adapters.js'
 import type { CompanionProfile } from './profile.js'
+import { TOOL_RESULT_PROTOCOL, ToolCapabilityRegistry } from './capabilities/contracts.js'
+import { createLookRelativeCapability } from './capabilities/look-relative.js'
+import { createMoveInputCapability } from './capabilities/move-input.js'
+import { createRememberCapability } from './capabilities/remember.js'
+import { createSayCapability } from './capabilities/say.js'
 
 const INFORMATION_GRANT_ID = 'grant-context-composer'
 const INFORMATION_PRINCIPAL_ID = 'context-composer'
-
-const TOOL_RESULT_PROTOCOL = 'mineintent.tool-result.v1'
 
 export interface CompanionRuntimeOptions {
   backend: MinecraftBackendApi
@@ -84,21 +81,10 @@ interface ActiveRound extends RunScope {
   runId: string
 }
 
-type HostedToolInvocation = Omit<ToolInvocation, 'round'> & { roundId: string }
-
-/** Which resource a tool needs. Locks are per resource, not per tool: `say` and `remember` touch
- * neither the body nor each other, so a body input in flight must not block them. */
-const TOOL_RESOURCE: Record<string, ExecutionResource> = {
-  look_relative: 'body', move_input: 'body', say: 'chat', remember: 'memory',
-}
-
-const MOVE_EFFECT_EPSILON = 0.01
-const LOOK_EFFECT_EPSILON_DEGREES = 0.01
-
 /**
  * The runtime intentionally has one model route: an addressed player chat. Chat text has no
  * privileged control phrases, and the model-visible surface is the small tool set in
- * `models/agent-tools.ts` — two short body inputs, `say`, and `remember`.
+ * the capability registry — two short body inputs, `say`, and `remember`.
  */
 export class CompanionRuntime {
   readonly #backend: MinecraftBackendApi
@@ -111,6 +97,7 @@ export class CompanionRuntime {
   readonly #speech: SpeechScheduler
   readonly #soundHistory: SoundHistory
   readonly #informationRuntime: InformationRuntime
+  readonly #capabilities: ToolCapabilityRegistry
   readonly #abort = new AbortController()
   /**
    * Events waiting for the next frame to carry them. Drained rather than kept as a rolling window:
@@ -146,6 +133,18 @@ export class CompanionRuntime {
     })
     this.#soundHistory = new SoundHistory(this.#backend)
     this.#informationRuntime = buildInformationRuntime(this.#backend, this.#soundHistory)
+    const readViewport = (runId: string, signal: AbortSignal) => this.#readViewport(runId, signal)
+    const releaseBodyInputs = () => this.#releaseBodyInputs()
+    this.#capabilities = new ToolCapabilityRegistry([
+      createLookRelativeCapability(this.#backend, this.#journal, readViewport, releaseBodyInputs),
+      createMoveInputCapability(this.#backend, this.#journal, readViewport, releaseBodyInputs),
+      createSayCapability(this.#speech, this.#journal, runId => {
+        const active = this.#activeRun
+        if (!active || active.runId !== runId) throw new Error('tool_run_is_not_active')
+        active.sayCount += 1
+      }),
+      createRememberCapability(this.#memory, this.#journal),
+    ])
   }
 
   async start(): Promise<void> {
@@ -194,10 +193,8 @@ export class CompanionRuntime {
     if (!active || active.runId !== invocation.runId) throw new Error('tool_run_is_not_active')
     this.#assertRunCurrent(active)
     const round = this.#roundFor(active, invocation.round)
-    const { round: _declaration, ...call } = invocation
-    const hosted: HostedToolInvocation = { ...call, roundId: round.roundId }
-    const resource = TOOL_RESOURCE[invocation.name]
-    if (resource === undefined) {
+    const capability = this.#capabilities.resolve(invocation.name)
+    if (capability === undefined) {
       // An honest unknown-name failure instead of a transport error: the model can recover.
       return {
         roundId: round.roundId,
@@ -206,149 +203,43 @@ export class CompanionRuntime {
     }
     // A held resource is a fact about the world, so it comes back as a failed result. Throwing here
     // would surface as a bridge 500 and kill the whole run over a transient conflict.
-    const acquired = this.#execution.acquire({ resource, runId: active.runId, toolName: invocation.name })
-    if ('code' in acquired) {
-      return {
-        roundId: round.roundId,
-        result: { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: acquired.summary },
+    let execution: { actionId: string; startedAt: string; release: () => void }
+    if (capability.resource === undefined) {
+      execution = { actionId: randomUUID(), startedAt: new Date().toISOString(), release: () => {} }
+    } else {
+      const acquired = this.#execution.acquire({
+        resource: capability.resource, runId: active.runId, toolName: capability.name,
+      })
+      if ('code' in acquired) {
+        return {
+          roundId: round.roundId,
+          result: { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: acquired.summary },
+        }
+      }
+      execution = {
+        actionId: acquired.lease.actionId, startedAt: acquired.lease.acquiredAt,
+        release: acquired.release,
       }
     }
-    const { actionId, acquiredAt: startedAt } = acquired.lease
+    const { actionId, startedAt } = execution
     try {
-      if (resource === 'body') {
-        this.#debug.update({ currentBodyTool: { id: actionId, tool: invocation.name, purpose: 'agent tool', startedAt } })
+      if (capability.resource === 'body') {
+        this.#debug.update({ currentBodyTool: { id: actionId, tool: capability.name, purpose: 'agent tool', startedAt } })
       }
       this.#assertRunCurrent(active)
-      let result: unknown
-      switch (invocation.name) {
-        case 'look_relative':
-        case 'move_input':
-          result = await this.#executeBodyTool(active, hosted, actionId, startedAt)
-          break
-        case 'say':
-          result = this.#executeSay(active, hosted, actionId)
-          break
-        default:
-          result = await this.#executeRemember(active, hosted, actionId)
-      }
+      const result = await capability.execute({
+        runId: active.runId, toolCallId: invocation.toolCallId, roundId: round.roundId,
+        arguments: invocation.arguments, actionId, startedAt,
+      }, {
+        signal: active.controller.signal, worldId: active.worldId, chatEventId: active.chatEventId,
+        assertCurrent: () => this.#assertRunCurrent(active),
+        isCurrent: () => this.#scopeMatches(active),
+      })
       return { roundId: round.roundId, result }
     } finally {
-      acquired.release()
-      if (resource === 'body') {
+      execution.release()
+      if (capability.resource === 'body') {
         try { this.#debug.update({ currentBodyTool: undefined }) } catch { /* cleanup must not wedge the gate */ }
-      }
-    }
-  }
-
-  async #executeBodyTool(
-    active: ActiveRun,
-    invocation: HostedToolInvocation,
-    actionId: string,
-    startedAt: string,
-  ): Promise<unknown> {
-    const name = invocation.name as 'look_relative' | 'move_input'
-    let motor: ReturnType<MinecraftBackendApi['motor']> | undefined
-    try {
-      motor = this.#backend.motor()
-      const before = this.#backend.observationSource().selfPose()
-      if (name === 'look_relative') {
-        const args = lookArgumentsSchema.parse(invocation.arguments)
-        await motor.lookRelative(args.yaw_degrees, args.pitch_degrees, active.controller.signal)
-      } else {
-        const args = moveArgumentsSchema.parse(invocation.arguments)
-        await motor.move(args.directions, args.duration_ms, args.sprint, active.controller.signal)
-      }
-      this.#assertRunCurrent(active)
-      const after = this.#backend.observationSource().selfPose()
-      const viewport = await this.#readViewport(active.runId, active.controller.signal)
-      this.#assertRunCurrent(active)
-      const effect = name === 'look_relative' ? measuredLookEffect(before, after) : measuredMoveEffect(before, after)
-      await this.#journal.append('body_tool.completed', {
-        actionId, runId: active.runId, toolCallId: invocation.toolCallId, roundId: invocation.roundId,
-        tool: name, startedAt,
-        // Internal diagnostics may retain poses; they never cross the model result boundary.
-        internal: { before, after },
-      })
-      this.#assertRunCurrent(active)
-      return { protocol: TOOL_RESULT_PROTOCOL, status: 'completed', effect, viewport }
-    } catch (error) {
-      if (active.controller.signal.aborted || !this.#scopeMatches(active)) throw error
-      this.#assertRunCurrent(active)
-      const viewport = await this.#readViewport(active.runId, active.controller.signal).catch(() => undefined)
-      this.#assertRunCurrent(active)
-      await this.#journal.append('body_tool.failed', {
-        actionId, runId: active.runId, toolCallId: invocation.toolCallId, roundId: invocation.roundId,
-        tool: name,
-        summary: error instanceof Error ? error.message : String(error),
-      })
-      this.#assertRunCurrent(active)
-      return {
-        protocol: TOOL_RESULT_PROTOCOL, status: 'failed',
-        summary: error instanceof Error ? error.message.slice(0, 300) : 'tool_failed',
-        ...(viewport ? { viewport } : {}),
-      }
-    } finally {
-      try { if (motor) motor.releaseAll(); else this.#releaseBodyInputs() } catch { /* best effort */ }
-    }
-  }
-
-  /** The only speech channel. Silence is simply this tool never being called during a run. */
-  #executeSay(active: ActiveRun, invocation: HostedToolInvocation, actionId: string): unknown {
-    const parsed = sayArgumentsSchema.safeParse(invocation.arguments)
-    const text = parsed.success ? parsed.data.text.trim() : ''
-    if (!text) {
-      return { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: 'say requires a non-empty text' }
-    }
-    let segments: number
-    try {
-      // actionId doubles as the speech request id so scheduler events correlate with this call.
-      segments = this.#speech.schedule({ id: actionId, text })
-    } catch (error) {
-      return {
-        protocol: TOOL_RESULT_PROTOCOL, status: 'failed',
-        summary: error instanceof Error ? error.message.slice(0, 300) : 'say_failed',
-      }
-    }
-    active.sayCount += 1
-    void this.#journal.append('say.queued', {
-      actionId, runId: active.runId, toolCallId: invocation.toolCallId, roundId: invocation.roundId,
-      segments, characters: text.length,
-    })
-    // `queued`, not `completed`: the scheduler segments and rate-limits, so the player has not seen
-    // this yet and a later scope change can still cancel it. Reporting completion here would be the
-    // same fabricated success the tool results exist to prevent.
-    return { protocol: TOOL_RESULT_PROTOCOL, status: 'queued', segments }
-  }
-
-  async #executeRemember(
-    active: ActiveRun,
-    invocation: HostedToolInvocation,
-    actionId: string,
-  ): Promise<unknown> {
-    const parsed = rememberArgumentsSchema.safeParse(invocation.arguments)
-    const summary = parsed.success ? parsed.data.summary.trim() : ''
-    if (!summary) {
-      return { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: 'remember requires a non-empty summary' }
-    }
-    try {
-      await this.#memory.remember({
-        worldId: active.worldId,
-        kind: 'episode',
-        summary,
-        evidence: [{ kind: 'event', id: active.chatEventId }],
-      })
-      this.#assertRunCurrent(active)
-      // The summary itself stays out of the journal, matching the redaction stance on speech.
-      await this.#journal.append('memory.remembered', {
-        actionId, runId: active.runId, toolCallId: invocation.toolCallId, roundId: invocation.roundId,
-      })
-      this.#assertRunCurrent(active)
-      return { protocol: TOOL_RESULT_PROTOCOL, status: 'completed' }
-    } catch (error) {
-      if (active.controller.signal.aborted || !this.#scopeMatches(active)) throw error
-      return {
-        protocol: TOOL_RESULT_PROTOCOL, status: 'failed',
-        summary: error instanceof Error ? error.message.slice(0, 300) : 'remember_failed',
       }
     }
   }
@@ -430,7 +321,7 @@ export class CompanionRuntime {
       }
       const started = Date.now()
       // Speech happens through the say tool while the run lives; the result only reports completion.
-      const result = await this.#model.run({ runId, context, tools: agentToolDefinitions() }, controller.signal)
+      const result = await this.#model.run({ runId, context, tools: this.#capabilities.definitions() }, controller.signal)
       this.#assertRunCurrent(active)
       await this.#journal.append('model.decision.completed', {
         runId, model: result.model, durationMs: Date.now() - started, usage: result.usage,
@@ -720,59 +611,6 @@ function sameScope(left: RunScope, right: RunScope): boolean {
     left.connectionEpoch === right.connectionEpoch &&
     left.worldId === right.worldId && left.dimension === right.dimension
 }
-
-interface PoseSample {
-  position: { x: number; y: number; z: number }
-  yaw: number
-  pitch: number
-}
-
-function measuredLookEffect(before: PoseSample, after: PoseSample) {
-  const yawDegrees = radiansToDegrees(normalizeRadians(before.yaw - after.yaw))
-  const pitchDegrees = radiansToDegrees(before.pitch - after.pitch)
-  return {
-    relativeTurnDegrees: { yaw: withoutNegativeZero(yawDegrees), pitch: withoutNegativeZero(pitchDegrees) },
-    turned: Math.hypot(yawDegrees, pitchDegrees) > LOOK_EFFECT_EPSILON_DEGREES,
-  }
-}
-
-/**
- * Says which frame it measured in, in place. The viewport declares every position it reports as
- * `minecraft_world_absolute`, and a model that carries that legend across to an action result would
- * read this triple as a world offset. It is not one: it is resolved against the pre-move facing, so
- * the same displacement means different things depending on where the companion was looking.
- */
-function measuredMoveEffect(before: PoseSample, after: PoseSample) {
-  const delta = {
-    x: after.position.x - before.position.x,
-    y: after.position.y - before.position.y,
-    z: after.position.z - before.position.z,
-  }
-  const forward = lookDirection(before.yaw, 0)
-  const right = { x: -forward.z, z: forward.x }
-  const relativeDisplacement: [number, number, number] = [
-    withoutNegativeZero(delta.x * right.x + delta.z * right.z),
-    withoutNegativeZero(delta.y),
-    withoutNegativeZero(delta.x * forward.x + delta.z * forward.z),
-  ]
-  const distance = Math.hypot(delta.x, delta.y, delta.z)
-  return {
-    coordinates: 'body_relative_before_move' as const,
-    legend: 'relativeDisplacement 是 [右, 上, 前] 三个格数，相对移动前的朝向，不是世界绝对坐标',
-    relativeDisplacement,
-    distance: withoutNegativeZero(distance),
-    movement: distance > MOVE_EFFECT_EPSILON ? 'changed' as const : 'no_effect' as const,
-  }
-}
-
-function normalizeRadians(value: number): number {
-  let normalized = value % (Math.PI * 2)
-  if (normalized > Math.PI) normalized -= Math.PI * 2
-  if (normalized < -Math.PI) normalized += Math.PI * 2
-  return normalized
-}
-function radiansToDegrees(value: number): number { return value * 180 / Math.PI }
-function withoutNegativeZero(value: number): number { return Object.is(value, -0) ? 0 : value }
 
 function withoutPrivateSpeech(event: unknown): unknown {
   if (!event || typeof event !== 'object') return event

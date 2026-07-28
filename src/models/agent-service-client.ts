@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import type { AgentDecisionContext, ModelProvider, ModelRunResult } from './contracts.js'
-import type { WireToolDefinition } from './agent-tools.js'
+import type { WireToolDefinition } from './contracts.js'
 
 interface FetchLike { (input: string | URL, init?: RequestInit): Promise<Response> }
 const MAX_RESPONSE_BYTES = 64 * 1_024
