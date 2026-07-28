@@ -1,5 +1,5 @@
 import type { Bot, ControlState } from 'mineflayer'
-import type { MinecraftMotorDriverApi, MotorMoveDirection } from './contracts.js'
+import type { MinecraftMotorDriverApi, MotorMoveDirection, MotorMoveDirections } from './contracts.js'
 
 const MAX_RELATIVE_LOOK_DEGREES = 90
 const MIN_MOVE_DURATION_MS = 50
@@ -25,13 +25,19 @@ export class MineflayerMotorDriver implements MinecraftMotorDriverApi {
   }
 
   async move(
-    direction: MotorMoveDirection,
+    directions: MotorMoveDirections,
     durationMs: number,
     sprint: boolean | undefined,
     signal: AbortSignal,
   ): Promise<void> {
     throwIfAborted(signal)
-    if (!MOVE_DIRECTIONS.has(direction)) throw new TypeError('Move direction is not supported')
+    if (!Array.isArray(directions) || directions.length < 1 || directions.length > MOVE_DIRECTIONS.size) {
+      throw new RangeError(`Move directions must contain from 1 to ${MOVE_DIRECTIONS.size} keys`)
+    }
+    if (directions.some(direction => !MOVE_DIRECTIONS.has(direction))) {
+      throw new TypeError('Move direction is not supported')
+    }
+    if (new Set(directions).size !== directions.length) throw new TypeError('Move directions must not repeat keys')
     if (!Number.isSafeInteger(durationMs) || durationMs < MIN_MOVE_DURATION_MS || durationMs > MAX_MOVE_DURATION_MS) {
       throw new RangeError(`Move duration must be an integer from ${MIN_MOVE_DURATION_MS} to ${MAX_MOVE_DURATION_MS} ms`)
     }
@@ -39,8 +45,10 @@ export class MineflayerMotorDriver implements MinecraftMotorDriverApi {
 
     const pressed: ControlState[] = []
     try {
-      pressed.push(direction)
-      this.bot.setControlState(direction, true)
+      for (const direction of directions) {
+        pressed.push(direction)
+        this.bot.setControlState(direction, true)
+      }
       if (sprint) {
         pressed.push('sprint')
         this.bot.setControlState('sprint', true)

@@ -200,7 +200,7 @@ class ServerTests(unittest.TestCase):
         model_messages = []
         responses = [
             {"choices": [{"message": {"role": "assistant", "tool_calls": [
-                {"id": "one", "function": {"name": "move_input", "arguments": '{"direction":"forward","duration_ms":50}'}},
+                {"id": "one", "function": {"name": "move_input", "arguments": '{"directions":["forward"],"duration_ms":50}'}},
                 {"id": "two", "function": {"name": "look_relative", "arguments": '{"yaw_degrees":10,"pitch_degrees":0}'}},
             ]}}]},
             {"choices": [{"message": {"role": "assistant", "content": ""}}]},
@@ -284,7 +284,7 @@ class ServerTests(unittest.TestCase):
         self.addCleanup(sink.dir.cleanup)
         responses = [
             {"choices": [{"message": {"role": "assistant", "tool_calls": [
-                {"id": "bad", "function": {"name": "move_input", "arguments": '{"direction":"forward","duration_ms":5000}'}}
+                {"id": "bad", "function": {"name": "move_input", "arguments": '{"directions":["forward"],"duration_ms":5000}'}}
             ]}}]},
             {"choices": [{"message": {"role": "assistant", "content": ""}}]},
         ]
@@ -296,7 +296,7 @@ class ServerTests(unittest.TestCase):
             )
         # 工具契约归工具侧：agent 不预判参数合法性，越界值也交给后端回真实失败。
         self.assertEqual(len(seen), 1)
-        self.assertEqual(seen[0][2], {"direction": "forward", "duration_ms": 5000})
+        self.assertEqual(seen[0][2], {"directions": ["forward"], "duration_ms": 5000})
 
     def test_float_arguments_survive_the_json_boundary(self):
         # 回归：_validate_json 用 math.isfinite 拒 NaN/Inf；漏掉 import math 会让任何浮点请求崩溃。
@@ -353,7 +353,7 @@ class ServerTests(unittest.TestCase):
             '好的\n<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name="look_relative">',
             '{"speech":"我先找找。","__tool__":"look_relative","__tool_args__":{"yaw_degrees":90}}',
             'look_relative({"yaw_degrees": 45, "pitch_degrees": 0})',
-            '{"name":"move_input","arguments":{"direction":"forward"}}',
+            '{"name":"move_input","arguments":{"directions":["forward"]}}',
         ]
         for leaked in leaks:
             self.assertTrue(server.leaked_tool_call(leaked, names), leaked)

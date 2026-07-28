@@ -7,7 +7,7 @@ import { JsonlEventJournal } from '../events/index.js'
 import { FileMemoryStore } from '../memory/index.js'
 import type {
   BackendEventEnvelope, BackendReady, BackendState, MinecraftBackendApi, MinecraftMotorDriverApi,
-  MinecraftSnapshotV1, MotorMoveDirection, ProtocolObservationSource, Unsubscribe,
+  MinecraftSnapshotV1, MotorMoveDirection, MotorMoveDirections, ProtocolObservationSource, Unsubscribe,
 } from '../minecraft/contracts.js'
 import type { AgentDecisionContext, ModelProvider, ModelRunResult, WireToolDefinition } from '../models/index.js'
 import { DebugStateStore } from '../telemetry/index.js'
@@ -190,6 +190,7 @@ class FakeMotor implements MinecraftMotorDriverApi {
   releases = 0
   releaseFailures = 0
   moving = false
+  moveCalls: MotorMoveDirection[][] = []
   nextMoveDelta?: { x: number; y: number; z: number }
   constructor(private backend: FakeBackend) {}
   async lookRelative(yawDegrees: number, pitchDegrees: number, signal: AbortSignal) {
@@ -198,8 +199,9 @@ class FakeMotor implements MinecraftMotorDriverApi {
     this.backend.pitch -= pitchDegrees * Math.PI / 180
     this.backend.revision++
   }
-  async move(direction: MotorMoveDirection, durationMs: number, _sprint: boolean | undefined, signal: AbortSignal) {
+  async move(directions: MotorMoveDirections, durationMs: number, _sprint: boolean | undefined, signal: AbortSignal) {
     this.moving = true
+    this.moveCalls.push([...directions])
     try {
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(resolve, durationMs)
@@ -207,8 +209,15 @@ class FakeMotor implements MinecraftMotorDriverApi {
         signal.addEventListener('abort', abort, { once: true })
         if (signal.aborted) abort()
       })
-      const amount = direction === 'forward' ? 1 : direction === 'back' ? -1 : 0
-      const delta = this.nextMoveDelta ?? { x: amount, y: 0, z: 0 }
+      const forwardAmount = Number(directions.includes('forward')) - Number(directions.includes('back'))
+      const rightAmount = Number(directions.includes('right')) - Number(directions.includes('left'))
+      const forward = { x: -Math.sin(this.backend.yaw), z: -Math.cos(this.backend.yaw) }
+      const right = { x: -forward.z, z: forward.x }
+      const delta = this.nextMoveDelta ?? {
+        x: forward.x * forwardAmount + right.x * rightAmount,
+        y: 0,
+        z: forward.z * forwardAmount + right.z * rightAmount,
+      }
       this.nextMoveDelta = undefined
       this.backend.position = {
         x: this.backend.position.x + delta.x,
@@ -299,29 +308,42 @@ test('say reports queued rather than completed, and journals the whole correlati
   assert.equal((scheduled!.payload as { requestId: string }).requestId, payload.actionId)
 })
 
-test('same-round movement refuses an opposing pair but allows a diagonal one', async t => {
+test('a key set moves diagonally, while opposing keys execute and report no effect', async t => {
   const { backend, model, runtime } = await fixture(t)
   const results: unknown[] = []
   model.handler = async input => {
     const round = new TestToolRound(runtime, input.runId)
-    // 固化 #98 尚未裁决前的现有谓词：正交放行。
-    results.push(await round.execute('move_input', { direction: 'forward', duration_ms: 50 }))
-    results.push(await round.execute('move_input', { direction: 'left', duration_ms: 50 }))
-    // 同一宿主里的相反方向仍拒绝；本任务不为这条政策补写理由。
-    results.push(await round.execute('move_input', { direction: 'back', duration_ms: 50 }))
-    // 换一轮就是新的决定，back 重新合法。
-    round.next()
-    results.push(await round.execute('move_input', { direction: 'back', duration_ms: 50 }))
+    results.push(await round.execute('move_input', {
+      directions: ['forward', 'left'], duration_ms: 50,
+    }))
+    results.push(await round.execute('move_input', {
+      directions: ['forward', 'back'], duration_ms: 50,
+    }))
     return { model: 'fake' }
   }
   backend.emitChat('Bot，走走看')
   await waitFor(() => model.calls.length === 1)
   await runtime.idle()
 
-  const statuses = results.map(entry => (entry as { status: string }).status)
-  assert.deepEqual(statuses, ['completed', 'completed', 'failed', 'completed'])
-  const refused = results[2] as { summary: string }
-  assert.match(refused.summary, /opposing_move:back cancels forward/u)
+  assert.deepEqual(backend.motorInstance.moveCalls, [
+    ['forward', 'left'],
+    ['forward', 'back'],
+  ])
+  const diagonal = results[0] as {
+    status: string
+    effect: { relativeDisplacement: number[]; movement: string }
+  }
+  assert.equal(diagonal.status, 'completed')
+  assert.deepEqual(diagonal.effect.relativeDisplacement, [-1, 0, 1])
+  assert.equal(diagonal.effect.movement, 'changed')
+  const opposing = results[1] as {
+    status: string
+    effect: { relativeDisplacement: number[]; distance: number; movement: string }
+  }
+  assert.equal(opposing.status, 'completed')
+  assert.deepEqual(opposing.effect.relativeDisplacement, [0, 0, 0])
+  assert.equal(opposing.effect.distance, 0)
+  assert.equal(opposing.effect.movement, 'no_effect')
 })
 
 test('round ids are minted by the run host and a replaced round cannot be resumed', async t => {
@@ -376,7 +398,7 @@ test('a held resource fails the call instead of killing the run, and only blocks
     // sequential response and then echoes it for the rest of the assistant response.
     await round.execute('look_relative', { yaw_degrees: 0, pitch_degrees: 0 })
     // 身体占用期间发起第二个身体调用：应得到真实失败，而不是异常。
-    const moving = round.execute('move_input', { direction: 'forward', duration_ms: 300 })
+    const moving = round.execute('move_input', { directions: ['forward'], duration_ms: 300 })
     await waitFor(() => backend.motorInstance.moving)
     results.push(await round.execute('look_relative', { yaw_degrees: 5, pitch_degrees: 0 }))
     // say 用的是聊天资源，不该被身体挡住——否则「行动前先说一句」就无法实现。
@@ -402,7 +424,7 @@ test('startup is local; player chat runs the two-tool closed loop with measured 
   model.handler = async input => {
     const round = new TestToolRound(runtime, input.runId)
     results.push(await round.execute('look_relative', { yaw_degrees: 90, pitch_degrees: 0 }))
-    results.push(await round.execute('move_input', { direction: 'forward', duration_ms: 50 }))
+    results.push(await round.execute('move_input', { directions: ['forward'], duration_ms: 50 }))
     results.push(await round.execute('say', { text: '我看到羊了，走近了一点。' }))
     return { model: 'fake' }
   }
@@ -446,7 +468,7 @@ test('a new player chat waits behind an in-flight turn without taking control fr
     const round = new TestToolRound(runtime, input.runId)
     if (first) {
       first = false
-      await round.execute('move_input', { direction: 'forward', duration_ms: 80 })
+      await round.execute('move_input', { directions: ['forward'], duration_ms: 80 })
       await round.execute('say', { text: '我先走完这一步。' })
       return { model: 'fake' }
     }
@@ -593,7 +615,7 @@ test('a connection-epoch scope change synchronously aborts the active run and re
     await round.execute('look_relative', { yaw_degrees: 0, pitch_degrees: 0 })
     activeRunId = input.runId
     activeRoundId = round.roundId
-    await round.execute('move_input', { direction: 'forward', duration_ms: 1500 })
+    await round.execute('move_input', { directions: ['forward'], duration_ms: 1500 })
     await round.execute('say', { text: '不应发送' })
     return { model: 'fake' }
   }
@@ -618,7 +640,7 @@ test('connection_closed aborts even while the last snapshot still has the old sc
   const { backend, model, runtime } = await fixture(t)
   model.handler = async input => {
     const round = new TestToolRound(runtime, input.runId)
-    await round.execute('move_input', { direction: 'forward', duration_ms: 1500 })
+    await round.execute('move_input', { directions: ['forward'], duration_ms: 1500 })
     await round.execute('say', { text: '不应发送' })
     return { model: 'fake' }
   }
@@ -669,7 +691,7 @@ test('release failure cannot wedge the tool gate and sub-epsilon motion is repor
     backend.motorInstance.releaseFailures = 1
     results.push(await round.execute('look_relative', { yaw_degrees: 0, pitch_degrees: 0 }))
     backend.motorInstance.nextMoveDelta = { x: 0.0005, y: 0, z: 0 }
-    results.push(await round.execute('move_input', { direction: 'forward', duration_ms: 50 }))
+    results.push(await round.execute('move_input', { directions: ['forward'], duration_ms: 50 }))
     return { model: 'fake' }
   }
   backend.emitChat('Bot，试着动一点')
@@ -687,7 +709,7 @@ test('stop aborts and releases synchronously before awaiting the decision tail',
   const { backend, model, runtime } = await fixture(t)
   model.handler = async input => {
     const round = new TestToolRound(runtime, input.runId)
-    await round.execute('move_input', { direction: 'forward', duration_ms: 1500 })
+    await round.execute('move_input', { directions: ['forward'], duration_ms: 1500 })
     return { model: 'fake' }
   }
   backend.emitChat('Bot，持续往前')

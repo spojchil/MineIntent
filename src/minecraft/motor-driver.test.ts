@@ -23,12 +23,13 @@ test('an already-aborted look never reaches Mineflayer', async () => {
   assert.equal(bot.lookCalls.length, 0)
 })
 
-test('move presses a real control briefly and always releases it', async () => {
+test('move presses the whole key set before the common hold and releases it in reverse', async () => {
   const bot = fakeBot()
   const driver = new MineflayerMotorDriver(bot as unknown as Bot)
-  await driver.move('forward', 50, true, new AbortController().signal)
+  await driver.move(['forward', 'left'], 50, true, new AbortController().signal)
   assert.deepEqual(bot.controlCalls, [
-    ['forward', true], ['sprint', true], ['sprint', false], ['forward', false],
+    ['forward', true], ['left', true], ['sprint', true],
+    ['sprint', false], ['left', false], ['forward', false],
   ])
 })
 
@@ -36,10 +37,17 @@ test('move interruption releases every pressed control', async () => {
   const bot = fakeBot()
   const driver = new MineflayerMotorDriver(bot as unknown as Bot)
   const controller = new AbortController()
-  const pending = driver.move('left', 1_500, true, controller.signal)
+  const pending = driver.move(['forward', 'left'], 1_500, true, controller.signal)
   controller.abort('player_interrupted')
   await assert.rejects(pending, error => error instanceof DOMException && error.name === 'AbortError')
-  assert.deepEqual(bot.controlCalls.slice(-2), [['sprint', false], ['left', false]])
+  assert.deepEqual(bot.controlCalls.slice(-3), [['sprint', false], ['left', false], ['forward', false]])
+})
+
+test('move rejects encodings that are not non-empty key sets', async () => {
+  const driver = new MineflayerMotorDriver(fakeBot() as unknown as Bot)
+  const signal = new AbortController().signal
+  await assert.rejects(driver.move([], 50, false, signal), RangeError)
+  await assert.rejects(driver.move(['forward', 'forward'], 50, false, signal), TypeError)
 })
 
 function fakeBot() {

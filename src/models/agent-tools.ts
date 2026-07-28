@@ -17,10 +17,12 @@ export const lookArgumentsSchema = z.strictObject({
 })
 
 export const moveArgumentsSchema = z.strictObject({
-  direction: z.enum(['forward', 'back', 'left', 'right'])
-    .describe('按住哪个移动键，方向相对当前朝向。'),
+  directions: z.array(z.enum(['forward', 'back', 'left', 'right'])).min(1).max(4)
+    .refine(directions => new Set(directions).size === directions.length, '移动键不能重复。')
+    .meta({ uniqueItems: true })
+    .describe('同时按住的移动键，方向相对当前朝向；斜走时把两个键放在这里。'),
   duration_ms: z.number().int().min(50).max(1_500)
-    .describe('按住时长，毫秒。步行大约每 250 毫秒走一格。'),
+    .describe('整组移动键共同按住的时长，毫秒。步行大约每 250 毫秒走一格。'),
   sprint: z.boolean().optional()
     .describe('是否同时按住疾跑；同样时长内走得更远。'),
 })
@@ -51,9 +53,9 @@ const TOOLS: ReadonlyArray<{ name: string; description: string; schema: z.ZodTyp
   {
     name: 'move_input',
     description:
-      '短暂按住一个真实移动键再松开，随后返回实际移动效果和新的视野。用来接近已经看见的'
-      + '目标。没有寻路也不会跳跃：一次最多走几格，障碍不会被自动绕开，返回时身体可能仍在'
-      + '滑行或下落。',
+      '想往一个方向挪一点、或斜着靠近已经看见的东西时，短暂按住一组真实移动键再一起松开，'
+      + '随后返回实际移动效果和新的视野。前后键或左右键同时按会互相抵消，对应轴不会移动。'
+      + '没有寻路也不会跳跃：一次最多走几格，障碍不会被自动绕开，返回时身体可能仍在滑行或下落。',
     schema: moveArgumentsSchema,
   },
   {

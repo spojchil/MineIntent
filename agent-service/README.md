@@ -4,7 +4,7 @@
 Completions，让模型在聊天回复与两个有界身体工具之间选择：
 
 - `look_relative`：相对转头；
-- `move_input`：短时按住前、后、左、右之一。
+- `move_input`：短时同时按住一组前、后、左、右移动键。
 
 工具由 Node 进程中只绑定 loopback 的回调服务执行。每次动作后都返回新视野；
 Python 不直接连接 Minecraft，也不执行模型生成的任意代码。该目录只依赖
