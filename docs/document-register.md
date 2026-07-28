@@ -2,7 +2,7 @@
 status: reference
 authority: informative
 implementation: current
-last_verified: 2026-07-25
+last_verified: 2026-07-28
 ---
 
 # 文档登记表
@@ -73,6 +73,7 @@ last_verified: 2026-07-25
 |---|---|---|---|
 | [来路入口](./history/README.md) | reference / informative | not-applicable | 分区导航；吸收原 `archive/README.md` |
 | [项目演进史](./history/project-evolution.md) | historical / informative | not-applicable | 结合提交、PR、Issue 撰写 |
+| [`primaryPlayer` 产品分叉调查](./history/primary-player-product-divergence-investigation.md) | reference / informative | current | 对 `main@46bcd4d` 的代码、Git 历史与 Issue/PR 平台快照调查；回应 Issue #108 暴露的方向审计与来源问题 |
 | [v0.2 合法信息接口](./history/roadmap-v0.2-legal-information-interfaces.md) | accepted / normative | stalled | 原 `docs/plans/` 同名；PR #42 / `e18f90f`，PR #62 / `b13aa58` 与实验 `f25c6e4`；五个设计 PR 后被关闭 |
 | [v0.3 可信具身](./history/roadmap-v0.3-trustworthy-embodiment.md) | accepted / normative | diverged | 原 `docs/plans/v0.3-trustworthy-embodiment.md`（PR #42）；实验越过 ADR 接受门和原 tracker 顺序 |
 | [认知感知研究](./history/research-cognitive-perception.md) | reference / informative | not-applicable | 原 `research/COGNITIVE_PERCEPTION_RESEARCH.md`；PR #25 / `e053f47` |

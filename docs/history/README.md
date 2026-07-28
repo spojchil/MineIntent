@@ -2,16 +2,20 @@
 status: reference
 authority: informative
 implementation: not-applicable
-last_verified: 2026-07-23
+last_verified: 2026-07-28
 ---
 
 # 项目来路
 
-本分区解释“为什么会走到这里”，不决定下一步必须走哪条路。这里的每份文档在写作时都可能是当前事实，但今天都不是。文中的“当前”“决定”“实现基线”等词描述的是它写作时的情境。
+本分区解释“为什么会走到这里”，不决定下一步必须走哪条路。历史材料中的“当前”“决定”“实现基线”等词描述的是它写作时的情境；带 `applies_to` 的事件调查只对指定基线负责，基线前进后需要重新核对。
 
 ## 演进
 
 - [项目演进史](./project-evolution.md)：v0.1 到最新实验分支的整体脉络。
+
+## 事件调查
+
+- [`primaryPlayer` 产品分叉调查](./primary-player-product-divergence-investigation.md)：以 `main@46bcd4d` 为基线，重建一条聊天守卫如何从原型身份约束演变成认知入口边界，并复盘 Issue #108 暴露的同源证据与思想起源混淆。
 
 ## 旧里程碑
 
