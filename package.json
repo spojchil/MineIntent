@@ -1,7 +1,7 @@
 {
   "name": "mineintent",
   "version": "0.1.0",
-  "description": "An embodied AI companion for Minecraft Java Edition",
+  "description": "An embodied AI participant for Minecraft Java Edition",
   "private": true,
   "scripts": {
     "check": "tsc --noEmit",

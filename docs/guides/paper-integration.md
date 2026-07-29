@@ -1,33 +1,23 @@
----
-status: reference
-authority: informative
-implementation: partial
-last_verified: 2026-07-25
-applies_to: main@9c46b9f
----
-
 # Paper 1.21.1 集成测试
 
-普通 PR CI 运行单元和契约测试，不启动 Minecraft。真实 Paper 测试通过手动 GitHub Actions 工作流在仓库专用的 self-hosted runner 上执行。
+Paper 测试都具有破坏性，但两条路径的隔离方式不同：`test:paper:ci` 使用专用模板和临时副本，`test:paper`
+直接修改 `mcserver/` 管理的现有世界。只能使用一次性或已备份的世界，且不得有未授权玩家在线。
 
-## 覆盖范围
+## 当前覆盖
 
-下面描述 `main@9c46b9f` 的**场景代码会检查什么**，不等于这些场景已经在当前提交
-在线跑通。D40 实验有七次真实 Paper/模型现场运行，但没有 Actions/Paper CI 运行，
-也没有在归档头上完整重跑：
+[`paper-ci-integration.ts`](../../src/integration/paper-ci-integration.ts) 当前只验证可复用的 Paper/协议边界：
 
-- Minecraft Backend 连接、死亡、重生和服务端重启后的自动重连
-- 测试客户端移动，以及清除控制状态后的停止
-- 装备镐、挖掘方块、确认方块消失和掉落进入背包
-- 同伴启动、共同收集木材、暂停、恢复、危险处理和返回活动起点
-- 共同经历写入记忆，并在同伴重启后被检索
-- 失败、超时和正常结束时清理 Bot 与 Paper 进程
+- Minecraft Backend 连接、死亡、重生和服务端重启后的重连。
+- 独立 Mineflayer 测试 Bot 的移动与清除控制状态后的停止。
+- 独立测试 Bot 的挖掘、方块消失和背包拾取。
+- 超时、清理、隔离世界副本和诊断 artifact。
 
-这些场景使用确定性模型替身，不需要模型 API 密钥，也不能替代真人与真实模型体验测试。
+它不启动当前 Python Agent，不调用真实模型，也不验证同伴聊天、关注、记忆或工具循环。源码明确把 Agent 行为留给
+单独的 live experiment；绿色 Paper 工作流不能被描述为当前产品闭环已经通过。
 
-## Self-hosted runner
+## GitHub Actions
 
-工作流需要带以下标签的 runner：
+`Paper Integration` 是手动工作流，需要带以下标签的 self-hosted runner：
 
 ```text
 self-hosted, Linux, ARM64, mineintent, paper-ci
@@ -37,41 +27,42 @@ self-hosted, Linux, ARM64, mineintent, paper-ci
 
 | 名称 | 用途 |
 |---|---|
-| `PAPER_CI_NODE_BIN` | Node 22 与 pnpm 所在目录 |
-| `PAPER_CI_NPM_REGISTRY` | runner 使用的 npm 镜像 |
+| `PAPER_CI_NODE_BIN` | Node 与 pnpm 所在目录 |
+| `PAPER_CI_NPM_REGISTRY` | runner 使用的 npm registry |
 | `PAPER_CI_JAVA` | Java 21 可执行文件 |
-| `PAPER_CI_JAR` | 锁定的 Paper 1.21.1 JAR |
-| `PAPER_CI_TEMPLATE` | 基准世界目录 |
+| `PAPER_CI_JAR` | Paper 1.21.1 JAR |
+| `PAPER_CI_TEMPLATE` | 专用、可删除的基准世界目录 |
 
-Paper 只监听 `127.0.0.1:25566`。工作流保持单并发，避免端口和内存冲突。
+触发并观察：
 
-## 世界隔离
-
-首次运行生成基准世界。以后每次运行都会：
-
-1. 复制基准世界到本轮 artifact 目录。
-2. 清除复制来的旧日志与崩溃报告。
-3. 写入仅用于本地测试的端口和 offline-mode 配置。
-4. 在副本中执行场景。
-5. 停止进程并保存 JSONL、摘要和服务端日志。
-6. 删除本轮世界副本。
-
-不要用硬链接复制 region 文件，否则 Paper 的写入可能污染基准世界。
-
-## 运行
-
-在 GitHub 上手动启动：
-
-```powershell
+```sh
 gh workflow run "Paper Integration"
 gh run watch
 ```
 
-本地 Windows Backend 生命周期测试：
+每轮会复制基准世界，在副本中运行，保存摘要、JSONL 和服务端日志，然后删除世界副本。不要用硬链接复制 region 文件。
 
-```powershell
-$env:MC_OBSERVER_USERNAMES='你的观察者游戏名'
-pnpm test:paper
+## 本地路径
+
+跨平台场景可以在设置以下环境变量后运行：
+
+```sh
+MC_JAVA=/path/to/java \
+MC_SERVER_JAR=/path/to/paper.jar \
+MC_SERVER_TEMPLATE=/path/to/template \
+MC_EULA=true \
+corepack pnpm test:paper:ci
 ```
 
-测试会控制 Bot、杀死实体、切换维度并重启服务端。不要在有未授权玩家或重要世界数据的服务器上运行。
+这会创建和删除 `.artifacts/paper/` 下的运行副本。`MC_SERVER_TEMPLATE` 必须指向专用于测试、允许被完整
+删除的目录；如果其中没有 `world/level.dat`，初始化流程会先递归删除该目录，再生成新的基准世界。绝不能
+把它指向重要世界、仓库或通用服务器目录。
+
+`corepack pnpm test:paper` 是另一条旧的本地管理路径，源码调用 `powershell.exe` 和 `mcserver/mc.ps1`，
+因此当前只支持 Windows。它直接操作现有服务器世界，会杀死 Bot、传送维度并重启服务端；发现未列入
+`MC_OBSERVER_USERNAMES` 的玩家时会拒绝运行。无论运行前服务器是否在线，清理结束时都会使服务器保持运行。
+
+## 尚缺的验收
+
+当前主线仍需要一条可重复的“当前 Agent + 真实模型 + Paper”纵向场景。建立该场景时必须保存逐轮输入、工具调用、
+动作后观察和清理结果，同时脱敏密钥、私人聊天和世界数据。

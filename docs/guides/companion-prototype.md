@@ -1,80 +1,99 @@
----
-status: reference
-authority: informative
-implementation: current
-last_verified: 2026-07-25
-applies_to: main@9c46b9f
----
+# 运行世界参与原型
 
-# 运行同伴原型
+当前原型用于开发和游戏内验证，尚不是可长期日常运行的完整 Minecraft AI 参与系统。
 
-当前原型用于本地开发和游戏内验证，还不是可供长期游玩的完整 Minecraft Agent。
+## 环境
 
-## 环境要求
+- Node.js 22 或更高版本，以及 Corepack。
+- Python 3.9 或更高版本。
+- 可连接的 Minecraft Java Edition 1.21.1 服务器。
+- 支持 `tools`、`tool_choice` 和标准 `tool_calls` 的 OpenAI-compatible Chat Completions 模型接口。
 
-- Node.js 22 或更高版本、pnpm 11.3.0
-- Python 3.10 或更高版本
-- Minecraft Java Edition 1.21.1 服务器
-- 支持 Chat Completions 与 `response_format: json_object` 的 OpenAI-compatible 模型接口
+连接远端服务器不需要在本机安装 Java。只有本机运行 Paper 或执行 Paper 集成测试时才需要 Java 21。
 
-离线服使用 `MINEINTENT_MC_AUTH=offline`。正版认证使用 `microsoft`，并通过 `MINEINTENT_MC_PROFILES_FOLDER` 指定认证资料目录。
+## 安装与配置
 
-## 配置
-
-复制配置样例：
-
-```powershell
-Copy-Item .env.example .env
+```sh
+corepack pnpm install --frozen-lockfile
+cp .env.example .env
 ```
 
-至少确认以下值：
+编辑 `.env`，至少确认 Minecraft 连接、模型服务和令牌配置。生成独立的 Agent Service 令牌：
 
-```dotenv
-MINEINTENT_MC_HOST=127.0.0.1
-MINEINTENT_MC_PORT=25565
-MINEINTENT_MC_USERNAME=MineIntentBot
-MINEINTENT_PRIMARY_PLAYER=你的游戏名
-MINEINTENT_MODEL_BASE_URL=https://服务商地址/v1
-MINEINTENT_MODEL_API_KEY=只放在本地的密钥
-MINEINTENT_MODEL=模型名
+```sh
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
-不要提交 `.env`、认证目录、私人聊天、世界存档或运行日志。
+不要复用模型 API key。`.env`、`.mineintent/`、认证资料、私人聊天和世界存档不得提交。
 
-## 启动与停止
+当前代码仍强制要求 `MINEINTENT_PRIMARY_PLAYER`。它只是尚未完成的迁移配置：该玩家的每条公屏消息都会
+触发模型，其他玩家消息在写入事件日志前就被丢弃。这与产品宪法草案拟议的程序平等和信息边界不一致，
+不能据此推导产品规则。
 
-先启动决策服务：
+## 启动
 
-```powershell
-python agent-service/server.py
+先启动 Python Agent Service：
+
+```sh
+python3 agent-service/server.py
 ```
 
-再打开另一个终端启动 MineIntent：
+可检查它是否响应：
 
-```powershell
-pnpm start
+```sh
+curl http://127.0.0.1:8765/healthz
 ```
 
-同伴连接服务器后会进行一次启动决策，之后处理配置的主要玩家发送的聊天。当前原型可以尝试跟随玩家、收集附近木材、等待，以及返回共同活动开始的位置；动作是否成功以游戏状态验证为准。
+再在另一个终端启动 MineIntent：
 
-`Ctrl+C` 会取消模型与游戏动作、释放身体资源、停止聊天调度、断开 Minecraft 并刷新本地事件日志。
+```sh
+corepack pnpm start
+```
+
+当前 Node 启动流程不会预先检查 Agent Service；若 Bot 已上线但首次聊天没有响应，先检查 `/healthz`、
+两个进程的 `.env` 是否一致，以及 Agent Service 终端中的错误。
+
+## 当前工具与限制
+
+模型当前可以调用：
+
+- `look_relative`：相对转头。
+- `move_input`：短时按住一组移动键。
+- `view`：不移动身体，重新读取当前视野。
+- `say`：向游戏聊天发送模型措辞。
+- `remember`：写入当前结构化记忆原型。
+
+当前没有启动决策、主动行为、寻路、跟随、采木、跳跃、挖掘、战斗或 GUI 操作。游戏内“停下”只是普通文本，
+不会走本地特权控制路径；连接、世界或应用作用域失效以及 180 秒模型轮次超时等客观条件会硬取消轮次并
+释放身体输入。
 
 ## 数据与调试
 
-默认运行数据位于 `.mineintent/`：
+默认数据目录为 `.mineintent/`：
 
-- `events.jsonl`：本地运行事件与失败摘要
-- `memories.json`：按世界保存的原型记忆
+- `events.jsonl`：事件、调用和失败记录；包含收到的主要玩家聊天全文。
+- `memories.json`：当前结构化记忆原型。
+- `agent-transcripts.jsonl` 及轮转文件 `.jsonl.1`：完整模型重放记录，可能含档案、聊天、记忆、视野、
+  工具 schema/结果、reasoning 和 closing。
 
-只读调试接口默认监听本机：
+这些文件都可能含私人全文。不要提交；分享日志、artifact 或调试响应前必须脱敏。
+
+本地只读接口：
 
 ```text
 GET http://127.0.0.1:3211/health
 GET http://127.0.0.1:3211/v1/state
 ```
 
-接口不提供游戏控制。模型密钥、令牌和完整私人正文不应出现在响应中，但错误日志仍可能包含供应商返回的内容，分享前必须人工检查。
+接口仅绑定 `127.0.0.1`，但分享响应或日志前仍需人工检查敏感内容。
 
-## 当前限制
+## 验证
 
-当前能力只覆盖原型场景，没有完整生存能力树、成熟战斗、建造、跨维度计划或长期自主规划。明确的停止表达会走本地停止路径；低生命值时也有本地危险反射。两者都是当前 `main` 的实现事实，不代表最终交互设计。
+```sh
+corepack pnpm check
+corepack pnpm check:docs
+corepack pnpm test
+python3 -m unittest discover -s agent-service -p 'test_*.py'
+```
+
+上述检查不启动 Minecraft，也不证明真实模型体验。真实 Paper 验证见 [Paper 集成测试](./paper-integration.md)。

@@ -1,10 +1,3 @@
----
-status: reference
-authority: informative
-implementation: current
-last_verified: 2026-07-23
----
-
 # `mc.ps1` 使用说明
 
 `mc.ps1` 是当前 Paper 1.21.1 服务端的命令行管理入口。它通过 Python 管理器在后台无窗口运行 Java，并允许安全停止服务器、查看日志和发送 Minecraft 控制台命令。
@@ -19,7 +12,7 @@ last_verified: 2026-07-23
 所有命令都应在服务端目录中执行：
 
 ```powershell
-cd C:\path\to\maineintent\mcserver
+cd C:\path\to\MineIntent\mcserver
 ```
 
 查看完整命令帮助：

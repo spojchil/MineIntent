@@ -249,7 +249,7 @@ async function fixture(t: test.TestContext, options: {
   const runtime = new CompanionRuntime({
     backend, model, memory,
     journal,
-    profile: { profileId: 'test', versionId: 'profile-1', content: '安静、诚实的朋友。', sourcePath: 'profile.md' },
+    profile: { profileId: 'test', versionId: 'profile-1', content: '安静、诚实的世界参与者。', sourcePath: 'profile.md' },
     debug, primaryPlayer: 'Alice', speechIntervalMs: options.speechIntervalMs ?? 0,
   })
   await runtime.start()
@@ -320,6 +320,9 @@ test('the model sees exactly the contracts registered for dispatch', async t => 
   ])
   assert.match(tools.find(tool => tool.function.name === 'move_input')!.function.description, /前后键或左右键同时按会互相抵消/u)
   assert.match(tools.find(tool => tool.function.name === 'view')!.function.description, /看一眼/u)
+  const remember = tools.find(tool => tool.function.name === 'remember')!.function.description
+  assert.match(remember, /你决定长期保留/u)
+  assert.doesNotMatch(remember, /玩家的偏好|共同经历|双方的约定/u)
 })
 
 test('view returns visible blocks without moving or turning the body', async t => {
@@ -486,6 +489,7 @@ test('startup is local; player chat runs the two-tool closed loop with measured 
   // the prompt by an order of magnitude, and re-sending it every request is what the tool replaces.
   const opening = model.calls[0]!.context.frame
   assert.deepEqual(opening.self, { position: [0, 64, 0], yawDegrees: 0, pitchDegrees: 0 })
+  assert.deepEqual(opening.events[0], { type: 'participant.started', summary: 'AI 参与者已进入世界' })
   assert.doesNotMatch(JSON.stringify(opening), /visibleBlocks|visibleEntities/u)
   assert.equal(model.calls[0]!.context.stable.profile.content.length > 0, true)
   const first = results[0] as {

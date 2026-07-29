@@ -14,9 +14,7 @@ export function createRememberCapability(
 ): ToolCapability<'memory'> {
   return {
     name: 'remember',
-    description:
-      '把这次交流里值得长期记住的事写进自己的记忆，供以后回忆。只记真正重要的：玩家的偏好、'
-      + '共同经历、双方的约定。不确定值不值得记时，就不记。',
+    description: '把你决定长期保留的内容写进持久记忆，供以后回忆。用一两句话清楚写下要保留的内容。',
     argumentsSchema: rememberArgumentsSchema,
     resource: 'memory',
     async execute(invocation, scope) {

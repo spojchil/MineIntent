@@ -8,12 +8,25 @@
 
 <!-- 采用了什么设计，为什么？ -->
 
+## 产品假设
+
+<!--
+如果本 PR 引入或改变产品语义，请逐条写清：
+- 具体主张是什么；
+- 证据来自哪个 Issue、PR 或维护者评论；
+- 哪些相邻问题仍未决定。
+- 是否替 AI 预选了关系或行动结果，或让启动者身份形成隐藏特权。
+没有产品语义变化时写“无”。早期记录是重要证据，但不自动成为现行结论。
+-->
+
 ## 验证
 
 <!-- 运行了哪些检查或游戏内测试，结果如何？ -->
 
-- [ ] `pnpm check`
-- [ ] `pnpm test`
+- [ ] `corepack pnpm check`
+- [ ] `corepack pnpm check:docs`
+- [ ] `corepack pnpm test`
+- [ ] `python3 -m unittest discover -s agent-service -p "test_*.py"`
 - [ ] 已补充适当的自动化或集成测试
 - [ ] 已验证失败、取消和清理路径
 
