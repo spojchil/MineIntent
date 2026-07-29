@@ -1,0 +1,162 @@
+# 当前实现结构
+
+> 实现快照：`recovery/product-constitution-docs@fac8c654b223ce429659c655cf703b1eefc2953a`
+>
+> 本页只描述该提交的代码事实，没有产品权威。产品判断与候选架构见[《产品》](../产品.md)；两者不一致时，
+> 应把这里记录为实现偏差，不能用既成实现反向解释产品。
+
+## 1. 运行拓扑
+
+```text
+Minecraft Java 1.21.1
+        ↕ Mineflayer
+Node / TypeScript
+世界连接、感知、运行作用域、工具执行、持久化
+        ↕ 带独立令牌的 loopback HTTP
+Python Agent Service
+系统提示词、模型消息、标准 tool-call 循环
+        ↕ OpenAI-compatible /chat/completions
+模型供应商
+```
+
+Node 入口是 [`src/main.ts`](../src/main.ts)，对象装配位于
+[`MineIntentApp.start()`](../src/app/mineintent-app.ts)。它创建 Minecraft Backend、事件日志、记忆、档案、
+Agent Service 客户端、工具回调和只读调试服务。
+
+Python 入口是 [`agent-service/server.py:main()`](../agent-service/server.py)。它只监听 `127.0.0.1`；Node 不负责
+启动 Python，Python 也不直接连接 Minecraft。`mcserver/` 管理器不是应用进程的一部分，只用于本地 Paper 服务端。
+
+## 2. Node 与 Python 的边界
+
+Node 通过 `POST /v1/decide` 把 `runId`、模型上下文和当前工具定义发送给 Python；取消或超时后尽力调用
+`POST /v1/cancel`。Agent Service 地址必须是无凭据的 loopback HTTP 地址。产生方是
+[`AgentServiceModelProvider`](../src/models/agent-service-client.ts)。
+
+Python 收到模型工具调用后，通过 Node 临时创建的 `POST /v1/tool` 回调执行。回调只绑定 loopback，使用独立随机令牌，
+并验证 run、tool call、round、工具名和参数。产生方是 [`ToolBridgeServer`](../src/models/tool-bridge.ts)及
+[模型契约](../src/models/contracts.ts)。
+
+Python 拥有模型消息序列、系统提示词和 tool-call 循环；Node 拥有世界状态、运行作用域、round 身份和工具的实际效果。
+
+## 3. 一次决策的生命周期
+
+当前唯一决策入口是配置为 `MINEINTENT_PRIMARY_PLAYER` 的玩家公屏聊天。该玩家的消息触发模型；其他玩家消息在写入
+应用事件日志前即被忽略。产生方是 [`CompanionRuntime`](../src/companion/runtime.ts)和
+[`classifyChatInput()`](../src/speech/chat-input.ts)。
+
+聊天与模型决策分别通过 Promise 队列保持顺序。新聊天等待已有决策完成，不主动抢占旧决策；连接、死亡、重生、维度
+切换、重连、应用停止等作用域变化会取消当前 run 并释放身体输入。
+
+每条触发消息创建一个新 run，并绑定 Node 会话、Minecraft 连接 epoch、worldId、dimension、触发事件和取消信号。
+运行时按聊天文本检索同一世界最多五条结构化记忆，组成 opening frame 后调用模型。
+
+不同 run 之间不重放聊天历史。跨 run 重新进入模型的长期状态只有启动时读取的档案和本次检索出的记忆；诊断 transcript
+不会被读回上下文。
+
+## 4. 模型上下文与 round
+
+上下文协议 `mineintent.agent-context.v2` 分为：
+
+- `stable`：档案正文和检索出的记忆；
+- `frame`：本次玩家消息、世界、自身姿态、状态、背包、近期声音、待报告事件和遗漏说明。
+
+协议类型见 [`src/models/contracts.ts`](../src/models/contracts.ts)，frame 组合见
+[`composeAgentContext()`](../src/information/context-composer.ts)。完整视野不在 opening frame 中；opening 只含姿态和
+坐标图例。
+
+Python 将通用系统提示词、档案和记忆组成 system message，再追加 opening frame。之后只追加 assistant tool calls、
+tool results 和新 frame，不重写旧 frame。实现见 [`prompt.py`](../agent-service/prompt.py)与
+[`run_tool_loop()`](../agent-service/server.py)。
+
+一次模型响应中的首个工具调用由 Node 创建 round ID；同一响应中的后续调用必须沿用该 ID。Python 依次执行该响应中的
+全部调用，先完成所有 tool result 配对，再追加额外 frame。
+
+当前上限为：每个 run 最多 16 次模型轮次、每轮最多 8 个工具调用、每个 run 最多 32 个工具调用，整轮期限 180 秒。
+
+当前没有上下文压缩、摘要或 checkpoint 恢复。上下文只在单个 run 内追加，直到正常结束、失败或达到限制；供应商返回的
+缓存 token 计数仅用于记录。模型最终的普通文本只进入 transcript，不会发到游戏；游戏内说话必须调用 `say`。
+
+## 5. 感知
+
+[`MinecraftBackend`](../src/minecraft/minecraft-backend.ts)使用 Mineflayer 连接固定版本 `1.21.1`，维护连接状态、快照、
+自动重连、实体/方块/声音/聊天事件和可取消身体输入。
+
+Node 内部 Information Runtime 当前注册四类 provider：
+
+- 当前生命、饥饿、氧气、经验和状态效果；
+- 背包与快捷栏；
+- 最近声音；
+- 第一人称视野投影。
+
+装配发生在 [`buildInformationRuntime()`](../src/companion/runtime.ts)。Information Runtime 还实现 catalog、help、selector、
+cursor 和权限机制，但这些通用接口目前没有作为模型工具暴露。
+
+模型通过专用 `view` 工具读取完整视野。当前投影包含姿态与世界坐标图例、脚下方块、准星方块、最多 8 个可见实体，
+以及最多 256 个、32 格范围内的可见方块。投影每次完整重读，不是 delta；产生方是
+[`ViewportInformationProvider`](../src/information/providers/viewport-provider.ts)。
+
+声音缓存最多 20 条，并按连接和世界作用域过滤。当前主动加入 pending frame 的世界变化主要是参与者启动和自身生命下降；
+实体移动、方块变化和其他复杂行为不会自行触发模型决策。
+
+## 6. 模型可见工具
+
+| 工具 | 当前实现 |
+|---|---|
+| `look_relative` | 水平和垂直各相对转动最多 ±90°，返回实测转动和新视野 |
+| `move_input` | 按住前、后、左、右键组合 50–1500 ms，可疾跑，返回实测位移和新视野 |
+| `view` | 不移动身体，完整重读当前视野 |
+| `say` | 把最多 500 字符的文本加入异步聊天队列 |
+| `remember` | 写入一条结构化 `episode` 记忆 |
+
+能力在 [`src/companion/capabilities/`](../src/companion/capabilities/)注册；同一 registry 同时产生模型 schema 和执行分派。
+身体、视野、聊天和记忆使用独立资源租约，资源冲突作为失败结果返回模型。
+
+`move_input` 没有寻路、跳跃或自动避障。当前也没有挖掘、放置、交互、战斗、GUI、制作或装备能力。系统提示词建议
+“一轮最多一个动作工具”，但执行层不强制；同一模型响应中的合法调用会依次执行。
+
+## 7. 记忆、日志与调试
+
+默认 `.mineintent/` 数据：
+
+| 文件 | 当前用途 |
+|---|---|
+| `memories.json` | 带 kind、summary、keywords、evidence、worldId 和时间的结构化记忆 |
+| `events.jsonl` | 调用方显式追加的应用事件，不是完整世界事件存档 |
+| `agent-transcripts.jsonl` | 每个模型 run 的完整诊断重放记录 |
+| `agent-transcripts.jsonl.1` | 上一份轮转记录 |
+
+`remember` 固定写入 `episode`，证据绑定触发本次 run 的聊天事件。记忆文件只在首次加载时读取，之后以内存记录为准；
+运行期间直接修改文件不会自动重载，后续写入还可能覆盖外部修改。实现见
+[`FileMemoryStore`](../src/memory/memory-store.ts)和 [`remember`](../src/companion/capabilities/remember.ts)。档案同样只在
+启动时由 [`loadCompanionProfile()`](../src/companion/profile.ts)读取。
+
+transcript 可能包含提示词、聊天、记忆、视口、工具 schema、结果、reasoning 和 closing。单条过大时会省略消息/schema，
+总文件达到约 32 MiB 时轮转；它不参与后续决策。
+
+只读调试状态位于 loopback `/v1/state`，保存在内存中并按字段脱敏，不是持久数据。实现见
+[`src/telemetry/`](../src/telemetry/)。
+
+## 8. 验证边界
+
+普通检查包括 TypeScript 类型检查、Markdown 本地链接检查、Node 测试和 Python Agent Service 测试。大部分测试使用
+fake backend、fake model/provider 和临时文件，不启动 Minecraft 或真实模型。
+
+手动 Paper workflow 使用隔离世界副本，验证 Backend 的连接、死亡、重生和重连，以及独立测试 Bot 的移动、取消、挖掘
+和背包行为。挖掘场景不表示当前 Agent 已拥有挖掘工具。具体命令和破坏性边界见[验证指南](./guides/validation.md)。
+
+当前没有可重复的“Paper + MineIntent Runtime + Python Agent Service + 真实模型”端到端验收。
+
+## 已知实现偏差
+
+相对于当前产品讨论，至少存在以下差异；这里仅记录，不替产品作决定：
+
+1. `primaryPlayer` 仍是必填配置；只有该玩家能触发决策，其他玩家信息被提前删除。
+2. 当前同时存在独立档案和结构化多记录记忆，不是单一、由 AI 直接编辑的文本记忆。
+3. 当前所有模型共用同一份系统提示词和档案，没有供应商、模型或版本专用提示词。
+4. 档案包含“小岚、安静、诚实、不虚报完成”等倾向，通用系统提示词也包含行为要求；这些是当前提示词事实，
+   不是已经确认的产品本性。
+5. 决策只由主要玩家聊天触发；世界事件不会产生后台主动 run。
+6. 当前感知不能完整理解告示牌文字、玩家拿取物品等复杂行为，也不会把所有可获得的世界信息自动送入模型。
+7. 当前动作能力远低于正常玩家的能力范围。
+8. 运行期间没有上下文压缩，也没有跨 run 对话连续性。
+9. 没有覆盖真实模型体验的可重复端到端验证。

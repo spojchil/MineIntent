@@ -5,6 +5,23 @@ import process from 'node:process'
 const repositoryRoot = resolve(import.meta.dirname, '..')
 const ignoredDirectories = new Set(['.git', '.mineintent', '.artifacts', 'node_modules'])
 const failures = []
+const requiredProjectDocuments = [
+  'README.md',
+  '产品.md',
+  'docs/README.md',
+  'docs/architecture.md',
+  'docs/guides/run.md',
+  'docs/guides/validation.md',
+  'docs/history/index.md',
+  'CONTRIBUTING.md',
+  'CLAUDE.md',
+]
+const retiredProjectDocuments = [
+  'PRODUCT_CONSTITUTION.md',
+  'docs/source-index.md',
+  'docs/guides/companion-prototype.md',
+  'docs/guides/paper-integration.md',
+]
 
 function walkMarkdown(directory) {
   return readdirSync(directory, { withFileTypes: true })
@@ -79,6 +96,12 @@ function checkDocument(path) {
 }
 
 const documents = walkMarkdown(repositoryRoot)
+for (const path of requiredProjectDocuments) {
+  if (!existsSync(resolve(repositoryRoot, path))) failures.push(`缺少项目文档入口 ${path}`)
+}
+for (const path of retiredProjectDocuments) {
+  if (existsSync(resolve(repositoryRoot, path))) failures.push(`旧项目文档入口不应恢复 ${path}`)
+}
 for (const path of documents) checkDocument(path)
 
 if (failures.length) {
