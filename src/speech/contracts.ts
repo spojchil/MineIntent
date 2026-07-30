@@ -1,7 +1,7 @@
 export type AddressingEvidence =
   | 'explicit_name'
   | 'explicit_reply'
-  | 'primary_player_single_party'
+  | 'single_party'
   | 'ongoing_conversation'
   | 'not_addressed'
 
@@ -9,7 +9,7 @@ export interface PlayerChatMessage {
   protocol: 'mineintent.player-chat.v1'
   sourceEventId: string
   occurredAt: string
-  sender: { username: string; isPrimaryPlayer: boolean }
+  sender: { username: string }
   text: string
   verified?: boolean
   addressing: { addressedToCompanion: boolean; evidence: AddressingEvidence[] }
@@ -18,7 +18,6 @@ export interface PlayerChatMessage {
 
 export interface ChatInputContext {
   companionUsername: string
-  primaryPlayerUsernames: readonly string[]
   onlinePlayerUsernames: readonly string[]
   conversationActiveWith?: string
 }

@@ -9,7 +9,6 @@ const envSchema = z.object({
   MINEINTENT_MC_USERNAME: z.string().trim().min(1).max(64).default('MineIntentBot'),
   MINEINTENT_MC_AUTH: z.enum(['offline', 'microsoft']).default('offline'),
   MINEINTENT_MC_PROFILES_FOLDER: z.string().trim().min(1).optional(),
-  MINEINTENT_PRIMARY_PLAYER: z.string().trim().min(1),
   MINEINTENT_PROFILE: z.string().trim().min(1).default('companion-profile.md'),
   MINEINTENT_DATA_DIR: z.string().trim().min(1).default('.mineintent'),
   MINEINTENT_DEBUG_PORT: z.coerce.number().int().min(0).max(65_535).default(3211),
@@ -19,7 +18,6 @@ const envSchema = z.object({
 
 export interface AppConfig {
   minecraft: MinecraftBackendConfig
-  primaryPlayer: string
   profileFile: string
   dataDirectory: string
   debugPort: number
@@ -37,7 +35,6 @@ export function loadAppConfig(env: NodeJS.ProcessEnv = process.env, cwd = proces
         ...(value.MINEINTENT_MC_PROFILES_FOLDER ? { profilesFolder: value.MINEINTENT_MC_PROFILES_FOLDER } : {}) },
       timeouts: { ...defaultMinecraftBackendConfig.timeouts }, reconnect: { ...defaultMinecraftBackendConfig.reconnect },
     },
-    primaryPlayer: value.MINEINTENT_PRIMARY_PLAYER,
     profileFile: path.resolve(cwd, value.MINEINTENT_PROFILE),
     dataDirectory: path.resolve(cwd, value.MINEINTENT_DATA_DIR),
     debugPort: value.MINEINTENT_DEBUG_PORT,

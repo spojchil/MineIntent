@@ -10,8 +10,8 @@
  * 可复现、可比较。
  *
  * 用法：node scripts/live-observer.mjs ["要说的话"] [秒数]
- * 前置：Paper 已运行、agent-service 已运行、同伴已连接，且 .env 的
- *       MINEINTENT_PRIMARY_PLAYER 等于下面的测试身份。
+ * 前置：Paper 已运行、agent-service 已运行、同伴已连接；通过 MINEINTENT_TEST_PLAYER
+ *       使用下面的专用测试身份。
  */
 import { readFileSync } from 'node:fs'
 import mineflayer from 'mineflayer'
@@ -37,15 +37,8 @@ const PROMPT = process.argv[2] ?? '看看那只羊，然后走过去'
 const RUN_SECONDS = Number(process.argv[3] ?? 90)
 const BOT = env.MINEINTENT_MC_USERNAME ?? 'MineIntentBot'
 // 操作者应提供专用测试身份，不借用真人玩家名：真人在线时会被顶号，同伴的长期记忆
-// 和关系状态也不该把自动化流量记成真人交互。脚本只能验证该身份与主要玩家配置一致，
-// 无法从用户名本身判断它是否属于真人。
+// 和关系状态也不该把自动化流量记成真人交互。脚本无法从用户名本身判断它是否属于真人。
 const TESTER = process.env.MINEINTENT_TEST_PLAYER ?? env.MINEINTENT_TEST_PLAYER ?? 'LiveTester'
-if (env.MINEINTENT_PRIMARY_PLAYER !== TESTER) {
-  console.error(`拒绝运行：.env 的 MINEINTENT_PRIMARY_PLAYER=${env.MINEINTENT_PRIMARY_PLAYER}，`
-    + `但测试身份是 ${TESTER}。同伴只回应主要玩家，两者必须一致；`
-    + `请把 .env 改成测试身份后再跑，避免污染真人玩家的记忆。`)
-  process.exit(2)
-}
 
 const t0 = Date.now()
 const stamp = () => `+${((Date.now() - t0) / 1000).toFixed(2)}s`
