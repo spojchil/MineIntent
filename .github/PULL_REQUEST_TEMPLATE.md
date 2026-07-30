@@ -8,12 +8,23 @@
 
 <!-- 采用了什么设计，为什么？ -->
 
+## 产品假设
+
+<!--
+如果本 PR 引入或改变产品语义，请逐条写清：
+- 引用《产品.md》的准确条目，或带“提案接受”标签的 Issue；
+- 说明本次新增、改变或仍未决定的内容。
+没有产品语义变化时写“无”。不要在 PR 中另写一套产品定义。
+-->
+
 ## 验证
 
 <!-- 运行了哪些检查或游戏内测试，结果如何？ -->
 
-- [ ] `pnpm check`
-- [ ] `pnpm test`
+- [ ] `corepack pnpm check`
+- [ ] `corepack pnpm check:docs`
+- [ ] `corepack pnpm test`
+- [ ] `python3 -m unittest discover -s agent-service -p "test_*.py"`
 - [ ] 已补充适当的自动化或集成测试
 - [ ] 已验证失败、取消和清理路径
 

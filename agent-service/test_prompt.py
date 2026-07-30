@@ -6,6 +6,9 @@ from prompt import system_prompt
 class PromptTests(unittest.TestCase):
     def test_prompt_carries_behavior_only(self):
         prompt = system_prompt()
+        self.assertIn("具身 AI", prompt)
+        self.assertNotIn("长期 AI 同伴", prompt)
+        self.assertNotIn("行动前先用 say", prompt)
         # say 是唯一说话通道，沉默 = 不调用。
         self.assertIn("say", prompt)
         self.assertIn("保持沉默", prompt)

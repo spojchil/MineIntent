@@ -165,8 +165,8 @@ export class CompanionRuntime {
     await this.#backend.start(this.#abort.signal)
     await this.#waitForSelfChunk()
     this.#refreshDebug()
-    await this.#journal.append('companion.started', { summary: '同伴加入世界' })
-    this.#pushPending('companion.started', '同伴加入世界')
+    await this.#journal.append('participant.started', { summary: 'AI 参与者已进入世界' })
+    this.#pushPending('participant.started', 'AI 参与者已进入世界')
     this.#noticeSelfChanges()
   }
 
@@ -179,7 +179,7 @@ export class CompanionRuntime {
     this.#unsubscribe?.()
     this.#soundHistory.dispose()
     await this.#backend.stop(reason)
-    await this.#journal.append('companion.stopped', { reason })
+    await this.#journal.append('participant.stopped', { reason })
     await this.#journal.flush()
     this.#debug.update({ connection: this.#backend.state(), currentBodyTool: undefined })
   }
