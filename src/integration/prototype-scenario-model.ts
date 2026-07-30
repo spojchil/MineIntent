@@ -1,7 +1,15 @@
 import type { CompanionDecisionV2, ContextPackageV2, ModelProvider, RawModelRunResult } from '../models/index.js'
 
+export interface PrototypeViewportSelection {
+  ref: string
+  readId: string
+  name: string
+  relativePosition: [number, number, number]
+}
+
 export class PrototypeScenarioModel implements ModelProvider {
   readonly contexts: ContextPackageV2[] = []
+  readonly viewportSelections: PrototypeViewportSelection[] = []
 
   async runDecision(input: { context: ContextPackageV2 }): Promise<RawModelRunResult> {
     const context = structuredClone(input.context)
@@ -13,6 +21,33 @@ export class PrototypeScenarioModel implements ModelProvider {
       text: memoryFragments(context).length ? '我回来了，还记得上次一起收集木材。' : '我来了，今天一起做点什么？',
       audience: { kind: 'primary_player' }, timing: 'now', purpose: 'social',
     }]))
+    if (text.includes('看向金块')) {
+      const target = viewportBlock(context, 'gold_block')
+      if (!target) return result(decision(context, []))
+      this.viewportSelections.push(structuredClone(target))
+      return result(decision(context, [
+        {
+          id: 'embodied_gaze_block', kind: 'embodied_intent', summary: '与观察中的金块建立视觉注意', desiredOutcome: '看向已观察的金块',
+          semanticGoal: {
+            schema: 'mineintent.semantic-goal.v1',
+            objective: { kind: 'state', state: {
+              id: 'state_attention_block', concept: 'self.attention_includes', description: '自身视觉注意覆盖选定方块',
+              arguments: {
+                observer: { kind: 'self' }, subject: { kind: 'referent_role', role: 'subject' },
+              },
+            } },
+            methodGuidance: [],
+          },
+          referents: [{ role: 'subject', selection: { kind: 'context_ref', ref: target.ref } }],
+          constraints: { maxDurationMs: 8_000, interruptibility: 'immediate' },
+        },
+        {
+          id: 'speech_gaze_block_done', kind: 'speech', text: '看见金块了。',
+          audience: { kind: 'primary_player' }, timing: 'after_intent_terminal', dependsOn: ['embodied_gaze_block'],
+          terminalCondition: 'completed', purpose: 'report',
+        },
+      ]))
+    }
     if (text.includes('看向我')) return result(decision(context, [
       {
         id: 'embodied_gaze', kind: 'embodied_intent', summary: '与说话者建立视觉共同注意', desiredOutcome: '看向说话者',
@@ -102,4 +137,30 @@ function triggerText(context: ContextPackageV2): string {
 
 function memoryFragments(context: ContextPackageV2) {
   return context.fragments.filter(fragment => fragment.section === 'retrieved_memories')
+}
+
+function viewportBlock(context: ContextPackageV2, name: string): PrototypeViewportSelection | undefined {
+  for (const fragment of context.fragments) {
+    if (fragment.section !== 'observations' || fragment.source.trust !== 'verified_observation' ||
+        !record(fragment.content)) continue
+    const read = fragment.content
+    if (read.protocol !== 'mineintent.information-read.v1' || read.interfaceId !== 'viewport_information' ||
+        typeof read.readId !== 'string' || !record(read.values)) continue
+    const visible = read.values.visibleBlocks
+    if (!record(visible) || !Array.isArray(visible.blocks)) continue
+    for (const candidate of visible.blocks) {
+      if (!record(candidate) || candidate.name !== name || typeof candidate.ref !== 'string' ||
+          !relativePosition(candidate.relativePosition)) continue
+      return { ref: candidate.ref, readId: read.readId, name, relativePosition: candidate.relativePosition }
+    }
+  }
+  return undefined
+}
+
+function relativePosition(value: unknown): value is [number, number, number] {
+  return Array.isArray(value) && value.length === 3 && value.every(item => typeof item === 'number' && Number.isFinite(item))
+}
+
+function record(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 }

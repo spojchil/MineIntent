@@ -52,7 +52,7 @@ function runtimeWith(...providers: Array<FakeInformationProvider<object, unknown
   })
 }
 
-test('runtime signs provider references and resolves them only for declared target providers', async () => {
+test('runtime keeps observed context refs while rejecting stale or wrongly targeted selectors', async () => {
   let inventoryRevision = 2
   let changeSourceDuringTooltipRead = false
   interface InventoryValues { item_refs: InformationSelectorRef[] }
@@ -175,7 +175,7 @@ test('runtime signs provider references and resolves them only for declared targ
     selector: ref,
   }, new AbortController().signal)
   assert.equal('code' in stale ? stale.code : undefined, 'invalid_selector')
-  assert.equal(runtime.resolveContextReference(caller, ref.id, ['item']), undefined)
+  assert.deepEqual(runtime.resolveContextReference<{ slot: number }>(caller, ref.id, ['item'])?.payload, { slot: 2 })
 
   const wrongTarget = await runtime.query(caller, {
     interfaceId: 'inventory_information',

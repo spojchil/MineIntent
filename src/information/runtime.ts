@@ -181,7 +181,11 @@ export class InformationRuntime {
       scope,
       ...(acceptedKinds ? { acceptedKinds } : {}),
     })
-    if (!resolved || !this.#selectorSourceIsCurrent(caller, grant, resolved.ref, scope)) return undefined
+    // A reference copied from a verified decision context names an observation that
+    // already happened. Unlike a selector for a new read, it must not become
+    // unusable merely because the aggregate source revision advanced afterwards.
+    // Ref-store scope and TTL checks still apply, and Grounding separately proves
+    // that the exact ref was conveyed by the current context before resolving it.
     return resolved
   }
 

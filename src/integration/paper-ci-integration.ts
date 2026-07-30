@@ -4,8 +4,10 @@ import { copyFileSync, existsSync, readFileSync, rmSync, writeFileSync } from 'n
 import { fileURLToPath } from 'node:url'
 import mineflayer, { type Bot } from 'mineflayer'
 import { randomUUID } from 'node:crypto'
+import { BackendPerceptionPort } from '../companion/information-adapters.js'
 import { CompanionRuntime } from '../companion/runtime.js'
 import { JsonlEventJournal } from '../events/journal.js'
+import { raycastLookedAtBlock } from '../information/source-ports/perception.js'
 import { FileMemoryStore } from '../memory/memory-store.js'
 import type { BackendEventEnvelope, BackendLifecyclePayload } from '../minecraft/contracts.js'
 import { defaultMinecraftBackendConfig } from '../minecraft/config.js'
@@ -109,6 +111,38 @@ async function companionPrototypeScenario() {
       assert.equal(gazeEvents.some(event => event.type === 'embodiment.controller.evidence' && event.payload.stage === 'outcome_verified'), true)
       assert.equal(gazeEvents.some(event => event.type === 'embodiment.controller.terminal' && event.payload.status === 'completed'), true)
       ctx.record('assertion', 'visual_attention_verified', { yawError: yawDistance(self.yaw, expectedYaw) })
+
+      const blockTarget = blockAtRelativeYaw(self, 0.5, 3.5)
+      const yawBeforeBlockAttention = self.yaw
+      server.send(`setblock ${blockTarget.x} ${blockTarget.y} ${blockTarget.z} minecraft:gold_block`)
+      await waitUntil(() => {
+        const block = backend!.observationSource().readBlock(blockTarget)
+        return block.status === 'loaded' && block.block.name === 'gold_block'
+      }, 10_000, 'relative-coordinate block fixture')
+      const blockMessageStart = messages.length
+      player!.chat('看向金块')
+      await waitUntil(() => messages.slice(blockMessageStart).some(message => message.includes('看见金块了')), 20_000, 'grounded block attention')
+      const selection = firstModel.viewportSelections.at(-1)
+      assert.ok(selection)
+      assert.equal(selection.name, 'gold_block')
+      assert.equal(selection.relativePosition.every(value => Number.isInteger(value * 2)), true)
+      const hit = raycastLookedAtBlock(new BackendPerceptionPort(backend), 4.5)
+      assert.equal(hit?.name, 'gold_block')
+      assert.deepEqual(hit?.position, blockTarget)
+      assert.equal(yawDistance(yawBeforeBlockAttention, backend.snapshot().self.yaw) > 0.2, true)
+      const blockEvents = readFileSync(firstJournal, 'utf8').trim().split(/\r?\n/u).map(line => JSON.parse(line) as { type: string; payload: any })
+      const blockGrounding = blockEvents.find(event =>
+        event.type === 'embodiment.grounding.finished' && event.payload.effectId === 'embodied_gaze_block')
+      assert.equal(blockGrounding?.payload.status, 'grounded')
+      assert.equal(blockGrounding?.payload.evidenceIds.includes(selection.readId), true)
+      assert.equal(blockEvents.some(event =>
+        event.type === 'embodiment.controller.terminal' && event.payload.effectId === 'embodied_gaze_block' &&
+        event.payload.status === 'completed' && event.payload.reasonCode === 'visual_attention_verified'), true)
+      ctx.record('assertion', 'relative_coordinate_ref_verified', {
+        relativePosition: selection.relativePosition,
+        readId: selection.readId,
+        targetName: hit?.name,
+      })
 
       const woodBeforeProposal = woodCount(backend.snapshot())
       player!.chat('一起收集些木头吧')
@@ -304,6 +338,18 @@ function lifecycleType(event: BackendEventEnvelope): string | undefined { return
 function woodCount(snapshot: ReturnType<MinecraftBackend['snapshot']>): number { return snapshot.inventory.slots.filter(slot => slot.itemName.endsWith('_log') || slot.itemName.endsWith('_stem')).reduce((sum, slot) => sum + slot.count, 0) }
 function distance(left: { x: number; y: number; z: number }, right: { x: number; y: number; z: number }): number { return Math.hypot(left.x - right.x, left.y - right.y, left.z - right.z) }
 function yawDistance(left: number, right: number): number { const delta = Math.abs(left - right) % (Math.PI * 2); return Math.min(delta, Math.PI * 2 - delta) }
+function blockAtRelativeYaw(
+  pose: { position: { x: number; y: number; z: number }; yaw: number },
+  yawOffset: number,
+  distanceFromFeet: number,
+): { x: number; y: number; z: number } {
+  const yaw = pose.yaw + yawOffset
+  return {
+    x: Math.floor(pose.position.x - Math.sin(yaw) * distanceFromFeet),
+    y: Math.floor(pose.position.y) + 1,
+    z: Math.floor(pose.position.z - Math.cos(yaw) * distanceFromFeet),
+  }
+}
 async function waitFor(events: BackendEventEnvelope[], predicate: (event: BackendEventEnvelope) => boolean, description: string, timeout = 30_000) { return waitUntil(() => events.find(predicate), timeout, description) }
 async function waitUntil<T>(predicate: () => T | undefined | false | Promise<T | undefined | false>, timeoutMs: number, description: string): Promise<T> { const start = Date.now(); while (Date.now() - start < timeoutMs) { const value = await predicate(); if (value) return value; await delay(25) } throw new Error(`Timed out waiting for ${description}`) }
 function delay(ms: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, ms)) }
