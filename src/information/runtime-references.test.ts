@@ -27,7 +27,7 @@ const scope: InformationScopeSnapshot = {
 const grant: InformationGrant = {
   id: 'grant-refs',
   principalId: 'model-refs',
-  audience: 'companion',
+  audience: 'participant',
   allowedInterfaces: '*',
   purpose: 'model_tool',
 }
@@ -60,7 +60,7 @@ test('runtime signs provider references and resolves them only for declared targ
     id: 'inventory_information',
     description: 'Visible inventory items',
     schemaRevision: 'inventory:1',
-    audiences: ['companion'],
+    audiences: ['participant'],
     scopeDependencies: ['connection', 'world'],
     fields: {
       item_refs: {
@@ -103,7 +103,7 @@ test('runtime signs provider references and resolves them only for declared targ
     id: 'item_tooltip_information',
     description: 'Visible item tooltip',
     schemaRevision: 'tooltip:1',
-    audiences: ['companion'],
+    audiences: ['participant'],
     scopeDependencies: ['connection', 'world'],
     selectors: { required: true, acceptsKinds: ['item'] },
     fields: {
@@ -190,7 +190,7 @@ test('runtime issues and consumes scope-bound continuation cursors', async () =>
     id: 'inventory_information',
     description: 'Paged visible entries',
     schemaRevision: 'paged:1',
-    audiences: ['companion'],
+    audiences: ['participant'],
     scopeDependencies: ['connection', 'world'],
     pagination: { defaultLimit: 2, maxLimit: 2 },
     fields: {

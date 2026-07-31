@@ -44,7 +44,7 @@ import { createViewCapability } from './capabilities/view.js'
 const INFORMATION_GRANT_ID = 'grant-context-composer'
 const INFORMATION_PRINCIPAL_ID = 'context-composer'
 
-export interface CompanionRuntimeOptions {
+export interface ParticipantRuntimeOptions {
   backend: MinecraftBackendApi
   model: ModelProvider
   memory: FileMemoryStore
@@ -75,7 +75,7 @@ interface ActiveRun extends RunScope {
  * privileged control phrases, and the model-visible surface is the small tool set in
  * the capability registry — two short body inputs, `view`, `say`, and `remember`.
  */
-export class CompanionRuntime {
+export class ParticipantRuntime {
   readonly #backend: MinecraftBackendApi
   readonly #model: ModelProvider
   readonly #memory: FileMemoryStore
@@ -106,7 +106,7 @@ export class CompanionRuntime {
   readonly #execution = new ExecutionArbiter()
   #started = false
 
-  constructor(options: CompanionRuntimeOptions) {
+  constructor(options: ParticipantRuntimeOptions) {
     this.#backend = options.backend
     this.#model = options.model
     this.#memory = options.memory
@@ -239,10 +239,10 @@ export class CompanionRuntime {
       snapshot.connectionEpoch !== event.connectionEpoch || snapshot.world.worldId !== event.worldId ||
       (event.dimension !== undefined && snapshot.world.dimension !== event.dimension)) return
     const message = interpretPlayerChat(event, {
-      companionUsername: snapshot.self.username,
+      participantUsername: snapshot.self.username,
       onlinePlayerUsernames: snapshot.trackedPlayers.filter(player => player.listed).map(player => player.username),
     })
-    if (!message?.addressing.addressedToCompanion) return
+    if (!message?.addressing.addressedToParticipant) return
     const generation = this.#runGeneration
     const journalEvent = await this.#journal.append('player.chat.received', {
       sourceEventId: message.sourceEventId, sender: message.sender.username, text: message.text,
@@ -389,7 +389,7 @@ export class CompanionRuntime {
 
   #caller(runId: string): TrustedInformationCaller {
     return {
-      principalId: INFORMATION_PRINCIPAL_ID, grantId: INFORMATION_GRANT_ID, purpose: 'companion_context',
+      principalId: INFORMATION_PRINCIPAL_ID, grantId: INFORMATION_GRANT_ID, purpose: 'participant_context',
       correlationId: runId, decisionRunId: runId,
     }
   }
@@ -434,7 +434,7 @@ export class CompanionRuntime {
    */
   #pushPending(type: string, summary: string): void {
     this.#pendingEvents.push({ type, summary, scope: this.#currentScope() })
-    // Bounded because nothing guarantees a frame is coming: an idle companion could otherwise
+    // Bounded because nothing guarantees a frame is coming: an idle participant could otherwise
     // accumulate events forever. Dropping the oldest is counted, never hidden.
     while (this.#pendingEvents.length > 20) {
       this.#pendingEvents.shift()
@@ -456,7 +456,7 @@ export class CompanionRuntime {
 
   /**
    * Drains only what belongs to this run's world. "受到伤害" from the world before a dimension change
-   * is not news in the world after it — it is a statement about somewhere the companion no longer is,
+   * is not news in the world after it — it is a statement about somewhere the participant no longer is,
    * and the model has no way to tell that from a fresh injury.
    *
    * Facts from another scope are dropped rather than held: there is no run that could ever be the
@@ -479,7 +479,7 @@ export class CompanionRuntime {
   }
 
   /**
-   * Forgets facts and baselines belonging to a world the companion has left. The health baseline
+   * Forgets facts and baselines belonging to a world the participant has left. The health baseline
    * matters as much as the queue: kept across a respawn it compares 20 against the 0 from dying, and
    * kept across a dimension change it turns any ordinary difference into a phantom injury.
    */
@@ -583,9 +583,9 @@ function buildInformationRuntime(backend: MinecraftBackendApi, soundHistory: Sou
   registry.seal('1.21.1')
   const accessPolicy = new InMemoryInformationAccessPolicy()
   accessPolicy.put({
-    id: INFORMATION_GRANT_ID, principalId: INFORMATION_PRINCIPAL_ID, audience: 'companion',
+    id: INFORMATION_GRANT_ID, principalId: INFORMATION_PRINCIPAL_ID, audience: 'participant',
     allowedInterfaces: ['current_status', 'inventory_information', 'sound_information', 'viewport_information'],
-    purpose: 'companion_context',
+    purpose: 'participant_context',
   })
   return new InformationRuntime({
     registry, accessPolicy, scopeSource: new BackendInformationScopeSource(backend, randomUUID()),

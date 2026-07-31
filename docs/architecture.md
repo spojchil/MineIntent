@@ -1,6 +1,6 @@
 # 当前实现结构
 
-> 实现快照：本分支相对 `main@fcfd1c0` 的当前实现
+> 实现快照：本分支相对 `main@e2d1f89` 的当前实现
 >
 > 本页只描述当前代码事实，没有产品权威。产品判断与候选架构见[《产品》](../产品.md)；两者不一致时，
 > 应把这里记录为实现偏差，不能用既成实现反向解释产品。
@@ -41,7 +41,7 @@ Python 拥有模型消息序列、系统提示词和 tool-call 循环；Node 拥
 ## 3. 一次决策的生命周期
 
 当前决策入口是任何玩家的被寻址公屏聊天；当前运行时按点名或单独在场判断寻址，不依据玩家身份。聊天契约保留无特权的
-进行中对话机制，但本次运行时装配不传该值。产生方是 [`CompanionRuntime`](../src/companion/runtime.ts)和
+进行中对话机制，但本次运行时装配不传该值。产生方是 [`ParticipantRuntime`](../src/participant/runtime.ts)和
 [`interpretPlayerChat()`](../src/speech/chat-input.ts)。
 
 聊天与模型决策分别通过 Promise 队列保持顺序。新聊天等待已有决策完成，不主动抢占旧决策；连接、死亡、重生、维度
@@ -99,7 +99,7 @@ Node 内部 Information Runtime 当前注册四类 provider：
 - 最近声音；
 - 第一人称视野投影。
 
-装配发生在 [`buildInformationRuntime()`](../src/companion/runtime.ts)。Information Runtime 还实现 catalog、help、selector、
+装配发生在 [`buildInformationRuntime()`](../src/participant/runtime.ts)。Information Runtime 还实现 catalog、help、selector、
 cursor 和权限机制，但这些通用接口目前没有作为模型工具暴露。
 
 模型通过专用 `view` 工具读取完整视野。当前投影包含姿态与世界坐标图例、脚下方块、准星方块、最多 8 个可见实体，
@@ -119,7 +119,7 @@ cursor 和权限机制，但这些通用接口目前没有作为模型工具暴�
 | `say` | 把最多 500 字符的文本加入异步聊天队列 |
 | `remember` | 写入一条结构化 `episode` 记忆 |
 
-能力在 [`src/companion/capabilities/`](../src/companion/capabilities/)注册；同一 registry 同时产生模型 schema 和执行分派。
+能力在 [`src/participant/capabilities/`](../src/participant/capabilities/)注册；同一 registry 同时产生模型 schema 和执行分派。
 身体、视野、聊天和记忆使用独立资源租约，资源冲突作为失败结果返回模型。
 
 `move_input` 没有寻路、跳跃或自动避障。当前也没有挖掘、放置、交互、战斗、GUI、制作或装备能力。系统提示词建议
@@ -138,7 +138,7 @@ cursor 和权限机制，但这些通用接口目前没有作为模型工具暴�
 
 `remember` 固定写入 `episode`，证据绑定触发本次 run 的聊天事件。记忆文件只在首次加载时读取，之后以内存记录为准；
 运行期间直接修改文件不会自动重载，后续写入还可能覆盖外部修改。实现见
-[`FileMemoryStore`](../src/memory/memory-store.ts)和 [`remember`](../src/companion/capabilities/remember.ts)。
+[`FileMemoryStore`](../src/memory/memory-store.ts)和 [`remember`](../src/participant/capabilities/remember.ts)。
 
 transcript 可能包含提示词、聊天、记忆、视口、工具 schema、结果、reasoning 和 closing。单条过大时会省略消息/schema，
 总文件达到约 32 MiB 时轮转；它不参与后续决策。

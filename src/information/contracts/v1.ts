@@ -22,7 +22,7 @@ export const INFORMATION_INTERFACE_IDS = [
 
 export type InformationInterfaceId = (typeof INFORMATION_INTERFACE_IDS)[number]
 
-export const INFORMATION_AUDIENCES = ['companion', 'controller', 'operator'] as const
+export const INFORMATION_AUDIENCES = ['participant', 'controller', 'operator'] as const
 export type InformationAudience = (typeof INFORMATION_AUDIENCES)[number]
 
 export const INFORMATION_SOURCE_KINDS = [
@@ -224,7 +224,7 @@ export interface InformationGrant {
   connectionEpoch?: number
   worldId?: string
   screenInstanceId?: string
-  purpose: 'companion_context' | 'model_tool' | 'controller' | 'operator'
+  purpose: 'participant_context' | 'model_tool' | 'controller' | 'operator'
   validUntil?: string
 }
 

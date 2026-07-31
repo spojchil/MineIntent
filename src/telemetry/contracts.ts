@@ -14,7 +14,7 @@ export interface DebugContextSource {
   size: number
 }
 
-export interface CompanionDebugState {
+export interface ParticipantDebugState {
   protocol: 'mineintent.debug-state.v1'
   revision: number
   capturedAt: string
@@ -38,4 +38,4 @@ export interface CompanionDebugState {
   }
 }
 
-export type DebugStateInput = Omit<CompanionDebugState, 'protocol' | 'revision' | 'capturedAt'>
+export type DebugStateInput = Omit<ParticipantDebugState, 'protocol' | 'revision' | 'capturedAt'>

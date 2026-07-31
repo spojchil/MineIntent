@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
-import { CompanionRuntime } from '../companion/index.js'
+import { ParticipantRuntime } from '../participant/index.js'
 import { JsonlEventJournal } from '../events/index.js'
 import { FileMemoryStore } from '../memory/index.js'
 import { MinecraftBackend } from '../minecraft/index.js'
@@ -10,14 +10,14 @@ import type { AppConfig } from './config.js'
 
 export class MineIntentApp {
   readonly #config: AppConfig
-  #runtime?: CompanionRuntime
+  #runtime?: ParticipantRuntime
   #debugServer?: LocalDebugServer
   #toolBridge?: ToolBridgeServer
 
   constructor(config: AppConfig) { this.#config = config }
 
   async start(): Promise<{ debugUrl: string }> {
-    let runtime: CompanionRuntime | undefined
+    let runtime: ParticipantRuntime | undefined
     let debugServer: LocalDebugServer | undefined
     let toolBridge: ToolBridgeServer | undefined
     try {
@@ -40,7 +40,7 @@ export class MineIntentApp {
         toolCallbackUrl: callback.url,
         toolCallbackToken: callback.token,
       })
-      runtime = new CompanionRuntime({ backend, model, memory, journal, debug })
+      runtime = new ParticipantRuntime({ backend, model, memory, journal, debug })
       debugServer = new LocalDebugServer(debug, this.#config.debugPort)
       const address = await debugServer.start()
       await runtime.start()

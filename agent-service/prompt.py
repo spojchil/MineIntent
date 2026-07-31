@@ -1,8 +1,8 @@
-"""System prompt for the companion agent.
+"""System prompt for the participant agent.
 
 How each tool works, its bounds and parameter conventions live in the tool schemas the backend
 sends with every request. The prompt only explains the one shared result-envelope convention that
-individual schemas cannot express, then carries who the companion is and how it should behave.
+individual schemas cannot express, then carries who the participant is and how it should behave.
 """
 from __future__ import annotations
 

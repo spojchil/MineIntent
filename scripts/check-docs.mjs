@@ -19,7 +19,7 @@ const requiredProjectDocuments = [
 const retiredProjectDocuments = [
   'PRODUCT_CONSTITUTION.md',
   'docs/source-index.md',
-  'docs/guides/companion-prototype.md',
+  'docs/guides/participant-prototype.md',
   'docs/guides/paper-integration.md',
 ]
 

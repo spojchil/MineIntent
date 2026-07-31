@@ -13,20 +13,20 @@ function chat(text: string, sender = 'spojchil'): BackendEventEnvelope<ProtocolC
 }
 
 const context = {
-  companionUsername: 'MineIntentBot',
+  participantUsername: 'MineIntentBot',
   onlinePlayerUsernames: ['spojchil', 'MineIntentBot'],
 }
 
 test('chat input records sender, addressing evidence, time and world context', () => {
   const message = interpretPlayerChat(chat('MineIntentBot，你在吗'), context)!
-  assert.equal(message.addressing.addressedToCompanion, true)
+  assert.equal(message.addressing.addressedToParticipant, true)
   assert.equal(message.world.dimension, 'overworld')
   assert.equal(message.occurredAt, '2026-07-12T00:00:00.000Z')
 })
 
 test('addressing is symmetric for players under the same multiplayer input conditions', () => {
   const multiplayer = {
-    companionUsername: 'MineIntentBot',
+    participantUsername: 'MineIntentBot',
     onlinePlayerUsernames: ['Alice', 'Bob', 'MineIntentBot'],
   }
   const aliceNamed = interpretPlayerChat(chat('MineIntentBot，你在吗', 'Alice'), multiplayer)!
@@ -36,35 +36,35 @@ test('addressing is symmetric for players under the same multiplayer input condi
   assert.deepEqual(aliceSender, { username: 'Alice' })
   assert.deepEqual(bobSender, { username: 'Bob' })
   assert.deepEqual(aliceNamedResult, bobNamedResult)
-  assert.equal(aliceNamed.addressing.addressedToCompanion, true)
-  assert.equal(bobNamed.addressing.addressedToCompanion, true)
+  assert.equal(aliceNamed.addressing.addressedToParticipant, true)
+  assert.equal(bobNamed.addressing.addressedToParticipant, true)
 
   const aliceUnaddressed = interpretPlayerChat(chat('今天天气不错', 'Alice'), multiplayer)!
   const bobUnaddressed = interpretPlayerChat(chat('今天天气不错', 'Bob'), multiplayer)!
-  assert.deepEqual(aliceUnaddressed.addressing, { addressedToCompanion: false, evidence: ['not_addressed'] })
-  assert.deepEqual(bobUnaddressed.addressing, { addressedToCompanion: false, evidence: ['not_addressed'] })
+  assert.deepEqual(aliceUnaddressed.addressing, { addressedToParticipant: false, evidence: ['not_addressed'] })
+  assert.deepEqual(bobUnaddressed.addressing, { addressedToParticipant: false, evidence: ['not_addressed'] })
 })
 
-test('the only online player is addressed by single-party conditions without naming the companion', () => {
+test('the only online player is addressed by single-party conditions without naming the participant', () => {
   const message = interpretPlayerChat(chat('今天天气不错', 'Casey'), {
-    companionUsername: 'MineIntentBot',
+    participantUsername: 'MineIntentBot',
     onlinePlayerUsernames: ['Casey', 'MineIntentBot'],
   })!
-  assert.deepEqual(message.addressing, { addressedToCompanion: true, evidence: ['single_party'] })
+  assert.deepEqual(message.addressing, { addressedToParticipant: true, evidence: ['single_party'] })
 })
 
 test('a straggler chat from someone other than the sole online player is not single-party addressed', () => {
   const message = interpretPlayerChat(chat('今天天气不错', 'Bob'), {
-    companionUsername: 'MineIntentBot',
+    participantUsername: 'MineIntentBot',
     onlinePlayerUsernames: ['Casey', 'MineIntentBot'],
   })!
-  assert.deepEqual(message.addressing, { addressedToCompanion: false, evidence: ['not_addressed'] })
+  assert.deepEqual(message.addressing, { addressedToParticipant: false, evidence: ['not_addressed'] })
 })
 
 test('stop wording remains ordinary addressed player text', () => {
   const message = interpretPlayerChat(chat('MineIntentBot，停一下'), context)
   assert.equal(message?.text, 'MineIntentBot，停一下')
-  assert.equal(message?.addressing.addressedToCompanion, true)
+  assert.equal(message?.addressing.addressedToParticipant, true)
 })
 
 test('segmentChat respects Unicode length and keeps ordered content', () => {

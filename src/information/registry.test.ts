@@ -14,7 +14,7 @@ function provider(id: InformationInterfaceId) {
     id,
     description: `Provider ${id}`,
     schemaRevision: `${id}:1`,
-    audiences: ['companion'],
+    audiences: ['participant'],
     scopeDependencies: ['connection'],
     fields: {
       value: {

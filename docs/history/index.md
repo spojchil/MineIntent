@@ -129,3 +129,4 @@
 | `docs/source-index.md` | 本页 | [`fac8c654` 原文](https://github.com/spojchil/MineIntent/blob/fac8c654b223ce429659c655cf703b1eefc2953a/docs/source-index.md) |
 | `docs/guides/companion-prototype.md` | [`docs/guides/run.md`](../guides/run.md) | [`fac8c654` 原文](https://github.com/spojchil/MineIntent/blob/fac8c654b223ce429659c655cf703b1eefc2953a/docs/guides/companion-prototype.md) |
 | `docs/guides/paper-integration.md` | [`docs/guides/validation.md`](../guides/validation.md) | [`fac8c654` 原文](https://github.com/spojchil/MineIntent/blob/fac8c654b223ce429659c655cf703b1eefc2953a/docs/guides/paper-integration.md) |
+| `src/companion/` | [`src/participant/`](../../src/participant/) | [`e2d1f89` 原路径](https://github.com/spojchil/MineIntent/tree/e2d1f89/src/companion) |

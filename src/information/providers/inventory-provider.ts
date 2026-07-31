@@ -26,7 +26,7 @@ export class InventoryProvider implements InformationProvider<InventoryValues> {
     id: 'inventory_information',
     description: '站立不动时可直接得知的背包内容与当前选中快捷栏槽',
     schemaRevision: 'inventory-information:1',
-    audiences: ['companion'] as const,
+    audiences: ['participant'] as const,
     fields: {
       selectedHotbarSlot: {
         description: '当前选中的快捷栏槽位（0-8）', valueSchema: z.number().int().min(0).max(8), valueType: 'number',

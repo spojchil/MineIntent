@@ -33,7 +33,7 @@ const player = (username: string, position: { x: number; y: number; z: number })
 const context = () => ({
   now: new Date().toISOString(),
   scope: { processSessionId: 's', connectionState: 'play' as const, connectionEpoch: 1, uiRevision: 0, capturedAt: new Date().toISOString() },
-  caller: { audience: 'companion' as const, purpose: 'companion_context' as const },
+  caller: { audience: 'participant' as const, purpose: 'participant_context' as const },
   refs: { issue: () => { throw new Error('model viewport does not issue refs') } },
 })
 
@@ -44,7 +44,7 @@ test('viewport provider satisfies its five-field contract', async () => {
 
 test('positions are world-absolute so the same block keeps one key from any stance', async () => {
   // Absolute coordinates are what make an incremental read possible at all: a body-relative tuple
-  // renames every block the moment the companion moves, so nothing can be diffed against it.
+  // renames every block the moment the participant moves, so nothing can be diffed against it.
   const blocks = new Map([['3,65,0', stone('stone')]])
   const entities = [sheep({ x: 5, y: 64, z: 1 })]
   const first = await new ViewportInformationProvider(new FakePort(
@@ -125,7 +125,7 @@ test('a read that fills the entity cap says so', async () => {
 test('a projection never reuses a revision while its content changes underneath', async () => {
   // The defect this replaces: the revision was signed from the pose plus the backend's
   // `snapshotRevision`, and that counter has no subscription to blocks or to entity movement. So a
-  // companion standing still watched the world change while its revision sat frozen — not as a race
+  // participant standing still watched the world change while its revision sat frozen — not as a race
   // window but on every read. Both fields are exercised because both were affected.
   // Same stance and same coordinates as the world-absolute test above, which establishes that this
   // block and this sheep are both inside the frustum and unoccluded.

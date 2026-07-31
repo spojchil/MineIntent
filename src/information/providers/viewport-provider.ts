@@ -13,7 +13,7 @@ type WorldPosition = [number, number, number]
  * someone to talk to. Keeping `player` as its own optional field means its presence *is* the
  * answer to "is this a person", with no sentinel value to misread.
  *
- * None of this widens what the companion may know. A vanilla player reads a species off the model
+ * None of this widens what the participant may know. A vanilla player reads a species off the model
  * and a name off the nameplate above it; the entity's handles — `entityKey`, `uuid`, the protocol
  * id — stay behind the port, as they do everywhere else.
  */
@@ -28,7 +28,7 @@ interface VisibleEntityView {
 /**
  * Absolute world coordinates, not body-relative ones.
  *
- * A body-relative frame renumbers every entry whenever the companion turns or steps, which makes
+ * A body-relative frame renumbers every entry whenever the participant turns or steps, which makes
  * an incremental read impossible and forces the model to re-register its whole picture from
  * discrete text every observation. World coordinates are also not privileged information: any vanilla
  * player reads their own position and the targeted block's position straight off the F3 screen and
@@ -38,7 +38,7 @@ interface VisibleEntityView {
 export interface ViewportValues {
   frame: {
     coordinates: 'minecraft_world_absolute'
-    /** Where the companion is and where it faces, so relative bearings stay derivable. */
+    /** Where the participant is and where it faces, so relative bearings stay derivable. */
     self: { position: WorldPosition; yawDegrees: number; pitchDegrees: number }
     legend: { visibleEntities: string; visibleBlocks: string }
   }
@@ -92,7 +92,7 @@ const ENTITY_LIMIT = 8
  * horizontal angle is derived from the window aspect ratio rather than hardcoded, so the shape
  * stays honest if the assumed ratio ever changes: at 16:9 it works out to 102.45° (half 51.22°),
  * at 4:3 to 86.07°. Sprint and the FOV-effects slider widen this in game; that is deliberately
- * not modelled, since the companion has no camera of its own to widen.
+ * not modelled, since the participant has no camera of its own to widen.
  */
 const VERTICAL_FOV_DEGREES = 70
 const ASSUMED_ASPECT_RATIO = 16 / 9
@@ -115,7 +115,7 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
    *
    * A revision earns its name only if equal revisions guarantee equal content, and this one cannot
    * make that promise. It used to be signed from the pose plus `port.revision()`, which resolves to
-   * the backend's `snapshotRevision` — and that counter advances on the companion's own vitals, held
+   * the backend's `snapshotRevision` — and that counter advances on the participant's own vitals, held
    * item, window updates, players joining or leaving, death, dimension change and readiness.
    * Nothing advances it when a block is placed or broken, or when a mob takes a step. So for the two
    * fields that dominate this read, a pose held still meant a frozen revision over changing content,
@@ -137,7 +137,7 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
     id: 'viewport_information',
     description: '粗略第一人称视野；所有位置都使用 Minecraft 世界绝对坐标，方块为整数体素',
     schemaRevision: 'viewport-information:10',
-    audiences: ['companion'] as const,
+    audiences: ['participant'] as const,
     fields: {
       frame: { description: '本次观察的姿态与坐标系图例', valueSchema: frameSchema, valueType: 'object', precision: 'exactly_displayed', sourceKinds: ['viewport_projection'] },
       standingOnBlock: { description: '脚下可见方块及其绝对体素坐标', valueSchema: blockSchema, valueType: 'object', precision: 'inferred', sourceKinds: ['viewport_projection'] },
@@ -204,7 +204,7 @@ export class ViewportInformationProvider implements InformationProvider<Viewport
       const result = await visibleBlocks(this.port, VISIBLE_BLOCKS_OPTIONS, signal)
       values.visibleBlocks = {
         // Block coordinates are exact integers, which is what makes an incremental read possible:
-        // the same block keeps the same key no matter where the companion stands.
+        // the same block keeps the same key no matter where the participant stands.
         blocks: result.blocks.map(block => {
           const [x, y, z] = voxel(block.position)
           return [block.name, x, y, z]

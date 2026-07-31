@@ -12,12 +12,12 @@ export interface PlayerChatMessage {
   sender: { username: string }
   text: string
   verified?: boolean
-  addressing: { addressedToCompanion: boolean; evidence: AddressingEvidence[] }
+  addressing: { addressedToParticipant: boolean; evidence: AddressingEvidence[] }
   world: { worldId: string; dimension?: string; connectionEpoch: number }
 }
 
 export interface ChatInputContext {
-  companionUsername: string
+  participantUsername: string
   onlinePlayerUsernames: readonly string[]
   conversationActiveWith?: string
 }

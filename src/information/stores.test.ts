@@ -19,7 +19,7 @@ const scope: InformationScopeSnapshot = {
 const grant: InformationGrant = {
   id: 'grant-1',
   principalId: 'model-1',
-  audience: 'companion',
+  audience: 'participant',
   allowedInterfaces: '*',
   purpose: 'model_tool',
 }

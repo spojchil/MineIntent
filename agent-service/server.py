@@ -1,4 +1,4 @@
-"""Loopback agent service: the companion agent proper (prompt, model calls, tool loop).
+"""Loopback agent service: the participant agent proper (prompt, model calls, tool loop).
 
 The tool contract arrives with each request from the tool backend; this side owns none of it.
 """
