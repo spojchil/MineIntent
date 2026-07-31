@@ -1,0 +1,9 @@
+[package]
+name = "mineintent-backend"
+version = "0.0.1"
+edition = "2021"
+description = "MineIntent 自有 Minecraft 协议后端（目标 26.1 / 协议号 775）"
+
+[dependencies]
+azalea = "0.16.0+mc26.1"
+tokio = { version = "1", features = ["full"] }

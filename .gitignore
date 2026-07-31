@@ -1,0 +1,7 @@
+supplies/*
+!supplies/MANIFEST.md
+!supplies/SHA256SUMS
+vendor/
+target/
+server-run/
+.cargo/registry/
