@@ -52,7 +52,6 @@ export interface CompanionRuntimeOptions {
   journal: JsonlEventJournal
   profile: CompanionProfile
   debug: DebugStateStore
-  primaryPlayer: string
   speechIntervalMs?: number
 }
 
@@ -94,7 +93,6 @@ export class CompanionRuntime {
   readonly #journal: JsonlEventJournal
   readonly #profile: CompanionProfile
   readonly #debug: DebugStateStore
-  readonly #primaryPlayer: string
   readonly #speech: SpeechScheduler
   readonly #soundHistory: SoundHistory
   readonly #informationRuntime: InformationRuntime
@@ -127,7 +125,6 @@ export class CompanionRuntime {
     this.#journal = options.journal
     this.#profile = options.profile
     this.#debug = options.debug
-    this.#primaryPlayer = options.primaryPlayer
     this.#speech = new SpeechScheduler({ send: message => this.#backend.sendChat(message) }, {
       minimumIntervalMs: options.speechIntervalMs ?? 1_000,
       onEvent: event => { void this.#journal.append(`speech.${event.type}`, withoutPrivateSpeech(event)) },
@@ -261,11 +258,9 @@ export class CompanionRuntime {
       (event.dimension !== undefined && snapshot.world.dimension !== event.dimension)) return
     const message = interpretPlayerChat(event, {
       companionUsername: snapshot.self.username,
-      primaryPlayerUsernames: [this.#primaryPlayer],
       onlinePlayerUsernames: snapshot.trackedPlayers.filter(player => player.listed).map(player => player.username),
-      conversationActiveWith: this.#primaryPlayer,
     })
-    if (!message?.addressing.addressedToCompanion || !message.sender.isPrimaryPlayer) return
+    if (!message?.addressing.addressedToCompanion) return
     const generation = this.#runGeneration
     const journalEvent = await this.#journal.append('player.chat.received', {
       sourceEventId: message.sourceEventId, sender: message.sender.username, text: message.text,
