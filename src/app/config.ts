@@ -9,7 +9,6 @@ const envSchema = z.object({
   MINEINTENT_MC_USERNAME: z.string().trim().min(1).max(64).default('MineIntentBot'),
   MINEINTENT_MC_AUTH: z.enum(['offline', 'microsoft']).default('offline'),
   MINEINTENT_MC_PROFILES_FOLDER: z.string().trim().min(1).optional(),
-  MINEINTENT_PROFILE: z.string().trim().min(1).default('companion-profile.md'),
   MINEINTENT_DATA_DIR: z.string().trim().min(1).default('.mineintent'),
   MINEINTENT_DEBUG_PORT: z.coerce.number().int().min(0).max(65_535).default(3211),
   MINEINTENT_AGENT_SERVICE_URL: z.string().url().default('http://127.0.0.1:8765'),
@@ -18,7 +17,6 @@ const envSchema = z.object({
 
 export interface AppConfig {
   minecraft: MinecraftBackendConfig
-  profileFile: string
   dataDirectory: string
   debugPort: number
   agentServiceUrl: string
@@ -35,7 +33,6 @@ export function loadAppConfig(env: NodeJS.ProcessEnv = process.env, cwd = proces
         ...(value.MINEINTENT_MC_PROFILES_FOLDER ? { profilesFolder: value.MINEINTENT_MC_PROFILES_FOLDER } : {}) },
       timeouts: { ...defaultMinecraftBackendConfig.timeouts }, reconnect: { ...defaultMinecraftBackendConfig.reconnect },
     },
-    profileFile: path.resolve(cwd, value.MINEINTENT_PROFILE),
     dataDirectory: path.resolve(cwd, value.MINEINTENT_DATA_DIR),
     debugPort: value.MINEINTENT_DEBUG_PORT,
     agentServiceUrl: value.MINEINTENT_AGENT_SERVICE_URL,

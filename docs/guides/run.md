@@ -44,15 +44,11 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 | Minecraft | `MINEINTENT_MC_HOST`、`MINEINTENT_MC_PORT` | 服务器地址与端口 |
 | Minecraft | `MINEINTENT_MC_USERNAME`、`MINEINTENT_MC_AUTH` | Bot 名称与 `offline`/`microsoft` 登录方式 |
 | Minecraft | `MINEINTENT_MC_PROFILES_FOLDER` | 可选的 Microsoft 登录资料目录 |
-| 当前兼容配置 | `MINEINTENT_PROFILE` | 当前实现仍读取的独立档案文件 |
 | 本地运行 | `MINEINTENT_DATA_DIR`、`MINEINTENT_DEBUG_PORT` | 数据目录与只读调试端口 |
 | 本地运行 | `MINEINTENT_AGENT_SERVICE_URL`、`MINEINTENT_AGENT_SERVICE_TOKEN` | Node 与 Python 服务的 loopback 地址和独立令牌 |
 | 模型 | `MINEINTENT_MODEL_BASE_URL`、`MINEINTENT_MODEL_API_KEY`、`MINEINTENT_MODEL` | 模型端点、密钥和模型名 |
 | 模型 | `MINEINTENT_MODEL_REASONING_EFFORT` | 可选：`low`、`medium` 或 `high` |
 | 模型 | `MINEINTENT_AGENT_SERVICE_PORT` | Python 服务端口，默认 `8765` |
-
-`MINEINTENT_PROFILE` 是当前代码仍要求的兼容配置，不因此成为产品定义；具体差异见
-[架构说明的“已知实现偏差”](../architecture.md#已知实现偏差)。
 
 ## 启动
 
@@ -94,7 +90,7 @@ GET http://127.0.0.1:3211/v1/state
 | `agent-transcripts.jsonl` | 模型逐轮重放记录 |
 | `agent-transcripts.jsonl.1` | 上一份轮转记录 |
 
-转录可能包含档案、聊天、记忆、视口、工具 schema 与结果、模型 reasoning 和 closing。`.env`、`.mineintent/`、
+转录可能包含提示词、聊天、记忆、视口、工具 schema 与结果、模型 reasoning 和 closing。`.env`、`.mineintent/`、
 认证资料、私人聊天、运行日志和世界存档不得提交；分享调试响应或 artifact 前必须人工脱敏。接口只绑定 loopback
 并不表示其内容适合公开。
 

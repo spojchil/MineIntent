@@ -116,7 +116,6 @@ class ServerTests(unittest.TestCase):
         system, opening = seen[0][0], seen[0][1]
         # Slowest-changing content leads, because prefix caching is prefix-only.
         self.assertEqual(system["role"], "system")
-        self.assertIn("朋友", system["content"])
         self.assertIn("玩家怕高", system["content"])
         self.assertEqual(opening["role"], "user")
         self.assertIn("看看羊", opening["content"])
@@ -413,6 +412,9 @@ class ServerTests(unittest.TestCase):
     def test_request_and_json_are_strict(self):
         self.assertEqual(server.require_request({"runId": "r", "context": context(), "tools": tools()})[0], "r")
         self.assertEqual(server.require_cancel_request({"runId": "r"}), "r")
+        legacy_context = {**context(), "protocol": "mineintent.agent-context.v2"}
+        with self.assertRaises(server.RequestValidationError):
+            server.require_request({"runId": "r", "context": legacy_context, "tools": tools()})
         with self.assertRaises(server.RequestValidationError):
             server.require_request({"runId": "r", "context": context()})
         with self.assertRaises(server.RequestValidationError):
@@ -636,9 +638,8 @@ class ServerTests(unittest.TestCase):
 
 def context():
     return {
-        "protocol": "mineintent.agent-context.v2",
+        "protocol": "mineintent.agent-context.v3",
         "stable": {
-            "profile": {"content": "朋友"},
             "memories": [{"kind": "note", "summary": "玩家怕高", "createdAt": "2026-07-01T00:00:00Z"}],
         },
         "frame": {

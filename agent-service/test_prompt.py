@@ -1,9 +1,19 @@
 import unittest
 
-from prompt import system_prompt
+from prompt import stable_context, system_prompt
 
 
 class PromptTests(unittest.TestCase):
+    def test_stable_context_ignores_profile_and_only_renders_memories(self):
+        rendered = stable_context({
+            "profile": {"content": "不应进入系统消息"},
+            "memories": [{"kind": "note", "summary": "玩家怕高", "createdAt": "2026-07-01T00:00:00Z"}],
+        })
+        self.assertNotIn("## 你的档案", rendered)
+        self.assertNotIn("不应进入系统消息", rendered)
+        self.assertIn("## 你记得的事", rendered)
+        self.assertIn("玩家怕高", rendered)
+
     def test_prompt_carries_behavior_and_the_shared_observation_semantics(self):
         prompt = system_prompt()
         self.assertIn("具身 AI", prompt)

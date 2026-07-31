@@ -33,7 +33,7 @@ _MAX_TOOL_CALLS_PER_RESPONSE = 8
 _MAX_TOOL_CALLS_PER_RUN = 32
 _RUN_TIMEOUT_S = 180.0
 _MAX_TOOLS = 32
-_CONTEXT_PROTOCOL = "mineintent.agent-context.v2"
+_CONTEXT_PROTOCOL = "mineintent.agent-context.v3"
 _TOOL_RESPONSE_PROTOCOL = "mineintent.tool-response.v2"
 _RUN_PROTOCOL = "mineintent.agent-run.v1"
 _TOOL_NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -520,7 +520,7 @@ def run_tool_loop(
     deadline = deadline if deadline is not None else time.monotonic() + _RUN_TIMEOUT_S
     tool_names = [tool["function"]["name"] for tool in tools]
     # Static first, volatile last, and nothing volatile ever re-rendered: the system message carries
-    # behaviour plus the slow-changing profile and memory, then the opening frame is appended, then
+    # behaviour plus slow-changing memory, then the opening frame is appended, then
     # later requests append after that. Every provider's cache is prefix-only, so the ordering is the design.
     messages = [
         {"role": "system", "content": system_prompt() + stable_context(context.get("stable"))},
@@ -644,7 +644,7 @@ def append_transcript(
     tool definitions are recorded too, since a schema change silently alters what the model could
     have done. Diagnostics must never fail a run, hence the blanket OSError swallow.
 
-    Contents are sensitive — player chat, profile, memories, viewports and reasoning traces — so
+    Contents are sensitive — player chat, memories, viewports and reasoning traces — so
     the file is created 0600 and rotated rather than allowed to grow without bound.
     """
     target = path if path is not None else transcript_path()
