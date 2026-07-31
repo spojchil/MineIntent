@@ -3,16 +3,16 @@ import test from 'node:test'
 import { MemoryIntegrationRecorder } from './recorder.js'
 import { PaperScenarioRunner } from './scenario-runner.js'
 
-test('scenario records setup, companion behavior and cleanup as distinct phases', async () => {
+test('scenario records setup, participant behavior and cleanup as distinct phases', async () => {
   const recorder = new MemoryIntegrationRecorder()
   const result = await new PaperScenarioRunner(recorder).run({
     name: 'movement', timeoutMs: 100,
     setup: async ctx => ctx.record('setup', 'command', 'build fixture'),
-    run: async ctx => ctx.record('companion', 'action', 'walk'),
+    run: async ctx => ctx.record('participant', 'action', 'walk'),
     cleanup: async ctx => ctx.record('cleanup', 'command', 'remove fixture'),
   })
   assert.equal(result.status, 'passed')
-  assert.deepEqual(recorder.records.map(record => record.phase), ['harness', 'setup', 'companion', 'cleanup', 'harness'])
+  assert.deepEqual(recorder.records.map(record => record.phase), ['harness', 'setup', 'participant', 'cleanup', 'harness'])
 })
 
 test('timeout still runs cleanup and records a terminal result', async () => {

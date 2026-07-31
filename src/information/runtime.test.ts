@@ -34,24 +34,24 @@ const initialScope: InformationScopeSnapshot = {
   capturedAt: '2026-07-14T00:00:00.000Z',
 }
 
-const companionGrant: InformationGrant = {
-  id: 'grant-companion',
-  principalId: 'companion-model',
-  audience: 'companion',
+const participantGrant: InformationGrant = {
+  id: 'grant-participant',
+  principalId: 'participant-model',
+  audience: 'participant',
   allowedInterfaces: '*',
   purpose: 'model_tool',
 }
 
 const caller = {
-  principalId: 'companion-model',
-  grantId: 'grant-companion',
+  principalId: 'participant-model',
+  grantId: 'grant-participant',
   purpose: 'model_tool' as const,
   correlationId: 'correlation-1',
 }
 
 function statusDefinition(
   id: InformationInterfaceId = 'current_status',
-  audiences: InformationProviderDefinition<StatusValues>['audiences'] = ['companion'],
+  audiences: InformationProviderDefinition<StatusValues>['audiences'] = ['participant'],
 ): InformationProviderDefinition<StatusValues> {
   return {
     id,
@@ -122,7 +122,7 @@ function setup(providers = [statusProvider()]) {
   for (const provider of providers) registry.register(provider)
   registry.seal('1.21.1')
   const policy = new InMemoryInformationAccessPolicy()
-  policy.put(companionGrant)
+  policy.put(participantGrant)
   const scope = new MutableInformationScopeSource(initialScope)
   const trace = new InMemoryInformationTrace()
   const runtime = new InformationRuntime({ registry, accessPolicy: policy, scopeSource: scope, trace })
@@ -136,7 +136,7 @@ function setupSingle<Values extends object, Selector, PageState>(
   registry.register(provider)
   registry.seal('1.21.1')
   const policy = new InMemoryInformationAccessPolicy()
-  policy.put(companionGrant)
+  policy.put(participantGrant)
   return new InformationRuntime({
     registry,
     accessPolicy: policy,
@@ -145,9 +145,9 @@ function setupSingle<Values extends object, Selector, PageState>(
 }
 
 test('runtime filters catalog by audience and serves Catalog → Help → Read', async () => {
-  const companion = statusProvider()
+  const participant = statusProvider()
   const diagnostics = statusProvider({ id: 'client_diagnostics', audiences: ['operator'] })
-  const { runtime, trace } = setup([companion, diagnostics])
+  const { runtime, trace } = setup([participant, diagnostics])
 
   const catalog = runtime.catalog(caller, { operation: 'list_interfaces' })
   assert.equal(catalog.protocol, 'mineintent.information-catalog.v1')
@@ -179,7 +179,7 @@ test('runtime filters catalog by audience and serves Catalog → Help → Read',
 test('effective catalog revisions change with grant-visible fields and purpose is bound', async () => {
   const { runtime, policy } = setup()
   policy.put({
-    ...companionGrant,
+    ...participantGrant,
     allowedFields: { current_status: ['health'] },
   })
   const first = runtime.catalog(caller, { operation: 'list_interfaces' })
@@ -200,7 +200,7 @@ test('effective catalog revisions change with grant-visible fields and purpose i
   assert.equal('code' in deniedRead ? deniedRead.code : undefined, 'audience_denied')
 
   policy.put({
-    ...companionGrant,
+    ...participantGrant,
     allowedFields: { current_status: ['food_display'] },
   })
   const changed = runtime.catalog(caller, {
@@ -302,7 +302,7 @@ test('runtime discards provider leaks and reads racing a scope change', async ()
   registry.register(racing)
   registry.seal('1.21.1')
   const policy = new InMemoryInformationAccessPolicy()
-  policy.put(companionGrant)
+  policy.put(participantGrant)
   const runtime = new InformationRuntime({ registry, accessPolicy: policy, scopeSource: scope })
   const raced = await runtime.query(caller, {
     interfaceId: 'current_status',
@@ -319,7 +319,7 @@ test('runtime rebuilds nested fields from parsed Zod data and enforces declared 
     id: 'current_status',
     description: 'Nested visible status',
     schemaRevision: 'nested:1',
-    audiences: ['companion'],
+    audiences: ['participant'],
     scopeDependencies: ['connection'],
     fields: {
       health: {
@@ -415,7 +415,7 @@ test('the reusable provider contract validates a legal provider fixture', async 
     context: {
       now: initialScope.capturedAt,
       scope: initialScope,
-      caller: { audience: 'companion', purpose: 'model_tool' },
+      caller: { audience: 'participant', purpose: 'model_tool' },
       refs: { issue: () => { throw new Error('not used') } },
     },
     request: { fields: ['health'], page: { limit: 1 } },
@@ -444,8 +444,8 @@ test('tool sessions enforce read-call and byte budgets before returning results'
     sessionId: 'session-1',
     decisionRunId: 'run-1',
     correlationId: 'correlation-1',
-    principalId: 'companion-model',
-    grantId: 'grant-companion',
+    principalId: 'participant-model',
+    grantId: 'grant-participant',
     budget: {
       maxCalls: 2,
       maxReadCalls: 1,
@@ -468,8 +468,8 @@ test('tool sessions enforce read-call and byte budgets before returning results'
     sessionId: 'session-2',
     decisionRunId: 'run-2',
     correlationId: 'correlation-2',
-    principalId: 'companion-model',
-    grantId: 'grant-companion',
+    principalId: 'participant-model',
+    grantId: 'grant-participant',
     budget: {
       maxCalls: 1,
       maxReadCalls: 1,
@@ -504,8 +504,8 @@ test('tool session deadline aborts a read already in progress', async () => {
     sessionId: 'session-deadline',
     decisionRunId: 'run-deadline',
     correlationId: 'correlation-deadline',
-    principalId: 'companion-model',
-    grantId: 'grant-companion',
+    principalId: 'participant-model',
+    grantId: 'grant-participant',
     budget: {
       maxCalls: 1,
       maxReadCalls: 1,
@@ -546,8 +546,8 @@ test('tool session forwards upstream cancellation to a read already in progress'
     sessionId: 'session-upstream-abort',
     decisionRunId: 'run-upstream-abort',
     correlationId: 'correlation-upstream-abort',
-    principalId: 'companion-model',
-    grantId: 'grant-companion',
+    principalId: 'participant-model',
+    grantId: 'grant-participant',
     budget: {
       maxCalls: 1,
       maxReadCalls: 1,

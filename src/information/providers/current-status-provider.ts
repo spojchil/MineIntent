@@ -28,7 +28,7 @@ export class CurrentStatusProvider implements InformationProvider<CurrentStatusV
     id: 'current_status',
     description: '站立不动时可直接得知的自身状态：生命、饥饿、氧气、经验和药水效果',
     schemaRevision: 'current-status:1',
-    audiences: ['companion'] as const,
+    audiences: ['participant'] as const,
     fields: {
       health: {
         description: '当前生命值', valueSchema: z.number().min(0), valueType: 'number',

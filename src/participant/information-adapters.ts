@@ -66,10 +66,10 @@ export class SoundHistory implements SoundHistoryPort {
   }
 
   /**
-   * Only sounds heard in the world the companion is in now.
+   * Only sounds heard in the world the participant is in now.
    *
    * A stored sound is not a name and a timestamp — it is a distance and a bearing, both measured
-   * against where the companion stood when it heard the sound. Replayed after a dimension change or
+   * against where the participant stood when it heard the sound. Replayed after a dimension change or
    * a reconnect, those two numbers describe a place that no longer exists, and nothing in the entry
    * says so. Filtering on read rather than clearing on a lifecycle event because the buffer has no
    * way to know it missed one; comparing against the live snapshot cannot go stale.
@@ -102,7 +102,7 @@ export class SoundHistory implements SoundHistoryPort {
       observedAt: event.occurredAt,
     }
     // From the envelope, not from the snapshot: the envelope says where the sound happened, while
-    // the snapshot only says where the companion is by the time the handler runs.
+    // the snapshot only says where the participant is by the time the handler runs.
     this.#entries.push({
       observation,
       scope: {

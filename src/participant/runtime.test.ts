@@ -12,7 +12,7 @@ import type {
 } from '../minecraft/contracts.js'
 import type { AgentDecisionContext, ModelProvider, ModelRunResult, WireToolDefinition } from '../models/index.js'
 import { DebugStateStore } from '../telemetry/index.js'
-import { CompanionRuntime } from './runtime.js'
+import { ParticipantRuntime } from './runtime.js'
 
 type ModelInput = { runId: string; context: AgentDecisionContext; tools: readonly WireToolDefinition[] }
 
@@ -20,7 +20,7 @@ let callSequence = 0
 /** Mirrors the bridge contract while keeping each model-provided tool call individually traceable. */
 class TestToolCaller {
   #lastToolCallId?: string
-  constructor(private readonly runtime: CompanionRuntime, private readonly runId: string) {}
+  constructor(private readonly runtime: ParticipantRuntime, private readonly runId: string) {}
 
   async execute(name: string, args: Record<string, unknown>): Promise<unknown> {
     callSequence += 1
@@ -244,7 +244,7 @@ async function fixture(t: test.TestContext, options: {
   const journal = options.gateJournal
     ? new GateJournal(path.join(directory, 'events.jsonl'), 'w', 's')
     : new JsonlEventJournal(path.join(directory, 'events.jsonl'), 'w', 's')
-  const runtime = new CompanionRuntime({
+  const runtime = new ParticipantRuntime({
     backend, model, memory,
     journal,
     debug, speechIntervalMs: options.speechIntervalMs ?? 0,
@@ -599,7 +599,7 @@ test('a fact observed in one world never reaches a run in another', async t => {
   await waitFor(() => model.calls.length === 1)
   await runtime.idle()
 
-  // "受到伤害，生命值 20 → 13.5" is a statement about somewhere the companion no longer is, and the
+  // "受到伤害，生命值 20 → 13.5" is a statement about somewhere the participant no longer is, and the
   // model has no way to tell a replayed injury from a fresh one.
   const frame = model.calls[0]!.context.frame
   assert.deepEqual(frame.events, [])
@@ -632,7 +632,7 @@ test('sounds heard before a world change are not replayed with their old distanc
   await waitFor(() => model.calls.length === 2)
   await runtime.idle()
 
-  // A stored sound is a distance and a bearing measured from where the companion stood. After the
+  // A stored sound is a distance and a bearing measured from where the participant stood. After the
   // change both describe a place that no longer exists, and the entry itself does not say so.
   assert.deepEqual(model.calls[1]!.context.frame.sound?.recentSounds, [])
 })

@@ -1,4 +1,4 @@
-export type IntegrationPhase = 'harness' | 'setup' | 'companion' | 'assertion' | 'cleanup'
+export type IntegrationPhase = 'harness' | 'setup' | 'participant' | 'assertion' | 'cleanup'
 export interface IntegrationRecord { sequence: number; at: string; scenario: string; phase: IntegrationPhase; type: string; detail: unknown }
 export interface IntegrationRecorder { record(scenario: string, phase: IntegrationPhase, type: string, detail: unknown): void }
 export interface PaperScenarioContext {

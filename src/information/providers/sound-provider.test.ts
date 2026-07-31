@@ -14,7 +14,7 @@ function context() {
   return {
     now: new Date().toISOString(),
     scope: { processSessionId: 's', connectionState: 'play' as const, connectionEpoch: 1, uiRevision: 0, capturedAt: new Date().toISOString() },
-    caller: { audience: 'companion' as const, purpose: 'companion_context' as const },
+    caller: { audience: 'participant' as const, purpose: 'participant_context' as const },
     refs: { issue: () => { throw new Error('not used') } },
   }
 }

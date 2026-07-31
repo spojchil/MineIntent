@@ -42,7 +42,7 @@ function buildRuntime(allowedInterfaces: '*' | readonly InformationInterfaceId[]
   registry.seal('1.21.1')
 
   const accessPolicy = new InMemoryInformationAccessPolicy()
-  accessPolicy.put({ id: 'grant-1', principalId: 'context-composer', audience: 'companion', allowedInterfaces, purpose: 'companion_context' })
+  accessPolicy.put({ id: 'grant-1', principalId: 'context-composer', audience: 'participant', allowedInterfaces, purpose: 'participant_context' })
 
   return new InformationRuntime({ registry, accessPolicy, scopeSource: new FixedScopeSource(scope()) })
 }
@@ -50,7 +50,7 @@ function buildRuntime(allowedInterfaces: '*' | readonly InformationInterfaceId[]
 test('composePassiveObservations flattens every allowed interface into plain values', async () => {
   const runtime = buildRuntime('*')
   const result = await composePassiveObservations(runtime, {
-    principalId: 'context-composer', grantId: 'grant-1', purpose: 'companion_context', correlationId: 'run-1',
+    principalId: 'context-composer', grantId: 'grant-1', purpose: 'participant_context', correlationId: 'run-1',
   }, new AbortController().signal)
   assert.equal(result.currentStatus?.health, 20)
   assert.equal(result.inventory?.selectedHotbarSlot, 0)
@@ -66,7 +66,7 @@ test('composePassiveObservations flattens every allowed interface into plain val
 test('composePassiveObservations records an omission instead of throwing when access is denied', async () => {
   const runtime = buildRuntime(['current_status'])
   const result = await composePassiveObservations(runtime, {
-    principalId: 'context-composer', grantId: 'grant-1', purpose: 'companion_context', correlationId: 'run-1',
+    principalId: 'context-composer', grantId: 'grant-1', purpose: 'participant_context', correlationId: 'run-1',
   }, new AbortController().signal)
   assert.equal(result.currentStatus?.health, 20)
   assert.equal(result.inventory, undefined)

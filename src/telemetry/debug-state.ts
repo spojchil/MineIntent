@@ -1,4 +1,4 @@
-import type { CompanionDebugState, DebugFailureSummary, DebugStateInput } from './contracts.js'
+import type { ParticipantDebugState, DebugFailureSummary, DebugStateInput } from './contracts.js'
 
 export class DebugStateStore {
   #revision = 0
@@ -17,14 +17,14 @@ export class DebugStateStore {
     this.update({ recentFailures: [...this.#state.recentFailures, failure].slice(-10) })
   }
 
-  snapshot(): Readonly<CompanionDebugState> {
-    const state: CompanionDebugState = {
+  snapshot(): Readonly<ParticipantDebugState> {
+    const state: ParticipantDebugState = {
       protocol: 'mineintent.debug-state.v1',
       revision: this.#revision,
       capturedAt: new Date().toISOString(),
       ...structuredClone(this.#state),
     }
-    return deepFreeze(redactSensitive(state)) as Readonly<CompanionDebugState>
+    return deepFreeze(redactSensitive(state)) as Readonly<ParticipantDebugState>
   }
 }
 

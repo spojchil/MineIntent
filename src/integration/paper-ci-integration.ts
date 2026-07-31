@@ -81,7 +81,7 @@ async function lifecycleScenario() {
     timeouts: { connectMs: 10_000, loginMs: 20_000, spawnMs: 60_000, stopMs: 5_000 },
     reconnect: { ...defaultMinecraftBackendConfig.reconnect, initialDelayMs: 250, maxDelayMs: 1_000, stableResetMs: 2_000 },
   })
-  backend.subscribe(event => { events.push(event); recorder.record('lifecycle-death-reconnect', 'companion', 'backend_event', event) })
+  backend.subscribe(event => { events.push(event); recorder.record('lifecycle-death-reconnect', 'participant', 'backend_event', event) })
   const runner = new PaperScenarioRunner(recorder)
   const result = await runner.run({
     name: 'lifecycle-death-reconnect', timeoutMs: 180_000,
@@ -168,7 +168,7 @@ async function fixture(bot: Bot): Promise<void> {
 async function connectBot(name: string): Promise<Bot> {
   const bot = mineflayer.createBot({ host: '127.0.0.1', port, username: name, auth: 'offline', version: '1.21.1', logErrors: false })
   await new Promise<void>((resolve, reject) => { bot.once('spawn', resolve); bot.once('error', reject); bot.once('kicked', reason => reject(new Error(String(reason)))) })
-  recorder.record('behavior-suite', 'companion', 'bot_connected', { username: name })
+  recorder.record('behavior-suite', 'participant', 'bot_connected', { username: name })
   return bot
 }
 

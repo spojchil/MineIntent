@@ -101,7 +101,7 @@ async function executeMove(
  * Says which frame it measured in, in place. The viewport declares every position it reports as
  * `minecraft_world_absolute`, and a model that carries that legend across to an action result would
  * read this triple as a world offset. It is not one: it is resolved against the pre-move facing, so
- * the same displacement means different things depending on where the companion was looking.
+ * the same displacement means different things depending on where the participant was looking.
  */
 function measuredMoveEffect(before: PoseSample, after: PoseSample) {
   const delta = {

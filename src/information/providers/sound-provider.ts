@@ -35,7 +35,7 @@ export class SoundInformationProvider implements InformationProvider<SoundValues
     id: 'sound_information',
     description: '站立不动时能听到的最近声音，含相对距离和方向',
     schemaRevision: 'sound-information:1',
-    audiences: ['companion'] as const,
+    audiences: ['participant'] as const,
     fields: {
       recentSounds: {
         description: '最近听到的声音，按时间从新到旧排列', valueSchema: z.array(soundSchema), valueType: 'array',
