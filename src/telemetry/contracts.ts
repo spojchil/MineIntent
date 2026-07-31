@@ -10,7 +10,7 @@ export interface DebugFailureSummary {
 
 export interface DebugContextSource {
   id: string
-  kind: 'runtime' | 'event' | 'profile' | 'memory' | 'player' | 'summary'
+  kind: 'runtime' | 'event' | 'memory' | 'player' | 'summary'
   size: number
 }
 

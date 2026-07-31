@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
-import { CompanionRuntime, loadCompanionProfile } from '../companion/index.js'
+import { CompanionRuntime } from '../companion/index.js'
 import { JsonlEventJournal } from '../events/index.js'
 import { FileMemoryStore } from '../memory/index.js'
 import { MinecraftBackend } from '../minecraft/index.js'
@@ -21,7 +21,6 @@ export class MineIntentApp {
     let debugServer: LocalDebugServer | undefined
     let toolBridge: ToolBridgeServer | undefined
     try {
-      const profile = await loadCompanionProfile(this.#config.profileFile)
       const debug = new DebugStateStore()
       const backend = new MinecraftBackend(this.#config.minecraft)
       const memory = new FileMemoryStore(path.join(this.#config.dataDirectory, 'memories.json'))
@@ -41,7 +40,7 @@ export class MineIntentApp {
         toolCallbackUrl: callback.url,
         toolCallbackToken: callback.token,
       })
-      runtime = new CompanionRuntime({ backend, model, memory, journal, profile, debug })
+      runtime = new CompanionRuntime({ backend, model, memory, journal, debug })
       debugServer = new LocalDebugServer(debug, this.#config.debugPort)
       const address = await debugServer.start()
       await runtime.start()

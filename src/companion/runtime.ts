@@ -34,7 +34,6 @@ import {
   BackendSelfVitalsPort,
   SoundHistory,
 } from './information-adapters.js'
-import type { CompanionProfile } from './profile.js'
 import { TOOL_RESULT_PROTOCOL, ToolCapabilityRegistry } from './capabilities/contracts.js'
 import { createLookRelativeCapability } from './capabilities/look-relative.js'
 import { createMoveInputCapability } from './capabilities/move-input.js'
@@ -50,7 +49,6 @@ export interface CompanionRuntimeOptions {
   model: ModelProvider
   memory: FileMemoryStore
   journal: JsonlEventJournal
-  profile: CompanionProfile
   debug: DebugStateStore
   speechIntervalMs?: number
 }
@@ -82,7 +80,6 @@ export class CompanionRuntime {
   readonly #model: ModelProvider
   readonly #memory: FileMemoryStore
   readonly #journal: JsonlEventJournal
-  readonly #profile: CompanionProfile
   readonly #debug: DebugStateStore
   readonly #speech: SpeechScheduler
   readonly #soundHistory: SoundHistory
@@ -114,7 +111,6 @@ export class CompanionRuntime {
     this.#model = options.model
     this.#memory = options.memory
     this.#journal = options.journal
-    this.#profile = options.profile
     this.#debug = options.debug
     this.#speech = new SpeechScheduler({ send: message => this.#backend.sendChat(message) }, {
       minimumIntervalMs: options.speechIntervalMs ?? 1_000,
@@ -286,7 +282,6 @@ export class CompanionRuntime {
       const frame = await this.#composeFrame(active, controller.signal, { username, text })
       this.#assertRunCurrent(active)
       sources = [
-        { id: this.#profile.versionId, kind: 'profile', size: this.#profile.content.length },
         { id: eventId, kind: 'player', size: text.length },
         ...memories.map(memory => ({ id: memory.id, kind: 'memory' as const, size: memory.summary.length })),
       ]
@@ -295,9 +290,8 @@ export class CompanionRuntime {
         retrievedMemoryIds: memoryIds,
       } })
       const context: AgentDecisionContext = {
-        protocol: 'mineintent.agent-context.v2',
+        protocol: 'mineintent.agent-context.v3',
         stable: {
-          profile: { content: this.#profile.content },
           memories: memories.map(({ kind, summary, createdAt }) => ({ kind, summary, createdAt })),
         },
         frame,

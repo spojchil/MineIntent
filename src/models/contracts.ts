@@ -1,6 +1,5 @@
 import { z } from 'zod'
 import type { PassiveObservations } from '../information/index.js'
-import type { CompanionProfile } from '../companion/profile.js'
 
 /** Model-provider wire shape; the implementing capability owns the actual contents. */
 export interface WireToolDefinition {
@@ -45,13 +44,12 @@ export interface AgentFrame {
  * What one request offers the model, split by how fast it changes rather than by topic.
  *
  * `stable` is rendered into the system message and `frame` is appended after it, because prefix
- * caching is prefix-only: whatever changes first invalidates everything after it. Profile changes
- * on the order of days and memory on the order of tool calls, while the world changes every tick.
+ * caching is prefix-only: whatever changes first invalidates everything after it. Memory changes
+ * on the order of tool calls, while the world changes every tick.
  */
 export interface AgentDecisionContext {
-  protocol: 'mineintent.agent-context.v2'
+  protocol: 'mineintent.agent-context.v3'
   stable: {
-    profile: Pick<CompanionProfile, 'content'>
     memories: Array<{ kind: string; summary: string; createdAt: string }>
   }
   frame: AgentFrame

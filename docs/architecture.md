@@ -1,6 +1,6 @@
 # 当前实现结构
 
-> 实现快照：本分支相对 `main@1699a1d` 的当前实现
+> 实现快照：本分支相对 `main@fcfd1c0` 的当前实现
 >
 > 本页只描述当前代码事实，没有产品权威。产品判断与候选架构见[《产品》](../产品.md)；两者不一致时，
 > 应把这里记录为实现偏差，不能用既成实现反向解释产品。
@@ -20,7 +20,7 @@ Python Agent Service
 ```
 
 Node 入口是 [`src/main.ts`](../src/main.ts)，对象装配位于
-[`MineIntentApp.start()`](../src/app/mineintent-app.ts)。它创建 Minecraft Backend、事件日志、记忆、档案、
+[`MineIntentApp.start()`](../src/app/mineintent-app.ts)。它创建 Minecraft Backend、事件日志、记忆、
 Agent Service 客户端、工具回调和只读调试服务。
 
 Python 入口是 [`agent-service/server.py:main()`](../agent-service/server.py)。它只监听 `127.0.0.1`；Node 不负责
@@ -50,21 +50,21 @@ Python 拥有模型消息序列、系统提示词和 tool-call 循环；Node 拥
 每条触发消息创建一个新 run，并绑定 Node 会话、Minecraft 连接 epoch、worldId、dimension、触发事件和取消信号。
 运行时按聊天文本检索同一世界最多五条结构化记忆，组成 opening frame 后调用模型。
 
-不同 run 之间不重放聊天历史。跨 run 重新进入模型的长期状态只有启动时读取的档案和本次检索出的记忆；诊断 transcript
+不同 run 之间不重放聊天历史。跨 run 重新进入模型的长期状态只有本次检索出的记忆；诊断 transcript
 不会被读回上下文。
 
 ## 4. 模型上下文与工具循环
 
-上下文协议 `mineintent.agent-context.v2` 分为：
+上下文协议 `mineintent.agent-context.v3` 分为：
 
-- `stable`：档案正文和检索出的记忆；
+- `stable`：检索出的记忆；
 - `frame`：本次玩家消息、世界、自身姿态、状态、背包、近期声音、待报告事件和遗漏说明。
 
 协议类型见 [`src/models/contracts.ts`](../src/models/contracts.ts)，frame 组合见
 [`composeAgentContext()`](../src/information/context-composer.ts)。完整视野不在 opening frame 中；opening 只含姿态和
 坐标图例。
 
-Python 将通用系统提示词、档案和记忆组成 system message，再追加 opening frame。之后只追加 assistant tool calls 和
+Python 将通用系统提示词和记忆组成 system message，再追加 opening frame。之后只追加 assistant tool calls 和
 对应的 tool results，不重写旧消息。实现见 [`prompt.py`](../agent-service/prompt.py)与
 [`run_tool_loop()`](../agent-service/server.py)。
 
@@ -138,8 +138,7 @@ cursor 和权限机制，但这些通用接口目前没有作为模型工具暴�
 
 `remember` 固定写入 `episode`，证据绑定触发本次 run 的聊天事件。记忆文件只在首次加载时读取，之后以内存记录为准；
 运行期间直接修改文件不会自动重载，后续写入还可能覆盖外部修改。实现见
-[`FileMemoryStore`](../src/memory/memory-store.ts)和 [`remember`](../src/companion/capabilities/remember.ts)。档案同样只在
-启动时由 [`loadCompanionProfile()`](../src/companion/profile.ts)读取。
+[`FileMemoryStore`](../src/memory/memory-store.ts)和 [`remember`](../src/companion/capabilities/remember.ts)。
 
 transcript 可能包含提示词、聊天、记忆、视口、工具 schema、结果、reasoning 和 closing。单条过大时会省略消息/schema，
 总文件达到约 32 MiB 时轮转；它不参与后续决策。
@@ -161,12 +160,10 @@ fake backend、fake model/provider 和临时文件，不启动 Minecraft 或真�
 
 相对于当前产品讨论，至少存在以下差异；这里仅记录，不替产品作决定：
 
-1. 当前同时存在独立档案和结构化多记录记忆，不是单一、由 AI 直接编辑的文本记忆。
-2. 当前所有模型共用同一份系统提示词和档案，没有供应商、模型或版本专用提示词。
-3. 档案包含“小岚、安静、诚实、不虚报完成”等倾向，通用系统提示词也包含行为要求；这些是当前提示词事实，
-   不是已经确认的产品本性。
-4. 决策只由被寻址的玩家聊天触发；世界事件不会产生后台主动 run。
-5. 当前感知不能完整理解告示牌文字、玩家拿取物品等复杂行为，也不会把所有可获得的世界信息自动送入模型。
-6. 当前动作能力远低于正常玩家的能力范围。
-7. 运行期间没有上下文压缩，也没有跨 run 对话连续性。
-8. 没有覆盖真实模型体验的可重复端到端验证。
+1. 当前长期记忆仍是结构化多记录，不是单一、由 AI 直接编辑的文本记忆。
+2. 当前所有模型共用同一份系统提示词，没有供应商、模型或版本专用提示词。
+3. 决策只由被寻址的玩家聊天触发；世界事件不会产生后台主动 run。
+4. 当前感知不能完整理解告示牌文字、玩家拿取物品等复杂行为，也不会把所有可获得的世界信息自动送入模型。
+5. 当前动作能力远低于正常玩家的能力范围。
+6. 运行期间没有上下文压缩，也没有跨 run 对话连续性。
+7. 没有覆盖真实模型体验的可重复端到端验证。

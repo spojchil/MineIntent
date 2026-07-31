@@ -247,7 +247,6 @@ async function fixture(t: test.TestContext, options: {
   const runtime = new CompanionRuntime({
     backend, model, memory,
     journal,
-    profile: { profileId: 'test', versionId: 'profile-1', content: '安静、诚实的世界参与者。', sourcePath: 'profile.md' },
     debug, speechIntervalMs: options.speechIntervalMs ?? 0,
   })
   await runtime.start()
@@ -478,7 +477,9 @@ test('startup is local; player chat runs the two-tool closed loop with measured 
   assert.deepEqual(opening.self, { position: [0, 64, 0], yawDegrees: 0, pitchDegrees: 0 })
   assert.deepEqual(opening.events[0], { type: 'participant.started', summary: 'AI 参与者已进入世界' })
   assert.doesNotMatch(JSON.stringify(opening), /visibleBlocks|visibleEntities/u)
-  assert.equal(model.calls[0]!.context.stable.profile.content.length > 0, true)
+  assert.equal(model.calls[0]!.context.protocol, 'mineintent.agent-context.v3')
+  assert.equal('profile' in model.calls[0]!.context.stable, false)
+  assert.deepEqual(model.calls[0]!.context.stable.memories, [])
   const first = results[0] as {
     viewport: { visibleEntities: { items: Array<Record<string, unknown>>; truncated: boolean } }
   }

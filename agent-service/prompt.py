@@ -11,17 +11,13 @@ def stable_context(stable: object) -> str:
     """Renders the slowest-changing content into the system message, ahead of everything volatile.
 
     Prefix caching is prefix-only: whatever changes first moves everything after it out of the
-    cache. The profile changes on the order of days and memory on the order of tool calls, while the
-    world changes every tick — so these belong here at the front and the world belongs in an
-    appended frame at the tail. Nothing here is re-rendered per model request, which is the point.
+    cache. Memory changes on the order of tool calls, while the world changes every tick — so memory
+    belongs here at the front and the world belongs in an appended frame at the tail. Nothing here
+    is re-rendered per model request, which is the point.
     """
     if not isinstance(stable, dict):
         return ""
     sections: list[str] = []
-    profile = stable.get("profile")
-    content = profile.get("content") if isinstance(profile, dict) else None
-    if isinstance(content, str) and content.strip():
-        sections.append("## 你的档案\n" + content.strip())
     memories = stable.get("memories")
     lines = []
     if isinstance(memories, list):
