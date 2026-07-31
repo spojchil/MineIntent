@@ -36,11 +36,12 @@ def tools():
     ]
 
 
-def hosted(result, round_id="round-from-host", frame=None):
-    response = {"protocol": "mineintent.tool-response.v1", "roundId": round_id, "result": result}
-    if frame is not None:
-        response["frame"] = frame
-    return response
+def tool_response(result, observation_after=None):
+    return {
+        "protocol": "mineintent.tool-response.v2",
+        "result": result,
+        "observationAfter": observation_after,
+    }
 
 
 class ServerTests(unittest.TestCase):
@@ -65,29 +66,33 @@ class ServerTests(unittest.TestCase):
             deadlines.append(deadline)
             return responses.pop(0)
 
-        def execute(run_id, name, arguments, _deadline, tool_call_id="", round_declaration=None):
-            calls.append((run_id, name, arguments, tool_call_id, round_declaration))
-            return hosted({"status": "completed", "viewport": {"visibleEntities": [["sheep", 0, 0, 3]]}})
+        def execute(run_id, name, arguments, _deadline, tool_call_id=""):
+            calls.append((run_id, name, arguments, tool_call_id))
+            return tool_response({"status": "completed", "viewport": {"visibleEntities": [["sheep", 0, 0, 3]]}})
 
         with patch.object(server, "model_completion", completion):
             closing, usage = server.run_tool_loop(sink.config(), "run-1", context(), execute, tools())
         self.assertEqual(closing, "")
         self.assertEqual(usage, {"prompt_tokens": 30, "completion_tokens": 5})
         self.assertEqual(deadlines[0], deadlines[1])
-        # Python only declares the boundary; the tool host, not this loop, supplies its identity.
-        self.assertEqual(calls, [("run-1", "look_relative", {"yaw_degrees": 90, "pitch_degrees": 0}, "call-1", {"new": True})])
+        self.assertEqual(calls, [("run-1", "look_relative", {"yaw_degrees": 90, "pitch_degrees": 0}, "call-1")])
         replay = model_messages[1][-2]
         tool_result = model_messages[1][-1]
         self.assertEqual(replay["reasoning_content"], "need turn")
         self.assertEqual(tool_result["tool_call_id"], "call-1")
-        self.assertIn("sheep", tool_result["content"])
+        self.assertEqual(
+            json.loads(tool_result["content"])["result"]["viewport"]["visibleEntities"][0][0],
+            "sheep",
+        )
 
-    def test_stable_content_leads_and_frames_are_appended_never_re_rendered(self):
+    def test_stable_content_leads_and_observations_stay_with_their_tool_results(self):
         sink = _Sink()
         self.addCleanup(sink.dir.cleanup)
         seen = []
-        frame = {"at": "2026-07-25T00:01:00Z", "world": {"dimension": "overworld"},
-                 "events": [{"type": "self.health.dropped", "summary": "受到伤害"}], "omissions": []}
+        first_observation = {"at": "2026-07-25T00:01:00Z", "world": {"dimension": "overworld"},
+                             "events": [{"type": "self.health.dropped", "summary": "受到伤害"}], "omissions": []}
+        second_observation = {"at": "2026-07-25T00:02:00Z", "world": {"dimension": "overworld"},
+                              "events": [], "omissions": []}
         responses = [
             {"choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [
                 {"id": "c1", "type": "function", "function": {"name": "say", "arguments": "{}"}},
@@ -100,13 +105,10 @@ class ServerTests(unittest.TestCase):
             seen.append(json.loads(json.dumps(messages)))
             return responses.pop(0)
 
-        declarations = []
-
-        def execute(_run_id, name, _arguments, _deadline, _tool_call_id="", round_declaration=None):
-            declarations.append(round_declaration)
+        def execute(_run_id, name, _arguments, _deadline, _tool_call_id=""):
             if name == "say":
-                return hosted({"status": "queued"}, "round-frame", frame)
-            return hosted({"status": "completed"}, "round-frame")
+                return tool_response({"status": "queued"}, first_observation)
+            return tool_response({"status": "completed"}, second_observation)
 
         with patch.object(server, "model_completion", completion):
             server.run_tool_loop(sink.config(), "run-frame", context(), execute, tools())
@@ -122,42 +124,85 @@ class ServerTests(unittest.TestCase):
         self.assertNotIn("看看羊", system["content"])
 
         roles = [message["role"] for message in seen[1]]
-        # Every tool result of the round first, then the frame: an assistant message with tool_calls
-        # must be followed by one result per call, and interleaving there breaks the pairing.
-        self.assertEqual(roles, ["system", "user", "assistant", "tool", "tool", "user"])
-        self.assertEqual(json.loads(seen[1][-1]["content"]), frame)
-        # The envelope is unwrapped: the model sees the tool's answer, not our transport around it.
-        self.assertEqual(json.loads(seen[1][3]["content"]), {"status": "queued"})
-        self.assertEqual(declarations, [{"new": True}, {"id": "round-frame"}])
-        self.assertNotIn("round-frame", json.dumps(seen[1]))
-        # Frames already in the conversation are byte-identical on the next round — appended once,
-        # never re-rendered, which is the only reason a volatile frame is free under caching.
+        self.assertEqual(roles, ["system", "user", "assistant", "tool", "tool"])
+        self.assertEqual(json.loads(seen[1][3]["content"]), {
+            "result": {"status": "queued"}, "observationAfter": first_observation,
+        })
+        self.assertEqual(json.loads(seen[1][4]["content"]), {
+            "result": {"status": "completed"}, "observationAfter": second_observation,
+        })
+        # Existing history is byte-identical on the next turn; volatile observations are appended.
         self.assertEqual(seen[0][:2], seen[1][:2])
 
-    def test_executor_round_identity_is_required_and_cannot_change_mid_response(self):
-        response = {"choices": [{"message": {"role": "assistant", "tool_calls": [
-            {"id": "c1", "function": {"name": "say", "arguments": "{}"}},
-        ]}}]}
-        sink = _Sink()
-        self.addCleanup(sink.dir.cleanup)
-        missing = {"protocol": "mineintent.tool-response.v1", "result": {"status": "queued"}}
-        with patch.object(server, "model_completion", lambda *_a, **_k: response):
-            with self.assertRaisesRegex(RuntimeError, "no round id"):
-                server.run_tool_loop(sink.config(), "run-missing", context(), lambda *_a: missing, tools())
+    def test_executor_response_envelope_is_strict(self):
+        valid = tool_response({"status": "queued"})
+        self.assertEqual(server.model_tool_output(valid), {
+            "result": {"status": "queued"}, "observationAfter": None,
+        })
+        invalid = [
+            {"protocol": "mineintent.tool-response.v1", "result": {}, "observationAfter": None},
+            {"protocol": "mineintent.tool-response.v2", "result": {}},
+            {"protocol": "mineintent.tool-response.v2", "result": {}, "observationAfter": []},
+            {**valid, "roundId": "legacy"},
+        ]
+        for value in invalid:
+            with self.assertRaisesRegex(RuntimeError, "invalid"):
+                server.model_tool_output(value)
 
-        responses = [{"choices": [{"message": {"role": "assistant", "tool_calls": [
-            {"id": "c1", "function": {"name": "say", "arguments": "{}"}},
-            {"id": "c2", "function": {"name": "say", "arguments": "{}"}},
-        ]}}]}]
-        returned_ids = iter(["round-a", "round-b"])
+    def test_tool_call_ids_are_preflighted_and_unique_within_the_run(self):
+        for invalid_id in ("", "x" * 129, "😀" * 65):
+            with self.assertRaisesRegex(RuntimeError, "invalid tool call"):
+                server.claim_tool_call_batch([
+                    {"id": invalid_id, "function": {"name": "say", "arguments": "{}"}},
+                ], set())
+
         sink = _Sink()
         self.addCleanup(sink.dir.cleanup)
-        with patch.object(server, "model_completion", lambda *_a, **_k: responses.pop(0)):
-            with self.assertRaisesRegex(RuntimeError, "changed the active round id"):
+        response = {"choices": [{"message": {"role": "assistant", "tool_calls": [
+            {"id": "same", "function": {"name": "say", "arguments": "{}"}},
+            {"id": "same", "function": {"name": "say", "arguments": "{}"}},
+        ]}}]}
+        executed = []
+        with patch.object(server, "model_completion", lambda *_a, **_k: response):
+            with self.assertRaisesRegex(RuntimeError, "reused a tool call id"):
                 server.run_tool_loop(
-                    sink.config(), "run-changed", context(),
-                    lambda *_a: hosted({"status": "queued"}, next(returned_ids)), tools(),
+                    sink.config(), "run-duplicate", context(),
+                    lambda *args: executed.append(args) or tool_response({"status": "queued"}), tools(),
                 )
+        # The whole response is checked before its first world-side effect.
+        self.assertEqual(executed, [])
+
+        seen = {"old-call"}
+        with self.assertRaisesRegex(RuntimeError, "reused a tool call id"):
+            server.claim_tool_call_batch([
+                {"id": "old-call", "function": {"name": "say", "arguments": "{}"}},
+            ], seen)
+
+    def test_invalid_model_tool_data_stays_local_and_keeps_the_tool_pair(self):
+        sink = _Sink()
+        self.addCleanup(sink.dir.cleanup)
+        seen_messages = []
+        responses = [
+            {"choices": [{"message": {"role": "assistant", "tool_calls": [
+                {"id": "bad-name", "function": {"name": "x" * 65, "arguments": "{}"}},
+            ]}}]},
+            {"choices": [{"message": {"role": "assistant", "content": ""}}]},
+        ]
+
+        def completion(_config, messages, *_args, **_kwargs):
+            seen_messages.append(json.loads(json.dumps(messages)))
+            return responses.pop(0)
+        executed = []
+        with patch.object(server, "model_completion", completion):
+            server.run_tool_loop(
+                sink.config(), "run-invalid-tool", context(),
+                lambda *args: executed.append(args) or tool_response({"status": "completed"}), tools(),
+            )
+        self.assertEqual(executed, [])
+        self.assertEqual(json.loads(seen_messages[1][-1]["content"]), {
+            "result": {"status": "failed", "summary": "invalid tool call"},
+            "observationAfter": None,
+        })
 
     def test_cache_counters_are_read_from_each_provider_shape_and_summed(self):
         # DeepSeek reports the hit at the top level; Zhipu and Moonshot use OpenAI's nested details.
@@ -187,9 +232,9 @@ class ServerTests(unittest.TestCase):
         ]
         with patch.object(server, "model_completion", lambda *_a, **_k: responses.pop(0)):
             _closing, usage = server.run_tool_loop(
-                sink.config(), "run-cache", context(), lambda *_a, **_k: hosted({"status": "queued"}), tools(),
+                sink.config(), "run-cache", context(), lambda *_a, **_k: tool_response({"status": "queued"}), tools(),
             )
-        # Round one is a cold write, round two hits the prefix built by round one: the run's own
+        # The first turn is a cold write; the second hits the prefix built by the first.
         # numbers are what make intra-run reuse visible without a provider dashboard.
         self.assertEqual(usage, {"prompt_tokens": 1900, "completion_tokens": 10, "cache_read_tokens": 704})
         self.assertEqual(sink.records()[0]["usage"]["cache_read_tokens"], 704)
@@ -214,7 +259,7 @@ class ServerTests(unittest.TestCase):
         with patch.object(server, "model_completion", completion):
             server.run_tool_loop(
                 sink.config(), "run-1", context(),
-                lambda *args: executed.append(args) or hosted({"status": "completed"}), tools(),
+                lambda *args: executed.append(args) or tool_response({"status": "completed"}), tools(),
             )
         # 并行调用不再被预先拒绝：约束在提示词里是建议，失败由工具后端如实回报。
         self.assertEqual([call[1] for call in executed], ["move_input", "look_relative"])
@@ -238,44 +283,48 @@ class ServerTests(unittest.TestCase):
             self.assertIn(reason, sink.records()[-1]["error"])
 
     def test_reported_and_absent_finish_reasons_that_mean_a_real_ending_are_accepted(self):
-        # 三家供应商对这个字段不一致，缺省和 null 都出现过；为一个没人依赖的字段失败整轮是错的。
+        # 三家供应商对这个字段不一致，缺省和 null 都出现过；为一个没人依赖的字段失败整个 run 是错的。
         for reason in ["stop", "tool_calls", "function_call", None]:
             self.assertIsNone(server.accept_finish_reason(reason))
         for reason in ["length", "", 7, {"code": "length"}]:
             self.assertIsNotNone(server.accept_finish_reason(reason))
 
-    def test_tool_calls_are_capped_per_round_and_per_run(self):
-        def one_round(count):
+    def test_tool_calls_are_capped_per_response_and_per_run(self):
+        def one_response(count, prefix="call"):
             return {"choices": [{"message": {"role": "assistant", "tool_calls": [
-                {"id": f"call-{index}", "function": {"name": "say", "arguments": '{"text":"hi"}'}}
+                {"id": f"{prefix}-{index}", "function": {"name": "say", "arguments": '{"text":"hi"}'}}
                 for index in range(count)
             ]}}]}
 
         sink = _Sink()
         self.addCleanup(sink.dir.cleanup)
         executed = []
-        over_round = one_round(server._MAX_TOOL_CALLS_PER_ROUND + 1)
-        with patch.object(server, "model_completion", lambda *_a, **_k: over_round):
+        over_response = one_response(server._MAX_TOOL_CALLS_PER_RESPONSE + 1)
+        with patch.object(server, "model_completion", lambda *_a, **_k: over_response):
             with self.assertRaises(RuntimeError) as caught:
                 server.run_tool_loop(
                     sink.config(), "run-1", context(),
-                    lambda *args: executed.append(args) or hosted({"status": "completed"}), tools(),
+                    lambda *args: executed.append(args) or tool_response({"status": "completed"}), tools(),
                 )
-        self.assertIn("in one round", str(caught.exception))
-        # 超限的一轮里一个调用都不执行：身体动作是真实时间，不能先做一半再报错。
+        self.assertIn("in one response", str(caught.exception))
+        # 超限的响应里一个调用都不执行：身体动作是真实时间，不能先做一半再报错。
         self.assertEqual(executed, [])
 
         sink = _Sink()
         self.addCleanup(sink.dir.cleanup)
         executed = []
-        full_round = one_round(server._MAX_TOOL_CALLS_PER_ROUND)
-        with patch.object(server, "model_completion", lambda *_a, **_k: full_round):
+        response_number = 0
+        def next_full_response(*_args, **_kwargs):
+            nonlocal response_number
+            response_number += 1
+            return one_response(server._MAX_TOOL_CALLS_PER_RESPONSE, f"response-{response_number}")
+        with patch.object(server, "model_completion", next_full_response):
             with self.assertRaises(RuntimeError) as caught:
                 server.run_tool_loop(
                     sink.config(), "run-2", context(),
-                    lambda *args: executed.append(args) or hosted({"status": "completed"}), tools(),
+                    lambda *args: executed.append(args) or tool_response({"status": "completed"}), tools(),
                 )
-        # 每轮都合法，累计不合法：_MAX_TOOL_ROUNDS 单独拦不住这条。
+        # 每次响应都合法，累计不合法：模型请求上限单独拦不住这条。
         self.assertIn("run limit", str(caught.exception))
         self.assertEqual(len(executed), server._MAX_TOOL_CALLS_PER_RUN)
 
@@ -292,7 +341,7 @@ class ServerTests(unittest.TestCase):
         with patch.object(server, "model_completion", lambda _config, _messages, _deadline, _run=None, tools=None: responses.pop(0)):
             server.run_tool_loop(
                 sink.config(), "run-1", context(),
-                lambda *args: seen.append(args) or hosted({"status": "failed", "summary": "duration out of range"}), tools(),
+                lambda *args: seen.append(args) or tool_response({"status": "failed", "summary": "duration out of range"}), tools(),
             )
         # 工具契约归工具侧：agent 不预判参数合法性，越界值也交给后端回真实失败。
         self.assertEqual(len(seen), 1)
@@ -465,7 +514,7 @@ class ServerTests(unittest.TestCase):
         self.assertFalse(runs.cancel("run-old"))
         new.ensure_active()
 
-    def test_decide_enforces_the_round_deadline(self):
+    def test_decide_enforces_the_run_deadline(self):
         httpd = self._start_server()
         request = urllib.request.Request(
             f"http://127.0.0.1:{httpd.server_port}/v1/decide",
@@ -478,7 +527,7 @@ class ServerTests(unittest.TestCase):
                 "x-mineintent-tool-executor-token": "0123456789abcdef",
             },
         )
-        with patch.object(server, "_ROUND_TIMEOUT_S", -1):
+        with patch.object(server, "_RUN_TIMEOUT_S", -1):
             with self.assertRaises(urllib.error.HTTPError) as caught:
                 urllib.request.urlopen(request, timeout=2)
         self.assertEqual(caught.exception.code, 504)

@@ -4,7 +4,7 @@ from prompt import system_prompt
 
 
 class PromptTests(unittest.TestCase):
-    def test_prompt_carries_behavior_only(self):
+    def test_prompt_carries_behavior_and_the_shared_observation_semantics(self):
         prompt = system_prompt()
         self.assertIn("具身 AI", prompt)
         self.assertNotIn("长期 AI 同伴", prompt)
@@ -15,7 +15,12 @@ class PromptTests(unittest.TestCase):
         # 收尾是普通文本，不再要求模型作者化任何信封。
         self.assertNotIn("mineintent.", prompt)
         self.assertNotIn("JSON", prompt)
-        # 工具机制与数据形状不进提示词：机制在工具 schema 里，形状在数据自带的 frame 字段里。
+        # 单个工具 schema 无法声明共同输出语义，因此只在这里解释一次。
+        self.assertIn("observationAfter", prompt)
+        self.assertIn("不一定由该工具造成", prompt)
+        self.assertIn("null", prompt)
+        self.assertIn("每次模型响应", prompt)
+        # 各工具的参数和具体机制仍只属于各自 schema。
         for banned in ["[right, up, forward]", "entity_name_or_player", "block_name",
                        "正 yaw", "正 pitch", "不会自动寻路", "look_relative", "move_input"]:
             self.assertNotIn(banned, prompt)

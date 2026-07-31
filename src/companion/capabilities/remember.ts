@@ -34,7 +34,6 @@ export function createRememberCapability(
         // The summary itself stays out of the journal, matching the redaction stance on speech.
         await journal.append('memory.remembered', {
           actionId: invocation.actionId, runId: invocation.runId, toolCallId: invocation.toolCallId,
-          roundId: invocation.roundId,
         })
         scope.assertCurrent()
         return { protocol: TOOL_RESULT_PROTOCOL, status: 'completed' }

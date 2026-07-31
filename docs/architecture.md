@@ -1,8 +1,8 @@
 # 当前实现结构
 
-> 实现快照：`recovery/product-constitution-docs@fac8c654b223ce429659c655cf703b1eefc2953a`
+> 实现快照：本分支相对 `main@1699a1d` 的当前实现
 >
-> 本页只描述该提交的代码事实，没有产品权威。产品判断与候选架构见[《产品》](../产品.md)；两者不一致时，
+> 本页只描述当前代码事实，没有产品权威。产品判断与候选架构见[《产品》](../产品.md)；两者不一致时，
 > 应把这里记录为实现偏差，不能用既成实现反向解释产品。
 
 ## 1. 运行拓扑
@@ -33,10 +33,10 @@ Node 通过 `POST /v1/decide` 把 `runId`、模型上下文和当前工具定义
 [`AgentServiceModelProvider`](../src/models/agent-service-client.ts)。
 
 Python 收到模型工具调用后，通过 Node 临时创建的 `POST /v1/tool` 回调执行。回调只绑定 loopback，使用独立随机令牌，
-并验证 run、tool call、round、工具名和参数。产生方是 [`ToolBridgeServer`](../src/models/tool-bridge.ts)及
+并验证 run、tool call、工具名和参数。产生方是 [`ToolBridgeServer`](../src/models/tool-bridge.ts)及
 [模型契约](../src/models/contracts.ts)。
 
-Python 拥有模型消息序列、系统提示词和 tool-call 循环；Node 拥有世界状态、运行作用域、round 身份和工具的实际效果。
+Python 拥有模型消息序列、系统提示词和 tool-call 循环；Node 拥有世界状态、运行作用域和工具的实际效果。
 
 ## 3. 一次决策的生命周期
 
@@ -53,7 +53,7 @@ Python 拥有模型消息序列、系统提示词和 tool-call 循环；Node 拥
 不同 run 之间不重放聊天历史。跨 run 重新进入模型的长期状态只有启动时读取的档案和本次检索出的记忆；诊断 transcript
 不会被读回上下文。
 
-## 4. 模型上下文与 round
+## 4. 模型上下文与工具循环
 
 上下文协议 `mineintent.agent-context.v2` 分为：
 
@@ -64,14 +64,25 @@ Python 拥有模型消息序列、系统提示词和 tool-call 循环；Node 拥
 [`composeAgentContext()`](../src/information/context-composer.ts)。完整视野不在 opening frame 中；opening 只含姿态和
 坐标图例。
 
-Python 将通用系统提示词、档案和记忆组成 system message，再追加 opening frame。之后只追加 assistant tool calls、
-tool results 和新 frame，不重写旧 frame。实现见 [`prompt.py`](../agent-service/prompt.py)与
+Python 将通用系统提示词、档案和记忆组成 system message，再追加 opening frame。之后只追加 assistant tool calls 和
+对应的 tool results，不重写旧消息。实现见 [`prompt.py`](../agent-service/prompt.py)与
 [`run_tool_loop()`](../agent-service/server.py)。
 
-一次模型响应中的首个工具调用由 Node 创建 round ID；同一响应中的后续调用必须沿用该 ID。Python 依次执行该响应中的
-全部调用，先完成所有 tool result 配对，再追加额外 frame。
+每个工具回调只携带当前 `runId`、模型提供的 `toolCallId`、工具名和参数。`runId` 绑定当前决策及世界作用域，
+`toolCallId` 把一个模型调用与它的结果及日志关联，并且在同一 run 内只能使用一次；Node 在执行前认领它，因而重放不会
+再次产生世界副作用。协议不再为一条模型响应另外创建批次身份。
 
-当前上限为：每个 run 最多 16 次模型轮次、每轮最多 8 个工具调用、每个 run 最多 32 个工具调用，整轮期限 180 秒。
+Node 在每个工具处理完成后采集一次世界观察，通过 `mineintent.tool-response.v2` 返回。Python 放入对应 tool message 的
+模型可见内容固定为 `{result, observationAfter}`：`result` 是该调用的执行结果；`observationAfter` 只表示在调用处理后
+采集到的世界状态和累计事件，不表示其中变化由该工具造成。采样失败或调用在 Python 本地即被拒绝时为 `null`。
+观察不再作为独立 user message 追加，因此同一 assistant 响应中的每个调用都与自己的结果和后续观察按 `toolCallId`
+一一配对。
+
+同一模型响应中的全部合法调用仍按出现顺序执行。pending event 在采样时排空；当前 bridge 没有 observation ACK 或重投，
+因此事件交付是 at-most-once，回调响应在送达前丢失时不会自动恢复。
+
+当前上限为：每个 run 最多 16 次模型请求、每条模型响应最多 8 个工具调用、每个 run 最多 32 个工具调用，
+整个 run 共用 180 秒期限。
 
 当前没有上下文压缩、摘要或 checkpoint 恢复。上下文只在单个 run 内追加，直到正常结束、失败或达到限制；供应商返回的
 缓存 token 计数仅用于记录。模型最终的普通文本只进入 transcript，不会发到游戏；游戏内说话必须调用 `say`。
@@ -95,7 +106,7 @@ cursor 和权限机制，但这些通用接口目前没有作为模型工具暴�
 以及最多 256 个、32 格范围内的可见方块。投影每次完整重读，不是 delta；产生方是
 [`ViewportInformationProvider`](../src/information/providers/viewport-provider.ts)。
 
-声音缓存最多 20 条，并按连接和世界作用域过滤。当前主动加入 pending frame 的世界变化主要是参与者启动和自身生命下降；
+声音缓存最多 20 条，并按连接和世界作用域过滤。当前主动加入 pending observation 的世界变化主要是参与者启动和自身生命下降；
 实体移动、方块变化和其他复杂行为不会自行触发模型决策。
 
 ## 6. 模型可见工具
@@ -112,7 +123,7 @@ cursor 和权限机制，但这些通用接口目前没有作为模型工具暴�
 身体、视野、聊天和记忆使用独立资源租约，资源冲突作为失败结果返回模型。
 
 `move_input` 没有寻路、跳跃或自动避障。当前也没有挖掘、放置、交互、战斗、GUI、制作或装备能力。系统提示词建议
-“一轮最多一个动作工具”，但执行层不强制；同一模型响应中的合法调用会依次执行。
+“每次模型响应最多一个动作工具”，但执行层不强制；同一模型响应中的合法调用会依次执行。
 
 ## 7. 记忆、日志与调试
 

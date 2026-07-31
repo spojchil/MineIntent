@@ -40,7 +40,7 @@ export function createSayCapability(
       recordQueuedSay(invocation.runId)
       void journal.append('say.queued', {
         actionId: invocation.actionId, runId: invocation.runId, toolCallId: invocation.toolCallId,
-        roundId: invocation.roundId, segments, characters: text.length,
+        segments, characters: text.length,
       })
       // `queued`, not `completed`: the scheduler segments and rate-limits, so the player has not
       // seen this yet and a later scope change can still cancel it.

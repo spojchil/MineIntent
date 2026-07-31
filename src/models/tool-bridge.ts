@@ -4,8 +4,8 @@ import { toolInvocationSchema, type ToolExecution, type ToolInvocation } from '.
 
 const HOST = '127.0.0.1'
 const ROUTE = '/v1/tool'
-/** Lets the agent loop tell a result carrying a frame from a bare result. */
-export const TOOL_RESPONSE_PROTOCOL = 'mineintent.tool-response.v1'
+/** Versioned envelope shared by the Node executor and the model-facing agent loop. */
+export const TOOL_RESPONSE_PROTOCOL = 'mineintent.tool-response.v2'
 const MAX_REQUEST_BYTES = 32_768
 const MAX_RESPONSE_BYTES = 262_144
 
@@ -55,14 +55,11 @@ export class ToolBridgeServer {
       catch { return send(response, 400, { error: 'invalid_json' }) }
       const invocation = toolInvocationSchema.safeParse(value)
       if (!invocation.success) return send(response, 400, { error: 'invalid_tool_invocation' })
-      // Envelope, not a merge: the frame rides beside the result so the agent loop can append it as
-      // its own conversation entry rather than hiding world news inside a tool's answer.
       const execution = await this.handler(invocation.data)
       send(response, 200, {
         protocol: TOOL_RESPONSE_PROTOCOL,
-        roundId: execution.roundId,
         result: execution.result,
-        ...(execution.frame === undefined ? {} : { frame: execution.frame }),
+        observationAfter: execution.observationAfter ?? null,
       })
     } catch (error) {
       send(response, 500, { error: error instanceof Error ? error.message.slice(0, 500) : 'tool_handler_failed' })
