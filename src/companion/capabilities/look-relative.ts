@@ -62,7 +62,7 @@ async function executeLook(
     scope.assertCurrent()
     await journal.append('body_tool.completed', {
       actionId: invocation.actionId, runId: invocation.runId, toolCallId: invocation.toolCallId,
-      roundId: invocation.roundId, tool: 'look_relative', startedAt: invocation.startedAt,
+      tool: 'look_relative', startedAt: invocation.startedAt,
       // Internal diagnostics may retain poses; they never cross the model result boundary.
       internal: { before, after },
     })
@@ -80,7 +80,7 @@ async function executeLook(
     scope.assertCurrent()
     await journal.append('body_tool.failed', {
       actionId: invocation.actionId, runId: invocation.runId, toolCallId: invocation.toolCallId,
-      roundId: invocation.roundId, tool: 'look_relative',
+      tool: 'look_relative',
       summary: error instanceof Error ? error.message : String(error),
     })
     scope.assertCurrent()

@@ -16,26 +16,18 @@ import { CompanionRuntime } from './runtime.js'
 type ModelInput = { runId: string; context: AgentDecisionContext; tools: readonly WireToolDefinition[] }
 
 let callSequence = 0
-/** Mirrors the real executor contract: declare once, then echo the host's opaque identity. */
-class TestToolRound {
-  #roundId?: string
+/** Mirrors the bridge contract while keeping each model-provided tool call individually traceable. */
+class TestToolCaller {
   #lastToolCallId?: string
   constructor(private readonly runtime: CompanionRuntime, private readonly runId: string) {}
 
   async execute(name: string, args: Record<string, unknown>): Promise<unknown> {
     callSequence += 1
-    const round = this.#roundId === undefined ? { new: true as const } : { id: this.#roundId }
     const toolCallId = `call-${callSequence}`
-    const execution = await this.runtime.executeTool({
-      runId: this.runId, toolCallId, round, name, arguments: args,
-    })
     this.#lastToolCallId = toolCallId
-    this.#roundId = execution.roundId
-    return execution.result
+    return this.runtime.executeTool({ runId: this.runId, toolCallId, name, arguments: args })
   }
 
-  next(): void { this.#roundId = undefined }
-  get roundId(): string | undefined { return this.#roundId }
   get lastToolCallId(): string | undefined { return this.#lastToolCallId }
 }
 
@@ -280,13 +272,11 @@ async function fixture(t: test.TestContext, options: {
 test('say reports queued rather than completed, and journals the whole correlation chain', async t => {
   const { backend, model, runtime, readJournal } = await fixture(t, { speechIntervalMs: 0 })
   let result: unknown
-  let hostedRoundId: string | undefined
   let sentToolCallId: string | undefined
   model.handler = async input => {
-    const round = new TestToolRound(runtime, input.runId)
-    result = await round.execute('say', { text: '好'.repeat(300) })
-    hostedRoundId = round.roundId
-    sentToolCallId = round.lastToolCallId
+    const caller = new TestToolCaller(runtime, input.runId)
+    result = await caller.execute('say', { text: '好'.repeat(300) })
+    sentToolCallId = caller.lastToolCallId
     return { model: 'fake' }
   }
   backend.emitChat('Bot，说一段长话')
@@ -298,10 +288,9 @@ test('say reports queued rather than completed, and journals the whole correlati
   const events = await readJournal()
   const queued = events.find(event => event.type === 'say.queued')
   assert.ok(queued, 'say must leave a journal record')
-  const payload = queued!.payload as { toolCallId: string; roundId: string; segments: number; actionId: string }
+  const payload = queued!.payload as { runId: string; toolCallId: string; segments: number; actionId: string }
+  assert.equal(payload.runId, model.calls[0]!.runId)
   assert.equal(payload.toolCallId, sentToolCallId)
-  assert.match(hostedRoundId!, /^[0-9a-f-]{36}$/u)
-  assert.equal(payload.roundId, hostedRoundId)
   assert.equal(payload.segments, 2)
   // actionId 同时是 speech 请求 id，调度器事件才能和这次调用对上。
   const scheduled = events.find(event => event.type === 'speech.scheduled')
@@ -332,8 +321,8 @@ test('view returns visible blocks without moving or turning the body', async t =
   const yawBefore = backend.yaw
   const pitchBefore = backend.pitch
   model.handler = async input => {
-    const round = new TestToolRound(runtime, input.runId)
-    result = await round.execute('view', {})
+    const caller = new TestToolCaller(runtime, input.runId)
+    result = await caller.execute('view', {})
     return { model: 'fake' }
   }
 
@@ -357,11 +346,11 @@ test('a key set moves diagonally, while opposing keys execute and report no effe
   const { backend, model, runtime } = await fixture(t)
   const results: unknown[] = []
   model.handler = async input => {
-    const round = new TestToolRound(runtime, input.runId)
-    results.push(await round.execute('move_input', {
+    const caller = new TestToolCaller(runtime, input.runId)
+    results.push(await caller.execute('move_input', {
       directions: ['forward', 'left'], duration_ms: 50,
     }))
-    results.push(await round.execute('move_input', {
+    results.push(await caller.execute('move_input', {
       directions: ['forward', 'back'], duration_ms: 50,
     }))
     return { model: 'fake' }
@@ -391,36 +380,27 @@ test('a key set moves diagonally, while opposing keys execute and report no effe
   assert.equal(opposing.effect.movement, 'no_effect')
 })
 
-test('round ids are minted by the run host and a replaced round cannot be resumed', async t => {
+test('tool calls are authorized by the active run and each tool-call id is one-shot', async t => {
   const { backend, model, runtime } = await fixture(t)
-  let firstRoundId: string | undefined
-  let secondRoundId: string | undefined
-  let staleRejection: unknown
-  let continuedRoundId: string | undefined
+  let activeRunId: string | undefined
+  let replayRejection: unknown
+  const results: unknown[] = []
   model.handler = async input => {
-    const first = await runtime.executeTool({
-      runId: input.runId, toolCallId: 'call-first-round', round: { new: true },
+    activeRunId = input.runId
+    results.push(await runtime.executeTool({
+      runId: input.runId, toolCallId: 'call-first',
       name: 'look_relative', arguments: { yaw_degrees: 0, pitch_degrees: 0 },
-    })
-    const second = await runtime.executeTool({
-      runId: input.runId, toolCallId: 'call-second-round', round: { new: true },
-      name: 'look_relative', arguments: { yaw_degrees: 0, pitch_degrees: 0 },
-    })
-    firstRoundId = first.roundId
-    secondRoundId = second.roundId
+    }))
     try {
       await runtime.executeTool({
-        runId: input.runId, toolCallId: 'call-stale-round', round: { id: first.roundId },
-        name: 'look_relative', arguments: { yaw_degrees: 0, pitch_degrees: 0 },
+        runId: input.runId, toolCallId: 'call-first',
+        name: 'say', arguments: { text: '不应重复执行' },
       })
-    } catch (error) {
-      staleRejection = error
-    }
-    const continued = await runtime.executeTool({
-      runId: input.runId, toolCallId: 'call-live-round', round: { id: second.roundId },
+    } catch (error) { replayRejection = error }
+    results.push(await runtime.executeTool({
+      runId: input.runId, toolCallId: 'call-second',
       name: 'look_relative', arguments: { yaw_degrees: 0, pitch_degrees: 0 },
-    })
-    continuedRoundId = continued.roundId
+    }))
     return { model: 'fake' }
   }
 
@@ -428,29 +408,30 @@ test('round ids are minted by the run host and a replaced round cannot be resume
   await waitFor(() => model.calls.length === 1)
   await runtime.idle()
 
-  assert.match(firstRoundId!, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u)
-  assert.notEqual(secondRoundId, firstRoundId)
-  assert.equal(staleRejection instanceof Error ? staleRejection.message : undefined, 'tool_round_is_not_active')
-  assert.equal(continuedRoundId, secondRoundId)
+  assert.deepEqual(results.map(result => (result as { status: string }).status), ['completed', 'completed'])
+  assert.equal(replayRejection instanceof Error ? replayRejection.message : undefined, 'tool_call_already_handled')
+  assert.deepEqual(backend.messages, [])
+  assert.ok(activeRunId)
+  await assert.rejects(runtime.executeTool({
+    runId: activeRunId, toolCallId: 'call-after-run',
+    name: 'look_relative', arguments: { yaw_degrees: 0, pitch_degrees: 0 },
+  }), /tool_run_is_not_active/u)
 })
 
 test('a held resource fails the call instead of killing the run, and only blocks its own resource', async t => {
   const { backend, model, runtime } = await fixture(t)
   const results: unknown[] = []
   model.handler = async input => {
-    const round = new TestToolRound(runtime, input.runId)
-    // Open the host before overlapping calls; the real agent loop learns this id from the first
-    // sequential response and then echoes it for the rest of the assistant response.
-    await round.execute('look_relative', { yaw_degrees: 0, pitch_degrees: 0 })
+    const caller = new TestToolCaller(runtime, input.runId)
     // 身体占用期间发起第二个身体调用：应得到真实失败，而不是异常。
-    const moving = round.execute('move_input', { directions: ['forward'], duration_ms: 300 })
+    const moving = caller.execute('move_input', { directions: ['forward'], duration_ms: 300 })
     await waitFor(() => backend.motorInstance.moving)
-    results.push(await round.execute('look_relative', { yaw_degrees: 5, pitch_degrees: 0 }))
+    results.push(await caller.execute('look_relative', { yaw_degrees: 5, pitch_degrees: 0 }))
     // Scanning has its own physical resource. Looking without moving must remain possible while the
     // body is occupied, even though a second scan at the same time would contend for the event loop.
-    results.push(await round.execute('view', {}))
+    results.push(await caller.execute('view', {}))
     // say 用的是聊天资源，不该被身体挡住——否则「行动前先说一句」就无法实现。
-    results.push(await round.execute('say', { text: '我先动一下。' }))
+    results.push(await caller.execute('say', { text: '我先动一下。' }))
     results.push(await moving)
     return { model: 'fake' }
   }
@@ -474,10 +455,10 @@ test('startup is local; player chat runs the two-tool closed loop with measured 
   assert.equal(model.calls.length, 0)
   const results: unknown[] = []
   model.handler = async input => {
-    const round = new TestToolRound(runtime, input.runId)
-    results.push(await round.execute('look_relative', { yaw_degrees: 90, pitch_degrees: 0 }))
-    results.push(await round.execute('move_input', { directions: ['forward'], duration_ms: 50 }))
-    results.push(await round.execute('say', { text: '我看到羊了，走近了一点。' }))
+    const caller = new TestToolCaller(runtime, input.runId)
+    results.push(await caller.execute('look_relative', { yaw_degrees: 90, pitch_degrees: 0 }))
+    results.push(await caller.execute('move_input', { directions: ['forward'], duration_ms: 50 }))
+    results.push(await caller.execute('say', { text: '我看到羊了，走近了一点。' }))
     return { model: 'fake' }
   }
   backend.emitChat('Bot，看看那只羊，再走过去一点')
@@ -518,14 +499,14 @@ test('a new player chat waits behind an in-flight turn without taking control fr
   const { backend, model, runtime } = await fixture(t)
   let first = true
   model.handler = async input => {
-    const round = new TestToolRound(runtime, input.runId)
+    const caller = new TestToolCaller(runtime, input.runId)
     if (first) {
       first = false
-      await round.execute('move_input', { directions: ['forward'], duration_ms: 80 })
-      await round.execute('say', { text: '我先走完这一步。' })
+      await caller.execute('move_input', { directions: ['forward'], duration_ms: 80 })
+      await caller.execute('say', { text: '我先走完这一步。' })
       return { model: 'fake' }
     }
-    await round.execute('say', { text: '我听见了，再判断是否停下。' })
+    await caller.execute('say', { text: '我听见了，再判断是否停下。' })
     return { model: 'fake' }
   }
   backend.emitChat('Bot，往前走')
@@ -544,19 +525,19 @@ test('a new player chat waits behind an in-flight turn without taking control fr
   assert.equal(model.calls[1]!.context.frame.events.some(event => event.summary.includes('停下')), false)
 })
 
-test('damage taken mid-run reaches the model as a frame beside the next tool result', async t => {
+test('damage taken mid-run is available as the observation after the next tool', async t => {
   const { backend, model, runtime } = await fixture(t)
-  const frames: Array<Awaited<ReturnType<typeof runtime.takePendingFrame>>> = []
+  const observations: Array<Awaited<ReturnType<typeof runtime.sampleObservationAfter>>> = []
   model.handler = async input => {
-    const round = new TestToolRound(runtime, input.runId)
+    const caller = new TestToolCaller(runtime, input.runId)
     // Hurt while the model is mid-loop. Nothing asked about health, so a pull-only design would
-    // never surface it: the frame channel is the only way this can reach the model at all.
+    // never surface it: the post-tool observation is the only way this can reach the model at all.
     backend.emitSelfChanged(13.5)
     await new Promise(resolve => setTimeout(resolve, 5))
-    await round.execute('say', { text: '有东西打我。' })
-    frames.push(await runtime.takePendingFrame(input.runId))
-    // Drained, not a window: a second ask has nothing left to report.
-    frames.push(await runtime.takePendingFrame(input.runId))
+    await caller.execute('say', { text: '有东西打我。' })
+    observations.push(await runtime.sampleObservationAfter(input.runId))
+    // Observations happen after every handled tool, while accumulated events are drained once.
+    observations.push(await runtime.sampleObservationAfter(input.runId))
     return { model: 'fake' }
   }
 
@@ -564,13 +545,13 @@ test('damage taken mid-run reaches the model as a frame beside the next tool res
   await waitFor(() => model.calls.length === 1)
   await runtime.idle()
 
-  const frame = frames[0]
-  assert.equal(frame?.events.length, 1)
-  assert.equal(frame.events[0]!.type, 'self.health.dropped')
-  assert.match(frame.events[0]!.summary, /20 → 13\.5（-6\.5）/u)
-  assert.equal(frame.status?.health, 13.5)
-  assert.equal(frame.player, undefined)
-  assert.equal(frames[1], undefined)
+  const observation = observations[0]
+  assert.equal(observation?.events.length, 1)
+  assert.equal(observation.events[0]!.type, 'self.health.dropped')
+  assert.match(observation.events[0]!.summary, /20 → 13\.5（-6\.5）/u)
+  assert.equal(observation.status?.health, 13.5)
+  assert.equal(observation.player, undefined)
+  assert.deepEqual(observations[1]?.events, [])
 })
 
 test('a fact observed in one world never reaches a run in another', async t => {
@@ -645,9 +626,9 @@ test('ordinary player chats preserve arrival order while the first journal write
 test('a newer chat preserves model-authored segments from the earlier turn', async t => {
   const { backend, model, runtime } = await fixture(t, { speechIntervalMs: 25 })
   model.handler = async input => {
-    const round = new TestToolRound(runtime, input.runId)
+    const caller = new TestToolCaller(runtime, input.runId)
     const text = input.context.frame.player?.text.includes('停下') ? '这是模型的回复。' : '旧'.repeat(300)
-    await round.execute('say', { text })
+    await caller.execute('say', { text })
     return { model: 'fake' }
   }
 
@@ -662,14 +643,12 @@ test('a newer chat preserves model-authored segments from the earlier turn', asy
 test('a connection-epoch scope change synchronously aborts the active run and releases movement', async t => {
   const { backend, model, runtime } = await fixture(t)
   let activeRunId: string | undefined
-  let activeRoundId: string | undefined
   model.handler = async input => {
-    const round = new TestToolRound(runtime, input.runId)
-    await round.execute('look_relative', { yaw_degrees: 0, pitch_degrees: 0 })
+    const caller = new TestToolCaller(runtime, input.runId)
+    await caller.execute('look_relative', { yaw_degrees: 0, pitch_degrees: 0 })
     activeRunId = input.runId
-    activeRoundId = round.roundId
-    await round.execute('move_input', { directions: ['forward'], duration_ms: 1500 })
-    await round.execute('say', { text: '不应发送' })
+    await caller.execute('move_input', { directions: ['forward'], duration_ms: 1500 })
+    await caller.execute('say', { text: '不应发送' })
     return { model: 'fake' }
   }
   backend.emitChat('Bot，往前走')
@@ -677,9 +656,9 @@ test('a connection-epoch scope change synchronously aborts the active run and re
   const releases = backend.motorInstance.releases
   backend.changeScope({ connectionEpoch: 2 })
   assert.ok(backend.motorInstance.releases > releases, 'scope event releases before asynchronous handling')
-  assert.ok(activeRunId && activeRoundId)
+  assert.ok(activeRunId)
   await assert.rejects(runtime.executeTool({
-    runId: activeRunId, toolCallId: 'call-after-scope-loss', round: { id: activeRoundId },
+    runId: activeRunId, toolCallId: 'call-after-scope-loss',
     name: 'look_relative', arguments: { yaw_degrees: 0, pitch_degrees: 0 },
   }), error => error instanceof Error && (
     error.message === 'tool_run_is_not_active' || error.message === 'Model run is no longer current'
@@ -692,9 +671,9 @@ test('a connection-epoch scope change synchronously aborts the active run and re
 test('connection_closed aborts even while the last snapshot still has the old scope', async t => {
   const { backend, model, runtime } = await fixture(t)
   model.handler = async input => {
-    const round = new TestToolRound(runtime, input.runId)
-    await round.execute('move_input', { directions: ['forward'], duration_ms: 1500 })
-    await round.execute('say', { text: '不应发送' })
+    const caller = new TestToolCaller(runtime, input.runId)
+    await caller.execute('move_input', { directions: ['forward'], duration_ms: 1500 })
+    await caller.execute('say', { text: '不应发送' })
     return { model: 'fake' }
   }
   backend.emitChat('Bot，往前走')
@@ -723,8 +702,8 @@ test('a scope change drops chat that is still waiting for its journal write', as
 test('connection_closed cancels speech segments even when no model run remains active', async t => {
   const { backend, model, runtime } = await fixture(t, { speechIntervalMs: 25 })
   model.handler = async input => {
-    const round = new TestToolRound(runtime, input.runId)
-    await round.execute('say', { text: '旧'.repeat(300) })
+    const caller = new TestToolCaller(runtime, input.runId)
+    await caller.execute('say', { text: '旧'.repeat(300) })
     return { model: 'fake' }
   }
 
@@ -740,11 +719,11 @@ test('release failure cannot wedge the tool gate and sub-epsilon motion is repor
   const { backend, model, runtime, debug } = await fixture(t)
   const results: unknown[] = []
   model.handler = async input => {
-    const round = new TestToolRound(runtime, input.runId)
+    const caller = new TestToolCaller(runtime, input.runId)
     backend.motorInstance.releaseFailures = 1
-    results.push(await round.execute('look_relative', { yaw_degrees: 0, pitch_degrees: 0 }))
+    results.push(await caller.execute('look_relative', { yaw_degrees: 0, pitch_degrees: 0 }))
     backend.motorInstance.nextMoveDelta = { x: 0.0005, y: 0, z: 0 }
-    results.push(await round.execute('move_input', { directions: ['forward'], duration_ms: 50 }))
+    results.push(await caller.execute('move_input', { directions: ['forward'], duration_ms: 50 }))
     return { model: 'fake' }
   }
   backend.emitChat('Bot，试着动一点')
@@ -761,8 +740,8 @@ test('release failure cannot wedge the tool gate and sub-epsilon motion is repor
 test('stop aborts and releases synchronously before awaiting the decision tail', async t => {
   const { backend, model, runtime } = await fixture(t)
   model.handler = async input => {
-    const round = new TestToolRound(runtime, input.runId)
-    await round.execute('move_input', { directions: ['forward'], duration_ms: 1500 })
+    const caller = new TestToolCaller(runtime, input.runId)
+    await caller.execute('move_input', { directions: ['forward'], duration_ms: 1500 })
     return { model: 'fake' }
   }
   backend.emitChat('Bot，持续往前')
@@ -779,9 +758,9 @@ test('queued player turns preserve both model replies after a delayed completion
   const gated = journal as GateJournal
   gated.blockNext('model.decision.completed')
   model.handler = async input => {
-    const round = new TestToolRound(runtime, input.runId)
+    const caller = new TestToolCaller(runtime, input.runId)
     const text = model.calls.length === 1 ? '旧回复' : '新回复'
-    await round.execute('say', { text })
+    await caller.execute('say', { text })
     return { model: 'fake' }
   }
   backend.emitChat('Bot，第一句话')

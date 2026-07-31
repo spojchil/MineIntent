@@ -18,7 +18,7 @@ const viewport: ViewportValues = {
 }
 
 const invocation: CapabilityInvocation = {
-  runId: 'run', toolCallId: 'call', roundId: 'round', arguments: {},
+  runId: 'run', toolCallId: 'call', arguments: {},
   actionId: 'action', startedAt: '2026-07-27T00:00:00.000Z',
 }
 

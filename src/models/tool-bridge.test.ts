@@ -6,7 +6,7 @@ test('tool bridge is loopback-only, authenticated and forwards strict invocation
   let seen: unknown
   const bridge = new ToolBridgeServer(async invocation => {
     seen = invocation
-    return { roundId: 'round-node-1', result: { status: 'completed' } }
+    return { result: { status: 'completed' }, observationAfter: null }
   })
   const address = await bridge.start()
   t.after(() => bridge.stop())
@@ -14,29 +14,39 @@ test('tool bridge is loopback-only, authenticated and forwards strict invocation
   assert.equal(unauthorized.status, 401)
   const response = await fetch(address.url, {
     method: 'POST', headers: { authorization: `Bearer ${address.token}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ runId: 'run-1', toolCallId: 'call-1', round: { new: true }, name: 'look_relative', arguments: { yaw_degrees: 10, pitch_degrees: 0 } }),
+    body: JSON.stringify({ runId: 'run-1', toolCallId: 'call-1', name: 'look_relative', arguments: { yaw_degrees: 10, pitch_degrees: 0 } }),
   })
   assert.equal(response.status, 200)
-  // Enveloped: the agent loop has to tell a result from a frame riding alongside it, and a bare
-  // result would give it no way to know whether the payload is one or the other.
   assert.deepEqual(await response.json(), {
-    protocol: 'mineintent.tool-response.v1', roundId: 'round-node-1', result: { status: 'completed' },
+    protocol: 'mineintent.tool-response.v2', result: { status: 'completed' }, observationAfter: null,
   })
-  assert.deepEqual(seen, { runId: 'run-1', toolCallId: 'call-1', round: { new: true }, name: 'look_relative', arguments: { yaw_degrees: 10, pitch_degrees: 0 } })
+  assert.deepEqual(seen, { runId: 'run-1', toolCallId: 'call-1', name: 'look_relative', arguments: { yaw_degrees: 10, pitch_degrees: 0 } })
+
+  const legacyRound = await fetch(address.url, {
+    method: 'POST', headers: { authorization: `Bearer ${address.token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ runId: 'run-1', toolCallId: 'call-2', round: { new: true }, name: 'say', arguments: { text: '好' } }),
+  })
+  assert.equal(legacyRound.status, 400)
+
+  const nonAsciiCallId = await fetch(address.url, {
+    method: 'POST', headers: { authorization: `Bearer ${address.token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ runId: 'run-1', toolCallId: '😀'.repeat(65), name: 'say', arguments: { text: '好' } }),
+  })
+  assert.equal(nonAsciiCallId.status, 400)
 })
 
-test('a frame rides beside the result rather than inside it', async t => {
-  const frame = { at: '2026-07-25T00:00:00.000Z', world: { dimension: 'overworld' }, events: [{ type: 'self.health.dropped', summary: '受到伤害' }], omissions: [] }
-  const bridge = new ToolBridgeServer(async () => ({ roundId: 'round-node-1', result: { status: 'queued' }, frame }))
+test('the tool response carries a post-handling observation without claiming causation', async t => {
+  const observationAfter = { at: '2026-07-25T00:00:00.000Z', world: { dimension: 'overworld' }, events: [{ type: 'self.health.dropped', summary: '受到伤害' }], omissions: [] }
+  const bridge = new ToolBridgeServer(async () => ({ result: { status: 'queued' }, observationAfter }))
   const address = await bridge.start()
   t.after(() => bridge.stop())
 
   const response = await fetch(address.url, {
     method: 'POST', headers: { authorization: `Bearer ${address.token}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ runId: 'run-1', toolCallId: 'call-1', round: { id: 'round-node-1' }, name: 'say', arguments: { text: '好' } }),
+    body: JSON.stringify({ runId: 'run-1', toolCallId: 'call-1', name: 'say', arguments: { text: '好' } }),
   })
 
   assert.deepEqual(await response.json(), {
-    protocol: 'mineintent.tool-response.v1', roundId: 'round-node-1', result: { status: 'queued' }, frame,
+    protocol: 'mineintent.tool-response.v2', result: { status: 'queued' }, observationAfter,
   })
 })

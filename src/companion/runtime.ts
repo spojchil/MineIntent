@@ -66,20 +66,11 @@ interface RunScope {
 interface ActiveRun extends RunScope {
   runId: string
   controller: AbortController
+  /** Claimed before execution so a callback retry cannot repeat a world-side effect. */
+  toolCallIds: Set<string>
   /** Journal id of the player chat that started this run; evidence for tool-written memories. */
   chatEventId: string
   sayCount: number
-  round?: ActiveRound
-}
-
-/**
- * One model response that contains tool calls. It is born on the response's first call because a
- * response without calls never reaches this process. Its identity and scope die with the owning
- * run; keeping either elsewhere would let middle-layer knowledge outlive the context it mirrors.
- */
-interface ActiveRound extends RunScope {
-  roundId: string
-  runId: string
 }
 
 /**
@@ -190,18 +181,16 @@ export class CompanionRuntime {
   }
 
   /** Called only by the authenticated loopback bridge while the matching player-chat run lives. */
-  async executeTool(invocation: ToolInvocation): Promise<{ roundId: string; result: unknown }> {
+  async executeTool(invocation: ToolInvocation): Promise<unknown> {
     const active = this.#activeRun
     if (!active || active.runId !== invocation.runId) throw new Error('tool_run_is_not_active')
     this.#assertRunCurrent(active)
-    const round = this.#roundFor(active, invocation.round)
+    if (active.toolCallIds.has(invocation.toolCallId)) throw new Error('tool_call_already_handled')
+    active.toolCallIds.add(invocation.toolCallId)
     const capability = this.#capabilities.resolve(invocation.name)
     if (capability === undefined) {
       // An honest unknown-name failure instead of a transport error: the model can recover.
-      return {
-        roundId: round.roundId,
-        result: { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: `unknown_tool:${invocation.name.slice(0, 64)}` },
-      }
+      return { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: `unknown_tool:${invocation.name.slice(0, 64)}` }
     }
     // A held resource is a fact about the world, so it comes back as a failed result. Throwing here
     // would surface as a bridge 500 and kill the whole run over a transient conflict.
@@ -213,10 +202,7 @@ export class CompanionRuntime {
         resource: capability.resource, runId: active.runId, toolName: capability.name,
       })
       if ('code' in acquired) {
-        return {
-          roundId: round.roundId,
-          result: { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: acquired.summary },
-        }
+        return { protocol: TOOL_RESULT_PROTOCOL, status: 'failed', summary: acquired.summary }
       }
       execution = {
         actionId: acquired.lease.actionId, startedAt: acquired.lease.acquiredAt,
@@ -230,14 +216,14 @@ export class CompanionRuntime {
       }
       this.#assertRunCurrent(active)
       const result = await capability.execute({
-        runId: active.runId, toolCallId: invocation.toolCallId, roundId: round.roundId,
+        runId: active.runId, toolCallId: invocation.toolCallId,
         arguments: invocation.arguments, actionId, startedAt,
       }, {
         signal: active.controller.signal, worldId: active.worldId, chatEventId: active.chatEventId,
         assertCurrent: () => this.#assertRunCurrent(active),
         isCurrent: () => this.#scopeMatches(active),
       })
-      return { roundId: round.roundId, result }
+      return result
     } finally {
       execution.release()
       if (capability.resource === 'body') {
@@ -292,7 +278,7 @@ export class CompanionRuntime {
     const active: ActiveRun = {
       runId, controller, processSessionId: snapshot.processSessionId,
       connectionEpoch: snapshot.connectionEpoch, worldId: snapshot.world.worldId,
-      dimension: snapshot.world.dimension, chatEventId: eventId, sayCount: 0,
+      dimension: snapshot.world.dimension, toolCallIds: new Set(), chatEventId: eventId, sayCount: 0,
     }
     this.#activeRun = active
     let sources: DebugContextSource[] = []
@@ -339,7 +325,6 @@ export class CompanionRuntime {
       this.#recordFailure('model', 'decision_failed', error)
     } finally {
       controller.abort('model_run_finished')
-      active.round = undefined
       this.#execution.pruneSettledJobs()
       this.#releaseBodyInputs()
       if (this.#activeRun?.controller === controller) this.#activeRun = undefined
@@ -375,29 +360,6 @@ export class CompanionRuntime {
     }
   }
 
-  /**
-   * Opens a round only when the agent loop's first tool call declares one. The UUID rides back on
-   * that call's existing response, so later calls can echo it without another network turn; a
-   * response with no tools creates no host at all.
-   */
-  #roundFor(active: ActiveRun, declaration: ToolInvocation['round']): ActiveRound {
-    if ('new' in declaration) {
-      const round: ActiveRound = {
-        roundId: randomUUID(), runId: active.runId,
-        processSessionId: active.processSessionId, connectionEpoch: active.connectionEpoch,
-        worldId: active.worldId, dimension: active.dimension,
-      }
-      active.round = round
-      return round
-    }
-    const round = active.round
-    if (round === undefined || round.roundId !== declaration.id || round.runId !== active.runId) {
-      throw new Error('tool_round_is_not_active')
-    }
-    if (!sameScope(round, active)) throw new Error('tool_round_scope_is_not_active')
-    return round
-  }
-
   #scopeMatches(scope: RunScope): boolean {
     try { if (this.#backend.state().status !== 'ready') return false } catch { return false }
     const current = this.#currentScope()
@@ -410,7 +372,6 @@ export class CompanionRuntime {
     this.#forgetPendingFacts()
     this.#execution.invalidate(reason)
     if (this.#activeRun) {
-      this.#activeRun.round = undefined
       this.#activeRun.controller.abort(reason)
     }
     this.#modelAbort?.abort(reason)
@@ -433,13 +394,8 @@ export class CompanionRuntime {
   }
 
   async #composePassiveObservations(runId: string, signal: AbortSignal): Promise<PassiveObservations> {
-    try {
-      this.#lastObservations = await composePassiveObservations(this.#informationRuntime, this.#caller(runId), signal)
-      return this.#lastObservations
-    } catch (error) {
-      this.#recordFailure('runtime', 'passive_observations_failed', error)
-      return { omissions: [] }
-    }
+    this.#lastObservations = await composePassiveObservations(this.#informationRuntime, this.#caller(runId), signal)
+    return this.#lastObservations
   }
 
   #caller(runId: string): TrustedInformationCaller {
@@ -559,14 +515,20 @@ export class CompanionRuntime {
     this.#pushPending('self.health.dropped', `受到伤害，生命值 ${previous} → ${health}（-${lost}）`)
   }
 
-  /** Composes a frame for the tool bridge, but only when there is news that warrants one. */
-  async takePendingFrame(runId: string): Promise<AgentFrame | undefined> {
+  /** Samples the world after every handled tool; temporal adjacency does not imply causation. */
+  async sampleObservationAfter(runId: string): Promise<AgentFrame | undefined> {
     const active = this.#activeRun
-    if (!active || active.runId !== runId || this.#pendingEvents.length === 0) return undefined
-    try { return await this.#composeFrame(active, active.controller.signal) }
+    if (!active || active.runId !== runId) return undefined
+    try {
+      this.#assertRunCurrent(active)
+      const observation = await this.#composeFrame(active, active.controller.signal)
+      this.#assertRunCurrent(active)
+      return observation
+    }
     catch (error) {
-      // A frame is an extra: failing to build one must never fail the tool result it rides with.
-      this.#recordFailure('runtime', 'frame_compose_failed', error)
+      if (active.controller.signal.aborted || !this.#scopeMatches(active)) throw error
+      // The tool result remains true even if this additional observation could not be sampled.
+      this.#recordFailure('runtime', 'post_tool_observation_failed', error)
       return undefined
     }
   }
@@ -583,6 +545,8 @@ export class CompanionRuntime {
       const snapshot = this.#backend.snapshot()
       world = { dimension: snapshot.world.dimension, ...(snapshot.world.timeOfDay === undefined ? {} : { timeOfDay: snapshot.world.timeOfDay }) }
     } catch { /* connection is not ready; the run scope still names the dimension */ }
+    // Do not drain events into an observation that belongs to a cancelled or replaced world scope.
+    this.#assertRunCurrent(active)
     return {
       at: new Date().toISOString(),
       ...(player === undefined ? {} : { player }),

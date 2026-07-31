@@ -30,7 +30,7 @@ interface VisibleEntityView {
  *
  * A body-relative frame renumbers every entry whenever the companion turns or steps, which makes
  * an incremental read impossible and forces the model to re-register its whole picture from
- * discrete text every round. World coordinates are also not privileged information: any vanilla
+ * discrete text every observation. World coordinates are also not privileged information: any vanilla
  * player reads their own position and the targeted block's position straight off the F3 screen and
  * can derive the rest. The no-cheating boundary therefore stays where the register puts it — on
  * what is observable and visible, never on how it is represented.

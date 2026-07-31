@@ -25,18 +25,19 @@ from prompt import stable_context, system_prompt
 
 _MAX_JSON_BYTES = 1_048_576
 _MAX_TOOL_RESULT_BYTES = 262_144
-_MAX_TOOL_ROUNDS = 16
-# Rounds are not the only way a run can grow: one assistant message may carry many calls, and each
+_MAX_MODEL_REQUESTS_PER_RUN = 16
+# Model requests are not the only way a run can grow: one assistant message may carry many calls, and each
 # is executed. A body input is real time in the world, so the count of executed calls needs its own
 # ceiling rather than inheriting the HTTP size limit as an accidental one.
-_MAX_TOOL_CALLS_PER_ROUND = 8
+_MAX_TOOL_CALLS_PER_RESPONSE = 8
 _MAX_TOOL_CALLS_PER_RUN = 32
-_ROUND_TIMEOUT_S = 180.0
+_RUN_TIMEOUT_S = 180.0
 _MAX_TOOLS = 32
 _CONTEXT_PROTOCOL = "mineintent.agent-context.v2"
-_TOOL_RESPONSE_PROTOCOL = "mineintent.tool-response.v1"
+_TOOL_RESPONSE_PROTOCOL = "mineintent.tool-response.v2"
 _RUN_PROTOCOL = "mineintent.agent-run.v1"
 _TOOL_NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_TOOL_CALL_ID_PATTERN = re.compile(r"[\x21-\x7e]{1,128}")
 _TRANSCRIPT_NAME = "agent-transcripts.jsonl"
 _MAX_TRANSCRIPT_CHARS = 262_144
 _MAX_TRANSCRIPT_BYTES = 32 * 1_024 * 1_024
@@ -92,7 +93,7 @@ class RequestValidationError(ValueError):
     pass
 
 
-class RoundDeadlineExceeded(TimeoutError):
+class RunDeadlineExceeded(TimeoutError):
     pass
 
 
@@ -259,7 +260,7 @@ def authorized(header: str | None, expected_token: str) -> bool:
 def remaining_seconds(deadline: float) -> float:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise RoundDeadlineExceeded("deadline_exceeded")
+        raise RunDeadlineExceeded("deadline_exceeded")
     return remaining
 
 
@@ -307,12 +308,11 @@ def http_tool_executor(url: str, token: str):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
     def execute(run_id: str, name: str, arguments: dict, deadline: float,
-                tool_call_id: str = "", round_declaration: dict | None = None) -> object:
+                tool_call_id: str = "") -> object:
         request = urllib.request.Request(
             url,
             data=strict_json_dumps({
                 "runId": run_id, "toolCallId": tool_call_id,
-                "round": round_declaration if round_declaration is not None else {"new": True},
                 "name": name, "arguments": arguments,
             }),
             method="POST",
@@ -330,7 +330,7 @@ def http_tool_executor(url: str, token: str):
             raise RuntimeError(f"tool executor failed ({error.code})") from None
         except (urllib.error.URLError, TimeoutError):
             if time.monotonic() >= deadline:
-                raise RoundDeadlineExceeded("deadline_exceeded") from None
+                raise RunDeadlineExceeded("deadline_exceeded") from None
             raise RuntimeError("tool executor failed") from None
 
     return execute
@@ -343,8 +343,8 @@ def model_completion(
     run: DecisionRun | None = None,
     tools: list | None = None,
 ) -> dict:
-    # Ordinary OpenAI-compatible tool calling: tools are offered on every round and the closing
-    # turn is plain assistant text. `response_format` is deliberately never sent. Asking the model
+    # Ordinary OpenAI-compatible tool calling: tools are offered on every request and the closing
+    # response is plain assistant text. `response_format` is deliberately never sent. Asking the model
     # to author a JSON envelope in a request that also offers tools puts two output contracts in
     # competition, and measured across seven models on three providers, six then stopped emitting
     # structured `tool_calls` — arguably correctly, since a tool call is not a JSON object in the
@@ -435,26 +435,39 @@ def model_completion(
         if run is not None:
             run.ensure_active()
         if time.monotonic() >= deadline:
-            raise RoundDeadlineExceeded("deadline_exceeded") from None
+            raise RunDeadlineExceeded("deadline_exceeded") from None
         raise RuntimeError("model request failed") from None
     finally:
         remove_cancel()
         connection.close()
 
 
-def split_tool_response(value: object) -> tuple[object, dict | None, str | None]:
-    """Separates model-visible data from opaque executor transport metadata.
+def model_tool_output(value: object) -> dict:
+    """Validates the executor envelope and removes its transport version before model replay."""
+    expected = {"protocol", "result", "observationAfter"}
+    if not isinstance(value, dict) or set(value) != expected or value.get("protocol") != _TOOL_RESPONSE_PROTOCOL:
+        raise RuntimeError("tool executor returned an invalid response")
+    observation = value.get("observationAfter")
+    if observation is not None and not isinstance(observation, dict):
+        raise RuntimeError("tool executor returned an invalid observationAfter")
+    return {"result": value.get("result"), "observationAfter": observation}
 
-    The frame is appended to the conversation as its own entry rather than merged into the result:
-    taking damage has nothing to do with whichever tool was running, and folding it in would teach
-    the model that tools report unrelated news. The round id is likewise never shown to the model;
-    the loop only echoes it to the executor on later calls in the same assistant response.
-    """
-    if isinstance(value, dict) and value.get("protocol") == _TOOL_RESPONSE_PROTOCOL:
-        round_id = value.get("roundId")
-        valid_round_id = round_id if isinstance(round_id, str) and 0 < len(round_id) <= 128 else None
-        return value.get("result"), value.get("frame"), valid_round_id
-    return value, None, None
+
+def claim_tool_call_batch(tool_calls: list, seen_ids: set[str]) -> list[tuple[str, dict]]:
+    """Validates and claims every correlation id before any call can take effect."""
+    calls: list[tuple[str, dict]] = []
+    batch_ids: set[str] = set()
+    for call in tool_calls:
+        call_id = call.get("id") if isinstance(call, dict) else None
+        function = call.get("function") if isinstance(call, dict) else None
+        if not isinstance(call_id, str) or not _TOOL_CALL_ID_PATTERN.fullmatch(call_id) or not isinstance(function, dict):
+            raise RuntimeError("model returned an invalid tool call")
+        if call_id in seen_ids or call_id in batch_ids:
+            raise RuntimeError("model reused a tool call id")
+        batch_ids.add(call_id)
+        calls.append((call_id, function))
+    seen_ids.update(batch_ids)
+    return calls
 
 
 def _non_negative_int(value: object) -> int | None:
@@ -504,23 +517,24 @@ def run_tool_loop(
     deadline: float | None = None,
     run: DecisionRun | None = None,
 ) -> tuple[str, dict | None]:
-    deadline = deadline if deadline is not None else time.monotonic() + _ROUND_TIMEOUT_S
+    deadline = deadline if deadline is not None else time.monotonic() + _RUN_TIMEOUT_S
     tool_names = [tool["function"]["name"] for tool in tools]
     # Static first, volatile last, and nothing volatile ever re-rendered: the system message carries
     # behaviour plus the slow-changing profile and memory, then the opening frame is appended, then
-    # rounds append after that. Every provider's cache is prefix-only, so the ordering is the design.
+    # later requests append after that. Every provider's cache is prefix-only, so the ordering is the design.
     messages = [
         {"role": "system", "content": system_prompt() + stable_context(context.get("stable"))},
         {"role": "user", "content": json.dumps(context.get("frame", {}), ensure_ascii=False, separators=(",", ":"))},
     ]
-    # Summed across rounds: one run is several requests, and the run's hit rate is only meaningful
+    # Summed across requests: the run's hit rate is only meaningful
     # against the run's total prompt tokens.
     usage: dict[str, int] = {}
     closing: str | None = None
     error_summary: str | None = None
     executed_calls = 0
+    seen_tool_call_ids: set[str] = set()
     try:
-        for _ in range(_MAX_TOOL_ROUNDS):
+        for _ in range(_MAX_MODEL_REQUESTS_PER_RUN):
             if run is not None:
                 run.ensure_active()
             remaining_seconds(deadline)
@@ -541,14 +555,15 @@ def run_tool_loop(
                 raise RuntimeError(rejection)
             tool_calls = message.get("tool_calls")
             if isinstance(tool_calls, list) and tool_calls:
-                if len(tool_calls) > _MAX_TOOL_CALLS_PER_ROUND:
+                if len(tool_calls) > _MAX_TOOL_CALLS_PER_RESPONSE:
                     raise RuntimeError(
-                        f"model requested {len(tool_calls)} tool calls in one round, over the limit of {_MAX_TOOL_CALLS_PER_ROUND}"
+                        f"model requested {len(tool_calls)} tool calls in one response, over the limit of {_MAX_TOOL_CALLS_PER_RESPONSE}"
                     )
                 if executed_calls + len(tool_calls) > _MAX_TOOL_CALLS_PER_RUN:
                     raise RuntimeError(
                         f"model exceeded the run limit of {_MAX_TOOL_CALLS_PER_RUN} tool calls"
                     )
+                calls = claim_tool_call_batch(tool_calls, seen_tool_call_ids)
                 executed_calls += len(tool_calls)
                 replay = {key: message[key] for key in ("role", "content", "reasoning_content", "tool_calls") if key in message}
                 replay.setdefault("role", "assistant")
@@ -556,47 +571,31 @@ def run_tool_loop(
                 # Every requested call executes, in order. Parallel calls are not pre-rejected:
                 # constraints belong in the prompt as advice, failures belong to the world, and the
                 # tool backend answers invalid or conflicting requests with honest failed results.
-                frames: list[dict] = []
-                # This loop knows a new model response began, but that fact is not an identity. The
-                # executor names the round on the first existing tool response; later calls merely
-                # carry that opaque name back, so opening it costs no extra network turn.
-                round_id: str | None = None
-                for call in tool_calls:
-                    call_id = call.get("id") if isinstance(call, dict) else None
-                    function = call.get("function") if isinstance(call, dict) else None
-                    if not isinstance(call_id, str) or not isinstance(function, dict):
-                        raise RuntimeError("model returned an invalid tool call")
+                for call_id, function in calls:
                     try:
                         name = function.get("name")
                         arguments = strict_json_loads(function.get("arguments", ""))
-                        if not isinstance(name, str) or not isinstance(arguments, dict):
+                        if (
+                            not isinstance(name, str) or not _TOOL_NAME_PATTERN.fullmatch(name)
+                            or not isinstance(arguments, dict)
+                        ):
                             raise ValueError("invalid tool call")
                         if run is not None:
                             run.ensure_active()
-                        declaration = {"new": True} if round_id is None else {"id": round_id}
-                        result, frame, response_round_id = split_tool_response(
-                            execute_tool(run_id, name, arguments, deadline, call_id, declaration)
+                        output = model_tool_output(
+                            execute_tool(run_id, name, arguments, deadline, call_id)
                         )
-                        if response_round_id is None:
-                            raise RuntimeError("tool executor response has no round id")
-                        if round_id is not None and response_round_id != round_id:
-                            raise RuntimeError("tool executor changed the active round id")
-                        round_id = response_round_id
-                        if isinstance(frame, dict):
-                            frames.append(frame)
                         if run is not None:
                             run.ensure_active()
                     except (ValueError, RequestValidationError) as error:
-                        result = {"status": "failed", "summary": str(error)[:300]}
+                        output = {
+                            "result": {"status": "failed", "summary": str(error)[:300]},
+                            "observationAfter": None,
+                        }
                     messages.append({
                         "role": "tool", "tool_call_id": call_id,
-                        "content": json.dumps(result, ensure_ascii=False, separators=(",", ":")),
+                        "content": json.dumps(output, ensure_ascii=False, separators=(",", ":")),
                     })
-                # After every tool result of the round, never between them: an assistant message with
-                # tool_calls must be followed by one result per call, and interleaving anything there
-                # breaks the pairing providers validate.
-                for frame in frames:
-                    messages.append({"role": "user", "content": json.dumps(frame, ensure_ascii=False, separators=(",", ":"))})
                 continue
             content = message.get("content")
             if not isinstance(content, str):
@@ -611,7 +610,7 @@ def run_tool_loop(
                 run.ensure_active()
             remaining_seconds(deadline)
             return closing, (usage or None)
-        raise RuntimeError("tool loop exceeded its round limit")
+        raise RuntimeError("tool loop exceeded its model request limit")
     except BaseException as error:
         error_summary = f"{type(error).__name__}: {error}"[:300]
         raise
@@ -641,7 +640,7 @@ def append_transcript(
     """Bounded per-run replay log: what the model was offered, saw and said — failures included.
 
     This closes the audit gap the live experiment hit: poses were journaled but the model-visible
-    viewport per round was not, so "what did it see at step 7" could only be reconstructed. The
+    viewport per model request was not, so "what did it see at step 7" could only be reconstructed. The
     tool definitions are recorded too, since a schema change silently alters what the model could
     have done. Diagnostics must never fail a run, hence the blanket OSError swallow.
 
@@ -685,11 +684,11 @@ class Handler(BaseHTTPRequestHandler):
         if not authorized(self.headers.get("authorization"), config["service_token"]):
             self._send(401, {"error": "unauthorized"})
             return
-        deadline = time.monotonic() + _ROUND_TIMEOUT_S
+        deadline = time.monotonic() + _RUN_TIMEOUT_S
         try:
             self.connection.settimeout(remaining_seconds(deadline))
             value = self._read_json_request()
-        except (RoundDeadlineExceeded, TimeoutError):
+        except (RunDeadlineExceeded, TimeoutError):
             self._send(504, {"error": "deadline_exceeded"})
             return
         except (ValueError, UnicodeError, RequestValidationError) as error:
@@ -743,7 +742,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"protocol": _RUN_PROTOCOL, "model": config["model"], **({"usage": usage} if usage else {})})
         except RunCancelled:
             self._send(409, {"error": "run_cancelled"})
-        except (RoundDeadlineExceeded, TimeoutError):
+        except (RunDeadlineExceeded, TimeoutError):
             self._send(504, {"error": "deadline_exceeded"})
         except (ValueError, UnicodeError, RequestValidationError) as error:
             self._send(400, {"error": "invalid_request", "detail": str(error)[:200]})

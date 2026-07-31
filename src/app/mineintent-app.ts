@@ -28,10 +28,11 @@ export class MineIntentApp {
       const journal = new JsonlEventJournal(path.join(this.#config.dataDirectory, 'events.jsonl'), this.#config.minecraft.worldId, randomUUID())
       toolBridge = new ToolBridgeServer(async invocation => {
         if (!runtime) throw new Error('runtime_not_ready')
-        const execution = await runtime.executeTool(invocation)
-        // Asked after the tool ran, so a frame reports the world the tool left behind — including
-        // anything that happened to the companion while it was busy.
-        return { ...execution, frame: await runtime.takePendingFrame(invocation.runId) }
+        const result = await runtime.executeTool(invocation)
+        // This is a time boundary, not a causal claim: unrelated world events may have happened
+        // while the tool was being handled and belong in the same subsequent observation.
+        const observationAfter = await runtime.sampleObservationAfter(invocation.runId) ?? null
+        return { result, observationAfter }
       })
       const callback = await toolBridge.start()
       const model = new AgentServiceModelProvider({

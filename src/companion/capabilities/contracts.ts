@@ -4,11 +4,10 @@ import { z } from 'zod'
 
 export const TOOL_RESULT_PROTOCOL = 'mineintent.tool-result.v1'
 
-/** Facts minted by the run/round host for one capability invocation. */
+/** Facts minted by the active run host for one capability invocation. */
 export interface CapabilityInvocation {
   runId: string
   toolCallId: string
-  roundId: string
   arguments: Record<string, unknown>
   actionId: string
   startedAt: string
