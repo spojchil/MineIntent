@@ -7,7 +7,8 @@ import { JsonlEventJournal } from '../events/index.js'
 import { FileMemoryStore } from '../memory/index.js'
 import type {
   BackendEventEnvelope, BackendReady, BackendState, MinecraftBackendApi, MinecraftMotorDriverApi,
-  MinecraftSnapshotV1, MotorMoveDirection, MotorMoveDirections, ProtocolObservationSource, Unsubscribe,
+  MinecraftSnapshotV1, MotorMoveDirection, MotorMoveDirections, ProtocolObservationSource,
+  TrackedPlayerSnapshot, Unsubscribe,
 } from '../minecraft/contracts.js'
 import type { AgentDecisionContext, ModelProvider, ModelRunResult, WireToolDefinition } from '../models/index.js'
 import { DebugStateStore } from '../telemetry/index.js'
@@ -90,6 +91,9 @@ class FakeBackend implements MinecraftBackendApi {
   pitch = 0
   health = 20
   messages: string[] = []
+  trackedPlayers: TrackedPlayerSnapshot[] = [
+    { playerKey: 'alice', username: 'Alice', listed: true, entityTracked: true },
+  ]
   motorInstance = new FakeMotor(this)
   subscribers = new Set<(event: BackendEventEnvelope) => void>()
 
@@ -106,7 +110,7 @@ class FakeBackend implements MinecraftBackendApi {
       world: { worldId: this.worldId, dimension: this.dimension, minecraftVersion: '1.21.1', protocolVersion: 767, gameMode: 'survival', minY: -64, height: 384, timeOfDay: 1000 },
       self: { entityKey: 'self', username: 'Bot', position: this.position, velocity: { x: 0, y: 0, z: 0 }, yaw: this.yaw, pitch: this.pitch, onGround: true, alive: true, health: this.health, food: 20, foodSaturation: 5, effects: [] },
       inventory: { selectedHotbarSlot: 0, slots: [] },
-      trackedPlayers: [{ playerKey: 'alice', username: 'Alice', listed: true, entityTracked: true }],
+      trackedPlayers: structuredClone(this.trackedPlayers),
     }
   }
   subscribe(listener: (event: BackendEventEnvelope) => void): Unsubscribe { this.subscribers.add(listener); return () => this.subscribers.delete(listener) }
@@ -138,11 +142,11 @@ class FakeBackend implements MinecraftBackendApi {
     for (const listener of this.subscribers) listener(event)
   }
 
-  emitChat(text: string) {
+  emitChat(text: string, sender = 'Alice') {
     const event = {
       protocol: 'mineintent.minecraft.backend-event.v1', id: `chat-${this.revision++}`, kind: 'chat', occurredAt: new Date().toISOString(),
       processSessionId: this.processSessionId, connectionEpoch: this.connectionEpoch, connectionAttemptId: 'a', worldId: this.worldId, dimension: this.dimension,
-      payload: { senderUsername: 'Alice', plainText: text, position: 'chat' },
+      payload: { senderUsername: sender, plainText: text, position: 'chat' },
     } satisfies BackendEventEnvelope
     for (const listener of this.subscribers) listener(event)
   }
@@ -229,9 +233,11 @@ async function fixture(t: test.TestContext, options: {
   gateJournal?: boolean
   speechIntervalMs?: number
   expectedHandlerFailures?: number
+  trackedPlayers?: TrackedPlayerSnapshot[]
 } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'mineintent-runtime-'))
   const backend = new FakeBackend()
+  if (options.trackedPlayers) backend.trackedPlayers = structuredClone(options.trackedPlayers)
   const model = new FakeModel()
   const memory = new FileMemoryStore(path.join(directory, 'memory.json'))
   const debug = new DebugStateStore()
@@ -242,7 +248,7 @@ async function fixture(t: test.TestContext, options: {
     backend, model, memory,
     journal,
     profile: { profileId: 'test', versionId: 'profile-1', content: '安静、诚实的世界参与者。', sourcePath: 'profile.md' },
-    debug, primaryPlayer: 'Alice', speechIntervalMs: options.speechIntervalMs ?? 0,
+    debug, speechIntervalMs: options.speechIntervalMs ?? 0,
   })
   await runtime.start()
   t.after(async () => {
@@ -493,6 +499,30 @@ test('startup is local; player chat runs the two-tool closed loop with measured 
   assert.deepEqual(await memory.list('w'), [])
   assertNoForbiddenSpatialKeys(model.calls[0]!.context)
   assertNoForbiddenSpatialKeys(results)
+})
+
+test('addressed chats from Alice and Bob trigger symmetric runtime runs while unaddressed chats do not', async t => {
+  const trackedPlayers: TrackedPlayerSnapshot[] = [
+    { playerKey: 'alice', username: 'Alice', listed: true, entityTracked: true },
+    { playerKey: 'bob', username: 'Bob', listed: true, entityTracked: true },
+  ]
+  const { backend, model, runtime, readJournal } = await fixture(t, { trackedPlayers })
+
+  backend.emitChat('大家好', 'Alice')
+  backend.emitChat('大家好', 'Bob')
+  await runtime.idle()
+  assert.equal(model.calls.length, 0)
+
+  backend.emitChat('Bot，你在吗', 'Alice')
+  backend.emitChat('Bot，你在吗', 'Bob')
+  await runtime.idle()
+
+  assert.deepEqual(model.calls.map(call => call.context.frame.player), [
+    { username: 'Alice', text: 'Bot，你在吗' },
+    { username: 'Bob', text: 'Bot，你在吗' },
+  ])
+  const received = (await readJournal()).filter(event => event.type === 'player.chat.received')
+  assert.deepEqual(received.map(event => event.payload.sender), ['Alice', 'Bob'])
 })
 
 test('a new player chat waits behind an in-flight turn without taking control from the model', async t => {

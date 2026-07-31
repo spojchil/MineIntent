@@ -41,7 +41,7 @@ export class MineIntentApp {
         toolCallbackUrl: callback.url,
         toolCallbackToken: callback.token,
       })
-      runtime = new CompanionRuntime({ backend, model, memory, journal, profile, debug, primaryPlayer: this.#config.primaryPlayer })
+      runtime = new CompanionRuntime({ backend, model, memory, journal, profile, debug })
       debugServer = new LocalDebugServer(debug, this.#config.debugPort)
       const address = await debugServer.start()
       await runtime.start()

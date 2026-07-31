@@ -44,7 +44,6 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 | Minecraft | `MINEINTENT_MC_HOST`、`MINEINTENT_MC_PORT` | 服务器地址与端口 |
 | Minecraft | `MINEINTENT_MC_USERNAME`、`MINEINTENT_MC_AUTH` | Bot 名称与 `offline`/`microsoft` 登录方式 |
 | Minecraft | `MINEINTENT_MC_PROFILES_FOLDER` | 可选的 Microsoft 登录资料目录 |
-| 当前兼容配置 | `MINEINTENT_PRIMARY_PLAYER` | 当前实现只用该玩家的公屏消息触发模型 |
 | 当前兼容配置 | `MINEINTENT_PROFILE` | 当前实现仍读取的独立档案文件 |
 | 本地运行 | `MINEINTENT_DATA_DIR`、`MINEINTENT_DEBUG_PORT` | 数据目录与只读调试端口 |
 | 本地运行 | `MINEINTENT_AGENT_SERVICE_URL`、`MINEINTENT_AGENT_SERVICE_TOKEN` | Node 与 Python 服务的 loopback 地址和独立令牌 |
@@ -52,7 +51,7 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 | 模型 | `MINEINTENT_MODEL_REASONING_EFFORT` | 可选：`low`、`medium` 或 `high` |
 | 模型 | `MINEINTENT_AGENT_SERVICE_PORT` | Python 服务端口，默认 `8765` |
 
-`MINEINTENT_PRIMARY_PLAYER` 和 `MINEINTENT_PROFILE` 是当前代码仍要求的兼容配置，不因此成为产品定义；具体差异见
+`MINEINTENT_PROFILE` 是当前代码仍要求的兼容配置，不因此成为产品定义；具体差异见
 [架构说明的“已知实现偏差”](../architecture.md#已知实现偏差)。
 
 ## 启动
@@ -131,7 +130,7 @@ JVM 与内存设置在 `mcserver/mc-config.json`。不要把最大内存设为�
 1. 检查 `http://127.0.0.1:8765/healthz`。
 2. 比较两个进程是否读取了同一份 `.env`；健康响应中的 `startedAt`、`pid` 和 `envSha256` 可帮助识别旧进程。
 3. 查看 Agent Service 终端中的模型或配置错误。
-4. 确认发言者与当前 `MINEINTENT_PRIMARY_PLAYER` 完全匹配。
+4. 确认消息点名了同伴，或你是唯一在线玩家。
 
 ### Agent Service 无法启动
 
