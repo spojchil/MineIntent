@@ -5,5 +5,11 @@ edition = "2021"
 description = "MineIntent 自有 Minecraft 协议后端（目标 26.1 / 协议号 775）"
 
 [dependencies]
-azalea = "0.16.0+mc26.1"
+# crates.io 的 semver 会忽略 +mc26.1；用精确基础版本锁住已发布的 26.1 构建。
+# 开启 packet-event 只用于记录服务端位置修正；其余高层自动行为仍由下方插件组装显式控制。
+azalea = { version = "=0.16.0", default-features = false, features = ["log", "packet-event"] }
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["full"] }
