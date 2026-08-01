@@ -43,6 +43,7 @@
 | decompiled/26.1.2-server/ | 官方 server 内层 jar 的 Vineflower 反编译树，4789 个 .java，全真名 | 抽查 ServerboundMovePlayerPacket 字段名均可读 |
 | mojang/26.1.2/server-inner.jar | 从官方 bundler 抽出的服务端内层 jar（16461 条目） | 反编译输入 |
 | mineintent-go-client/ | 只读协议行为参考；最新提交实现每连接协议时钟、串行出站调度和 KeepAlive/Teleport/Configuration 自动应答 | 不作为本项目代码基础；用于 M1 时序和错误分类交叉核对 |
+| simple-agent/ | 维护者亲写的 Rust agent 微型实现（Rig 形状：typed tool + 可步进 run + 数组顺序资源裁决） | **授权复用源**：阶段 5 AgentRunner 直接复用改造，细节见其 _供给说明.md（2026-08-02 放入，cargo test 5/5） |
 
 ## 工具链（本机已装，非 supplies 内容）
 
