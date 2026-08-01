@@ -135,3 +135,23 @@
 | `git diff --check` | 通过。 |
 
 - 最终审查未修改 `supplies/`、`vendor/`、`移植计划/`、`crates/backend/`；没有联网，没有进入 main/A worktree，没有加入 runtime/HTTP/模型 SDK，也没有实现 I03 之外的业务。
+
+## 2026-08-01｜P1：middle 并行叶子共享脚手架
+
+### 范围与变更
+
+- 本提交只建立 A/B 并行开发共同需要的 crate 依赖与模块入口，不声明 events、execution、information 或 speech 的任何迁移已经完成，也不包含阶段 2 行为实现。
+- `mineintent-middle` 加入 `mineintent-contracts` 路径依赖，以及 lock/vendor 已有的 `serde` derive、`serde_json`、`thiserror 2`、`uuid`（`v4/serde`）、`tokio`（仅 `fs/macros/rt/sync/time`）和 `sha2 0.11`。
+- 一次性在 `middle/src/lib.rs` 声明 `events`、`execution`、`information`、`speech`；四个 `mod.rs` 只有边界文档。后续 `information` 由 A 独占，另外三个模块由 B 独占，双方不再修改共享入口。
+- 根 lock 只为既有 `mineintent-middle` package 增加上述 7 个依赖引用；离线解析没有新增 registry package 或修改依赖来源。
+
+### 命令与结果
+
+| 命令 | 结果 |
+|---|---|
+| `git status --short` | 开始前位于 `port/b-decision-runtime`、HEAD=`1462116f721b8e446aefe552001dea0e162b9764`，工作树干净且无 `index.lock`。 |
+| `cargo check --workspace --offline` | 通过；middle 及全 workspace 离线解析/编译成功。 |
+| `cargo test --workspace --offline` | 通过；backend 13、I03 Agent 14、I03 capability 8、I01 26、I02 17 条测试全部通过，middle 空库与 doctest 通过。 |
+| `cargo +stable fmt --all --check` | 通过。 |
+
+- 未访问网络，未操作 main worktree，未修改 `supplies/`、`vendor/`、`移植计划/`、backend 或 contracts。

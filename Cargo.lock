@@ -1793,6 +1793,15 @@ dependencies = [
 [[package]]
 name = "mineintent-middle"
 version = "0.0.1"
+dependencies = [
+ "mineintent-contracts",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.19",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "miniz_oxide"
