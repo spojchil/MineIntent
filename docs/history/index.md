@@ -1,6 +1,6 @@
 # MineIntent 历史来源与旧路径
 
-> 本页用于寻找思想和旧文件，不裁决产品，也不描述当前实现。产品文字见[《产品》](../../产品.md)，当前实现见
+> 本页用于寻找思想和旧文件，不裁决产品，也不描述当前实现。产品文字见[《产品》](../产品.md)，当前实现见
 > [绑定版本的架构说明](../architecture.md)。
 
 ## 使用规则
@@ -57,7 +57,7 @@
 
 | 旧路径（不可变原文） | 当前入口 |
 |---|---|
-| [`docs/product-design.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/product-design.md) | [产品](../../产品.md)；未重新确认的内容只作为历史 |
+| [`docs/product-design.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/product-design.md) | [产品](../产品.md)；未重新确认的内容只作为历史 |
 
 ### 架构、状态、接口和旧 ADR
 
@@ -73,9 +73,9 @@
 | [`docs/architecture/domain-events-and-journal.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/architecture/domain-events-and-journal.md) | 当前事实看[架构页](../architecture.md)，旧设计看快照 |
 | [`docs/architecture/information-access-and-ui.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/architecture/information-access-and-ui.md) | 当前事实看[架构页](../architecture.md)，旧设计看快照 |
 | [`docs/architecture/information-runtime.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/architecture/information-runtime.md) | 当前事实看[架构页](../architecture.md)，旧设计看快照 |
-| [`docs/architecture/memory-model-and-profile-versioning.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/architecture/memory-model-and-profile-versioning.md) | 当前事实看[架构页](../architecture.md)，候选记忆选择看[产品](../../产品.md) |
+| [`docs/architecture/memory-model-and-profile-versioning.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/architecture/memory-model-and-profile-versioning.md) | 当前事实看[架构页](../architecture.md)，候选记忆选择看[产品](../产品.md) |
 | [`docs/architecture/minecraft-backend.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/architecture/minecraft-backend.md) | 当前事实看[架构页](../architecture.md)，旧设计看快照 |
-| [`docs/architecture/target-system.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/architecture/target-system.md) | 产品看[产品](../../产品.md)，实现看[架构页](../architecture.md) |
+| [`docs/architecture/target-system.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/architecture/target-system.md) | 产品看[产品](../产品.md)，实现看[架构页](../architecture.md) |
 | [`docs/architecture/ui-context.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/architecture/ui-context.md) | 当前事实看[架构页](../architecture.md)，旧设计看快照 |
 | [`docs/current-status.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/current-status.md) | [当前实现结构](../architecture.md)与[运行指南](../guides/run.md) |
 | [`docs/guides/model-interface.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/guides/model-interface.md) | 模型边界看[架构页](../architecture.md)，配置看[运行指南](../guides/run.md) |
@@ -125,8 +125,10 @@
 
 | 恢复稿路径 | 当前路径 | 恢复稿不可变原文 |
 |---|---|---|
-| `PRODUCT_CONSTITUTION.md` | [`产品.md`](../../产品.md) | [`fac8c654` 原文](https://github.com/spojchil/MineIntent/blob/fac8c654b223ce429659c655cf703b1eefc2953a/PRODUCT_CONSTITUTION.md) |
+| `PRODUCT_CONSTITUTION.md` | [`产品.md`](../产品.md) | [`fac8c654` 原文](https://github.com/spojchil/MineIntent/blob/fac8c654b223ce429659c655cf703b1eefc2953a/PRODUCT_CONSTITUTION.md) |
 | `docs/source-index.md` | 本页 | [`fac8c654` 原文](https://github.com/spojchil/MineIntent/blob/fac8c654b223ce429659c655cf703b1eefc2953a/docs/source-index.md) |
 | `docs/guides/companion-prototype.md` | [`docs/guides/run.md`](../guides/run.md) | [`fac8c654` 原文](https://github.com/spojchil/MineIntent/blob/fac8c654b223ce429659c655cf703b1eefc2953a/docs/guides/companion-prototype.md) |
 | `docs/guides/paper-integration.md` | [`docs/guides/validation.md`](../guides/validation.md) | [`fac8c654` 原文](https://github.com/spojchil/MineIntent/blob/fac8c654b223ce429659c655cf703b1eefc2953a/docs/guides/paper-integration.md) |
 | `src/companion/` | [`src/participant/`](../../src/participant/) | [`e2d1f89` 原路径](https://github.com/spojchil/MineIntent/tree/e2d1f89/src/companion) |
+| `产品.md`（仓库根） | [`docs/产品.md`](../产品.md) | [`e37ffe7` 原路径](https://github.com/spojchil/MineIntent/blob/e37ffe7/产品.md) |
+| `产品待澄清问题.md` | 已移出仓库（转维护者本地 `*.local.*` 文件；2026-07-31 基线整体确认后仅余历史价值） | [`e37ffe7` 原文](https://github.com/spojchil/MineIntent/blob/e37ffe7/产品待澄清问题.md) |
