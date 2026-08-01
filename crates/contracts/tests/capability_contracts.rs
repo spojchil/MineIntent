@@ -1,4 +1,6 @@
 use std::{
+    future::Future,
+    pin::Pin,
     sync::Arc,
     task::{Context as TaskContext, Poll, Wake, Waker},
     time::{Duration, Instant},
@@ -198,6 +200,11 @@ fn capability_context_checks_cancellation_deadline_then_scope() {
         context.check_at(now).unwrap_err().code,
         AgentErrorCode::RunCancelled
     );
+    let mut cancelled_notification = context.control().cancelled();
+    assert!(matches!(
+        poll_once(cancelled_notification.as_mut()),
+        Poll::Ready(error) if error.code == AgentErrorCode::RunCancelled
+    ));
 
     let context = CapabilityExecutionContext::new(
         "world-1",
@@ -209,6 +216,11 @@ fn capability_context_checks_cancellation_deadline_then_scope() {
         context.check_at(now).unwrap_err().code,
         AgentErrorCode::DeadlineExceeded
     );
+    let mut active_notification = context.control().cancelled();
+    assert!(matches!(
+        poll_once(active_notification.as_mut()),
+        Poll::Pending
+    ));
 
     let context = CapabilityExecutionContext::new(
         "world-1",
@@ -248,7 +260,8 @@ fn in_process_capability_and_dispatch_traits_need_no_transport_fields() {
             .expect("stub capability executes in process");
     assert_eq!(capability_result["actionId"], "action-1");
 
-    let dispatcher = StubDispatcher;
+    let dispatcher_impl = StubDispatcher;
+    let dispatcher: &dyn ToolDispatcher<Observation = Value> = &dispatcher_impl;
     let dispatch_result =
         poll_ready(dispatcher.dispatch(agent_fixtures::tool_invocation(), control))
             .expect("stub dispatcher executes in process");
@@ -323,6 +336,13 @@ impl CancellationSignal for FixedCancellation {
     fn cancellation_error(&self) -> Option<AgentError> {
         self.0.clone()
     }
+
+    fn cancelled(&self) -> Pin<Box<dyn Future<Output = AgentError> + Send + '_>> {
+        match self.0.clone() {
+            Some(error) => Box::pin(std::future::ready(error)),
+            None => Box::pin(std::future::pending()),
+        }
+    }
 }
 
 struct FixedScope(bool);
@@ -351,12 +371,19 @@ impl Wake for NoopWake {
 }
 
 fn poll_ready<T>(mut future: ContractFuture<'_, T>) -> T {
-    let waker = Waker::from(Arc::new(NoopWake));
-    let mut context = TaskContext::from_waker(&waker);
-    match future.as_mut().poll(&mut context) {
+    match poll_once(future.as_mut()) {
         Poll::Ready(value) => value,
         Poll::Pending => panic!("contract test future unexpectedly yielded"),
     }
+}
+
+fn poll_once<F>(mut future: Pin<&mut F>) -> Poll<F::Output>
+where
+    F: Future + ?Sized,
+{
+    let waker = Waker::from(Arc::new(NoopWake));
+    let mut context = TaskContext::from_waker(&waker);
+    future.as_mut().poll(&mut context)
 }
 
 fn parse<T: DeserializeOwned>(source: &str) -> T {

@@ -1,10 +1,16 @@
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context as TaskContext, Poll, Wake, Waker},
+    time::{Duration, Instant},
+};
 
 use mineintent_contracts::agent::{
-    fixtures, AgentContextProtocol, AgentError, AgentErrorCode, AgentRunRequest,
-    CancellationSignal, Deadline, ExecutionControl, JsonAgentDecisionContext, ModelRunResult,
-    ModelUsage, RequiredNullable, ToolCallKey, ToolDefinitionName, ToolExecution, ToolInvocation,
-    ToolName, WireToolDefinition,
+    fixtures, AgentContextProtocol, AgentError, AgentErrorCode, AgentRunRequest, AgentRunner,
+    CancellationSignal, ContractFuture, Deadline, ExecutionControl, JsonAgentDecisionContext,
+    ModelProvider, ModelRunResult, ModelUsage, RequiredNullable, ToolCallKey, ToolDefinitionName,
+    ToolExecution, ToolInvocation, ToolName, WireToolDefinition,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -263,6 +269,39 @@ fn run_request_uses_external_prompt_reference_and_excludes_transport_configurati
 }
 
 #[test]
+fn python_test_config_requires_an_independent_service_token_maps_to_strict_contract_rejection() {
+    for legacy in ["serviceToken", "modelApiKey"] {
+        assert_legacy_agent_run_field_rejected(legacy);
+    }
+}
+
+#[test]
+fn python_test_decide_authentication_happens_before_body_validation_maps_to_no_transport_phase() {
+    for legacy in [
+        "Authorization",
+        "authorization",
+        "callbackUrl",
+        "callbackToken",
+        "toolCallbackUrl",
+        "toolExecutorUrl",
+        "agentServiceUrl",
+        "body",
+        "rawBody",
+        "contentType",
+    ] {
+        assert_legacy_agent_run_field_rejected(legacy);
+    }
+
+    let encoded =
+        serde_json::to_value(fixtures::agent_run_request()).expect("in-process request serializes");
+    let fields = encoded.as_object().expect("request is an object");
+    assert_eq!(fields.len(), 4);
+    for field in ["runId", "context", "tools", "promptTemplate"] {
+        assert!(fields.contains_key(field));
+    }
+}
+
+#[test]
 fn model_result_usage_and_structured_errors_are_versioned_and_strict() {
     let result = fixtures::model_run_result();
     let value = serde_json::to_value(&result).expect("model result serializes");
@@ -305,6 +344,15 @@ fn cancellation_precedes_deadline_and_deadline_is_deterministic() {
     let deadline = Deadline::after(now, Duration::from_millis(10));
     let active = FixedCancellation(None);
     let active_control = ExecutionControl::new(&active, deadline);
+    assert_eq!(
+        active_control.deadline().expires_at(),
+        deadline.expires_at()
+    );
+    let mut active_notification = active_control.cancelled();
+    assert!(matches!(
+        poll_once(active_notification.as_mut()),
+        Poll::Pending
+    ));
     assert!(active_control.check_at(now).is_ok());
     assert_eq!(
         active_control
@@ -316,10 +364,34 @@ fn cancellation_precedes_deadline_and_deadline_is_deterministic() {
 
     let cancelled = FixedCancellation(Some(AgentError::run_cancelled()));
     let cancelled_control = ExecutionControl::new(&cancelled, Deadline::at(now));
+    let mut cancelled_notification = cancelled_control.cancelled();
+    assert!(matches!(
+        poll_once(cancelled_notification.as_mut()),
+        Poll::Ready(error) if error.code == AgentErrorCode::RunCancelled
+    ));
     assert_eq!(
         cancelled_control.check_at(now).unwrap_err().code,
         AgentErrorCode::RunCancelled
     );
+}
+
+#[test]
+fn public_agent_traits_are_object_safe_with_bound_associated_types() {
+    let now = Instant::now();
+    let active = FixedCancellation(None);
+    let control = ExecutionControl::new(&active, Deadline::after(now, Duration::from_secs(1)));
+
+    let runner_impl = StubAgentRunner;
+    let runner: &dyn AgentRunner<Context = JsonAgentDecisionContext> = &runner_impl;
+    let result = poll_ready(runner.run(fixtures::agent_run_request(), control))
+        .expect("stub runner completes");
+    assert_eq!(result, fixtures::model_run_result());
+
+    let provider_impl = StubModelProvider;
+    let provider: &dyn ModelProvider<Request = Value, Response = Value> = &provider_impl;
+    let response = poll_ready(provider.complete(json!({"request": true}), control))
+        .expect("stub provider completes");
+    assert_eq!(response, json!({"request": true}));
 }
 
 #[test]
@@ -334,6 +406,70 @@ struct FixedCancellation(Option<AgentError>);
 impl CancellationSignal for FixedCancellation {
     fn cancellation_error(&self) -> Option<AgentError> {
         self.0.clone()
+    }
+
+    fn cancelled(&self) -> Pin<Box<dyn Future<Output = AgentError> + Send + '_>> {
+        match self.0.clone() {
+            Some(error) => Box::pin(std::future::ready(error)),
+            None => Box::pin(std::future::pending()),
+        }
+    }
+}
+
+struct StubAgentRunner;
+
+impl AgentRunner for StubAgentRunner {
+    type Context = JsonAgentDecisionContext;
+
+    fn run<'a>(
+        &'a self,
+        _request: AgentRunRequest<Self::Context>,
+        control: ExecutionControl<'a>,
+    ) -> ContractFuture<'a, Result<ModelRunResult, AgentError>> {
+        Box::pin(async move {
+            control.check_at(Instant::now())?;
+            Ok(fixtures::model_run_result())
+        })
+    }
+}
+
+struct StubModelProvider;
+
+impl ModelProvider for StubModelProvider {
+    type Request = Value;
+    type Response = Value;
+
+    fn complete<'a>(
+        &'a self,
+        request: Self::Request,
+        control: ExecutionControl<'a>,
+    ) -> ContractFuture<'a, Result<Self::Response, AgentError>> {
+        Box::pin(async move {
+            control.check_at(Instant::now())?;
+            Ok(request)
+        })
+    }
+}
+
+struct NoopWake;
+
+impl Wake for NoopWake {
+    fn wake(self: Arc<Self>) {}
+}
+
+fn poll_once<F>(mut future: Pin<&mut F>) -> Poll<F::Output>
+where
+    F: Future + ?Sized,
+{
+    let waker = Waker::from(Arc::new(NoopWake));
+    let mut context = TaskContext::from_waker(&waker);
+    future.as_mut().poll(&mut context)
+}
+
+fn poll_ready<T>(mut future: ContractFuture<'_, T>) -> T {
+    match poll_once(future.as_mut()) {
+        Poll::Ready(value) => value,
+        Poll::Pending => panic!("contract test future unexpectedly yielded"),
     }
 }
 
@@ -350,6 +486,12 @@ fn insert_unknown(value: &mut Value, key: &str) {
         .as_object_mut()
         .expect("test target is an object")
         .insert(key.to_owned(), json!(true));
+}
+
+fn assert_legacy_agent_run_field_rejected(field: &str) {
+    let mut value = fixture_value(AGENT_RUN);
+    insert_unknown(&mut value, field);
+    assert_rejected::<AgentRunRequest<JsonAgentDecisionContext>>(value);
 }
 
 fn assert_rejected<T: DeserializeOwned>(value: Value) {

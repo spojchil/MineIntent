@@ -1,9 +1,21 @@
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    pin::Pin,
+    time::{Duration, Instant},
+};
 
 use super::AgentError;
 
 pub trait CancellationSignal: Send + Sync {
+    /// Returns the cancellation state without waiting.
     fn cancellation_error(&self) -> Option<AgentError>;
+
+    /// Waits until cancellation and resolves with its structured error.
+    ///
+    /// Each call must be independently waitable. An already-cancelled signal should return a
+    /// ready future; an active signal must retain the task waker so cancellation can wake blocked
+    /// provider/runner work.
+    fn cancelled(&self) -> Pin<Box<dyn Future<Output = AgentError> + Send + '_>>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -48,6 +60,15 @@ impl<'a> ExecutionControl<'a> {
 
     pub fn cancellation(self) -> &'a dyn CancellationSignal {
         self.cancellation
+    }
+
+    /// Returns the waitable cancellation branch for an async execution boundary.
+    ///
+    /// Runtime implementations can select this future against a timer scheduled for
+    /// [`Deadline::expires_at`]. After either branch wakes, call [`Self::check_at`] with the
+    /// current instant; that preserves cancellation priority when both become ready together.
+    pub fn cancelled(self) -> Pin<Box<dyn Future<Output = AgentError> + Send + 'a>> {
+        self.cancellation.cancelled()
     }
 
     pub fn deadline(self) -> Deadline {

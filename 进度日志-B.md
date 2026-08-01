@@ -73,41 +73,35 @@
 
 ### Oracle 测试映射
 
-Python 25 条中，本轮迁入 I03 能负责的契约级断言如下；Rust 测试名保持指向原断言，而不复刻 Python HTTP 结构：
+以下表格与 `agent-service/test_server.py`、`agent-service/test_prompt.py` 的 25 个方法一一对应；每个 Python 源测试只出现一行。HTTP/Python 机制被替换时，仍迁移其严格边界或取消安全意图，不把任何源测试标为“无需迁移”。
 
-| Python 测试 | 本轮 Rust 对应 |
+| Python 源测试 | contract 已覆盖或后续实现归属 |
 |---|---|
-| `test_executor_response_envelope_is_strict` | `tool_execution_v2_requires_nullable_observation_and_rejects_transport_legacy`：v2、必需 `observationAfter`、null/object、v1/数组/`roundId` 负例。 |
-| `test_arguments_are_forwarded_untouched_for_the_tool_side_to_judge` | `invocation_preserves_open_tool_name_and_arguments_but_validates_keys`：嵌套 arguments 原样保留，不在 Agent 契约预判具体 capability 范围。 |
-| `test_float_arguments_survive_the_json_boundary` | 同上：`-30.5` 原样 round-trip，NaN/+Inf/-Inf JSON 拒绝；frame 的非有限浮点输出也拒绝。 |
-| `test_request_and_json_are_strict` | `context_v3_round_trips_with_strict_outer_shapes`、`advertised_tool_definition_is_strict_and_provider_safe`、`run_request_uses_external_prompt_reference_and_excludes_transport_configuration`：协议、未知字段、tools 数量/名称与严格 JSON；其中 loopback executor URL 子断言随 HTTP 边界消亡。 |
-| `test_tool_call_ids_are_preflighted_and_unique_within_the_run` | 本轮只迁空值、129 ASCII、65 emoji 的 ID 形状和 `ToolCallKey`；整批 preflight/一次性 claim 留给后续 runtime。 |
-| `test_cache_counters_are_read_from_each_provider_shape_and_summed` | 本轮只迁统一 `ModelUsage` 四字段、非负整数、显式 0/缺省/null/未知字段语义；provider 形状规范化与跨轮求和留给后续 provider/runner。 |
-| `test_decide_enforces_the_run_deadline` | 本轮只迁 `Deadline`/`ExecutionControl` 与取消优先顺序；AgentRunner 的 180s 执行上限留给后续循环实现，HTTP 504 不保留。 |
-
-其余仍须后续逐名迁移的 Python 行为测试（本轮未实现其循环、状态机、transcript、模板或 provider 行为）：
-
-- `test_deepseek_replay_preserves_reasoning_and_tool_call_id`
-- `test_stable_content_leads_and_observations_stay_with_their_tool_results`
-- `test_invalid_model_tool_data_stays_local_and_keeps_the_tool_pair`
-- `test_parallel_calls_all_execute_in_order`
-- `test_truncated_and_filtered_completions_fail_instead_of_closing_the_run`
-- `test_reported_and_absent_finish_reasons_that_mean_a_real_ending_are_accepted`
-- `test_tool_calls_are_capped_per_response_and_per_run`
-- `test_transcript_records_tools_rotates_and_honors_the_data_dir`
-- `test_transcript_records_the_run_even_when_it_fails`
-- `test_leak_guard_catches_call_shaped_mentions_but_not_prose`
-- `test_cancelled_run_does_not_block_its_replacement`
-- `test_late_cancel_for_superseded_id_does_not_cancel_new_run`
-- `test_model_transport_connects_directly_to_the_configured_endpoint`
-- `test_model_transport_cancellation_closes_a_blocked_upstream`
-- `test_tool_call_ids_are_preflighted_and_unique_within_the_run`（剩余 preflight/claim）
-- `test_cache_counters_are_read_from_each_provider_shape_and_summed`（剩余规范化/求和/transcript）
-- `test_decide_enforces_the_run_deadline`（剩余 runner 执行上限）
-- `test_stable_context_ignores_profile_and_only_renders_memories`
-- `test_prompt_carries_behavior_and_the_shared_observation_semantics`
-
-随单进程裁定明确消亡、不得在 Rust 复刻的 Python 测试是 `test_config_requires_an_independent_service_token` 与 `test_decide_authentication_happens_before_body_validation`；它们验证的是已删除 Python 服务的独立 token/HTTP 鉴权顺序。
+| `test_deepseek_replay_preserves_reasoning_and_tool_call_id` | 后续 AgentRunner/model-provider：reasoning replay、tool 配对与跨轮 usage；I03 已冻结 run/tool-call key。 |
+| `test_stable_content_leads_and_observations_stay_with_their_tool_results` | 后续 AgentRunner/template：消息顺序与 prefix 稳定；I03 已冻结 context/tool-result envelope。 |
+| `test_executor_response_envelope_is_strict` | contract 已覆盖：`tool_execution_v2_requires_nullable_observation_and_rejects_transport_legacy`。 |
+| `test_tool_call_ids_are_preflighted_and_unique_within_the_run` | contract 已覆盖 ID 形状与 `ToolCallKey`；后续 runtime 实现整批 preflight 和一次性 claim。 |
+| `test_invalid_model_tool_data_stays_local_and_keeps_the_tool_pair` | 后续 AgentRunner：失败 tool 配对与 loop continuation；I03 已冻结结构化错误和 nullable observation。 |
+| `test_cache_counters_are_read_from_each_provider_shape_and_summed` | contract 已覆盖 `ModelUsage` 四字段及 strict 非负整数；后续 provider/runner 实现形状规范化、求和与 transcript。 |
+| `test_parallel_calls_all_execute_in_order` | 后续 AgentRunner/runtime：并行调用执行与声明顺序。 |
+| `test_truncated_and_filtered_completions_fail_instead_of_closing_the_run` | 后续 AgentRunner/model-provider：finish reason 失败语义。 |
+| `test_reported_and_absent_finish_reasons_that_mean_a_real_ending_are_accepted` | 后续 AgentRunner/model-provider：允许的结束原因集合。 |
+| `test_tool_calls_are_capped_per_response_and_per_run` | 后续 AgentRunner：每响应 8、每 run 32 的执行上限与 preflight。 |
+| `test_arguments_are_forwarded_untouched_for_the_tool_side_to_judge` | contract 已覆盖：`invocation_preserves_open_tool_name_and_arguments_but_validates_keys`。 |
+| `test_float_arguments_survive_the_json_boundary` | contract 已覆盖：有限浮点 round-trip，NaN/+Inf/-Inf 拒绝。 |
+| `test_transcript_records_tools_rotates_and_honors_the_data_dir` | 后续 AgentRunner/transcript：格式、轮转和 data dir。 |
+| `test_transcript_records_the_run_even_when_it_fails` | 后续 AgentRunner/transcript：失败 run 仍落盘。 |
+| `test_leak_guard_catches_call_shaped_mentions_but_not_prose` | 后续 AgentRunner：closing leak guard。 |
+| `test_request_and_json_are_strict` | contract 已覆盖协议、未知字段、tools、ID 与非有限 JSON；旧 executor URL 作为 transport 字段由严格进程内 request 拒绝。 |
+| `test_config_requires_an_independent_service_token` | contract 已覆盖：`python_test_config_requires_an_independent_service_token_maps_to_strict_contract_rejection` 拒绝遗留 `serviceToken`/`modelApiKey`，进程内 API 不提供共享 token 槽位。 |
+| `test_decide_authentication_happens_before_body_validation` | contract 已覆盖：`python_test_decide_authentication_happens_before_body_validation_maps_to_no_transport_phase` 拒绝 Authorization/callback/body transport 字段；进程内 request 只有四个契约字段，不存在可表达的 auth-before-body 阶段顺序。 |
+| `test_cancelled_run_does_not_block_its_replacement` | 后续 AgentRunner/runtime：旧 run 取消和 replacement 并发；I03 的取消通知 future 可唤醒阻塞工作。 |
+| `test_late_cancel_for_superseded_id_does_not_cancel_new_run` | 后续 runtime：run identity、supersession 与迟到取消隔离。 |
+| `test_decide_enforces_the_run_deadline` | contract 已覆盖 `Deadline`、可等待取消分支及取消优先；后续 AgentRunner/runtime 用 timer 实现 180s 上限。 |
+| `test_model_transport_connects_directly_to_the_configured_endpoint` | 后续 ModelProvider 实现：模型 endpoint 行为；I03 不引入 HTTP/SDK。 |
+| `test_model_transport_cancellation_closes_a_blocked_upstream` | 后续 ModelProvider 实现：把 I03 取消通知接入阻塞上游并等待退出。 |
+| `test_stable_context_ignores_profile_and_only_renders_memories` | 后续外部 prompt template + I01 memory：稳定上下文渲染。 |
+| `test_prompt_carries_behavior_and_the_shared_observation_semantics` | 后续外部 prompt template/AgentRunner：行为文本与 observation 语义；I03 只冻结模板 key/version。 |
 
 直接 TS capability/bridge 映射：
 
@@ -117,7 +111,14 @@ Python 25 条中，本轮迁入 I03 能负责的契约级断言如下；Rust 测
 - `view declares one full read with an empty argument object and its own scan resource` → `view_arguments_and_execution_enums_are_closed`；只迁 schema/resource，未实现 viewport scan。
 - `view rejects an already-cancelled signal before starting the scan` → `capability_context_checks_cancellation_deadline_then_scope` 的执行前 guard；具体 read 次数断言留给后续 `view` 实现。
 - `the tool response carries a post-handling observation without claiming causation` → `tool_execution_v2_requires_nullable_observation_and_rejects_transport_legacy`。
-- `tool bridge is loopback-only, authenticated and forwards strict invocations` → strict invocation/ID/arguments 已迁；loopback/auth/HTTP size-limit 子断言随 bridge 消亡。
+- `tool bridge is loopback-only, authenticated and forwards strict invocations` → strict invocation/ID/arguments 已迁；loopback/auth 安全意图由严格拒绝遗留 transport 字段覆盖，不复刻 HTTP 机制。
+
+### 维护审查返修
+
+- `CancellationSignal` 增加对象安全的 `cancelled()` future；已取消信号立即返回结构化 `AgentError`，可取消实现必须登记 waker。`ExecutionControl::cancelled()` 暴露等待分支，文档明确要求与 `Deadline::expires_at()` 对应的 runtime timer 一起 select，并在任一分支唤醒后调用 `check_at(now)` 保留“取消优先于 deadline”。
+- agent/capability 两组 `FixedCancellation` 均实现 ready/pending 通知；手写单次 poll 断言 triggered=`Ready`、active=`Pending`。测试还以 `dyn AgentRunner<Context=...>`、`dyn ModelProvider<Request=..., Response=...>`、`dyn ToolDispatcher<Observation=...>` 和 `Arc<dyn ToolCapability>` 编译/调用公开 trait。
+- 新增两个显式 Python 来源映射测试，严格拒绝 `serviceToken`、`modelApiKey`、Authorization、callback URL/token、executor/service URL 及 body transport 字段；序列化的进程内 `AgentRunRequest` 顶层精确只有 `runId/context/tools/promptTemplate`，没有可表达的 auth/body 阶段顺序。
+- 用 PowerShell 正则分别提取两个 Python 文件的方法名和本节表格首列并做集合比较：`SOURCE_COUNT=25`、`LOG_COUNT=25`、`LOG_UNIQUE_COUNT=25`、`MISSING_COUNT=0`、`EXTRA_COUNT=0`。
 
 ### Mutation 验证
 
@@ -129,7 +130,7 @@ Python 25 条中，本轮迁入 I03 能负责的契约级断言如下；Rust 测
 | 命令 | 结果 |
 |---|---|
 | `cargo +stable fmt --all --check` | 通过。 |
-| `cargo test --workspace --offline` | 通过；backend 13/13、Agent contracts 11/11、capability contracts 8/8，middle 空库与全 workspace doctest 通过。 |
+| `cargo test --workspace --offline` | 通过；backend 13/13、Agent contracts 14/14、capability contracts 8/8，middle 空库与全 workspace doctest 通过。 |
 | `cargo check --workspace --offline` | 通过。 |
 | `git diff --check` | 通过。 |
 
