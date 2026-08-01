@@ -1,7 +1,8 @@
 use mineintent_middle::information::contracts::{
     parse_information_catalog_request, parse_information_query_request,
     parse_information_selector_ref, InformationProvider, InformationQueryRequest,
-    InformationReferenceIssuer, InformationValueSchema, INFORMATION_AUDIENCES,
+    InformationReferenceIssueError, InformationReferenceIssueRequest, InformationReferenceIssuer,
+    InformationSelectorRef, InformationValueSchema, INFORMATION_AUDIENCES,
     INFORMATION_AVAILABILITIES, INFORMATION_ERROR_CODES, INFORMATION_INTERFACE_IDS,
     INFORMATION_SCOPE_DEPENDENCIES, INFORMATION_SOURCE_KINDS,
 };
@@ -138,6 +139,14 @@ fn provider_spi_traits_are_object_safe() {
     }
 
     accepts_trait_objects(None, None, None);
+
+    fn issue_through_object_safe_port(
+        issuer: &dyn InformationReferenceIssuer,
+        request: InformationReferenceIssueRequest,
+    ) -> Result<InformationSelectorRef, InformationReferenceIssueError> {
+        issuer.issue(request)
+    }
+    let _fallible_port_signature = issue_through_object_safe_port;
 }
 
 #[test]

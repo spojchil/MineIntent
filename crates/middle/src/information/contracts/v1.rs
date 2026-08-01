@@ -827,8 +827,35 @@ pub struct InformationReferenceIssueRequest {
     pub bind_to_screen: Option<bool>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum InformationReferenceIssueError {
+    #[error("information reference per-read issue limit exceeded")]
+    PerIssuerLimitExceeded,
+    #[error("information reference requires an allowed target interface")]
+    AllowedTargetRequired,
+    #[error("information reference metadata is invalid")]
+    InvalidMetadata,
+    #[error("screen-bound information reference requires an active screen revision")]
+    ActiveScreenRevisionRequired,
+    #[error("information reference capacity exceeded")]
+    CapacityExceeded,
+    #[error("information reference payload must be JSON serializable")]
+    PayloadNotJsonSerializable,
+    #[error("information reference payload exceeds its byte limit ({actual} > {maximum})")]
+    PayloadByteLimitExceeded { actual: usize, maximum: usize },
+    #[error("information reference lifetime exceeds its limit")]
+    LifetimeExceeded,
+    #[error("information reference timestamp is outside the supported UTC range")]
+    TimestampOutOfRange,
+    #[error("information reference store is unavailable while issuing")]
+    StoreUnavailable,
+}
+
 pub trait InformationReferenceIssuer: Send + Sync {
-    fn issue(&self, request: InformationReferenceIssueRequest) -> InformationSelectorRef;
+    fn issue(
+        &self,
+        request: InformationReferenceIssueRequest,
+    ) -> Result<InformationSelectorRef, InformationReferenceIssueError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

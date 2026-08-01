@@ -274,3 +274,13 @@ TS 本批 **3/3 tests**：
 - `cargo check --workspace --all-targets --offline`：通过。
 - `cargo +stable fmt --all -- --check`：通过。
 - 剩余未迁：`stores.test.ts:158+` 对应 cursor-store，以及 access-policy、provider/runtime；均未进入本提交。
+
+## 2026-08-01｜Information ref issuer 端口独立审查返修
+
+- 对齐 `contracts/v1.ts:312-324` 与 `ref-store.ts`：`InformationReferenceIssuer` 保持对象安全同步端口，签名冻结为 `issue(request) -> Result<InformationSelectorRef, InformationReferenceIssueError>`；provider context 现在可以注入真实、可失败的 store issuer，而不需要 panic、吞错、伪造 ref 或字符串 boxed error。
+- 在 information contracts 中定义共享结构化 `InformationReferenceIssueError`，统一承载 per-issuer、metadata/target/screen、容量、payload、lifetime/timestamp 与 store unavailable 等签发失败；`InformationRefStoreError` 仅保留 constructor 的 `InvalidLimits` 以及 resolve/invalidation/clear/size 的结构化锁错误，避免签发错误在 store 与端口重复且漂移。
+- `InformationRefIssuer` 实现 `InformationReferenceIssuer`，trait 方法直接委托其固有 `issue`，两条入口经过同一计数、校验、容量和写入生产路径。
+- `information_contracts_schema` 的对象安全 contract 测试增加 fallible issue 函数指针证明；`information_ref_store` 新增 `review_fix_ref_issuer_is_a_fallible_object_safe_provider_port`，运行期证明 `&InformationRefIssuer` 可注入为 `&dyn InformationReferenceIssuer`，并观察成功 ref、`PerIssuerLimitExceeded` 与 `CapacityExceeded`。
+- 定向 `information_ref_store`：9 passed；定向 `information_contracts_schema`：7 passed。
+- `cargo test --workspace --offline`：134 passed、doc tests 通过；`cargo check --workspace --all-targets --offline`：通过；`cargo +stable fmt --all -- --check`：通过。
+- 未扩大范围：cursor-store、access-policy、provider/runtime 与其他 information/backend 模块均未修改。

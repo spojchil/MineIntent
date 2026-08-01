@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 use super::contracts::{
     InformationGrant, InformationInterfaceId, InformationInvalidationEvent,
-    InformationReferenceIssueRequest, InformationScopeSnapshot, InformationSelectorRef,
-    InformationSelectorRefProtocol,
+    InformationReferenceIssueError, InformationReferenceIssueRequest, InformationReferenceIssuer,
+    InformationScopeSnapshot, InformationSelectorRef, InformationSelectorRefProtocol,
 };
 
 pub const DEFAULT_MAX_REFERENCE_ENTRIES: usize = 2_048;
@@ -72,24 +72,6 @@ impl Default for InformationRefStoreOptions {
 pub enum InformationRefStoreError {
     #[error("information reference limits must be positive integers")]
     InvalidLimits,
-    #[error("information reference per-read issue limit exceeded")]
-    PerIssuerLimitExceeded,
-    #[error("information reference requires an allowed target interface")]
-    AllowedTargetRequired,
-    #[error("information reference metadata is invalid")]
-    InvalidMetadata,
-    #[error("screen-bound information reference requires an active screen revision")]
-    ActiveScreenRevisionRequired,
-    #[error("information reference capacity exceeded")]
-    CapacityExceeded,
-    #[error("information reference payload must be JSON serializable")]
-    PayloadNotJsonSerializable,
-    #[error("information reference payload exceeds its byte limit ({actual} > {maximum})")]
-    PayloadByteLimitExceeded { actual: usize, maximum: usize },
-    #[error("information reference lifetime exceeds its limit")]
-    LifetimeExceeded,
-    #[error("information reference timestamp is outside the supported UTC range")]
-    TimestampOutOfRange,
     #[error("information reference store lock was poisoned during {operation}")]
     LockPoisoned { operation: &'static str },
 }
@@ -205,7 +187,7 @@ impl InformationRefStore {
         {
             return Ok(None);
         }
-        clone_bounded_json(&stored.payload, self.inner.options.max_payload_bytes).map(Some)
+        Ok(Some(stored.payload.clone()))
     }
 
     pub fn invalidate(
@@ -270,9 +252,9 @@ impl InformationRefStore {
         &self,
         input: &InformationRefIssuerInput,
         request: InformationReferenceIssueRequest,
-    ) -> Result<InformationSelectorRef, InformationRefStoreError> {
+    ) -> Result<InformationSelectorRef, InformationReferenceIssueError> {
         if request.allowed_interfaces.is_empty() {
-            return Err(InformationRefStoreError::AllowedTargetRequired);
+            return Err(InformationReferenceIssueError::AllowedTargetRequired);
         }
         if request.kind.trim().is_empty()
             || request
@@ -280,7 +262,7 @@ impl InformationRefStore {
                 .as_deref()
                 .is_some_and(|timestamp| parse_rfc3339_millis(timestamp).is_none())
         {
-            return Err(InformationRefStoreError::InvalidMetadata);
+            return Err(InformationReferenceIssueError::InvalidMetadata);
         }
         if request.bind_to_screen == Some(true)
             && (input
@@ -290,7 +272,7 @@ impl InformationRefStore {
                 .is_none_or(str::is_empty)
                 || input.scope.screen_revision.is_none())
         {
-            return Err(InformationRefStoreError::ActiveScreenRevisionRequired);
+            return Err(InformationReferenceIssueError::ActiveScreenRevisionRequired);
         }
 
         let now = self.inner.options.clock.now_millis();
@@ -298,7 +280,7 @@ impl InformationRefStore {
             .inner
             .entries
             .lock()
-            .map_err(|_| InformationRefStoreError::LockPoisoned { operation: "issue" })?;
+            .map_err(|_| InformationReferenceIssueError::StoreUnavailable)?;
         entries.retain(|_, stored| !is_expired(stored.reference.valid_until.as_deref(), now));
         if entries.len() >= self.inner.options.max_entries
             || count_entries(&entries, |stored| stored.principal_id == input.principal_id)
@@ -307,23 +289,23 @@ impl InformationRefStore {
                 stored.reference.interface_id == input.interface_id
             }) >= self.inner.options.max_entries_per_interface
         {
-            return Err(InformationRefStoreError::CapacityExceeded);
+            return Err(InformationReferenceIssueError::CapacityExceeded);
         }
 
         let payload = clone_bounded_json(&request.payload, self.inner.options.max_payload_bytes)?;
         let maximum_valid_until = now
             .checked_add(
                 i64::try_from(self.inner.options.ttl_ms)
-                    .map_err(|_| InformationRefStoreError::TimestampOutOfRange)?,
+                    .map_err(|_| InformationReferenceIssueError::TimestampOutOfRange)?,
             )
-            .ok_or(InformationRefStoreError::TimestampOutOfRange)?;
+            .ok_or(InformationReferenceIssueError::TimestampOutOfRange)?;
         if request
             .valid_until
             .as_deref()
             .and_then(parse_rfc3339_millis)
             .is_some_and(|valid_until| valid_until > maximum_valid_until)
         {
-            return Err(InformationRefStoreError::LifetimeExceeded);
+            return Err(InformationReferenceIssueError::LifetimeExceeded);
         }
         let valid_until = match request.valid_until {
             Some(valid_until) => valid_until,
@@ -390,7 +372,7 @@ impl InformationRefIssuer {
     pub fn issue(
         &self,
         request: InformationReferenceIssueRequest,
-    ) -> Result<InformationSelectorRef, InformationRefStoreError> {
+    ) -> Result<InformationSelectorRef, InformationReferenceIssueError> {
         let previous = match self
             .issued
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |issued| {
@@ -399,9 +381,18 @@ impl InformationRefIssuer {
             Ok(previous) | Err(previous) => previous,
         };
         if previous >= self.store.inner.options.max_issues_per_issuer {
-            return Err(InformationRefStoreError::PerIssuerLimitExceeded);
+            return Err(InformationReferenceIssueError::PerIssuerLimitExceeded);
         }
         self.store.issue(&self.input, request)
+    }
+}
+
+impl InformationReferenceIssuer for InformationRefIssuer {
+    fn issue(
+        &self,
+        request: InformationReferenceIssueRequest,
+    ) -> Result<InformationSelectorRef, InformationReferenceIssueError> {
+        InformationRefIssuer::issue(self, request)
     }
 }
 
@@ -434,17 +425,20 @@ fn next_unique_reference_id(entries: &HashMap<String, StoredReference>) -> Strin
     }
 }
 
-fn clone_bounded_json(value: &Value, maximum: usize) -> Result<Value, InformationRefStoreError> {
+fn clone_bounded_json(
+    value: &Value,
+    maximum: usize,
+) -> Result<Value, InformationReferenceIssueError> {
     let serialized = serde_json::to_vec(value)
-        .map_err(|_| InformationRefStoreError::PayloadNotJsonSerializable)?;
+        .map_err(|_| InformationReferenceIssueError::PayloadNotJsonSerializable)?;
     if serialized.len() > maximum {
-        return Err(InformationRefStoreError::PayloadByteLimitExceeded {
+        return Err(InformationReferenceIssueError::PayloadByteLimitExceeded {
             actual: serialized.len(),
             maximum,
         });
     }
     serde_json::from_slice(&serialized)
-        .map_err(|_| InformationRefStoreError::PayloadNotJsonSerializable)
+        .map_err(|_| InformationReferenceIssueError::PayloadNotJsonSerializable)
 }
 
 fn is_expired(valid_until: Option<&str>, now: i64) -> bool {
@@ -534,12 +528,12 @@ fn parse_rfc3339_millis(timestamp: &str) -> Option<i64> {
     i64::try_from(local_millis - i128::from(offset_minutes * 60_000)).ok()
 }
 
-fn format_utc_millis(timestamp: i64) -> Result<String, InformationRefStoreError> {
+fn format_utc_millis(timestamp: i64) -> Result<String, InformationReferenceIssueError> {
     let days = timestamp.div_euclid(86_400_000);
     let time = timestamp.rem_euclid(86_400_000);
     let (year, month, day) = civil_from_days(days);
     if !(0..=9_999).contains(&year) {
-        return Err(InformationRefStoreError::TimestampOutOfRange);
+        return Err(InformationReferenceIssueError::TimestampOutOfRange);
     }
     let hour = time / 3_600_000;
     let minute = time % 3_600_000 / 60_000;

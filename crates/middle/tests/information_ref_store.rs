@@ -7,8 +7,8 @@ use mineintent_middle::information::{
     contracts::{
         InformationAllInterfaces, InformationAllowedInterfaces, InformationAudience,
         InformationConnectionState, InformationGrant, InformationGrantPurpose,
-        InformationInterfaceId, InformationInvalidationEvent, InformationReferenceIssueRequest,
-        InformationScopeSnapshot,
+        InformationInterfaceId, InformationInvalidationEvent, InformationReferenceIssueError,
+        InformationReferenceIssueRequest, InformationReferenceIssuer, InformationScopeSnapshot,
     },
     ref_store::{
         InformationRefClock, InformationRefIssuer, InformationRefIssuerInput,
@@ -188,7 +188,7 @@ fn screen_bound_references_require_a_concrete_screen_revision() {
     );
     assert_eq!(
         issuer.issue(item_request(1, true)),
-        Err(InformationRefStoreError::ActiveScreenRevisionRequired)
+        Err(InformationReferenceIssueError::ActiveScreenRevisionRequired)
     );
 }
 
@@ -217,7 +217,7 @@ fn reference_limits_isolate_principals_and_interfaces_and_bound_per_read_payload
         .expect("first issue should succeed");
     assert_eq!(
         limited_issuer.issue(item_request(2, false)),
-        Err(InformationRefStoreError::PerIssuerLimitExceeded)
+        Err(InformationReferenceIssueError::PerIssuerLimitExceeded)
     );
     assert_eq!(
         issuer(
@@ -228,7 +228,7 @@ fn reference_limits_isolate_principals_and_interfaces_and_bound_per_read_payload
             scope(),
         )
         .issue(item_request(2, false)),
-        Err(InformationRefStoreError::CapacityExceeded)
+        Err(InformationReferenceIssueError::CapacityExceeded)
     );
 
     let payload_limited = InformationRefStore::new(InformationRefStoreOptions {
@@ -249,8 +249,50 @@ fn reference_limits_isolate_principals_and_interfaces_and_bound_per_read_payload
             scope(),
         )
         .issue(request),
-        Err(InformationRefStoreError::PayloadByteLimitExceeded { .. })
+        Err(InformationReferenceIssueError::PayloadByteLimitExceeded { .. })
     ));
+}
+
+#[test]
+fn review_fix_ref_issuer_is_a_fallible_object_safe_provider_port() {
+    let store = InformationRefStore::new(InformationRefStoreOptions {
+        max_entries_per_principal: 1,
+        max_issues_per_issuer: 1,
+        ..InformationRefStoreOptions::default()
+    })
+    .expect("valid review options");
+    let first = issuer(
+        &store,
+        InformationInterfaceId::InventoryInformation,
+        "model-1",
+        grant(),
+        scope(),
+    );
+    let first_port: &dyn InformationReferenceIssuer = &first;
+    let reference = first_port
+        .issue(item_request(1, false))
+        .expect("trait-object issue should use the production path");
+    assert_eq!(
+        reference.interface_id,
+        InformationInterfaceId::InventoryInformation
+    );
+    assert_eq!(
+        first_port.issue(item_request(2, false)),
+        Err(InformationReferenceIssueError::PerIssuerLimitExceeded)
+    );
+
+    let second = issuer(
+        &store,
+        InformationInterfaceId::HotbarInformation,
+        "model-1",
+        grant(),
+        scope(),
+    );
+    let second_port: &dyn InformationReferenceIssuer = &second;
+    assert_eq!(
+        second_port.issue(item_request(3, false)),
+        Err(InformationReferenceIssueError::CapacityExceeded)
+    );
 }
 
 #[test]
@@ -352,7 +394,7 @@ fn contract_global_and_per_interface_capacities_are_independent() {
             scope(),
         )
         .issue(item_request(2, false)),
-        Err(InformationRefStoreError::CapacityExceeded)
+        Err(InformationReferenceIssueError::CapacityExceeded)
     );
     issuer(
         &store,
@@ -372,7 +414,7 @@ fn contract_global_and_per_interface_capacities_are_independent() {
             scope(),
         )
         .issue(item_request(3, false)),
-        Err(InformationRefStoreError::CapacityExceeded)
+        Err(InformationReferenceIssueError::CapacityExceeded)
     );
 }
 
@@ -562,25 +604,25 @@ fn contract_metadata_lifetime_and_option_limits_return_structured_errors() {
     request.allowed_interfaces.clear();
     assert_eq!(
         metadata_issuer.issue(request),
-        Err(InformationRefStoreError::AllowedTargetRequired)
+        Err(InformationReferenceIssueError::AllowedTargetRequired)
     );
     let mut request = item_request(1, false);
     request.kind = "  ".to_owned();
     assert_eq!(
         metadata_issuer.issue(request),
-        Err(InformationRefStoreError::InvalidMetadata)
+        Err(InformationReferenceIssueError::InvalidMetadata)
     );
     let mut request = item_request(1, false);
     request.valid_until = Some("not-a-date".to_owned());
     assert_eq!(
         metadata_issuer.issue(request),
-        Err(InformationRefStoreError::InvalidMetadata)
+        Err(InformationReferenceIssueError::InvalidMetadata)
     );
     let mut request = item_request(1, false);
     request.valid_until = Some("2026-07-14T00:00:01.001Z".to_owned());
     assert_eq!(
         metadata_issuer.issue(request),
-        Err(InformationRefStoreError::LifetimeExceeded)
+        Err(InformationReferenceIssueError::LifetimeExceeded)
     );
 
     let utf8_limited = InformationRefStore::new(InformationRefStoreOptions {
@@ -601,7 +643,7 @@ fn contract_metadata_lifetime_and_option_limits_return_structured_errors() {
             scope(),
         )
         .issue(request),
-        Err(InformationRefStoreError::PayloadByteLimitExceeded {
+        Err(InformationReferenceIssueError::PayloadByteLimitExceeded {
             actual: 11,
             maximum: 10
         })
