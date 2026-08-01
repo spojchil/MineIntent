@@ -38,7 +38,7 @@
 
 ### 命名空间预约
 
-- 提交 `a76561a848534d012c9cfa3df0754b7fec83327f`（`契约：预留 P0 公共模块命名空间`）预声明 `agent`、`capability`、`information`、`minecraft`；`information`/`minecraft` 仅有边界文档，后续业务仍由 A 独占。
+- 提交 `a76561aaa698b533ccd9c8a4af8a30876b3101e6`（`契约：预留 P0 公共模块命名空间`）预声明 `agent`、`capability`、`information`、`minecraft`；`information`/`minecraft` 仅有边界文档，后续业务仍由 A 独占。
 - `mineintent-contracts` 只加入锁文件已有的 `serde`/`serde_json`；未加入 runtime、HTTP 或模型 SDK。
 - 预约提交前 `cargo +stable fmt --all --check` 与 `cargo test --workspace --offline` 均通过。
 
@@ -60,6 +60,7 @@
 
 ### I03 capability 契约批次
 
+- 提交 `84c528b24bd829c7633c7c76c77a8a342ad3178f`（`契约：冻结 I03 capability 执行边界`）。
 - 冻结 `CapabilityInvocation`、`ExecutionResource`、`mineintent.tool-result.v1`、`CapabilityExecutionContext`、`ScopeGuard`、`ToolCapability`、`ToolCapabilityRegistry` 与进程内 `ToolDispatcher` trait。
 - registry 的模型定义与 dispatch 项由同一 capability 实例生成；保持注册顺序，重复名返回结构化 `duplicate_tool_capability`，未知名保持未解析状态。本批次不实现 tool-call claim、run 生命周期或执行状态机。
 - 冻结 `move_input` 的模型可见方向枚举、唯一键约束、50..=1500ms 整数边界及 JSON Schema；冻结 `view` 的严格空参数 schema。只实现契约校验，没有实现移动、视野读取或其他具体 capability 动作。
@@ -69,3 +70,67 @@
 |---|---|
 | `cargo test -p mineintent-contracts --offline` | 通过；Agent 11/11、capability 8/8，crate/doctest 通过。 |
 | `cargo +stable fmt --all` | 通过；随后提交前使用 `--check` 复核。 |
+
+### Oracle 测试映射
+
+Python 25 条中，本轮迁入 I03 能负责的契约级断言如下；Rust 测试名保持指向原断言，而不复刻 Python HTTP 结构：
+
+| Python 测试 | 本轮 Rust 对应 |
+|---|---|
+| `test_executor_response_envelope_is_strict` | `tool_execution_v2_requires_nullable_observation_and_rejects_transport_legacy`：v2、必需 `observationAfter`、null/object、v1/数组/`roundId` 负例。 |
+| `test_arguments_are_forwarded_untouched_for_the_tool_side_to_judge` | `invocation_preserves_open_tool_name_and_arguments_but_validates_keys`：嵌套 arguments 原样保留，不在 Agent 契约预判具体 capability 范围。 |
+| `test_float_arguments_survive_the_json_boundary` | 同上：`-30.5` 原样 round-trip，NaN/+Inf/-Inf JSON 拒绝；frame 的非有限浮点输出也拒绝。 |
+| `test_request_and_json_are_strict` | `context_v3_round_trips_with_strict_outer_shapes`、`advertised_tool_definition_is_strict_and_provider_safe`、`run_request_uses_external_prompt_reference_and_excludes_transport_configuration`：协议、未知字段、tools 数量/名称与严格 JSON；其中 loopback executor URL 子断言随 HTTP 边界消亡。 |
+| `test_tool_call_ids_are_preflighted_and_unique_within_the_run` | 本轮只迁空值、129 ASCII、65 emoji 的 ID 形状和 `ToolCallKey`；整批 preflight/一次性 claim 留给后续 runtime。 |
+| `test_cache_counters_are_read_from_each_provider_shape_and_summed` | 本轮只迁统一 `ModelUsage` 四字段、非负整数、显式 0/缺省/null/未知字段语义；provider 形状规范化与跨轮求和留给后续 provider/runner。 |
+| `test_decide_enforces_the_run_deadline` | 本轮只迁 `Deadline`/`ExecutionControl` 与取消优先顺序；AgentRunner 的 180s 执行上限留给后续循环实现，HTTP 504 不保留。 |
+
+其余仍须后续逐名迁移的 Python 行为测试（本轮未实现其循环、状态机、transcript、模板或 provider 行为）：
+
+- `test_deepseek_replay_preserves_reasoning_and_tool_call_id`
+- `test_stable_content_leads_and_observations_stay_with_their_tool_results`
+- `test_invalid_model_tool_data_stays_local_and_keeps_the_tool_pair`
+- `test_parallel_calls_all_execute_in_order`
+- `test_truncated_and_filtered_completions_fail_instead_of_closing_the_run`
+- `test_reported_and_absent_finish_reasons_that_mean_a_real_ending_are_accepted`
+- `test_tool_calls_are_capped_per_response_and_per_run`
+- `test_transcript_records_tools_rotates_and_honors_the_data_dir`
+- `test_transcript_records_the_run_even_when_it_fails`
+- `test_leak_guard_catches_call_shaped_mentions_but_not_prose`
+- `test_cancelled_run_does_not_block_its_replacement`
+- `test_late_cancel_for_superseded_id_does_not_cancel_new_run`
+- `test_model_transport_connects_directly_to_the_configured_endpoint`
+- `test_model_transport_cancellation_closes_a_blocked_upstream`
+- `test_tool_call_ids_are_preflighted_and_unique_within_the_run`（剩余 preflight/claim）
+- `test_cache_counters_are_read_from_each_provider_shape_and_summed`（剩余规范化/求和/transcript）
+- `test_decide_enforces_the_run_deadline`（剩余 runner 执行上限）
+- `test_stable_context_ignores_profile_and_only_renders_memories`
+- `test_prompt_carries_behavior_and_the_shared_observation_semantics`
+
+随单进程裁定明确消亡、不得在 Rust 复刻的 Python 测试是 `test_config_requires_an_independent_service_token` 与 `test_decide_authentication_happens_before_body_validation`；它们验证的是已删除 Python 服务的独立 token/HTTP 鉴权顺序。
+
+直接 TS capability/bridge 映射：
+
+- `one registration produces both the advertised contract and dispatch entry` → `registry_derives_ordered_definitions_and_dispatch_from_same_instances`。
+- `duplicate capability names fail while the registry is constructed` → `registry_rejects_duplicate_advertised_names_with_structured_error`。
+- `move contract exposes one simultaneous key set and rejects duplicate keys` → `move_input_schema_matches_the_model_visible_oracle` + `move_input_arguments_reject_unknown_fields_versions_and_constraint_mutations`。
+- `view declares one full read with an empty argument object and its own scan resource` → `view_arguments_and_execution_enums_are_closed`；只迁 schema/resource，未实现 viewport scan。
+- `view rejects an already-cancelled signal before starting the scan` → `capability_context_checks_cancellation_deadline_then_scope` 的执行前 guard；具体 read 次数断言留给后续 `view` 实现。
+- `the tool response carries a post-handling observation without claiming causation` → `tool_execution_v2_requires_nullable_observation_and_rejects_transport_legacy`。
+- `tool bridge is loopback-only, authenticated and forwards strict invocations` → strict invocation/ID/arguments 已迁；loopback/auth/HTTP size-limit 子断言随 bridge 消亡。
+
+### Mutation 验证
+
+- 临时删除 `MoveInputArguments` 的方向唯一性条件后，运行 `cargo test -p mineintent-contracts --test capability_contracts move_input_arguments_reject_unknown_fields_versions_and_constraint_mutations --offline`，目标测试按预期失败（0 passed / 1 failed），报告重复方向被错误接受。
+- 立即用相反 patch 恢复条件；同一命令复跑通过（1 passed），`git diff --exit-code -- crates/contracts/src/capability/schemas.rs` 通过，mutation 未进入提交。
+
+### 最终离线门禁
+
+| 命令 | 结果 |
+|---|---|
+| `cargo +stable fmt --all --check` | 通过。 |
+| `cargo test --workspace --offline` | 通过；backend 13/13、Agent contracts 11/11、capability contracts 8/8，middle 空库与全 workspace doctest 通过。 |
+| `cargo check --workspace --offline` | 通过。 |
+| `git diff --check` | 通过。 |
+
+- 最终审查未修改 `supplies/`、`vendor/`、`移植计划/`、`crates/backend/`；没有联网，没有进入 main/A worktree，没有加入 runtime/HTTP/模型 SDK，也没有实现 I03 之外的业务。

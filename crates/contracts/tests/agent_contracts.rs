@@ -159,12 +159,19 @@ fn invocation_preserves_open_tool_name_and_arguments_but_validates_keys() {
         complex_arguments.as_object().unwrap().clone()
     );
 
+    let mut finite_float = fixture_value(TOOL_INVOCATION);
+    finite_float["arguments"] = json!({"yaw_degrees": -30.5});
+    let decoded: ToolInvocation =
+        serde_json::from_value(finite_float).expect("finite float is accepted");
+    assert_eq!(decoded.arguments["yaw_degrees"], json!(-30.5));
+
     for (field, invalid) in [
         ("runId", String::new()),
         ("runId", "r".repeat(129)),
         ("toolCallId", String::new()),
         ("toolCallId", "c".repeat(129)),
         ("toolCallId", "包含空格".to_owned()),
+        ("toolCallId", "🐑".repeat(65)),
         ("name", String::new()),
         ("name", "n".repeat(65)),
     ] {
@@ -181,8 +188,10 @@ fn invocation_preserves_open_tool_name_and_arguments_but_validates_keys() {
     non_object_arguments["arguments"] = json!([]);
     assert_rejected::<ToolInvocation>(non_object_arguments);
 
-    let invalid_number = TOOL_INVOCATION.replace("10", "NaN");
-    assert!(serde_json::from_str::<ToolInvocation>(&invalid_number).is_err());
+    for invalid in ["NaN", "Infinity", "-Infinity"] {
+        let invalid_number = TOOL_INVOCATION.replace("10", invalid);
+        assert!(serde_json::from_str::<ToolInvocation>(&invalid_number).is_err());
+    }
 }
 
 #[test]
