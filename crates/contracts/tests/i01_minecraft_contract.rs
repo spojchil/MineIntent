@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use mineintent_contracts::minecraft::*;
-use serde_json::{json, Value};
+use serde_json::json;
 
 fn json_sequences() -> BackendSequenceFixtures {
     serde_json::from_str(include_str!("../testdata/i01/backend_sequences.v2.json"))
@@ -334,10 +334,9 @@ fn event_v2_fixture_matches_deterministic_builder() {
 
 #[test]
 fn event_v2_rejects_v1_discriminator() {
-    let mut value: Value =
-        serde_json::from_str(include_str!("../testdata/i01/backend_sequences.v2.json")).unwrap();
-    value["ready"][0]["protocol"] = json!("mineintent.minecraft.backend-event.v1");
-    assert!(serde_json::from_value::<BackendSequenceFixtures>(value).is_err());
+    let mut event = serde_json::to_value(&json_sequences().ready[0]).unwrap();
+    event["protocol"] = json!("mineintent.minecraft.backend-event.v1");
+    assert!(serde_json::from_value::<BackendEventEnvelope>(event).is_err());
 }
 
 #[test]
