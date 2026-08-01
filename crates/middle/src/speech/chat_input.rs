@@ -3,8 +3,8 @@ use mineintent_contracts::minecraft::{
 };
 
 use super::{
-    Addressing, AddressingEvidence, ChatInputContext, PlayerChatMessage, PlayerChatProtocol,
-    PlayerChatSender, PlayerChatWorld,
+    segment::is_javascript_whitespace, Addressing, AddressingEvidence, ChatInputContext,
+    PlayerChatMessage, PlayerChatProtocol, PlayerChatSender, PlayerChatWorld,
 };
 
 pub fn interpret_player_chat(
@@ -97,21 +97,4 @@ fn is_name_suffix(character: char) -> bool {
             character,
             '，' | ',' | '：' | ':' | '！' | '!' | '.' | '?' | '？'
         )
-}
-
-fn is_javascript_whitespace(character: char) -> bool {
-    matches!(
-        character,
-        '\u{0009}'..='\u{000D}'
-            | '\u{0020}'
-            | '\u{00A0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200A}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202F}'
-            | '\u{205F}'
-            | '\u{3000}'
-            | '\u{FEFF}'
-    )
 }

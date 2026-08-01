@@ -287,3 +287,35 @@
 | `git diff --check` | 通过。 |
 
 - 首次将全部门禁串在一个 PowerShell 调用时触及 120 秒工具时限，未产生失败诊断；拆分为以上独立命令后均明确通过。
+
+## 2026-08-01｜阶段 2 B 范围整理返修
+
+### Scheduler 线性化与错误边界
+
+- 当前段由 worker 在 scheduler 锁内从 `queued` claim 为 `dispatching`，该状态转换是 stop/dispatch 的线性化点。stop 先到时移除并取消 queued 请求；worker 先 claim 时允许当前段完成且不提前发 `cancelled`。若请求还有剩余段，stop 只写入 `cancel_after_dispatch`，worker 在锁外发出当前段 `sent` 后移除余段并在锁外发 `cancelled`，之后不再调用 transport。transport、event callback 与所有 await 仍在队列锁外。
+- 无 sleep 的 `Condvar` 阻塞 transport 回归覆盖两种已 claim 情形：单段请求只产生 `scheduled`/`sent`；多段请求只发送当前段，随后按 `sent`/`cancelled` 顺序终结并不发送余段。既有 oracle stop 测试继续覆盖 stop 先于 claim 时 `scheduled`/`cancelled` 且零发送。
+- `SpeechTransport::send` 的 panic 在 transport actor 边界转换为 `failed` reason，当前请求丢弃，worker 随后继续 FIFO；没有捕获或改变 `on_event` panic 语义。
+- constructor 使用 `Instant::checked_add` 拒绝不可表示的 `minimum_interval`，返回 `SpeechSchedulerBuildError::InvalidMinimumInterval`；worker deadline 计算也不再使用可能 panic 的 `Instant + Duration`。
+
+### 契约、依赖与文档整理
+
+- middle execution 删除重复的 `ExecutionResource`，直接复用并重导出 `mineintent_contracts::capability::ExecutionResource`。P0 类型未实现 `Hash`，因此 arbiter 私有四资源 lease 表从 `HashMap` 最小调整为 `Vec` 查找；公共 API、lease identity/generation 与行为未改。
+- Tokio 生产 features 收窄为 `macros/rt/sync/time`；仅测试使用的 `fs/test-util` 移到 dev-dependencies，未新增 package，Cargo.lock 未变化。
+- 更新 middle crate、Cargo package 与 events journal 的过时脚手架/迁移所有权文档；chat-input 复用 segment 的 JavaScript whitespace helper。
+- 没有修改 Drop、arbiter shutdown 或 journal 公共错误模型；它们继续作为后续生命周期/错误模型设计项。重复 UTC formatter 本次未抽取：在当前允许范围内只能引入 events/execution 反向耦合，或新增未授权的共享根模块。
+
+### 测试与门禁
+
+- scheduler 新增 4 条额外 Rust tests：单段与多段 claim/stop 并发线性化、transport panic 后续跑、不可表示 interval 的结构化构造错误；不冒充 TS 映射。`speech.test.ts` 映射仍为 8/8，scheduler 测试现为 11 条（2 条 oracle + 9 条额外）。
+- execution 额外 contract test 增加编译期同型赋值，证明 middle 导出的资源类型就是 P0 contracts 权威类型；execution 测试计数仍为 9 条。
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test -p mineintent-middle --test speech_scheduler --offline` | 通过；11/11。 |
+| `cargo test -p mineintent-middle --test execution_arbiter --offline` | 通过；9/9。 |
+| `cargo test -p mineintent-middle --test speech_input_segment --offline` | 通过；8/8。 |
+| `cargo test -p mineintent-middle --test events_journal --offline` | 通过；当前平台 2/2，Unix 权限测试保持 `cfg(unix)`。 |
+| `cargo test --workspace --offline` | 通过；workspace 既有与新增测试及 doctests 全部通过。 |
+| `cargo check --workspace --all-targets --offline` | 通过。 |
+| `cargo +stable fmt --all -- --check` | 通过。 |
+| `git diff --check` | 通过。 |

@@ -1,4 +1,4 @@
-//! B 独占的应用事件 journal。
+//! 应用事件的串行 JSONL journal。
 //!
 //! 这里持久化的是 `mineintent.event.v1` 应用信封；它不是 backend 事实流使用的
 //! `mineintent.minecraft.backend-event.v2`。

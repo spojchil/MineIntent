@@ -1,5 +1,7 @@
 use std::{
+    any::Any,
     collections::VecDeque,
+    panic::{catch_unwind, AssertUnwindSafe},
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
@@ -42,6 +44,8 @@ pub enum SpeechSchedulerBuildError {
     InvalidMaxSegmentLength,
     #[error("SpeechScheduler requires an active Tokio runtime")]
     RuntimeUnavailable,
+    #[error("minimum interval is outside the supported Tokio instant range")]
+    InvalidMinimumInterval,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -86,6 +90,8 @@ struct QueuedSpeech {
     segments: Vec<String>,
     next: usize,
     generation: u64,
+    dispatching: bool,
+    cancel_after_dispatch: Option<String>,
 }
 
 struct Delivery {
@@ -108,6 +114,12 @@ where
         }
         let runtime =
             Handle::try_current().map_err(|_| SpeechSchedulerBuildError::RuntimeUnavailable)?;
+        if Instant::now()
+            .checked_add(options.minimum_interval)
+            .is_none()
+        {
+            return Err(SpeechSchedulerBuildError::InvalidMinimumInterval);
+        }
         let inner = Arc::new(SchedulerInner {
             transport,
             max_segment_length: options.max_segment_length,
@@ -165,6 +177,8 @@ where
                 segments,
                 next: 0,
                 generation,
+                dispatching: false,
+                cancel_after_dispatch: None,
             });
         }
 
@@ -184,11 +198,20 @@ where
         let reason = reason.into();
         let cancelled: Vec<String> = {
             let mut state = lock_recover(&self.inner.state);
-            state
-                .queue
-                .drain(..)
-                .map(|queued| queued.request.id)
-                .collect()
+            let mut retained = VecDeque::new();
+            let mut cancelled = Vec::new();
+            while let Some(mut queued) = state.queue.pop_front() {
+                if queued.dispatching {
+                    if queued.cancel_after_dispatch.is_none() {
+                        queued.cancel_after_dispatch = Some(reason.clone());
+                    }
+                    retained.push_back(queued);
+                } else {
+                    cancelled.push(queued.request.id);
+                }
+            }
+            state.queue = retained;
+            cancelled
         };
         self.inner.changed.notify_one();
         for request_id in cancelled {
@@ -223,7 +246,7 @@ where
                 Some(
                     state
                         .last_sent_at
-                        .map(|sent_at| sent_at + inner.minimum_interval)
+                        .and_then(|sent_at| sent_at.checked_add(inner.minimum_interval))
                         .unwrap_or_else(Instant::now),
                 )
             }
@@ -242,11 +265,16 @@ where
         tokio::task::yield_now().await;
 
         let delivery = {
-            let state = lock_recover(&inner.state);
-            state.queue.front().and_then(|queued| {
-                queued.segments.get(queued.next).map(|text| Delivery {
+            let mut state = lock_recover(&inner.state);
+            state.queue.front_mut().and_then(|queued| {
+                if queued.dispatching {
+                    return None;
+                }
+                let text = queued.segments.get(queued.next)?.clone();
+                queued.dispatching = true;
+                Some(Delivery {
                     request_id: queued.request.id.clone(),
-                    text: text.clone(),
+                    text,
                     segment: queued.next,
                     generation: queued.generation,
                 })
@@ -256,11 +284,15 @@ where
             continue;
         };
 
-        let result = inner.transport.send(&delivery.text);
-        let event = {
+        let result = catch_unwind(AssertUnwindSafe(|| inner.transport.send(&delivery.text)))
+            .map_err(|payload| panic_message(payload.as_ref()))
+            .and_then(|result| result.map_err(|error| error.to_string()));
+        let completion = {
             let mut state = lock_recover(&inner.state);
             let is_current = state.queue.front().is_some_and(|queued| {
-                queued.generation == delivery.generation && queued.next == delivery.segment
+                queued.generation == delivery.generation
+                    && queued.next == delivery.segment
+                    && queued.dispatching
             });
             if !is_current {
                 None
@@ -268,33 +300,76 @@ where
                 match result {
                     Ok(()) => {
                         state.last_sent_at = Some(Instant::now());
-                        let queued = state.queue.front_mut();
-                        if let Some(queued) = queued {
+                        if let Some(queued) = state.queue.front_mut() {
                             queued.next = queued.next.saturating_add(1);
-                            if queued.next == queued.segments.len() {
-                                state.queue.pop_front();
-                            }
                         }
-                        Some(SpeechEvent::Sent {
-                            request_id: delivery.request_id,
-                            segment: delivery.segment,
-                            text: delivery.text,
-                        })
+                        Some((
+                            SpeechEvent::Sent {
+                                request_id: delivery.request_id,
+                                segment: delivery.segment,
+                                text: delivery.text,
+                            },
+                            true,
+                        ))
                     }
-                    Err(error) => {
-                        state.queue.pop_front();
-                        Some(SpeechEvent::Failed {
+                    Err(reason) => Some((
+                        SpeechEvent::Failed {
                             request_id: delivery.request_id,
-                            reason: error.to_string(),
-                        })
-                    }
+                            reason,
+                        },
+                        false,
+                    )),
                 }
             }
         };
-        if let Some(event) = event {
+        let Some((event, sent)) = completion else {
+            continue;
+        };
+        (inner.on_event)(event);
+
+        let cancellation = {
+            let mut state = lock_recover(&inner.state);
+            let is_current = state.queue.front().is_some_and(|queued| {
+                queued.generation == delivery.generation && queued.dispatching
+            });
+            if !is_current {
+                None
+            } else if !sent {
+                state.queue.pop_front();
+                None
+            } else {
+                match state.queue.front_mut() {
+                    Some(queued) if queued.next == queued.segments.len() => {
+                        state.queue.pop_front();
+                        None
+                    }
+                    Some(queued) => match queued.cancel_after_dispatch.take() {
+                        Some(reason) => {
+                            let request_id = queued.request.id.clone();
+                            state.queue.pop_front();
+                            Some(SpeechEvent::Cancelled { request_id, reason })
+                        }
+                        None => {
+                            queued.dispatching = false;
+                            None
+                        }
+                    },
+                    None => None,
+                }
+            }
+        };
+        if let Some(event) = cancellation {
             (inner.on_event)(event);
         }
     }
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "speech transport panicked".to_owned())
 }
 
 /// Scheduler locks protect only local queue bookkeeping. No await, transport call or event callback

@@ -6,7 +6,8 @@
 use std::{
     collections::VecDeque,
     fmt,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
+    thread,
     time::Duration,
 };
 
@@ -113,6 +114,84 @@ async fn scheduler_stop_cancels_queued_speech_before_it_is_sent() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn additional_concurrent_stop_does_not_cancel_an_already_claimed_delivery() {
+    let transport = BlockingTransport::default();
+    let events = EventLog::default();
+    let scheduler = Arc::new(
+        SpeechScheduler::new(transport.clone(), options(256, Duration::ZERO, &events)).unwrap(),
+    );
+    scheduler
+        .schedule(request("claimed", "已经开始发送"))
+        .unwrap();
+
+    let stopping_scheduler = Arc::clone(&scheduler);
+    let stopping_transport = transport.clone();
+    let stopper = thread::spawn(move || {
+        stopping_transport.wait_until_entered();
+        stopping_scheduler.stop_with_reason("concurrent_stop");
+        stopping_transport.release();
+    });
+
+    drive_worker().await;
+    stopper.join().unwrap();
+    assert_eq!(transport.snapshot(), vec!["已经开始发送"]);
+    assert_eq!(
+        events.snapshot(),
+        vec![
+            SpeechEvent::Scheduled {
+                request_id: "claimed".to_owned(),
+                segments: 1,
+            },
+            SpeechEvent::Sent {
+                request_id: "claimed".to_owned(),
+                segment: 0,
+                text: "已经开始发送".to_owned(),
+            },
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn additional_concurrent_stop_after_segment_claim_cancels_remaining_segments() {
+    let transport = BlockingTransport::default();
+    let events = EventLog::default();
+    let scheduler = Arc::new(
+        SpeechScheduler::new(transport.clone(), options(2, Duration::ZERO, &events)).unwrap(),
+    );
+    assert_eq!(scheduler.schedule(request("multi", "甲乙丙丁")).unwrap(), 2);
+
+    let stopping_scheduler = Arc::clone(&scheduler);
+    let stopping_transport = transport.clone();
+    let stopper = thread::spawn(move || {
+        stopping_transport.wait_until_entered();
+        stopping_scheduler.stop_with_reason("concurrent_stop");
+        stopping_transport.release();
+    });
+
+    drive_worker().await;
+    stopper.join().unwrap();
+    assert_eq!(transport.snapshot(), vec!["甲乙"]);
+    assert_eq!(
+        events.snapshot(),
+        vec![
+            SpeechEvent::Scheduled {
+                request_id: "multi".to_owned(),
+                segments: 2,
+            },
+            SpeechEvent::Sent {
+                request_id: "multi".to_owned(),
+                segment: 0,
+                text: "甲乙".to_owned(),
+            },
+            SpeechEvent::Cancelled {
+                request_id: "multi".to_owned(),
+                reason: "concurrent_stop".to_owned(),
+            },
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn additional_transport_failure_discards_current_request_and_continues_fifo() {
     let transport = RecordingTransport::with_failures([true, false]);
     let events = EventLog::default();
@@ -148,6 +227,49 @@ async fn additional_transport_failure_discards_current_request_and_continues_fif
             SpeechEvent::Failed {
                 request_id: "bad".to_owned(),
                 reason: "scripted transport failure".to_owned(),
+            },
+            SpeechEvent::Sent {
+                request_id: "good".to_owned(),
+                segment: 0,
+                text: "第二条".to_owned(),
+            },
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn additional_transport_panic_becomes_failed_and_worker_continues_fifo() {
+    let transport = RecordingTransport::with_panics([true, false]);
+    let events = EventLog::default();
+    let scheduler =
+        SpeechScheduler::new(transport.clone(), options(256, Duration::ZERO, &events)).unwrap();
+    scheduler.schedule(request("panic", "第一条")).unwrap();
+    scheduler.schedule(request("good", "第二条")).unwrap();
+
+    drive_worker().await;
+
+    assert_eq!(
+        transport
+            .snapshot()
+            .iter()
+            .map(|record| record.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["第二条"]
+    );
+    assert_eq!(
+        events.snapshot(),
+        vec![
+            SpeechEvent::Scheduled {
+                request_id: "panic".to_owned(),
+                segments: 1,
+            },
+            SpeechEvent::Scheduled {
+                request_id: "good".to_owned(),
+                segments: 1,
+            },
+            SpeechEvent::Failed {
+                request_id: "panic".to_owned(),
+                reason: "scripted transport panic".to_owned(),
             },
             SpeechEvent::Sent {
                 request_id: "good".to_owned(),
@@ -251,6 +373,21 @@ fn additional_constructor_validation_is_structured_and_does_not_require_panics()
 }
 
 #[tokio::test(start_paused = true)]
+async fn additional_unrepresentable_interval_is_a_structured_build_error() {
+    let result = SpeechScheduler::new(
+        RecordingTransport::default(),
+        SpeechSchedulerOptions {
+            minimum_interval: Duration::MAX,
+            ..SpeechSchedulerOptions::default()
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(SpeechSchedulerBuildError::InvalidMinimumInterval)
+    ));
+}
+
+#[tokio::test(start_paused = true)]
 async fn additional_request_validation_is_structured_and_emits_nothing() {
     let events = EventLog::default();
     let scheduler = SpeechScheduler::new(
@@ -284,6 +421,7 @@ struct RecordingTransport {
 struct TransportState {
     calls: Vec<SentRecord>,
     failures: VecDeque<bool>,
+    panics: VecDeque<bool>,
 }
 
 #[derive(Clone)]
@@ -298,6 +436,17 @@ impl RecordingTransport {
             state: Arc::new(Mutex::new(TransportState {
                 calls: Vec::new(),
                 failures: failures.into_iter().collect(),
+                panics: VecDeque::new(),
+            })),
+        }
+    }
+
+    fn with_panics(panics: impl IntoIterator<Item = bool>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(TransportState {
+                calls: Vec::new(),
+                failures: VecDeque::new(),
+                panics: panics.into_iter().collect(),
             })),
         }
     }
@@ -322,16 +471,75 @@ impl SpeechTransport for RecordingTransport {
     type Error = TestTransportError;
 
     fn send(&self, message: &str) -> Result<(), Self::Error> {
+        let (should_panic, should_fail) = {
+            let mut state = self.state.lock().unwrap();
+            (
+                state.panics.pop_front().unwrap_or(false),
+                state.failures.pop_front().unwrap_or(false),
+            )
+        };
+        if should_panic {
+            panic!("scripted transport panic");
+        }
         let mut state = self.state.lock().unwrap();
         state.calls.push(SentRecord {
             at: Instant::now(),
             text: message.to_owned(),
         });
-        if state.failures.pop_front().unwrap_or(false) {
+        if should_fail {
             Err(TestTransportError)
         } else {
             Ok(())
         }
+    }
+}
+
+#[derive(Clone, Default)]
+struct BlockingTransport {
+    state: Arc<(Mutex<BlockingTransportState>, Condvar)>,
+}
+
+#[derive(Default)]
+struct BlockingTransportState {
+    entered: bool,
+    released: bool,
+    calls: Vec<String>,
+}
+
+impl BlockingTransport {
+    fn wait_until_entered(&self) {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().unwrap();
+        while !state.entered {
+            state = changed.wait(state).unwrap();
+        }
+    }
+
+    fn release(&self) {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().unwrap();
+        state.released = true;
+        changed.notify_all();
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        self.state.0.lock().unwrap().calls.clone()
+    }
+}
+
+impl SpeechTransport for BlockingTransport {
+    type Error = TestTransportError;
+
+    fn send(&self, message: &str) -> Result<(), Self::Error> {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().unwrap();
+        state.entered = true;
+        changed.notify_all();
+        while !state.released {
+            state = changed.wait(state).unwrap();
+        }
+        state.calls.push(message.to_owned());
+        Ok(())
     }
 }
 

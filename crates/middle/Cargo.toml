@@ -2,7 +2,7 @@
 name = "mineintent-middle"
 version = "0.0.1"
 edition = "2021"
-description = "MineIntent 中间层与 Agent 循环骨架"
+description = "MineIntent 进程内事件、执行、信息与语音协调层"
 publish = false
 
 [dependencies]
@@ -11,5 +11,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "macros", "rt", "sync", "test-util", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["fs", "test-util"] }
