@@ -1,12 +1,18 @@
-# MineIntent Minecraft 后端（Rust / MC 26.1）
+# MineIntent（Rust workspace / MC 26.1）
 
-这是一个独立的离线 Minecraft Java 客户端后端，当前固定目标为 Paper 26.1.2、协议号 775，协议执行层使用已发布的 `azalea 0.16.0+mc26.1`。
+本仓库是 MineIntent 全 Rust 单进程移植的 Cargo workspace。当前 P0 骨架包含：
+
+- `crates/backend`：既有离线 Minecraft Java 客户端后端；
+- `crates/contracts`：公共契约的薄骨架，具体契约留待 I01/I02/I03 冻结；
+- `crates/middle`：中间层与 Agent 循环的薄骨架，尚无业务实现。
+
+既有后端固定目标为 Paper 26.1.2、协议号 775，协议执行层使用已发布的 `azalea 0.16.0+mc26.1`。
 
 ## 构建与运行
 
 ```powershell
-cargo build --offline
-.\target\debug\mineintent-backend.exe --host 127.0.0.1 --port 25565 --username MineIntentBot --duration-secs 30
+cargo build --workspace --offline
+cargo run -p mineintent-backend --offline -- --host 127.0.0.1 --port 25565 --username MineIntentBot --duration-secs 30
 ```
 
 程序 stdout 是逐行 JSON 事件流。stdin 可以逐行接收严格的 `BackendCommandEnvelope`：
@@ -31,4 +37,4 @@ cargo build --offline
 
 viewport 的 `visibleBlocks` 是 `[block_name, x, y, z]` 整数体素并按距离排序，`visibleEntities` 是最近优先且带 `truncated` 的有限列表；未加载方块会让相关可见性射线保守失败，不会被当作空气。Azalea 的角度输入是度，投影内部转换为与主仓库几何函数相同的弧度约定，输出 frame 仍使用 `yawDegrees/pitchDegrees`。
 
-里程碑证据和待裁决项见 [`进度日志.md`](进度日志.md)，版本/选型证据见 [`M0-版本与选型.md`](M0-版本与选型.md)。
+workspace 移植进度见 [`进度日志-B.md`](进度日志-B.md)；既有后端里程碑证据和待裁决项见 [`进度日志.md`](进度日志.md)，版本/选型证据见 [`M0-版本与选型.md`](M0-版本与选型.md)。

@@ -1,0 +1,7 @@
+{
+  "protocol": "mineintent.tool-response.v2",
+  "result": {
+    "status": "completed"
+  },
+  "observationAfter": null
+}

@@ -1,0 +1,5 @@
+{
+  "directions": ["forward", "right"],
+  "duration_ms": 250,
+  "sprint": false
+}

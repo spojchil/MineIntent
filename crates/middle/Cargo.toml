@@ -1,0 +1,6 @@
+[package]
+name = "mineintent-middle"
+version = "0.0.1"
+edition = "2021"
+description = "MineIntent 中间层与 Agent 循环骨架"
+publish = false
