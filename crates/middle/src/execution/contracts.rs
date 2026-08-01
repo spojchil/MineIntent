@@ -1,25 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutionResource {
-    Body,
-    Chat,
-    Memory,
-    Viewport,
-}
-
-impl ExecutionResource {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Body => "body",
-            Self::Chat => "chat",
-            Self::Memory => "memory",
-            Self::Viewport => "viewport",
-        }
-    }
-}
+pub use mineintent_contracts::capability::ExecutionResource;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

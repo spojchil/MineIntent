@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::{Arc, Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -26,7 +25,7 @@ struct ArbiterInner {
 struct ArbiterState {
     epoch: u64,
     next_lease_generation: u64,
-    leases: HashMap<ExecutionResource, HeldLease>,
+    leases: Vec<HeldLease>,
     jobs: Vec<Arc<JobShared>>,
 }
 
@@ -56,10 +55,13 @@ impl ResourceLeaseHandle {
         let mut state = lock_recover(&self.inner.state);
         let is_current = state
             .leases
-            .get(&self.lease.resource)
+            .iter()
+            .find(|held| held.lease.resource == self.lease.resource)
             .is_some_and(|held| held.generation == self.generation);
         if is_current {
-            state.leases.remove(&self.lease.resource);
+            state.leases.retain(|held| {
+                held.lease.resource != self.lease.resource || held.generation != self.generation
+            });
         }
     }
 }
@@ -175,19 +177,24 @@ impl ExecutionArbiter {
     pub fn lease_for(&self, resource: ExecutionResource) -> Option<ResourceLease> {
         lock_recover(&self.inner.state)
             .leases
-            .get(&resource)
+            .iter()
+            .find(|held| held.lease.resource == resource)
             .map(|held| held.lease.clone())
     }
 
     /// A resource conflict is an ordinary refusal value, never a panic or error path.
     pub fn acquire(&self, input: ExecutionRequest) -> AcquireDecision {
         let mut state = lock_recover(&self.inner.state);
-        if let Some(held) = state.leases.get(&input.resource) {
+        if let Some(held) = state
+            .leases
+            .iter()
+            .find(|held| held.lease.resource == input.resource)
+        {
             return AcquireDecision::Refused(ExecutionRefusal {
                 code: ExecutionRefusalCode::ResourceBusy,
                 summary: format!(
                     "resource_busy:{} is held by {}",
-                    input.resource.as_str(),
+                    resource_name(input.resource),
                     held.lease.tool_name
                 ),
             });
@@ -202,13 +209,10 @@ impl ExecutionArbiter {
             tool_name: input.tool_name,
             acquired_at: current_timestamp(),
         };
-        state.leases.insert(
-            lease.resource,
-            HeldLease {
-                lease: lease.clone(),
-                generation,
-            },
-        );
+        state.leases.push(HeldLease {
+            lease: lease.clone(),
+            generation,
+        });
         AcquireDecision::Granted(ResourceLeaseHandle {
             inner: Arc::clone(&self.inner),
             lease,
@@ -297,6 +301,15 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+const fn resource_name(resource: ExecutionResource) -> &'static str {
+    match resource {
+        ExecutionResource::Body => "body",
+        ExecutionResource::Chat => "chat",
+        ExecutionResource::Memory => "memory",
+        ExecutionResource::Viewport => "viewport",
     }
 }
 

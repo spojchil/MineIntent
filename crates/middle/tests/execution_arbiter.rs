@@ -200,6 +200,10 @@ fn settled_jobs_are_pruned_while_running_jobs_survive_in_insertion_order() {
 
 #[test]
 fn additional_execution_contracts_are_strict_and_keep_outcomes_narrow() {
+    let shared_resource: mineintent_contracts::capability::ExecutionResource =
+        ExecutionResource::Body;
+    assert_eq!(shared_resource, ExecutionResource::Body);
+
     for resource in ["body", "chat", "memory", "viewport"] {
         assert!(serde_json::from_value::<ExecutionResource>(json!(resource)).is_ok());
     }

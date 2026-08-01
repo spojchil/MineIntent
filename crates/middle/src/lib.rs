@@ -1,6 +1,6 @@
-//! MineIntent 中间层与 Agent 循环的 crate 边界。
+//! MineIntent 的进程内协调层。
 //!
-//! P1 共享脚手架只声明并行叶子的模块入口，不包含业务实现。
+//! 提供应用事件 journal、资源与 job 协调、信息查询及玩家聊天输入/输出边界。
 
 pub mod events;
 pub mod execution;
