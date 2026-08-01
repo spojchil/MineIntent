@@ -155,3 +155,27 @@
 | `cargo +stable fmt --all --check` | 通过。 |
 
 - 未访问网络，未操作 main worktree，未修改 `supplies/`、`vendor/`、`移植计划/`、backend 或 contracts。
+
+## 2026-08-01｜P1-B：events journal 第一批
+
+### 范围与实现
+
+- 本批只机械迁移 `events/journal.ts`：严格的 `mineintent.event.v1` 应用事件信封、单 writer 队列串行 JSONL append、flush barrier，以及 Unix 文件权限 `0600`。该信封明确不同于 backend 事实流的 `mineintent.minecraft.backend-event.v2`。
+- writer actor 按请求进入队列的顺序逐条完成写入，单条 JSON 后只追加一个换行；阻塞文件 I/O 在 `spawn_blocking` 中执行，没有持锁跨越 await。append 返回前完成该行 flush，显式 `flush()` 等待此前已入队请求完成。
+- 没有迁移 execution、speech、capability、model、runtime、app、memory 或 information，也没有修改 manifest、lock、共享 `lib.rs` 或禁区文件。
+
+### Characterization / contract tests
+
+- TS oracle 没有独立 `journal.test`；本批测试仅标为 characterization/contract tests，不计作任何 TS 测试的一一迁移。
+- Windows 当前平台执行 2 条：严格 v1 serde/未知字段拒绝/v2 discriminator 拒绝；25 次含并发 append 仍形成 25 个完整单行、写入集合与返回事件一致、先入队记录保持首位，并在 flush 后可见。
+- 另有 1 条 `cfg(unix)` 权限测试，断言创建后的 journal 文件权限精确为 `0600`；当前 Windows 门禁不虚报该平台测试已执行。
+
+### 命令与结果
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test -p mineintent-middle --test events_journal --offline` | 通过；当前平台 2/2。 |
+| `cargo test --workspace --offline` | 通过；含 middle journal 当前平台 2/2，workspace 既有测试全部通过。 |
+| `cargo check --workspace --offline` | 通过。 |
+| `cargo +stable fmt --all --check` | 通过。 |
+| `git diff --check` | 通过。 |
