@@ -4,3 +4,5 @@
 //! 与 viewport 投影 kernel 不属于这一层。
 
 pub mod contracts;
+pub mod geometry;
+pub mod source_ports;
