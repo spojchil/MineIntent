@@ -179,3 +179,38 @@
 | `cargo check --workspace --offline` | 通过。 |
 | `cargo +stable fmt --all --check` | 通过。 |
 | `git diff --check` | 通过。 |
+
+## 2026-08-01｜P1-B：execution contracts + arbiter
+
+### 范围与实现
+
+- 本批只迁移 `execution/contracts.ts` 与 `execution-arbiter.ts`：`body/chat/memory/viewport` 四类独立资源、lease 字段、三类普通 refusal、四态 job 与窄 `JobOutcome`。
+- `acquire` 对同资源冲突返回 `AcquireDecision::Refused`，不同资源互不阻塞。lease handle 携带外部不可构造的私有 generation；release 幂等，旧 handle 和 invalidate 前 handle 均不能删除替代租约。
+- job handle 立即返回并持有共享状态；settle/cancel、`jobs_for` 插入顺序和 prune 对齐 oracle。晚 cancel 不改 settled 历史状态；invalidate 只取消 running job、epoch 加一并清空全部 lease，外部 handle 和可等待 watch signal 同步观察取消。
+- 所有 await 只发生在取消通知等待中，不持有 arbiter/job 锁。同步临界区不执行用户回调、I/O 或序列化；std Mutex 中毒使用 `PoisonError::into_inner` 显式恢复，避免无关 panic 扩散，生产路径不对锁调用 `unwrap`。
+- 未修改 manifest、lock、共享 `lib.rs`、events、speech、information、contracts/backend 或禁区文件；未实现工具动作、上层组装、planner、runtime、app 或 memory。
+
+### `execution-arbiter.test.ts` 8/8 映射
+
+| TS oracle test | Rust test |
+|---|---|
+| `leases are per resource, so chat and memory stay free while the body is held` | `leases_are_per_resource_so_chat_memory_and_viewport_stay_free_while_body_is_held` |
+| `a refusal is returned rather than thrown so one conflict cannot kill a run` | `a_refusal_is_returned_rather_than_panicking_so_one_conflict_cannot_kill_a_run` |
+| `releasing is idempotent and frees the resource exactly once` | `releasing_is_idempotent_and_frees_the_resource_exactly_once` |
+| `a stale release after invalidation cannot evict the lease that replaced it` | `a_stale_release_after_invalidation_cannot_evict_the_replacement_lease` |
+| `a job hands back a handle immediately and reports its outcome later` | `a_job_returns_a_shared_handle_immediately_and_reports_its_outcome_later` |
+| `cancelling a running job aborts its signal` | `cancelling_a_running_job_updates_shared_state_and_wakes_its_signal` |
+| `scope loss voids every lease and running job in one step` | `scope_loss_voids_every_lease_and_running_job_in_one_step` |
+| `settled jobs are pruned while running ones survive to be reported` | `settled_jobs_are_pruned_while_running_jobs_survive_in_insertion_order` |
+
+- 额外 Rust contract test：`additional_execution_contracts_are_strict_and_keep_outcomes_narrow`，覆盖资源、状态、refusal 枚举闭集，未知字段/遗留 transport 字段拒绝，以及 outcome 不泄漏 resource/run/tool 等内部字段；不计入 8 条 TS 一一映射。
+
+### 命令与结果
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test -p mineintent-middle --test execution_arbiter --offline` | 通过；9/9（8 条 oracle 映射 + 1 条额外 contract test）。 |
+| `cargo test --workspace --offline` | 通过；含 execution 9/9，workspace 既有测试全部通过。 |
+| `cargo check --workspace --offline` | 通过。 |
+| `cargo +stable fmt --all --check` | 通过。 |
+| `git diff --check` | 通过。 |
