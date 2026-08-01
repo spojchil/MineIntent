@@ -32,6 +32,7 @@
 ### 补给申请与明确边界
 
 - 如要求默认工具链上的 `cargo fmt --all --check` 在完全离线环境直接通过，需要预装 `nightly-x86_64-pc-windows-msvc` 的 `rustfmt` 组件。本次未联网安装；stable 编译又被依赖所需的 nightly feature 明确拒绝，因此未为绕过环境缺件而改变既有 nightly 编译工具链。
+- [x] 2026-08-01 补给已到位：维护者安装了默认 nightly 工具链的 `rustfmt`；主线 `d81ff6f` 已复验 `cargo fmt --all -- --check` 通过。上表保留 P0-B1 当时的失败记录，不再视为当前阻塞。
 - P0-B1 没有冻结或预设公共契约；I01/I02/I03 仍由后续独立任务完成。
 
 ## 2026-08-01｜P0-I03：Agent/capability contracts
