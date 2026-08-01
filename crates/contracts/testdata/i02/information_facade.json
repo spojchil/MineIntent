@@ -1,0 +1,37 @@
+{
+  "scope": {"processSessionId":"process-fixture-0001","connectionState":"play","connectionEpoch":1,"worldId":"world-fixture","dimension":"minecraft:overworld","uiRevision":0,"capturedAt":"2026-08-01T00:00:21Z"},
+  "plainValues": {
+    "currentStatus": {"health":18.0,"food":17.0,"foodSaturation":3.5,"oxygen":20.0,"experienceLevel":3,"statusEffects":[{"name":"speed","amplifier":1,"durationTicks":120}]},
+    "inventory": {"selectedHotbarSlot":2,"slots":[{"slot":38,"itemName":"diamond_pickaxe","count":1,"metadata":0,"durabilityUsed":7}]},
+    "sound": {"recentSounds":[{"soundName":"block.note_block.harp","category":"record","distance":4.5,"direction":"ahead","volume":1.0,"pitch":0.8,"observedAt":"2026-08-01T00:00:20Z"}]},
+    "viewport": {
+      "frame":{"coordinates":"minecraft_world_absolute","self":{"position":[1.5,64.0,-2.5],"yawDegrees":28.6,"pitchDegrees":-14.3},"legend":{"visibleEntities":"items: {type, player?, position}; nearest first","visibleBlocks":"[block_name, x, y, z]; nearest first"}},
+      "standingOnBlock":{"name":"stone","position":[1.0,63.0,-3.0]},
+      "lookedAtBlock":{"name":"glass","position":[1.0,65.0,-5.0]},
+      "visibleEntities":{"items":[{"type":"player","player":"Observer","position":[4.0,64.0,-2.0]}],"truncated":false},
+      "visibleBlocks":{"blocks":[["glass",1,65,-5]],"truncated":false}
+    }
+  },
+  "viewportRead": {
+    "projection": {
+      "frame":{"coordinates":"minecraft_world_absolute","self":{"position":[1.5,64.0,-2.5],"yawDegrees":28.6,"pitchDegrees":-14.3},"legend":{"visibleEntities":"items: {type, player?, position}; nearest first","visibleBlocks":"[block_name, x, y, z]; nearest first"}},
+      "standingOnBlock":{"name":"stone","position":[1.0,63.0,-3.0]},
+      "lookedAtBlock":{"name":"glass","position":[1.0,65.0,-5.0]},
+      "visibleEntities":{"items":[{"type":"player","player":"Observer","position":[4.0,64.0,-2.0]}],"truncated":false},
+      "visibleBlocks":{"blocks":[["glass",1,65,-5]],"truncated":false}
+    },
+    "source":"server_observed",
+    "revision":9
+  },
+  "composed": {
+    "currentStatus":{"health":18.0,"food":17.0,"foodSaturation":3.5,"oxygen":20.0,"experienceLevel":3,"statusEffects":[{"name":"speed","amplifier":1,"durationTicks":120}]},
+    "inventory":{"selectedHotbarSlot":2,"slots":[{"slot":38,"itemName":"diamond_pickaxe","count":1,"metadata":0,"durabilityUsed":7}]},
+    "sound":{"recentSounds":[{"soundName":"block.note_block.harp","category":"record","distance":4.5,"direction":"ahead","volume":1.0,"pitch":0.8,"observedAt":"2026-08-01T00:00:20Z"}]},
+    "viewport":{"frame":{"coordinates":"minecraft_world_absolute","self":{"position":[1.5,64.0,-2.5],"yawDegrees":28.6,"pitchDegrees":-14.3},"legend":{"visibleEntities":"items: {type, player?, position}; nearest first","visibleBlocks":"[block_name, x, y, z]; nearest first"}}},
+    "omissions":[]
+  },
+  "denied":{"omissions":[{"interfaceId":"current_status","reason":"audience_denied","message":"participant grant does not allow current_status"}]},
+  "unavailable":{"omissions":[{"interfaceId":"viewport_information","reason":"unavailable","fields":[{"field":"frame","reason":"not_connected"}]}]},
+  "partial":{"currentStatus":{"health":18.0},"omissions":[{"interfaceId":"current_status","reason":"partial","fields":[{"field":"oxygen","reason":"not_exposed"},{"field":"experienceLevel","reason":"not_exposed"}]}]},
+  "timeout":{"omissions":[{"interfaceId":"viewport_information","reason":"deadline_exceeded","message":"viewport read exceeded its deadline"}]}
+}
