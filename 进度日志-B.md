@@ -219,3 +219,38 @@
 
 - `JobOutcome.summary` 保持缺省时为 `None`、序列化时省略；字段一旦出现，只接受 string，显式 `null` 严格拒绝，与 TS `summary?: string` 对齐。
 - `execution` contracts 中没有其他 `Option` 字段；arbiter API 与行为未改。额外 contract test 同时断言 omitted 接受和 `null` 拒绝。
+
+## 2026-08-01｜P1-B：speech contracts + chat input + segmentChat
+
+### 范围与实现
+
+- 本批迁移 `speech/contracts.ts` 全部闭集 DTO 与 `SpeechTransport` 边界、`chat-input.ts`，以及 `speech-scheduler.ts` 中独立的文本清洗/`segmentChat` 纯函数；未实现 scheduler 队列、限速、timer、发送 transport、duplicate id、stop/cancellation 或 failure event 触发行为。
+- chat input 直接消费 P0 冻结的 `BackendEventEnvelope<ProtocolChatEvent>`（backend event v2），不重定义底层 chat wire；过滤非 chat kind、非 public chat position 和缺失/空 sender。
+- 点名与 ongoing conversation 大小写不敏感；single-party 只在排除 participant 后唯一在线者就是 sender 时成立。evidence 固定为 explicit name、ongoing conversation、single party 顺序，无证据时为 `not_addressed`；输出保留 source event id、sender、occurredAt、world/dimension/epoch、verified 与原文，“停一下”不进入特殊控制路径。
+- `segment_chat` 机械保持 JS 清洗、标点回退和 Unicode code point 计数语义；没有改成 byte、grapheme cluster 或仅按空白切分。
+- speech DTO 使用严格 serde；`verified`、`dimension`、`conversationActiveWith` 缺省可省略且显式 `null` 拒绝。
+
+### `speech.test.ts` 6/8 映射
+
+| TS oracle test | Rust test / 状态 |
+|---|---|
+| `chat input records sender, addressing evidence, time and world context` | `chat_input_records_sender_addressing_evidence_time_and_world_context` |
+| `addressing is symmetric for players under the same multiplayer input conditions` | `addressing_is_symmetric_for_players_under_the_same_multiplayer_input_conditions` |
+| `the only online player is addressed by single-party conditions without naming the participant` | `sole_online_player_is_addressed_by_single_party_conditions_without_naming_participant` |
+| `a straggler chat from someone other than the sole online player is not single-party addressed` | `straggler_chat_from_someone_other_than_sole_online_player_is_not_single_party_addressed` |
+| `stop wording remains ordinary addressed player text` | `stop_wording_remains_ordinary_addressed_player_text` |
+| `segmentChat respects Unicode length and keeps ordered content` | `segment_chat_respects_unicode_code_point_length_and_keeps_ordered_content` |
+| `scheduler rate limits and preserves segment order` | 未迁；下一批异步 scheduler 队列/确定性 clock-waiter。 |
+| `scheduler stop cancels queued speech before it is sent` | 未迁；下一批 scheduler stop/cancellation。 |
+
+- 额外 Rust tests 2 条：`additional_non_player_public_chat_and_missing_sender_are_filtered` 与 `additional_speech_contracts_are_closed_strict_and_optional_non_null`；不计入 TS 6/8。
+
+### 命令与结果
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test -p mineintent-middle --test speech_input_segment --offline` | 通过；8/8（6 条 TS 映射 + 2 条额外 contract tests）。 |
+| `cargo test --workspace --offline` | 通过；含 speech 8/8，workspace 既有测试全部通过。 |
+| `cargo check --workspace --offline` | 通过。 |
+| `cargo +stable fmt --all --check` | 通过。 |
+| `git diff --check` | 通过。 |
