@@ -35,3 +35,7 @@ mcserver/version_history.json
 
 # 临时实验记录：文件自身要求不要随 PR 提交，靠约定挡不住 `git add -A`
 TEMP_*.md
+
+# 本地私有文件与临时目录：*.local.* 罩单个文件（如 notes.local.md），tmp/ 罩整个目录
+*.local.*
+tmp/
