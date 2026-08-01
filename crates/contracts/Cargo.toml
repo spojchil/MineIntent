@@ -1,0 +1,6 @@
+[package]
+name = "mineintent-contracts"
+version = "0.0.1"
+edition = "2021"
+description = "MineIntent 进程内公共契约骨架"
+publish = false

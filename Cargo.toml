@@ -1,16 +1,7 @@
-[package]
-name = "mineintent-backend"
-version = "0.0.1"
-edition = "2021"
-description = "MineIntent 自有 Minecraft 协议后端（目标 26.1 / 协议号 775）"
-
-[dependencies]
-# crates.io 的 semver 会忽略 +mc26.1；用精确基础版本锁住已发布的 26.1 构建。
-# 直接在自有插件中读取 ReceiveGamePacketEvent，只筛选位置校正；不打开
-# Azalea 的 packet-event 高层转发，避免所有游戏包进入 unbounded Event 通道。
-azalea = { version = "=0.16.0", default-features = false, features = ["log"] }
-chrono = { version = "0.4.45", default-features = false, features = ["std"] }
-parking_lot = "0.12"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["full"] }
+[workspace]
+members = [
+    "crates/backend",
+    "crates/contracts",
+    "crates/middle",
+]
+resolver = "2"
