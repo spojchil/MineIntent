@@ -1,13 +1,13 @@
 # MineIntent
 
 MineIntent 是一个把 AI 接入 Minecraft Java Edition 世界的实验项目。准确的产品定义与候选架构只见
-[《产品》](./产品.md)；本页只负责导航和最短启动。
+[《产品》](./docs/产品.md)；本页只负责导航和最短启动。
 
 ## 按任务阅读
 
 | 你要做什么 | 从这里开始 |
 |---|---|
-| 判断项目为什么存在、应当成为什么 | [产品](./产品.md) |
+| 判断项目为什么存在、应当成为什么 | [产品](./docs/产品.md) |
 | 运行当前原型 | [运行指南](./docs/guides/run.md) |
 | 运行检查或 Paper 集成验证 | [验证指南](./docs/guides/validation.md) |
 | 理解当前代码如何组成 | [当前实现结构](./docs/architecture.md) |

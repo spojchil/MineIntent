@@ -7,7 +7,7 @@ const ignoredDirectories = new Set(['.git', '.mineintent', '.artifacts', 'node_m
 const failures = []
 const requiredProjectDocuments = [
   'README.md',
-  '产品.md',
+  'docs/产品.md',
   'docs/README.md',
   'docs/architecture.md',
   'docs/guides/run.md',
@@ -18,6 +18,8 @@ const requiredProjectDocuments = [
 ]
 const retiredProjectDocuments = [
   'PRODUCT_CONSTITUTION.md',
+  '产品.md',
+  '产品待澄清问题.md',
   'docs/source-index.md',
   'docs/guides/participant-prototype.md',
   'docs/guides/paper-integration.md',
