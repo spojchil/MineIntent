@@ -378,3 +378,31 @@ TS 本批 **2/2 tests**：
 - Information 相关测试共 57 passed：support 2、access-policy 7、contracts/schema 7、cursor 8、geometry 6、ref-store 12、registry 6、scope/trace 4、source-ports 5。`cargo test --package mineintent-middle --offline` 总计 83 passed。
 - `cargo test --workspace --offline`：161 passed，doc tests 通过；`cargo check --workspace --all-targets --offline`、对应 `--locked` 检查与 `cargo +stable fmt --all -- --check`：通过。
 - 本次无范围阻塞项；阶段 4 的 provider/runtime/context-composer 与 `runtime.test.ts:179` 仍按原 gate deferred。
+
+## 2026-08-01｜P1-A 阶段 3 current-status/inventory provider 叶子迁移
+
+### 基线、oracle 与范围
+
+- 开始基线：`d81ff6f`，`port/a-world-info` worktree clean；完整只读对照 `providers/current-status-provider.ts`、`current-status-provider.test.ts`、`inventory-provider.ts`、`inventory-provider.test.ts`、`testing/provider-contract.ts`，以及 Rust 冻结 provider SPI/source ports/registry tests。未联网，supplies/vendor/移植计划零修改，未生成 TS/JS。
+- 新增 `information/providers`，公开 `CurrentStatusProvider` 与 `InventoryProvider`；两者均由 `Arc<dyn SelfVitalsPort/InventoryPort>` 注入，可直接作为 `Arc<dyn InformationProvider>` 注册，保持 Send+Sync/object-safe。未改冻结 contracts、source ports、manifest/lock，也未进入 backend adapter、sound/viewport provider、runtime/tool-session/context-composer 或 B 路径。
+- definition 的 id、中文 description、schema revision、participant audience、每个 field description/value type/`exactly_displayed`/`client_state`、connection+world scope dependencies 与 limits 逐字段对齐 oracle。每个字段持有真实 `InformationValueSchema`：覆盖 number 范围、Zod v4 safe integer、非空字符串、optional 非 null、array/object 成员，并保持普通 `z.object` 对未知键的 strip 语义。
+- availability/read 均先在锁外调用 source port；revision 锁内只比较/clone owned snapshot。revision 初始 0，首次观测为 1，相同快照稳定，语义变化恰增 1；Rust `f64` 相等比较使 `-0` 与 `0` 不产生 JSON.stringify 不会产生的漂移。read 不主动检查 OperationControl，精确保持两个 TS provider 未检查 AbortSignal 的行为。
+- 两者仅返回请求字段，unavailable 为空；source kind/acquisition、adapter/source revision、observedAt/evidenceIds 精确对齐。current-status 保留 oxygen=20、experienceLevel=0 默认；inventory 完整保留 slot/itemName/count/metadata/durabilityUsed 映射。非有限 source 数值转换失败时返回结构化 `InformationProviderError::Failed`，生产路径没有 panic/expect。
+
+### TS 5/5 一对一映射与 Rust-only
+
+1. `current-status-provider.test.ts:21` `current status provider satisfies the provider contract` → `ts_current_status_provider_satisfies_the_provider_contract`。
+2. `current-status-provider.test.ts:30` `defaults missing oxygen to full and reads experience level` → `ts_current_status_defaults_missing_oxygen_to_full_and_reads_experience_level`。
+3. `current-status-provider.test.ts:38` `bumps revision only when vitals change` → `ts_current_status_bumps_revision_only_when_vitals_change`。
+4. `inventory-provider.test.ts:21` `inventory provider satisfies the provider contract` → `ts_inventory_provider_satisfies_the_provider_contract`。
+5. `inventory-provider.test.ts:30` `reports current slots and selected hotbar slot` → `ts_inventory_provider_reports_current_slots_and_selected_hotbar_slot`。
+
+上述两个 contract 映射共同调用机械迁移的 `assert_information_provider_contract`，覆盖 definition 完整性、revision 的 Rust 非负整数类型、只返回请求字段、逐值 runtime schema、unavailable 去重/不得与 value 重叠，以及每个请求字段恰好 value/unavailable 二选一。
+
+另有 **4 条 Rust-only contract tests**，不冒充 TS 映射：两个 provider 各一条精确 definition/严格 schema 正负例；各一条 registry trait-object 注入、并发 revision、available/空 field reasons、`-0` 稳定性。inventory 条目另锁定只请求 slots 时不泄漏 selectedHotbarSlot，以及语义变化只增一次。
+
+### mutation、验证与 deferred
+
+- mutation：临时将 `current_status.rs` 的缺省 oxygen 从 `20.0` 改为 `19.0`，运行 `cargo test -p mineintent-middle --test information_current_status_provider ts_current_status_defaults_missing_oxygen_to_full_and_reads_experience_level --locked --offline`；指定测试按预期失败，差异 `Some(19.0) != Some(20.0)`。维护侧另独立反转 `RevisionTracker` 的快照变化条件，`ts_current_status_bumps_revision_only_when_vitals_change` 按预期以 revision `0 != 1` 失败。两处均已恢复；current-status 5/5、inventory 4/4、registry 6/6 定向测试通过。
+- `cargo test --workspace --all-targets --locked --offline`：174 passed；`cargo check --workspace --all-targets --locked --offline`、`cargo +stable fmt --all -- --check`、`git diff --check`：通过。
+- 冻结 SPI 没有发现必须修改却被本轮范围挡住的实现障碍。明确 deferred：source-port 的 backend adapter；sound/viewport providers；Information runtime/tool-session/context-composer；B 所有的 participant/runtime、app、models、speech、execution、events。ProviderReadRequest 的 selector/page 形状未扩张，runtime 层的 field/budget/access/cancellation 组合校验也未提前实现。
