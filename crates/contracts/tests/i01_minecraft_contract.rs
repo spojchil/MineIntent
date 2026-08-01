@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    future::{pending, ready},
+    sync::Arc,
+    task::{Context, Poll, Wake, Waker},
+};
 
 use mineintent_contracts::minecraft::*;
 use serde_json::json;
@@ -13,12 +17,28 @@ impl CancellationSignal for FixedCancellation {
     fn is_cancelled(&self) -> bool {
         self.0
     }
+
+    fn cancelled(&self) -> BoxFuture<'_, ()> {
+        if self.0 {
+            Box::pin(ready(()))
+        } else {
+            Box::pin(pending())
+        }
+    }
 }
 
 struct FixedDeadline(bool);
 impl Deadline for FixedDeadline {
     fn has_elapsed(&self) -> bool {
         self.0
+    }
+
+    fn elapsed(&self) -> BoxFuture<'_, ()> {
+        if self.0 {
+            Box::pin(ready(()))
+        } else {
+            Box::pin(pending())
+        }
     }
 }
 
@@ -29,10 +49,24 @@ fn control(cancelled: bool, elapsed: bool) -> OperationControl {
     )
 }
 
+struct NoopWake;
+impl Wake for NoopWake {
+    fn wake(self: Arc<Self>) {}
+}
+
+fn poll_once(future: &mut BoxFuture<'_, ()>) -> Poll<()> {
+    let waker = Waker::from(Arc::new(NoopWake));
+    let mut context = Context::from_waker(&waker);
+    future.as_mut().poll(&mut context)
+}
+
 #[test]
 fn config_rejects_unknown_fields_and_non_target_version() {
     let config = fixture_config();
-    config.validate().expect("canonical fixture is valid");
+    config
+        .clone()
+        .validate_and_normalize()
+        .expect("canonical fixture is valid");
 
     let mut unknown = serde_json::to_value(&config).unwrap();
     unknown["unexpected"] = json!(true);
@@ -41,18 +75,78 @@ fn config_rejects_unknown_fields_and_non_target_version() {
     let mut wrong_version = config.clone();
     wrong_version.server.version = "1.21.1".to_owned();
     assert!(matches!(
-        wrong_version.validate(),
+        wrong_version.validate_and_normalize(),
         Err(BackendError::UnsupportedVersion { actual, .. }) if actual == "1.21.1"
     ));
 
     let mut microsoft = config;
     microsoft.identity.auth = AuthKind::Microsoft;
     assert_eq!(
-        microsoft.validate(),
+        microsoft.validate_and_normalize(),
         Err(BackendError::UnsupportedAuth {
             auth: AuthKind::Microsoft
         })
     );
+}
+
+#[test]
+fn config_normalizes_whitespace_and_accepts_oracle_boundaries() {
+    let mut config = fixture_config();
+    config.world_id = "  world-trimmed  ".to_owned();
+    config.server.host = "  localhost  ".to_owned();
+    config.identity.username = format!("  {}  ", "界".repeat(64));
+    config.identity.profiles_folder = Some("   ".to_owned());
+    config.reconnect.initial_delay_ms = 10_000;
+    config.reconnect.max_delay_ms = 1;
+    config.reconnect.stable_reset_ms = 0;
+
+    let normalized = config.validate_and_normalize().unwrap();
+    assert_eq!(normalized.world_id, "world-trimmed");
+    assert_eq!(normalized.server.host, "localhost");
+    assert_eq!(normalized.identity.username, "界".repeat(64));
+    assert_eq!(normalized.identity.profiles_folder.as_deref(), Some("   "));
+    assert_eq!(normalized.reconnect.initial_delay_ms, 10_000);
+    assert_eq!(normalized.reconnect.max_delay_ms, 1);
+    assert_eq!(normalized.reconnect.stable_reset_ms, 0);
+}
+
+#[test]
+fn config_rejects_65_character_username_blank_fields_and_empty_profiles_folder() {
+    let mut too_long = fixture_config();
+    too_long.identity.username = "a".repeat(65);
+    assert!(matches!(
+        too_long.validate_and_normalize(),
+        Err(BackendError::InvalidConfig { field, .. }) if field == "identity.username"
+    ));
+
+    let mut blank = fixture_config();
+    blank.world_id = " \t ".to_owned();
+    assert!(matches!(
+        blank.validate_and_normalize(),
+        Err(BackendError::InvalidConfig { field, .. }) if field == "worldId"
+    ));
+
+    let mut blank_host = fixture_config();
+    blank_host.server.host = " \r\n ".to_owned();
+    assert!(matches!(
+        blank_host.validate_and_normalize(),
+        Err(BackendError::InvalidConfig { field, .. }) if field == "server.host"
+    ));
+
+    let mut blank_username = fixture_config();
+    blank_username.identity.username = " \n ".to_owned();
+    assert!(matches!(
+        blank_username.validate_and_normalize(),
+        Err(BackendError::InvalidConfig { field, .. }) if field == "identity.username"
+    ));
+
+    let mut empty_profiles = fixture_config();
+    empty_profiles.identity.profiles_folder = Some(String::new());
+    assert!(matches!(
+        empty_profiles.validate_and_normalize(),
+        Err(BackendError::InvalidConfig { field, .. })
+            if field == "identity.profilesFolder"
+    ));
 }
 
 #[test]
@@ -93,6 +187,25 @@ fn connect_timeout_faults_without_reconnect() {
         Err(BackendError::BackendFailure { .. })
     ));
     assert!(script.events.is_empty());
+}
+
+#[test]
+fn operation_control_notifications_wake_blocked_futures() {
+    let triggered = control(true, true);
+    let mut cancelled = triggered.cancelled();
+    let mut elapsed = triggered.deadline_elapsed().expect("fixture deadline");
+    assert_eq!(poll_once(&mut cancelled), Poll::Ready(()));
+    assert_eq!(poll_once(&mut elapsed), Poll::Ready(()));
+
+    let dormant = control(false, false);
+    let mut not_cancelled = dormant.cancelled();
+    let mut not_elapsed = dormant.deadline_elapsed().expect("fixture deadline");
+    assert_eq!(poll_once(&mut not_cancelled), Poll::Pending);
+    assert_eq!(poll_once(&mut not_elapsed), Poll::Pending);
+    assert!(dormant.preflight("viewport").is_ok());
+
+    let without_deadline = OperationControl::new(Arc::new(FixedCancellation(false)), None);
+    assert!(without_deadline.deadline_elapsed().is_none());
 }
 
 #[test]
@@ -372,6 +485,8 @@ fn snapshot_v1_is_strict_and_keeps_target_axes() {
 
 #[test]
 fn public_async_traits_are_object_safe() {
+    let _: Option<&dyn CancellationSignal> = None;
+    let _: Option<&dyn Deadline> = None;
     let _: Option<&dyn MinecraftBackendApi> = None;
     let _: Option<&dyn ProtocolObservationSource> = None;
     let _: Option<&dyn MinecraftMotorDriverApi> = None;

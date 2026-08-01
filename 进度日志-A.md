@@ -59,3 +59,30 @@ Mutation：
 - `Q01/Q07`：提示词模板组织属于 B；不阻塞 AgentRunner trait 和 25 条 Python 行为测试迁移。
 
 新《移植任务书.md》覆盖旧附件中“Python Agent Service/25 条 Python 测试本次不迁”的旧说法；本轮只完成 A 所有的 I01/I02，不提前越界实现 AgentRunner。
+
+## 2026-08-01｜I01 独立审查返修
+
+### 配置 oracle 对齐
+
+- 证据：`supplies/mineintent-main/src/minecraft/config.ts`。
+- 以消费式 `validate_and_normalize()` 取代容易误解的纯 `validate()`；成功值明确返回 trim 后的 `worldId/server.host/identity.username`。
+- worldId 按 trim 后 1..128、username 按 trim 后 1..64 校验；长度按 JavaScript/Zod 的 UTF-16 code unit 口径。移除 ASCII/16 字符限制。
+- `profilesFolder` 存在时只要求原字符串非空，不 trim；空串拒绝、纯空格保留。
+- reconnect 三个 delay 使用 `u64` 表达整数非负；移除 `initialDelayMs <= maxDelayMs` 的非 oracle 限制。
+- 继续固定目标 `26.1.2` / protocol `775`；合法 `microsoft` 枚举在 schema 形状校验后返回 `UnsupportedAuth`。
+
+新增/调整测试覆盖：64 字符用户名通过、65 拒绝、三项 trim 返回值、blank world/host/username、空 profiles、空格 profiles 保留、`initialDelayMs > maxDelayMs` 通过、stableReset 取 0、Microsoft/旧版本拒绝及 strict unknown-field。
+
+### 可等待取消与期限
+
+- `CancellationSignal::cancelled()` 与 `Deadline::elapsed()` 返回现有 `BoxFuture`；文档冻结“已触发首 poll Ready、未触发保持 Pending 并在状态转换时 wake”的契约。
+- `OperationControl` 增加 `cancelled()` / `deadline_elapsed()` 转发入口并保留 `preflight()`。
+- 测试只用 `std::future::{ready,pending}`、安全手写 `Waker` 和单次 `poll`；未引入 executor、timer、线程或通道。
+- `CancellationSignal`、`Deadline`、Backend/Observation/Motor/InformationFacade trait object 编译通过；I02 无源码变更。
+
+### 验证
+
+- `cargo +stable fmt --all --check`：通过。
+- `cargo test --workspace --offline`：通过；backend 13、I01 26、I02 17，共 56 条测试通过，doc tests 通过。
+- `cargo check --workspace --offline`：通过。
+- 仅修改 I01 的 `config.rs`、`api.rs`、专属测试与本日志；manifest、`lib.rs`、I02、B 模块、backend、`Cargo.lock` 均无变更。

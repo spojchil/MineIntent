@@ -60,12 +60,20 @@ pub struct ReconnectPolicy {
 }
 
 impl MinecraftBackendConfig {
-    /// 校验移植期固定部署轴；Microsoft 枚举可反序列化，但明确返回 unsupported_auth。
-    pub fn validate(&self) -> Result<(), BackendError> {
-        if self.world_id.is_empty() || self.world_id.len() > 128 {
+    /// 按 TS parser 校验并返回归一化后的配置。
+    ///
+    /// 本方法消费原值，避免调用方在校验成功后继续误用尚未 trim 的 DTO。
+    /// `profilesFolder` 与 oracle 一样只检查原字符串非空，不做 trim。Microsoft
+    /// 枚举可反序列化，但在这里明确返回 `UnsupportedAuth`。
+    pub fn validate_and_normalize(mut self) -> Result<Self, BackendError> {
+        self.world_id = self.world_id.trim().to_owned();
+        self.server.host = self.server.host.trim().to_owned();
+        self.identity.username = self.identity.username.trim().to_owned();
+
+        if self.world_id.is_empty() || javascript_string_len(&self.world_id) > 128 {
             return Err(BackendError::InvalidConfig {
                 field: "worldId".to_owned(),
-                message: "must contain from 1 to 128 bytes".to_owned(),
+                message: "must contain from 1 to 128 UTF-16 code units after trim".to_owned(),
             });
         }
         if self.server.host.is_empty() {
@@ -86,21 +94,22 @@ impl MinecraftBackendConfig {
                 actual: self.server.version.clone(),
             });
         }
-        if self.identity.auth != AuthKind::Offline {
-            return Err(BackendError::UnsupportedAuth {
-                auth: self.identity.auth,
-            });
-        }
-        let username = self.identity.username.as_bytes();
-        if username.is_empty()
-            || username.len() > 16
-            || !username
-                .iter()
-                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        if self.identity.username.is_empty() || javascript_string_len(&self.identity.username) > 64
         {
             return Err(BackendError::InvalidConfig {
                 field: "identity.username".to_owned(),
-                message: "offline username must match [A-Za-z0-9_]{1,16}".to_owned(),
+                message: "must contain from 1 to 64 UTF-16 code units after trim".to_owned(),
+            });
+        }
+        if self
+            .identity
+            .profiles_folder
+            .as_ref()
+            .is_some_and(String::is_empty)
+        {
+            return Err(BackendError::InvalidConfig {
+                field: "identity.profilesFolder".to_owned(),
+                message: "must not be empty when present".to_owned(),
             });
         }
         for (field, value) in [
@@ -130,12 +139,18 @@ impl MinecraftBackendConfig {
                 message: "must be finite and between 0 and 1".to_owned(),
             });
         }
-        if self.reconnect.initial_delay_ms > self.reconnect.max_delay_ms {
-            return Err(BackendError::InvalidConfig {
-                field: "reconnect.initialDelayMs".to_owned(),
-                message: "must not exceed reconnect.maxDelayMs".to_owned(),
+        if self.identity.auth != AuthKind::Offline {
+            return Err(BackendError::UnsupportedAuth {
+                auth: self.identity.auth,
             });
         }
-        Ok(())
+        // The three delay fields are u64, which exactly encodes the oracle's integer/nonnegative
+        // constraint. In particular, initialDelayMs is not ordered against maxDelayMs.
+        Ok(self)
     }
+}
+
+/// JavaScript/Zod string length is measured in UTF-16 code units rather than UTF-8 bytes.
+fn javascript_string_len(value: &str) -> usize {
+    value.encode_utf16().count()
 }

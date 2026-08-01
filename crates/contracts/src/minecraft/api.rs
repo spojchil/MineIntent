@@ -22,11 +22,19 @@ pub struct BackendReady {
 /// 逐调用取消抽象；具体 token、线程或 executor 不属于 contracts。
 pub trait CancellationSignal: Send + Sync {
     fn is_cancelled(&self) -> bool;
+
+    /// Resolves when cancellation is requested. If already cancelled, the first poll is Ready;
+    /// otherwise the implementation must retain/wake the task's waker on transition.
+    fn cancelled(&self) -> BoxFuture<'_, ()>;
 }
 
 /// 逐调用期限抽象；由宿主选择单调时钟和计时实现。
 pub trait Deadline: Send + Sync {
     fn has_elapsed(&self) -> bool;
+
+    /// Resolves when the deadline elapses, with the same immediate-Ready guarantee for an already
+    /// elapsed deadline. Timer ownership remains outside contracts.
+    fn elapsed(&self) -> BoxFuture<'_, ()>;
 }
 
 #[derive(Clone)]
@@ -52,6 +60,16 @@ impl OperationControl {
 
     pub fn deadline(&self) -> Option<&dyn Deadline> {
         self.deadline.as_deref()
+    }
+
+    /// Awaitable notification suitable for waking a blocked start/motor/viewport future.
+    pub fn cancelled(&self) -> BoxFuture<'_, ()> {
+        self.cancellation.cancelled()
+    }
+
+    /// Awaitable deadline notification when the call has a deadline.
+    pub fn deadline_elapsed(&self) -> Option<BoxFuture<'_, ()>> {
+        self.deadline.as_ref().map(|deadline| deadline.elapsed())
     }
 
     /// 供 adapter/backend 在进入一次操作前使用的统一边界检查。
