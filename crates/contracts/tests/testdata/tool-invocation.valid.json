@@ -1,0 +1,9 @@
+{
+  "runId": "run-1",
+  "toolCallId": "call-1",
+  "name": "look_relative",
+  "arguments": {
+    "yaw_degrees": 10,
+    "pitch_degrees": 0
+  }
+}

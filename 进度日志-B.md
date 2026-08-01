@@ -33,3 +33,26 @@
 
 - 如要求默认工具链上的 `cargo fmt --all --check` 在完全离线环境直接通过，需要预装 `nightly-x86_64-pc-windows-msvc` 的 `rustfmt` 组件。本次未联网安装；stable 编译又被依赖所需的 nightly feature 明确拒绝，因此未为绕过环境缺件而改变既有 nightly 编译工具链。
 - P0-B1 没有冻结或预设公共契约；I01/I02/I03 仍由后续独立任务完成。
+
+## 2026-08-01｜P0-I03：Agent/capability contracts
+
+### 命名空间预约
+
+- 提交 `a76561a848534d012c9cfa3df0754b7fec83327f`（`契约：预留 P0 公共模块命名空间`）预声明 `agent`、`capability`、`information`、`minecraft`；`information`/`minecraft` 仅有边界文档，后续业务仍由 A 独占。
+- `mineintent-contracts` 只加入锁文件已有的 `serde`/`serde_json`；未加入 runtime、HTTP 或模型 SDK。
+- 预约提交前 `cargo +stable fmt --all --check` 与 `cargo test --workspace --offline` 均通过。
+
+### I03 Agent 契约批次
+
+- 冻结 `mineintent.agent-context.v3` 的严格外层结构、run/tool-call 键、tool definition/invocation/result、`mineintent.tool-response.v2`、`mineintent.agent-run.v1`、模型用量与结构化错误。
+- 增加进程内 `AgentRunner`、`ModelProvider`、取消信号和 deadline trait/值对象；没有实现循环、provider、状态机或传输层。
+- prompt 仅表达外部模板的 `key`/`version` 引用，没有把模板正文写入 contracts。
+- `information`/`minecraft` 所属的 memory/status/inventory/sound/omission 内层值保持泛型/不透明；I03 只冻结其所在 envelope，不复制 A 的 DTO。
+- TS oracle 允许 invocation 的工具名保持开放字符串，Python provider 只允许发布 `[A-Za-z0-9_-]{1,64}` 名称；因此分别建模 invocation name 与 advertised definition name，两条边界均未放宽。
+- 增加 5 个确定性 JSON testdata 和 11 条 Agent 契约测试，覆盖协议/枚举版本、未知字段、必需 nullable、显式 null、ID 形状、参数原样透传、非有限浮点、外部 prompt 引用、无 callback/token 字段、取消/deadline 顺序及 fixture 稳定性。
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test -p mineintent-contracts --offline` | 通过；Agent 契约测试 11/11，crate/doctest 通过。 |
+| `cargo check -p mineintent-contracts --offline` | 通过。 |
+| `cargo +stable fmt --all` | 通过；随后提交前使用 `--check` 复核。 |
