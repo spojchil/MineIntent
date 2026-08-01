@@ -107,7 +107,8 @@ pub enum SpeechEvent {
     },
 }
 
-/// Output port used by the later scheduler batch.
+/// Synchronous output port used by [`super::SpeechScheduler`]. Transport failures become
+/// `SpeechEvent::Failed` events and do not stop later queued requests.
 pub trait SpeechTransport: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 

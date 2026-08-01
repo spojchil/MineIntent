@@ -1,5 +1,5 @@
 //! The first six tests map one-to-one to `speech.test.ts`; the final two are explicitly additional
-//! contract/characterization tests. The two asynchronous scheduler tests remain unported.
+//! contract/characterization tests. The two asynchronous tests are mapped in `speech_scheduler.rs`.
 
 use std::convert::Infallible;
 

@@ -69,7 +69,7 @@ fn is_segment_boundary(character: char) -> bool {
         )
 }
 
-fn is_javascript_whitespace(character: char) -> bool {
+pub(crate) fn is_javascript_whitespace(character: char) -> bool {
     matches!(
         character,
         '\u{0009}'..='\u{000D}'

@@ -254,3 +254,36 @@
 | `cargo check --workspace --offline` | 通过。 |
 | `cargo +stable fmt --all --check` | 通过。 |
 | `git diff --check` | 通过。 |
+
+## 2026-08-01｜P1-B：SpeechScheduler
+
+### 范围与实现
+
+- 本批完整迁移 `speech-scheduler.ts` 的 scheduler 生产语义，复用既有 `SpeechRequest`、`SpeechEvent`、`SpeechTransport` 与 `segment_chat`；没有修改 chat-input，也没有进入 participant、runtime、capability 或其他模块。
+- scheduler 使用一个 Tokio worker 和 `VecDeque` FIFO。`schedule` 同步校验/入队并同步发出 `scheduled`，实际首段及后续段均由异步 worker 投递；成功发送后记录 Tokio `Instant`，下一段/请求遵守 minimum interval。
+- queued request id 重复返回结构化 `DuplicateRequest`；request 完成或失败出队后可重用同一 id。transport 失败发出 `failed`、丢弃当前 request 并继续下一项，不终止 worker。
+- `stop` 通过清空队列和 `Notify` 唤醒 worker 取消当前 timer，按 FIFO 为全部排队 request 发出 `cancelled`。schedule 后同一同步调用序列立即 stop 时，首段尚未投递，事件精确为 `scheduled`/`cancelled`。
+- transport 调用、event callback 与所有 await 均在锁外；Mutex poison 显式恢复。构造期 max segment length/runtime 缺失及 schedule 的空请求/重复 id 均返回结构化错误，生产路径不以 panic 表达校验失败。
+- `mineintent-middle` 既有 Tokio 依赖只增加 `test-util` feature，用于 paused time/advance；未新增 package，lock 未变化。
+
+### `speech.test.ts` 最后 2/2 映射
+
+| TS oracle test | Rust test |
+|---|---|
+| `scheduler rate limits and preserves segment order`（line 76） | `scheduler_rate_limits_and_preserves_segment_order` |
+| `scheduler stop cancels queued speech before it is sent`（line 91） | `scheduler_stop_cancels_queued_speech_before_it_is_sent` |
+
+- 本批额外 Rust tests 5 条：transport 失败续跑、queued duplicate/reuse、stop 全队列 FIFO cancellation、构造校验、请求校验；不冒充 TS 映射。speech.test.ts 至此累计 8/8。
+- 全部异步测试使用 Tokio `start_paused`、`advance` 与 task yield；没有 wall-clock sleep 或竞速等待，#125 只替换等待机制，保留 oracle 行为断言。
+
+### 命令与结果
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test -p mineintent-middle --test speech_scheduler --offline` | 通过；7/7（2 条 TS 映射 + 5 条额外 tests）。 |
+| `cargo test --workspace --offline` | 通过；含 scheduler 7/7，workspace 既有测试全部通过。 |
+| `cargo check --workspace --all-targets --offline` | 通过。 |
+| `cargo +stable fmt --all -- --check` | 通过。 |
+| `git diff --check` | 通过。 |
+
+- 首次将全部门禁串在一个 PowerShell 调用时触及 120 秒工具时限，未产生失败诊断；拆分为以上独立命令后均明确通过。
