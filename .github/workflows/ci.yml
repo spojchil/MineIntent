@@ -36,7 +36,7 @@ jobs:
       # The agent's tool loop lives in `agent-service/`, so a green Node-only run said nothing
       # about it. No install step: the service imports the standard library only, on purpose.
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: '3.13'
 
