@@ -5,6 +5,7 @@
 
 pub mod contracts;
 pub mod geometry;
+pub mod ref_store;
 pub mod registry;
 pub mod scope;
 pub mod source_ports;

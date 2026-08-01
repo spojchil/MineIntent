@@ -232,3 +232,45 @@ Rust 另有 7 条 contract/characterization，不冒充 TS 对应项：
 - 新增 `review_fix_sealed_register_does_not_read_provider_definition`：计数 provider 在 sealed register 上直接得到 `Sealed`，definition 调用数保持 0。
 - 定向 `information_registry`：6 passed。
 - `cargo +stable fmt --all --check`：通过；`cargo test --workspace --offline`：117 passed、doc tests 通过；`cargo check --workspace --offline`：通过。
+
+## 2026-08-01｜P1-A Information ref-store 原子迁移
+
+### 基线、oracle 与范围
+
+- 开始基线：`83e8746`，worktree `port/a-world-info` clean；完整只读 oracle 为 `supplies/mineintent-main/src/information/ref-store.ts:1-231`，未联网、未生成 TS/JS。
+- 只修改 `information/ref_store.rs`、`information/mod.rs`、`tests/information_ref_store.rs` 与本日志；未修改 contracts/scope、manifest/lock/lib、B 模块、backend、supplies/vendor/移植计划或其他禁区。
+- 明确没有实现 cursor-store、access-policy、provider 或 runtime。
+
+### 完整生产语义
+
+- 默认限制精确为：global 2048、每 principal 512、每 source interface 256、payload 8192 UTF-8 bytes、每 issuer 32 次、TTL 60000ms；所有配置必须为正值。
+- `InformationRefIssuer` 每个实例独立原子计数，且像 TS 一样在实际 issue 校验前消耗次数；fallible `issue -> Result` 使用现有 `InformationReferenceIssueRequest/SelectorRef/Grant/ScopeSnapshot`，不以 panic 表达 TS throw。
+- issue 在容量判断前清理 TTL 到期项；容量分别按全局、principal、source interface 计数。payload 经紧凑 JSON 序列化、UTF-8 byte 长度检查和反序列化深拷贝；默认 validUntil 生成 UTC millisecond ISO 字符串，显式 lifetime 不得超过 TTL。
+- selector id 为 `iref_<uuid-v4>`；完整 ref 内容不可篡改，绑定 issuer/source interface、principal、grant id/audience、allowed target、connection epoch、world、dimension，以及可选 screen instance/revision；accepted kind 参与 resolve。
+- resolve 对到期 ref 执行删除，返回 payload 深拷贝；`size()` 与 TS 一样只读当前条目数，不主动 TTL cleanup。
+- grant-ended、connection-changed、world-changed、screen-changed 四类 invalidation 均按 oracle 精确 retain/remove；非 screen-bound ref 不受 screen invalidation。另按任务明确要求提供结构化 `clear()` 与 `size()`。
+- store 使用 `Arc + Mutex`，clock 可注入；生产路径无 `unwrap()/expect()/panic!`，lock poisoning 返回结构化错误。
+
+### `stores.test.ts` 前三条一对一映射
+
+TS 本批 **3/3 tests**：
+
+1. `stores.test.ts:27-81` → `opaque_references_bind_principal_grant_scope_target_and_full_ref_content`，逐项覆盖成功 resolve、ref revision 防篡改、target/principal/dimension 拒绝及 screen invalidation。
+2. `stores.test.ts:83-102` → `screen_bound_references_require_a_concrete_screen_revision`。
+3. `stores.test.ts:104-156` → `reference_limits_isolate_principals_and_interfaces_and_bound_per_read_payloads`，覆盖 per-issuer、per-principal 与 payload byte cap。
+
+另有 5 条 Rust contract 测试，不冒充 TS 对应项：
+
+- 默认常量、TTL 边界/cleanup、accepted kind、payload 深拷贝及 size 不主动清理。
+- global/per-interface 独立容量。
+- grant/audience/epoch/world/screen/kind 与完整 ref 字段绑定；process/ui/capturedAt 明确不额外绑定。
+- 四类 invalidation 的 retain/remove、clear/size。
+- metadata/lifetime/options 结构化错误与 Unicode JSON UTF-8 byte cap。
+
+### 验证与剩余边界
+
+- `cargo test --package mineintent-middle --offline --test information_ref_store`：8 passed。
+- `cargo test --workspace --offline`：133 passed（本批新增 8），doc tests 通过。
+- `cargo check --workspace --all-targets --offline`：通过。
+- `cargo +stable fmt --all -- --check`：通过。
+- 剩余未迁：`stores.test.ts:158+` 对应 cursor-store，以及 access-policy、provider/runtime；均未进入本提交。
