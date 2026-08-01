@@ -1,3 +1,8 @@
 //! MineIntent 进程内公共契约的 crate 边界。
 //!
 //! P0-B1 仅建立可编译骨架；I01、I02、I03 将在后续任务中冻结具体契约。
+
+pub mod agent;
+pub mod capability;
+pub mod information;
+pub mod minecraft;
