@@ -180,3 +180,46 @@ TS oracle 共 7 个 test，本批严格迁移前 6 个：
 - `cargo test --workspace --offline`：98 passed（本批新增 11），doc tests 通过。
 - `cargo check --workspace --offline`：通过。
 - 明确未迁：`perception.ts:91+` 的常量、扫描、raycast、投影与 `viewRelativePosition`；stores/providers/catalog/runtime/backend gap 均未进入本批。backend viewport 仍是唯一生产 kernel。
+
+## 2026-08-01｜P1-A registry/scope/trace 第三批
+
+### 基线、oracle 与范围
+
+- 开始基线：`c8e29c8`，worktree `port/a-world-info` clean；只读 oracle 为 `supplies/mineintent-main@6fb3ed0`，未联网。
+- 只修改 `information/{registry,scope,trace,mod}.rs`、`tests/information_{registry,scope_trace}.rs` 与本日志；未修改 contracts/source_ports/geometry、manifest/lock/lib、B 模块、backend 或其他禁区。
+
+### 迁移内容
+
+- `registry.ts:43-133`：冻结 definition 副本并校验 description/schema revision、audience/dependency 重复、字段元数据/source kind、正数 limits、pagination 与 selector kind。
+- `registry.ts:135-200`：重复 provider id、seal/register/read 时序使用结构化错误；公开 provider/descriptor/revision/version 读取均要求 sealed，`seal` 使用内部 descriptor snapshot，符合本批“seal 前拒绝读取”的明确要求。
+- provider 以 `Arc` 持有，registry state 以 `RwLock` 保护；调用 `definition()` 在加锁前完成，返回 provider 后 availability/read 不持 registry lock，锁内不调用 provider/user code。
+- descriptor 按 wire id、field id 的 JavaScript UTF-16 字符串顺序确定性排列；catalog canonical copy 另将 audiences/fieldIds 排序，不改变公开 descriptor 中原 audience 顺序。
+- SHA-256 输入严格为紧凑 JSON：根字段 `targetMinecraftVersion/providers`，descriptor 字段 `id/description/schemaRevision/audiences/fieldIds`；digest 取小写十六进制前 16 位。固定 fixture 得到 `catalog:1.21.1:5c2f95176291633f`，并以本地 Node 内置 `crypto` 离线交叉核对。
+- `scope.ts:6-54`：对象安全 scope source、owned capture/update；process session 永远参与比较，其余仅按 connection/world/dimension/ui/screen dependency 比较原字段组合。
+- `trace.ts:3-32`：对象安全 sink、默认 1024/可配置正容量、新est-retained FIFO read trace、owned records 快照与 noop sink；锁 poisoning 恢复不 panic。
+
+### 测试映射
+
+TS `registry.test.ts` 共 **1 个 test，本批 1/1 完整对应**到 `registry_is_deterministic_sealed_and_rejects_duplicate_providers`：
+
+1. `registry.test.ts:50-58`：相反注册顺序分别 seal。
+2. `registry.test.ts:60`：catalog revision 相等。
+3. `registry.test.ts:61`：descriptor id 稳定排序为 `current_status, ui_context`。
+4. `registry.test.ts:62`：seal 后 register 返回 sealed error。
+5. `registry.test.ts:64-66`：重复 provider id 拒绝。
+6. `registry.test.ts:67`：seal 前 provider read 拒绝。
+
+Rust 另有 7 条 contract/characterization，不冒充 TS 对应项：
+
+- registry：固定 canonical hash 与 field 排序、完整 definition 结构化校验、seal/read 生命周期错误，共 3 条。
+- scope：owned mutable source、五类 dependency 精确比较，共 2 条 characterization。
+- trace：固定容量/顺序/快照、对象安全 noop sink，共 2 条 characterization/contract。
+- oracle 目录无独立 `scope*.test.ts` 或 `trace*.test.ts`，因此上述 scope/trace 测试不计 TS 映射。
+
+### 验证与未迁边界
+
+- 定向：`information_registry` 4 passed；`information_scope_trace` 4 passed。
+- `cargo +stable fmt --all --check`：通过。
+- `cargo test --workspace --offline`：115 passed（本批新增 8），doc tests 通过。
+- `cargo check --workspace --offline`：通过。
+- 未迁：access-policy、reference/cursor store、provider 实现、catalog service/runtime/facade 组装及 backend gaps；本批没有扩展到任何 provider/user 行为。
