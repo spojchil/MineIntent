@@ -132,3 +132,51 @@ Rust 另有 6 个边界测试，不冒充 TS 对应项：
 - `perception.ts:91+` viewport 投影 kernel 明确禁止进入本批；backend viewport 仍是唯一 kernel。
 - stores、provider 实现、catalog/registry、reference/cursor store、runtime/facade 组装及 backend 11 项行为缺口均未实现。
 - memory 继续受 `DELTA-01/Q12` gate 约束，未进入 Information contracts/schema。
+
+## 2026-08-01｜P1-A geometry/source-port 第二批
+
+### 基线与写入范围
+
+- 开始基线：`5d9c02c`，worktree `port/a-world-info` clean；沿用上一批已完成的 `supplies/mineintent-main@6fb3ed0` 只读 oracle 调研，未联网。
+- 只修改 `information/geometry.rs`、`information/source_ports/**`、`information/mod.rs`、两份 `information_*` 专属测试及本日志。
+- 未修改 contracts、manifest/lock、`src/lib.rs`、events/execution/speech、backend、I01-I03、supplies/vendor/移植计划或其他禁区。
+
+### 机械迁移边界
+
+- `information/geometry.ts:1-38`：`Point3`、复用 P0 同值 `RelativeDirection`、三维 distance、Mineflayer yaw/pitch 符号约定及四象限 relative bearing；保留 `[−π/4, π/4)` 等原区间和同点默认 `ahead`。
+- `source-ports/self-vitals.ts:1-12`：vitals/experience/effect DTO 与同步对象安全 `SelfVitalsPort`。
+- `source-ports/inventory.ts:1-16`：slot/state DTO 与同步对象安全 `InventoryPort`。
+- `source-ports/sound.ts:1-16`：sound DTO 与同步对象安全 `SoundHistoryPort`。
+- `source-ports/perception.ts:4-89`：pose/block/entity、looked-at/visible DTO、frustum/options/metrics、显式 `PerceptionBlockAt::{Block, Unloaded}` 与同步对象安全 `PerceptionPort`。
+- 所有 object DTO 使用 `deny_unknown_fields`；optional 缺省与显式 `null` 分离；所有 TS `number` 保持 `f64`，serde 输入/输出拒绝非有限值，不擅自增加整数、正数或范围产品约束。
+
+### `geometry.test.ts` 映射
+
+TS oracle 共 7 个 test，本批严格迁移前 6 个：
+
+1. `geometry.test.ts:6-9` → `distance_between_computes_3d_euclidean_distance`。
+2. `geometry.test.ts:15-27` → `look_direction_matches_mineflayers_own_yaw_pitch_to_direction_formula`。
+3. `geometry.test.ts:29-37` → `relative_bearing_classifies_target_position_relative_to_self_facing`。
+4. `geometry.test.ts:39-50` → `relative_bearing_agrees_with_the_rightward_axis_of_look_direction_at_every_yaw`。
+5. `geometry.test.ts:52-56` → `relative_bearing_rotates_with_self_yaw`。
+6. `geometry.test.ts:58-61` → `relative_bearing_defaults_to_ahead_when_target_is_exactly_at_self_position`。
+
+`geometry.test.ts:65-74` 的 `bearing labels agree with the right axis of view-relative coordinates` 依赖生产函数 `perception.ts:501 viewRelativePosition`。本批禁止迁移 perception 91 行后的投影 kernel，因此该第 7 项明确留作后续 **VIEW-01** 回归；没有在测试中复制公式冒充覆盖。
+
+### Rust-only source-port 契约测试
+
+以下 5 条不计入 TS 映射：
+
+- `rust_contract_source_port_traits_are_object_safe`。
+- `rust_contract_source_port_dtos_are_strict_and_preserve_unicode`。
+- `rust_contract_optional_fields_reject_explicit_null`。
+- `rust_contract_numeric_dtos_reject_non_finite_serialization`。
+- `rust_contract_perception_unloaded_is_an_explicit_closed_enum`。
+
+### 验证与未迁边界
+
+- 定向：`information_geometry` 6 passed；`information_source_ports` 5 passed。
+- `cargo +stable fmt --all --check`：通过。
+- `cargo test --workspace --offline`：98 passed（本批新增 11），doc tests 通过。
+- `cargo check --workspace --offline`：通过。
+- 明确未迁：`perception.ts:91+` 的常量、扫描、raycast、投影与 `viewRelativePosition`；stores/providers/catalog/runtime/backend gap 均未进入本批。backend viewport 仍是唯一生产 kernel。
