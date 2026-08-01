@@ -325,3 +325,32 @@ TS 本批 **2/2 tests**：
 - 未改公开 API、共享 helper 或其他 cursor/ref-store 行为；范围仅为 `cursor_store.rs`、`information_cursor_store.rs` 与本日志。
 - 定向 `information_cursor_store`：8 passed（原 7 + review 回归 1）；定向 `information_ref_store`：9 passed。
 - `cargo test --workspace --offline`：149 passed，doc tests 通过；`cargo check --workspace --all-targets --offline` 与 `cargo +stable fmt --all -- --check` 均通过。
+
+## 2026-08-01｜P1-A Information access-policy 原子迁移
+
+### 基线、oracle 与范围
+
+- 开始基线：`2ed2999`，worktree clean；完整只读 oracle 为 `supplies/mineintent-main/src/information/access-policy.ts`，未联网、未生成 TS/JS。
+- 只修改 `information/access_policy.rs`、`information/mod.rs`、`information/ref_store.rs` 的 crate-private UTC parser 可见性、独立 `tests/information_access_policy.rs` 与本日志；未进入 provider/runtime/context-composer、B/main 或其他禁区。
+
+### 完整生产语义
+
+- 定义 object-safe `InformationAccessPolicy`，端口与 TS 一致只含 `resolve/authorize`；`InMemoryInformationAccessPolicy` 提供 fallible `put/revoke`，以 `Arc<RwLock<HashMap<...>>>` 保证线程安全，锁 poisoning 使用带闭合 operation 的结构化错误，生产路径无 panic。
+- `put` 深 clone grant 及其 interfaces/field vectors，按相同 id 替换；`resolve` 同时匹配 grant id/principal 并返回 owned deep clone，调用方后续修改不能污染 store；missing revoke 为 no-op。
+- 闭合 authorization operation 为 catalog/help/read，三者采用完全相同规则；闭合 result 为 allowed 或 denied，denial reason 仅 `audience_denied`，对齐 oracle。
+- authorize 完整覆盖：expiry、provider audience、allowedInterfaces `*`/列表、可选 connection epoch/world/screen 绑定，以及按 provider interface 查询的 field allowlist。allowlist 未配置或只配置其他 interface 时不限制当前 provider；配置后任何请求字段不在列表即拒绝。
+- expiry 复用 ref-store 已验证的 crate-private UTC parser，没有复制日期实现；grant `validUntil` 或 scope `capturedAt` 任一无法解析时都不因 expiry 分支误拒绝，对齐 JavaScript `NaN` 比较结果。ref/cursor 公开 API 与行为不变。
+
+### 测试归类与 deferred
+
+- `access-policy.ts` **没有独立 TS test，因此直接 TS 一对一映射为 0 条**。
+- 新增 **6 条 source-characterization**：put/resolve/replace/revoke；expiry 与无效 timestamp；audience/interface；三类 scope binding；per-interface field allowlist；catalog/help/read 同规则。
+- 另有 **1 条 Rust contract**：trait object/Send+Sync 注入及 put/resolve 两侧 deep-clone isolation。以上 7 条均不冒充 TS test 映射。
+- `runtime.test.ts:179` 的 `effective catalog revisions change with grant-visible fields and purpose is bound` 属于阶段 4 runtime 组合断言，明确 deferred；本批未复制或替代该覆盖。
+
+### 验证与剩余边界
+
+- 定向 `information_access_policy`：7 passed；ref/cursor 回归：9 + 8 = 17 passed。
+- `cargo test --workspace --offline`：156 passed，doc tests 通过。
+- `cargo check --workspace --all-targets --offline` 与 `cargo +stable fmt --all -- --check`：通过。
+- 剩余未迁：provider、runtime、context-composer，以及上述 runtime:179 阶段 4 组合回归。

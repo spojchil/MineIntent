@@ -454,7 +454,7 @@ pub(crate) fn is_expired(valid_until: Option<&str>, now: i64) -> bool {
         .is_some_and(|valid_until| valid_until <= now)
 }
 
-fn parse_rfc3339_millis(timestamp: &str) -> Option<i64> {
+pub(crate) fn parse_rfc3339_millis(timestamp: &str) -> Option<i64> {
     let (date, time_and_zone) = timestamp.split_once('T')?;
     let date_parts: Vec<_> = date.split('-').collect();
     if date_parts.len() != 3

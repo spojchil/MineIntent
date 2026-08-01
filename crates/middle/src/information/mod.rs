@@ -3,6 +3,7 @@
 //! 本模块只承载 Information 的协议、纯数学和 source-port 边界。provider/store/runtime
 //! 与 viewport 投影 kernel 不属于这一层。
 
+pub mod access_policy;
 pub mod contracts;
 pub mod cursor_store;
 pub mod geometry;
