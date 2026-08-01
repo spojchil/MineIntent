@@ -1,5 +1,5 @@
 use std::sync::{
-    atomic::{AtomicI64, Ordering},
+    atomic::{AtomicI64, AtomicUsize, Ordering},
     Arc,
 };
 
@@ -43,6 +43,36 @@ impl FixedClock {
 impl InformationRefClock for FixedClock {
     fn now_millis(&self) -> i64 {
         self.now.load(Ordering::SeqCst)
+    }
+}
+
+struct CountingClock {
+    calls: AtomicUsize,
+    first: i64,
+    later: i64,
+}
+
+impl CountingClock {
+    fn new(first: i64, later: i64) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            first,
+            later,
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl InformationRefClock for CountingClock {
+    fn now_millis(&self) -> i64 {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.first
+        } else {
+            self.later
+        }
     }
 }
 
@@ -120,6 +150,31 @@ fn options(clock: Arc<dyn InformationRefClock>) -> InformationCursorStoreOptions
         clock,
         ..InformationCursorStoreOptions::default()
     }
+}
+
+#[test]
+fn review_fix_first_issue_samples_clock_once_and_uses_that_value_for_ttl() {
+    let clock = Arc::new(CountingClock::new(
+        FIXED_NOW_MS,
+        FIXED_NOW_MS + DEFAULT_CURSOR_TTL_MS as i64,
+    ));
+    let store = InformationCursorStore::new(options(clock.clone())).expect("valid cursor options");
+    let cursor = store
+        .issue(issue_input(json!({"offset": 20})))
+        .expect("first cursor should issue");
+    assert_eq!(
+        clock.calls(),
+        1,
+        "empty-store issue must sample the injected clock exactly once"
+    );
+
+    assert_eq!(store.resolve(resolve_input(cursor)), Ok(None));
+    assert_eq!(
+        clock.calls(),
+        2,
+        "resolve samples the exact TTL boundary once"
+    );
+    assert_eq!(store.size(), Ok(0));
 }
 
 #[test]

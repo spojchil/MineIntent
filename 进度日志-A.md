@@ -317,3 +317,11 @@ TS 本批 **2/2 tests**：
 - `cargo check --workspace --all-targets --offline`：通过。
 - `cargo +stable fmt --all -- --check`：通过。
 - 剩余未迁：access-policy，以及 provider/runtime；本批均未实现。
+
+## 2026-08-01｜cursor clock 独立审查返修
+
+- 修正 `InformationCursorStore::issue`：锁前只采样一次注入 clock，并以同一个 `now` 同时执行 TTL 过期清理和计算 `validUntil`；entries mutex 内不再调用用户 clock。对空 store 首次签发精确对齐 TS：`evictExpired` 无条目时不取时，随后 TTL 只取时一次。
+- 新增 `review_fix_first_issue_samples_clock_once_and_uses_that_value_for_ttl`：side-effect counting clock 证明首次 issue 后调用数为 1；第二次采样只发生在 resolve 的精确 TTL 边界，cursor 判定过期，从而锁定 TTL 来源是首次采样值。
+- 未改公开 API、共享 helper 或其他 cursor/ref-store 行为；范围仅为 `cursor_store.rs`、`information_cursor_store.rs` 与本日志。
+- 定向 `information_cursor_store`：8 passed（原 7 + review 回归 1）；定向 `information_ref_store`：9 passed。
+- `cargo test --workspace --offline`：149 passed，doc tests 通过；`cargo check --workspace --all-targets --offline` 与 `cargo +stable fmt --all -- --check` 均通过。

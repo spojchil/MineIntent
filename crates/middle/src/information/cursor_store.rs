@@ -170,11 +170,7 @@ impl InformationCursorStore {
                 maximum,
             },
         )?;
-        let valid_until_millis = self
-            .inner
-            .options
-            .clock
-            .now_millis()
+        let valid_until_millis = now
             .checked_add(
                 i64::try_from(self.inner.options.ttl_ms)
                     .map_err(|_| InformationCursorStoreError::TimestampOutOfRange)?,
