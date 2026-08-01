@@ -200,13 +200,49 @@ impl SharedRuntime {
         if matches!(kind, BackendEventKind::Lifecycle) {
             self.lifecycle_revision.fetch_add(1, Ordering::AcqRel);
         }
-        let event = self.writer.lock().emit(kind, source, payload);
+        let mut writer = self.writer.lock();
+        let event = writer.emit(kind, source, payload);
         let mut subscribers = self.subscribers.lock();
         subscribers.retain(|subscriber| subscriber.send(event.clone()).is_ok());
     }
 
-    fn new_attempt(&self) {
-        self.writer.lock().new_attempt();
+    /// 在发起网络连接前分配身份，并保证该身份下的第一条生命周期事件就是
+    /// `connection_requested`。writer 锁覆盖身份分配、事件编号和广播，避免
+    /// 其他生产者把事件插入新 attempt 与请求事件之间。
+    fn begin_connection_attempt(&self) {
+        self.attempt_epoch_reserved.store(true, Ordering::Release);
+        self.disconnect_reported.store(false, Ordering::Release);
+        self.clear_observations();
+        self.lifecycle_revision.fetch_add(1, Ordering::AcqRel);
+
+        let mut writer = self.writer.lock();
+        writer.new_attempt();
+        let attempt = writer.connection_epoch;
+        let event = writer.emit(
+            BackendEventKind::Lifecycle,
+            FactSource::Commanded,
+            json!({
+                "type":"connection_requested",
+                "attempt":attempt,
+                "username":self.config.username,
+                "host":self.config.host,
+                "port":self.config.port
+            }),
+        );
+        let mut subscribers = self.subscribers.lock();
+        subscribers.retain(|subscriber| subscriber.send(event.clone()).is_ok());
+    }
+
+    /// `Event::Init` 消费连接发起前预留的身份，而不是再创建一个 epoch。
+    /// 防御性 fallback 仍走同一入口，确保即使 Azalea 新增调用路径，也先有
+    /// `connection_requested`，随后才发 transport 生命周期事件。
+    fn consume_attempt_for_transport_init(&self) {
+        if !self.attempt_epoch_reserved.swap(false, Ordering::AcqRel) {
+            self.begin_connection_attempt();
+            self.attempt_epoch_reserved.store(false, Ordering::Release);
+        }
+        self.disconnect_reported.store(false, Ordering::Release);
+        self.clear_observations();
     }
 
     fn context(&self) -> (String, u64, String) {
@@ -1000,12 +1036,7 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             // Swarm 重连在某些路径复用已有本地玩家事件发送器，不一定再次发出
             // Event::Init；重连调度器会预留 epoch，若 Init 到达则消费该预留，避免
             // 同一次握手被错误地记成两个 epoch。
-            if !shared.attempt_epoch_reserved.swap(false, Ordering::AcqRel) {
-                shared.new_attempt();
-            }
-            shared.disconnect_reported.store(false, Ordering::Release);
-            // 新 epoch 的服务端事实尚未到达前，不暴露上一条连接的世界缓存。
-            shared.clear_observations();
+            shared.consume_attempt_for_transport_init();
             shared.emit(
                 BackendEventKind::Lifecycle,
                 FactSource::ServerObserved,
@@ -1212,14 +1243,7 @@ async fn handle_swarm(swarm: Swarm, event: SwarmEvent, state: SwarmState) {
                 shared.reconnect_pending.store(false, Ordering::Release);
                 return;
             }
-            shared.new_attempt();
-            shared.attempt_epoch_reserved.store(true, Ordering::Release);
-            shared.disconnect_reported.store(false, Ordering::Release);
-            shared.emit(
-                BackendEventKind::Lifecycle,
-                FactSource::Commanded,
-                json!({"type":"reconnect_requested"}),
-            );
+            shared.begin_connection_attempt();
             let state = BotState {
                 shared: shared.clone(),
             };
@@ -1243,11 +1267,7 @@ pub async fn run_with_handle(
     validate_run_config(&config)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let shared = handle.shared.clone();
-    shared.emit(
-        BackendEventKind::Lifecycle,
-        FactSource::Commanded,
-        json!({"type":"connection_requested", "attempt":1, "username":config.username, "host":config.host, "port":config.port}),
-    );
+    shared.begin_connection_attempt();
     let account = Account::offline(&config.username);
     let socket: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     let address = ResolvedAddr {
@@ -1374,5 +1394,48 @@ mod tests {
         assert!(validate_run_config(&config).is_err());
         config.username = "MineM130Fresh".to_owned();
         assert!(validate_run_config(&config).is_ok());
+    }
+
+    #[test]
+    fn connection_request_preallocates_and_init_reuses_each_attempt_identity() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        assert!(events.try_recv().is_err());
+
+        handle.shared.begin_connection_attempt();
+        let first_request = events.try_recv().expect("首次连接请求事件");
+        assert_eq!(first_request.connection_epoch, 1);
+        assert_eq!(first_request.connection_attempt_id, "attempt-1");
+        assert_eq!(first_request.payload["type"], "connection_requested");
+        assert_eq!(first_request.payload["attempt"], 1);
+
+        handle.shared.consume_attempt_for_transport_init();
+        handle.shared.emit(
+            BackendEventKind::Lifecycle,
+            FactSource::ServerObserved,
+            json!({"type":"transport_initialized"}),
+        );
+        let first_init = events.try_recv().expect("首次连接初始化事件");
+        assert_eq!(
+            first_init.process_session_id,
+            first_request.process_session_id
+        );
+        assert_eq!(first_init.connection_epoch, 1);
+        assert_eq!(first_init.connection_attempt_id, "attempt-1");
+
+        handle.shared.begin_connection_attempt();
+        let second_request = events.try_recv().expect("重连请求事件");
+        assert_eq!(
+            second_request.process_session_id,
+            first_request.process_session_id
+        );
+        assert_eq!(second_request.connection_epoch, 2);
+        assert_eq!(second_request.connection_attempt_id, "attempt-2");
+        assert_eq!(second_request.payload["type"], "connection_requested");
+        assert_eq!(second_request.payload["attempt"], 2);
+
+        handle.shared.consume_attempt_for_transport_init();
+        assert_eq!(handle.shared.context().1, 2);
+        assert!(events.try_recv().is_err());
     }
 }
