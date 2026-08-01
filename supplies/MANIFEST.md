@@ -25,6 +25,7 @@
 | tools/vineflower-1.12.0.jar | 反编译器 | github.com/Vineflower | 见 SHA256SUMS |
 | azalea/ | azalea 全历史克隆（主线目标 26.2；0.16.0 发布提交 a253702e 目标 26.1） | github.com/azalea-rs/azalea | git 自校验 |
 | mineintent-main/ | MineIntent 主仓库只读克隆（Backend 契约、场景、产品.md） | 本地克隆 | git 自校验 |
+| mineintent-go-client/ | 维护者早前实现的 Go 无头客户端只读参考（协议时钟、自动应答、26.1.2/775） | 本地克隆；HEAD `2082785` | git 自校验 |
 | decompiled/26.1.2-server/ | 官方 server.jar 反编译源码树（语义 oracle） | Vineflower 本地生成 | — |
 | eula/EULA.html | Minecraft EULA 存档 | account.mojang.com | 见 SHA256SUMS |
 | ../vendor/ + ../.cargo/config.toml | 全部 Rust 依赖 vendor（离线构建） | crates.io | cargo 内建校验 |
@@ -41,6 +42,7 @@
 | paper/26.1.2/first-run/ | Paper 完整首启产物：cache/、libraries/、versions/、config、已生成世界 | 离线重启无需任何下载；已实测完整启动 |
 | decompiled/26.1.2-server/ | 官方 server 内层 jar 的 Vineflower 反编译树，4789 个 .java，全真名 | 抽查 ServerboundMovePlayerPacket 字段名均可读 |
 | mojang/26.1.2/server-inner.jar | 从官方 bundler 抽出的服务端内层 jar（16461 条目） | 反编译输入 |
+| mineintent-go-client/ | 只读协议行为参考；最新提交实现每连接协议时钟、串行出站调度和 KeepAlive/Teleport/Configuration 自动应答 | 不作为本项目代码基础；用于 M1 时序和错误分类交叉核对 |
 
 ## 工具链（本机已装，非 supplies 内容）
 

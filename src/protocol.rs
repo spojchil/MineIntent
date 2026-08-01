@@ -119,6 +119,8 @@ pub enum BackendCommand {
         crouch: Option<bool>,
     },
     ReleaseAll,
+    /// 显式请求服务端重生；运行时不在死亡事件上自动调用它。
+    Respawn,
 }
 
 impl<'de> Deserialize<'de> for BackendCommand {
@@ -168,6 +170,12 @@ impl<'de> Deserialize<'de> for BackendCommand {
             #[serde(rename = "type")]
             _kind: String,
         }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RespawnWire {
+            #[serde(rename = "type")]
+            _kind: String,
+        }
 
         match kind {
             "send_chat" => {
@@ -201,6 +209,12 @@ impl<'de> Deserialize<'de> for BackendCommand {
                     .map_err(|error| D::Error::custom(error.to_string()))?;
                 let _ = wire._kind;
                 Ok(Self::ReleaseAll)
+            }
+            "respawn" => {
+                let wire: RespawnWire = serde_json::from_value(value)
+                    .map_err(|error| D::Error::custom(error.to_string()))?;
+                let _ = wire._kind;
+                Ok(Self::Respawn)
             }
             other => Err(D::Error::custom(format!("未知命令类型：{other}"))),
         }
@@ -273,5 +287,13 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn respawn_command_round_trips_as_explicit_wire_action() {
+        let encoded = serde_json::to_value(BackendCommand::Respawn).expect("重生命令应能编码");
+        assert_eq!(encoded["type"], "respawn");
+        let decoded: BackendCommand = serde_json::from_value(encoded).expect("重生命令应能解码");
+        assert!(matches!(decoded, BackendCommand::Respawn));
     }
 }

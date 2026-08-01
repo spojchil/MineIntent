@@ -3,3 +3,4 @@
 pub mod protocol;
 pub mod runtime;
 pub mod snapshot;
+pub mod viewport;

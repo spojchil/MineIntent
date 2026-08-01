@@ -16,8 +16,8 @@ use azalea::{
     auto_respawn::AutoRespawnPlugin,
     bot::DefaultBotPlugins,
     ecs::{
-        message::MessageWriter,
-        prelude::{Query, With},
+        message::{MessageReader, MessageWriter},
+        prelude::{Commands, On, Query, With},
         system::Res,
     },
     entity::{Dead, LocalEntity, Physics, Position},
@@ -39,6 +39,7 @@ use crate::{
         BlockReadResult, MinecraftSnapshotV1, PoseSnapshot, ProtocolEntitySnapshot,
         TrackedPlayerSnapshot, Vec3Value,
     },
+    viewport::{project as project_viewport, ViewportOptions, ViewportProjection},
 };
 
 #[derive(Clone, Debug)]
@@ -52,6 +53,11 @@ pub struct RunConfig {
     /// 仅用于本地验收 M2；正式集成通过 `RuntimeHandle::send_chat`。
     pub initial_chat: Option<String>,
 }
+
+/// 服务端先发送死亡/生命值更新、再在同一 tick 设置 waitingForRespawn；显式
+/// respawn 若紧贴 DeathEvent 发出会落在这段窗口里。这个延迟只作用于上层已经
+/// 明确请求的重生，不会在死亡事件上自动创建请求。
+const RESPAWN_SETTLE_DELAY: Duration = Duration::from_millis(100);
 
 impl Default for RunConfig {
     fn default() -> Self {
@@ -137,6 +143,7 @@ struct SharedRuntime {
     commands: parking_lot::Mutex<VecDeque<BackendCommandEnvelope>>,
     subscribers: parking_lot::Mutex<Vec<mpsc::UnboundedSender<BackendEventEnvelope>>>,
     world: parking_lot::Mutex<Option<Arc<parking_lot::RwLock<azalea::world::World>>>>,
+    reported_dimension: parking_lot::Mutex<Option<String>>,
     snapshot: parking_lot::Mutex<Option<MinecraftSnapshotV1>>,
     snapshot_source: parking_lot::Mutex<Option<FactSource>>,
     tracked_entities: parking_lot::Mutex<Vec<ProtocolEntitySnapshot>>,
@@ -167,6 +174,7 @@ impl SharedRuntime {
             commands: parking_lot::Mutex::new(VecDeque::new()),
             subscribers: parking_lot::Mutex::new(Vec::new()),
             world: parking_lot::Mutex::new(None),
+            reported_dimension: parking_lot::Mutex::new(None),
             snapshot: parking_lot::Mutex::new(None),
             snapshot_source: parking_lot::Mutex::new(None),
             tracked_entities: parking_lot::Mutex::new(Vec::new()),
@@ -215,6 +223,7 @@ impl SharedRuntime {
 
     fn clear_observations(&self) {
         *self.world.lock() = None;
+        *self.reported_dimension.lock() = None;
         *self.snapshot.lock() = None;
         *self.snapshot_source.lock() = None;
         self.tracked_entities.lock().clear();
@@ -426,6 +435,11 @@ impl RuntimeHandle {
         self.send_command(self.next_command(BackendCommand::ReleaseAll))
     }
 
+    /// 显式请求服务端执行重生；死亡后不会由运行时自动触发。
+    pub fn respawn(&self) -> Result<(), String> {
+        self.send_command(self.next_command(BackendCommand::Respawn))
+    }
+
     /// 主动结束运行时；停止动作本身会写入 `commanded` 事件。
     pub fn stop(&self, reason: &str) {
         self.shared.initiate_stop(reason);
@@ -469,7 +483,7 @@ fn validate_command(command: &BackendCommand) -> Result<(), String> {
                 return Err("移动时长必须是 50 到 1500 毫秒".to_owned());
             }
         }
-        BackendCommand::ReleaseAll => {}
+        BackendCommand::ReleaseAll | BackendCommand::Respawn => {}
     }
     Ok(())
 }
@@ -516,6 +530,33 @@ impl RuntimeObservationSource {
         self.shared.tracked_entities.lock().clone()
     }
 
+    /// 对齐 MineIntent viewport 的只读投影；所有坐标仍是 Minecraft 世界绝对坐标。
+    ///
+    /// 投影不会把本地缓存的方块直接宣称为可见：它会对视锥内候选执行暴露面和
+    /// 遮挡射线判断。调用方如需携带事实来源，应同时读取 `snapshot_source()`。
+    pub fn viewport(
+        &self,
+        options: &ViewportOptions,
+    ) -> Result<Option<ViewportProjection>, String> {
+        let Some(pose) = self.self_pose() else {
+            return Ok(None);
+        };
+        let entities = self.list_tracked_entities();
+        let Some(world) = self.shared.world.lock().clone() else {
+            return Ok(None);
+        };
+        // 一次投影只读一个世界视图，避免候选扫描的每次体素访问都重新获取
+        // RwLock；独立的 read_block() 仍保持短锁，供增量读取使用。
+        let world = world.read();
+        project_viewport(
+            &pose,
+            &entities,
+            |position| read_block_from_world(&world, position),
+            options,
+        )
+        .map(Some)
+    }
+
     /// 读取已加载世界中的绝对方块状态；结果不等于视线可见性。
     ///
     /// 上层 viewport 应基于 `transparentHint`、碰撞/轮廓几何和观察者姿态
@@ -524,29 +565,33 @@ impl RuntimeObservationSource {
         let Some(world) = self.shared.world.lock().clone() else {
             return BlockReadResult::Unloaded;
         };
-        let block_position = azalea::BlockPos {
-            x: position.x,
-            y: position.y,
-            z: position.z,
-        };
         let world = world.read();
-        if block_position.y < world.chunks.min_y()
-            || block_position.y >= world.chunks.min_y() + world.chunks.height() as i32
-        {
-            return BlockReadResult::OutOfWorld;
-        }
-        let Some(state) = world.get_block_state(block_position) else {
-            return BlockReadResult::Unloaded;
-        };
-        BlockReadResult::Loaded {
-            block: block_snapshot(position, state),
-        }
+        read_block_from_world(&world, position)
     }
 
     pub fn subscribe(&self) -> mpsc::UnboundedReceiver<BackendEventEnvelope> {
         let (sender, receiver) = mpsc::unbounded_channel();
         self.shared.subscribers.lock().push(sender);
         receiver
+    }
+}
+
+fn read_block_from_world(world: &azalea::world::World, position: BlockPosition) -> BlockReadResult {
+    let block_position = azalea::BlockPos {
+        x: position.x,
+        y: position.y,
+        z: position.z,
+    };
+    if block_position.y < world.chunks.min_y()
+        || block_position.y >= world.chunks.min_y() + world.chunks.height() as i32
+    {
+        return BlockReadResult::OutOfWorld;
+    }
+    let Some(state) = world.get_block_state(block_position) else {
+        return BlockReadResult::Unloaded;
+    };
+    BlockReadResult::Loaded {
+        block: block_snapshot(position, state),
     }
 }
 
@@ -579,6 +624,136 @@ impl Default for SwarmState {
 /// 在 Azalea 自己的 ECS schedule 内发送退出消息，避免跨任务直接写消息时
 /// 与 Bevy 的双缓冲消息更新时序竞争。
 struct RuntimeShutdownPlugin;
+
+/// 只从 Azalea 的底层接收包消息中筛选服务端位置校正。
+///
+/// Azalea 的 `packet-event` feature 会把每一个游戏包再转发到高层
+/// `LocalPlayerEvents` unbounded channel；对带区块流量的 26.1 服务器而言，
+/// 这会制造无意义的积压。自有插件直接读取同一条 ECS message，只保留
+/// `ClientboundPlayerPosition` 这一条 M4 需要的服务端事实。
+struct ServerPositionCorrectionPlugin;
+
+impl Plugin for ServerPositionCorrectionPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(
+            Update,
+            (
+                record_server_position_corrections,
+                reset_spawn_marker_on_world_loaded,
+            ),
+        );
+        app.add_observer(record_respawn_packet);
+    }
+}
+
+/// Azalea 的 `Spawn` 去重标记只在 `Login` 时清除；26.1 的跨维度/重生包走
+/// `WorldLoadedEvent`，如果保留旧标记，新维度的区块加载不会再产生 Spawn。
+/// 重置这两个加载边界后，下一批区块会重新进入标准 Spawn 处理，避免在这里
+/// 复制一套快照或生命周期逻辑。
+fn reset_spawn_marker_on_world_loaded(
+    mut world_loaded: MessageReader<azalea::packet::game::WorldLoadedEvent>,
+    mut commands: Commands,
+    state: Res<SwarmState>,
+) {
+    for event in world_loaded.read() {
+        let dimension = event.name.to_string();
+        let previous = state
+            .shared
+            .reported_dimension
+            .lock()
+            .replace(dimension.clone());
+        if let Some(previous) = previous {
+            if previous != dimension {
+                state.shared.emit(
+                    BackendEventKind::Lifecycle,
+                    FactSource::ServerObserved,
+                    json!({
+                        "type":"dimension_changed",
+                        "from":previous,
+                        "to":dimension
+                    }),
+                );
+            }
+        }
+        commands.entity(event.entity).remove::<(
+            azalea::events::SentSpawnEvent,
+            azalea::entity::InLoadedChunk,
+        )>();
+    }
+}
+
+fn record_respawn_packet(
+    trigger: On<azalea::packet::game::SendGamePacketEvent>,
+    state: Res<SwarmState>,
+    query: Query<Option<&azalea::InGameState>>,
+) {
+    let azalea::protocol::packets::game::ServerboundGamePacket::ClientCommand(packet) =
+        &trigger.event().packet
+    else {
+        return;
+    };
+    if !matches!(
+        packet.action,
+        azalea::protocol::packets::game::s_client_command::Action::PerformRespawn
+    ) {
+        return;
+    }
+    // 这是本地明确请求实际发出的协议包；只有后续 Spawn 才算服务端确认。
+    let in_game = query
+        .get(trigger.event().sent_by)
+        .is_ok_and(|value| value.is_some());
+    state.shared.emit(
+        BackendEventKind::Lifecycle,
+        FactSource::Commanded,
+        json!({"type":"respawn_packet_dispatched", "inGameState":in_game}),
+    );
+}
+
+fn record_server_position_corrections(
+    mut packets: MessageReader<azalea::packet::game::ReceiveGamePacketEvent>,
+    state: Res<SwarmState>,
+) {
+    for event in packets.read() {
+        let azalea::protocol::packets::game::ClientboundGamePacket::PlayerPosition(packet) =
+            event.packet.as_ref()
+        else {
+            continue;
+        };
+        // 这是服务端主动校正玩家位置的协议事实；它不代表每个 tick
+        // 都有一个服务端坐标包，因此客户端预测轨迹仍单独记录。
+        state.shared.emit(
+            BackendEventKind::SelfState,
+            FactSource::ServerObserved,
+            json!({
+                "type":"server_position_correction",
+                "teleportId":packet.id,
+                "position":Vec3Value {
+                    x: packet.change.pos.x,
+                    y: packet.change.pos.y,
+                    z: packet.change.pos.z,
+                },
+                "velocity":Vec3Value {
+                    x: packet.change.delta.x,
+                    y: packet.change.delta.y,
+                    z: packet.change.delta.z,
+                },
+                "yaw":packet.change.look_direction.y_rot(),
+                "pitch":packet.change.look_direction.x_rot(),
+                "relative":{
+                    "x":packet.relative.x,
+                    "y":packet.relative.y,
+                    "z":packet.relative.z,
+                    "yaw":packet.relative.y_rot,
+                    "pitch":packet.relative.x_rot,
+                    "deltaX":packet.relative.delta_x,
+                    "deltaY":packet.relative.delta_y,
+                    "deltaZ":packet.relative.delta_z,
+                    "rotateDelta":packet.relative.rotate_delta
+                }
+            }),
+        );
+    }
+}
 
 impl Plugin for RuntimeShutdownPlugin {
     fn build(&self, app: &mut App) {
@@ -745,6 +920,30 @@ fn handle_command(bot: &Client, shared: &Arc<SharedRuntime>, envelope: BackendCo
             );
             shared.emit_predicted_pose(bot, &command_id);
         }
+        BackendCommand::Respawn => {
+            // 服务端的死亡包与 waitingForRespawn 状态可能跨一个网络 tick；
+            // 只延迟这一条已经明确请求的动作，避免请求在服务端状态切换前到达。
+            // 仍走 Azalea 自带 RespawnPlugin 的消息链，保持实体绑定和 ECS 时序。
+            let delayed_bot = bot.clone();
+            let delayed_shared = shared.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(RESPAWN_SETTLE_DELAY).await;
+                if delayed_shared.stopping.load(Ordering::Acquire) {
+                    return;
+                }
+                delayed_bot
+                    .ecs
+                    .write()
+                    .write_message(azalea::respawn::PerformRespawnEvent {
+                        entity: delayed_bot.entity,
+                    });
+            });
+            shared.emit(
+                BackendEventKind::Lifecycle,
+                FactSource::Commanded,
+                json!({"type":"respawn_requested", "commandId":command_id}),
+            );
+        }
     }
 }
 
@@ -786,6 +985,7 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             json!({"type":"logged_in", "version":"26.1.2", "protocol":775}),
         ),
         Event::Spawn => {
+            let was_dead = shared.death_reported.load(Ordering::Acquire);
             shared.ready.store(true, Ordering::Release);
             shared.death_reported.store(false, Ordering::Release);
             shared.set_world(bot.world());
@@ -799,6 +999,20 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                 }),
             );
             if let Some(snapshot) = snapshot {
+                shared
+                    .reported_dimension
+                    .lock()
+                    .replace(snapshot.world.dimension.clone());
+                if was_dead {
+                    shared.emit(
+                        BackendEventKind::Lifecycle,
+                        FactSource::ServerObserved,
+                        json!({
+                            "type":"respawned",
+                            "dimension":snapshot.world.dimension
+                        }),
+                    );
+                }
                 shared.emit_snapshot(snapshot, FactSource::ServerObserved);
             }
 
@@ -836,45 +1050,6 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                 json!({"type":"acknowledged_by_azalea", "id":id}),
             );
         }
-        Event::Packet(packet) => {
-            if let azalea::protocol::packets::game::ClientboundGamePacket::PlayerPosition(packet) =
-                packet.as_ref()
-            {
-                // 这是服务端主动校正玩家位置的协议事实；它不代表每个 tick
-                // 都有一个服务端坐标包，因此客户端预测轨迹仍单独记录。
-                shared.emit(
-                    BackendEventKind::SelfState,
-                    FactSource::ServerObserved,
-                    json!({
-                        "type":"server_position_correction",
-                        "teleportId":packet.id,
-                        "position":Vec3Value {
-                            x: packet.change.pos.x,
-                            y: packet.change.pos.y,
-                            z: packet.change.pos.z,
-                        },
-                        "velocity":Vec3Value {
-                            x: packet.change.delta.x,
-                            y: packet.change.delta.y,
-                            z: packet.change.delta.z,
-                        },
-                        "yaw":packet.change.look_direction.y_rot(),
-                        "pitch":packet.change.look_direction.x_rot(),
-                        "relative":{
-                            "x":packet.relative.x,
-                            "y":packet.relative.y,
-                            "z":packet.relative.z,
-                            "yaw":packet.relative.y_rot,
-                            "pitch":packet.relative.x_rot,
-                            "deltaX":packet.relative.delta_x,
-                            "deltaY":packet.relative.delta_y,
-                            "deltaZ":packet.relative.delta_z,
-                            "rotateDelta":packet.relative.rotate_delta
-                        }
-                    }),
-                );
-            }
-        }
         Event::Chat(packet) => shared.emit(
             BackendEventKind::Chat,
             FactSource::ServerObserved,
@@ -909,9 +1084,8 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
         Event::Disconnect(reason) => {
             let reason = reason.map(|value| value.to_string());
             shared.mark_disconnected(reason);
-            bot.walk(WalkDirection::None);
-            bot.set_jumping(false);
-            bot.set_crouching(false);
+            // Disconnect 会由 Azalea 同步移除本地玩家的运动组件；此处只
+            // 更新运行时状态，不再向已失效的实体投递 walk/jump/crouch 消息。
         }
         Event::ConnectionFailed(error) => {
             shared.ready.store(false, Ordering::Release);
@@ -1051,6 +1225,7 @@ pub async fn run_with_handle(
             .disable::<AutoRespawnPlugin>()
             .disable::<AcceptResourcePacksPlugin>()
             .disable::<AutoReconnectPlugin>(),
+        ServerPositionCorrectionPlugin,
         RuntimeShutdownPlugin,
         DefaultSwarmPlugins,
     );
