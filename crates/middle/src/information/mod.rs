@@ -4,6 +4,7 @@
 //! 与 viewport 投影 kernel 不属于这一层。
 
 pub mod contracts;
+pub mod cursor_store;
 pub mod geometry;
 pub mod ref_store;
 pub mod registry;

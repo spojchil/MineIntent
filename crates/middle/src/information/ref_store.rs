@@ -292,7 +292,15 @@ impl InformationRefStore {
             return Err(InformationReferenceIssueError::CapacityExceeded);
         }
 
-        let payload = clone_bounded_json(&request.payload, self.inner.options.max_payload_bytes)?;
+        let payload = clone_bounded_json(
+            &request.payload,
+            self.inner.options.max_payload_bytes,
+            || InformationReferenceIssueError::PayloadNotJsonSerializable,
+            |actual, maximum| InformationReferenceIssueError::PayloadByteLimitExceeded {
+                actual,
+                maximum,
+            },
+        )?;
         let maximum_valid_until = now
             .checked_add(
                 i64::try_from(self.inner.options.ttl_ms)
@@ -309,7 +317,9 @@ impl InformationRefStore {
         }
         let valid_until = match request.valid_until {
             Some(valid_until) => valid_until,
-            None => format_utc_millis(maximum_valid_until)?,
+            None => format_utc_millis(maximum_valid_until, || {
+                InformationReferenceIssueError::TimestampOutOfRange
+            })?,
         };
         let id = next_unique_reference_id(&entries);
         let screen_bound = request.bind_to_screen == Some(true);
@@ -425,23 +435,20 @@ fn next_unique_reference_id(entries: &HashMap<String, StoredReference>) -> Strin
     }
 }
 
-fn clone_bounded_json(
+pub(crate) fn clone_bounded_json<E>(
     value: &Value,
     maximum: usize,
-) -> Result<Value, InformationReferenceIssueError> {
-    let serialized = serde_json::to_vec(value)
-        .map_err(|_| InformationReferenceIssueError::PayloadNotJsonSerializable)?;
+    not_serializable: impl Fn() -> E,
+    too_large: impl Fn(usize, usize) -> E,
+) -> Result<Value, E> {
+    let serialized = serde_json::to_vec(value).map_err(|_| not_serializable())?;
     if serialized.len() > maximum {
-        return Err(InformationReferenceIssueError::PayloadByteLimitExceeded {
-            actual: serialized.len(),
-            maximum,
-        });
+        return Err(too_large(serialized.len(), maximum));
     }
-    serde_json::from_slice(&serialized)
-        .map_err(|_| InformationReferenceIssueError::PayloadNotJsonSerializable)
+    serde_json::from_slice(&serialized).map_err(|_| not_serializable())
 }
 
-fn is_expired(valid_until: Option<&str>, now: i64) -> bool {
+pub(crate) fn is_expired(valid_until: Option<&str>, now: i64) -> bool {
     valid_until
         .and_then(parse_rfc3339_millis)
         .is_some_and(|valid_until| valid_until <= now)
@@ -528,12 +535,15 @@ fn parse_rfc3339_millis(timestamp: &str) -> Option<i64> {
     i64::try_from(local_millis - i128::from(offset_minutes * 60_000)).ok()
 }
 
-fn format_utc_millis(timestamp: i64) -> Result<String, InformationReferenceIssueError> {
+pub(crate) fn format_utc_millis<E>(
+    timestamp: i64,
+    out_of_range: impl Fn() -> E,
+) -> Result<String, E> {
     let days = timestamp.div_euclid(86_400_000);
     let time = timestamp.rem_euclid(86_400_000);
     let (year, month, day) = civil_from_days(days);
     if !(0..=9_999).contains(&year) {
-        return Err(InformationReferenceIssueError::TimestampOutOfRange);
+        return Err(out_of_range());
     }
     let hour = time / 3_600_000;
     let minute = time % 3_600_000 / 60_000;

@@ -284,3 +284,36 @@ TS 本批 **3/3 tests**：
 - 定向 `information_ref_store`：9 passed；定向 `information_contracts_schema`：7 passed。
 - `cargo test --workspace --offline`：134 passed、doc tests 通过；`cargo check --workspace --all-targets --offline`：通过；`cargo +stable fmt --all -- --check`：通过。
 - 未扩大范围：cursor-store、access-policy、provider/runtime 与其他 information/backend 模块均未修改。
+
+## 2026-08-01｜P1-A Information cursor-store 原子迁移
+
+### 基线、oracle 与范围
+
+- 开始基线：`f52c25f`，worktree `port/a-world-info` clean；完整只读 oracle 为 `supplies/mineintent-main/src/information/cursor-store.ts:1-177` 与 `stores.test.ts:158-233`，未联网、未生成 TS/JS。
+- 只修改 `information/cursor_store.rs`、`information/mod.rs`、`information/ref_store.rs` 的最小 crate-private helper、独立 `tests/information_cursor_store.rs` 与本日志；未进入 access-policy、provider、runtime、B/main 或其他禁区。
+
+### 完整生产语义与共享 helper
+
+- 默认/可配置限制精确为：global 2048、每 principal 跨 interface 512、每 interface 256、page-state 8192 UTF-8 JSON bytes、TTL 60000ms；构造和 issue/resolve/invalidate/size 全部使用结构化 `Result`，`Arc + Mutex` 保证容量检查与消费原子性，生产路径无 panic。
+- issue 在容量判断前清理过期 cursor；验证正 limit，紧凑 JSON 序列化后按 UTF-8 byte 限制并深拷贝 page-state；生成 `icur_<UUID-v4>` opaque id。`size()` 与 TS 一样不主动清理，TS 没有公开 `clear()`，Rust 未扩增该 API。
+- cursor 精确绑定 interface、fields 原顺序、selector **仅 id**、information revision、limit、principal、grant id/audience、connection epoch、world、dimension、screen id/revision。无效 resolve 不消费；匹配成功先原子移除再返回 state/revision，二次 resolve 失败。
+- 四类 invalidation 精确对齐 TS。特别是 `screen_changed` 对 stored screen id/revision 全量比较，因此无 screen cursor 遇到有 screen event 也会失效；未套用 ref-store 的 screen-bound 特例。
+- 从 ref-store 提取的 helper 仅为 crate-private 泛型错误映射版本：复用既有 `InformationRefClock`、UTC millisecond ISO formatter/expiry parser 与 bounded JSON clone；没有复制第二套日历解析器，也没有改变 ref-store 的公开 API 或行为。
+
+### `stores.test.ts` 最后两条一对一映射
+
+TS 本批 **2/2 tests**：
+
+1. `stores.test.ts:158-197` → `cursors_bind_query_shape_and_are_one_time_continuations`：错误 fields 不消费、正确 resolve 返回 state/revision、成功后二次失败；另锁定 `icur_` UUID-v4 形状。
+2. `stores.test.ts:199-233` → `cursor_state_and_per_principal_capacity_are_bounded`：principal 容量跨 interface 生效，page-state byte cap 返回结构化错误。
+
+另有 5 条 Rust contract 测试，不冒充 TS 对应项：默认/metadata/TTL cleanup/size；global 与 per-interface 容量；fields 顺序及全部 resolve 绑定和 selector-id-only；四类 invalidation 与 cursor 特有 screen 规则；Unicode JSON UTF-8 byte 精确边界。
+
+### 验证与剩余边界
+
+- `cargo test --package mineintent-middle --offline --test information_cursor_store`：7 passed。
+- `cargo test --package mineintent-middle --offline --test information_ref_store`：9 passed。
+- `cargo test --workspace --offline`：148 passed，doc tests 通过。
+- `cargo check --workspace --all-targets --offline`：通过。
+- `cargo +stable fmt --all -- --check`：通过。
+- 剩余未迁：access-policy，以及 provider/runtime；本批均未实现。
