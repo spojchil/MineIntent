@@ -287,8 +287,8 @@ pub enum BlockReadResult {
     OutOfWorld,
 }
 
-pub fn capture_pose(bot: &Client) -> PoseSnapshot {
-    bot.query_self::<(&Position, &Physics, &LookDirection), _>(|(position, physics, look)| {
+pub fn capture_pose(bot: &Client) -> Option<PoseSnapshot> {
+    bot.try_query_self::<(&Position, &Physics, &LookDirection), _>(|(position, physics, look)| {
         PoseSnapshot {
             position: Vec3Value::from_azalea(**position),
             velocity: Vec3Value::from_azalea(physics.velocity),
@@ -297,6 +297,7 @@ pub fn capture_pose(bot: &Client) -> PoseSnapshot {
             on_ground: physics.on_ground(),
         }
     })
+    .ok()
 }
 
 pub fn capture(
@@ -308,8 +309,8 @@ pub fn capture(
     snapshot_revision: u64,
     lifecycle_revision: u64,
     captured_at: chrono::DateTime<chrono::Utc>,
-) -> MinecraftSnapshotV1 {
-    let pose = capture_pose(bot);
+) -> Option<MinecraftSnapshotV1> {
+    let pose = capture_pose(bot)?;
     let (dimension, min_y, height) = bot
         .try_query_self::<(Option<&WorldName>, Option<&WorldHolder>), _>(|(world_name, holder)| {
             let dimension = world_name
@@ -337,7 +338,7 @@ pub fn capture(
         .unwrap_or_else(|| "survival".to_owned());
     let alive = bot.get_component::<Dead>().is_none();
 
-    MinecraftSnapshotV1 {
+    Some(MinecraftSnapshotV1 {
         protocol: SNAPSHOT_PROTOCOL.to_owned(),
         snapshot_revision,
         lifecycle_revision,
@@ -374,7 +375,7 @@ pub fn capture(
         },
         inventory: capture_inventory(bot),
         tracked_players: capture_tracked_players(bot),
-    }
+    })
 }
 
 fn capture_inventory(bot: &Client) -> InventorySnapshot {

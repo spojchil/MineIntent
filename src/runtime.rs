@@ -213,6 +213,10 @@ impl SharedRuntime {
         self.writer.lock().context()
     }
 
+    fn connection_epoch(&self) -> u64 {
+        self.writer.lock().connection_epoch
+    }
+
     fn set_swarm(&self, swarm: Swarm) {
         *self.swarm.lock() = Some(swarm);
     }
@@ -275,7 +279,7 @@ impl SharedRuntime {
     ) -> Option<MinecraftSnapshotV1> {
         let (process_session_id, connection_epoch, connection_attempt_id) = self.context();
         let next_revision = self.snapshot_revision.load(Ordering::Acquire) + 1;
-        let candidate = capture(
+        let Some(candidate) = capture(
             bot,
             &self.config.world_id,
             &process_session_id,
@@ -284,7 +288,11 @@ impl SharedRuntime {
             next_revision,
             self.lifecycle_revision.load(Ordering::Acquire),
             now_utc(),
-        );
+        ) else {
+            // 断线/重连时 Azalea 会先移除本地玩家实体；此刻不能把“读不到”
+            // 伪造成坐标，也不能调用 query_self 触发 panic。
+            return None;
+        };
         *self.tracked_entities.lock() = capture_tracked_entities(bot);
         let mut current = self.snapshot.lock();
         let changed = current
@@ -314,7 +322,9 @@ impl SharedRuntime {
     }
 
     fn emit_predicted_pose(&self, bot: &Client, command_id: &str) {
-        let pose: PoseSnapshot = capture_pose(bot);
+        let Some(pose): Option<PoseSnapshot> = capture_pose(bot) else {
+            return;
+        };
         self.emit(
             BackendEventKind::Motor,
             FactSource::ClientPredicted,
@@ -809,6 +819,17 @@ fn sprint_direction(direction: WalkDirection) -> Option<SprintDirection> {
     }
 }
 
+/// 断线时本地玩家实体可能已经被 Azalea 移除；运动清理必须使用可失败查询。
+fn try_set_movement_flags(bot: &Client, jumping: bool, crouching: bool) -> bool {
+    bot.try_query_self::<(&mut azalea::entity::Jumping, &mut azalea::PhysicsState), _>(
+        |(mut jumping_component, mut physics)| {
+            **jumping_component = jumping;
+            physics.trying_to_crouch = crouching;
+        },
+    )
+    .is_ok()
+}
+
 fn handle_command(bot: &Client, shared: &Arc<SharedRuntime>, envelope: BackendCommandEnvelope) {
     let command_id = envelope.id;
     match envelope.command {
@@ -861,8 +882,9 @@ fn handle_command(bot: &Client, shared: &Arc<SharedRuntime>, envelope: BackendCo
             } else {
                 bot.walk(direction);
             }
-            bot.set_jumping(jump.unwrap_or(false));
-            bot.set_crouching(crouch.unwrap_or(false));
+            if !try_set_movement_flags(bot, jump.unwrap_or(false), crouch.unwrap_or(false)) {
+                return;
+            }
             shared.emit(
                 BackendEventKind::Motor,
                 FactSource::Commanded,
@@ -891,17 +913,17 @@ fn handle_command(bot: &Client, shared: &Arc<SharedRuntime>, envelope: BackendCo
                     if shared.movement_generation.load(Ordering::Acquire) == generation
                         && !shared.stopping.load(Ordering::Acquire)
                     {
-                        bot_to_stop.walk(WalkDirection::None);
-                        bot_to_stop.set_jumping(false);
-                        bot_to_stop.set_crouching(false);
-                        shared.active_movement.store(false, Ordering::Release);
-                        *shared.active_movement_id.lock() = None;
-                        shared.emit(
-                            BackendEventKind::Motor,
-                            FactSource::Commanded,
-                            json!({"type":"move_released", "commandId":command_id}),
-                        );
-                        shared.emit_predicted_pose(&bot_to_stop, &command_id);
+                        if try_set_movement_flags(&bot_to_stop, false, false) {
+                            bot_to_stop.walk(WalkDirection::None);
+                            shared.active_movement.store(false, Ordering::Release);
+                            *shared.active_movement_id.lock() = None;
+                            shared.emit(
+                                BackendEventKind::Motor,
+                                FactSource::Commanded,
+                                json!({"type":"move_released", "commandId":command_id}),
+                            );
+                            shared.emit_predicted_pose(&bot_to_stop, &command_id);
+                        }
                     }
                 });
             }
@@ -910,9 +932,10 @@ fn handle_command(bot: &Client, shared: &Arc<SharedRuntime>, envelope: BackendCo
             shared.movement_generation.fetch_add(1, Ordering::AcqRel);
             shared.active_movement.store(false, Ordering::Release);
             *shared.active_movement_id.lock() = None;
+            if !try_set_movement_flags(bot, false, false) {
+                return;
+            }
             bot.walk(WalkDirection::None);
-            bot.set_jumping(false);
-            bot.set_crouching(false);
             shared.emit(
                 BackendEventKind::Motor,
                 FactSource::Commanded,
@@ -928,7 +951,11 @@ fn handle_command(bot: &Client, shared: &Arc<SharedRuntime>, envelope: BackendCo
             let delayed_shared = shared.clone();
             tokio::task::spawn_local(async move {
                 tokio::time::sleep(RESPAWN_SETTLE_DELAY).await;
-                if delayed_shared.stopping.load(Ordering::Acquire) {
+                if delayed_shared.stopping.load(Ordering::Acquire)
+                    || delayed_bot
+                        .try_query_self::<&LocalEntity, _>(|_| ())
+                        .is_err()
+                {
                     return;
                 }
                 delayed_bot
@@ -953,6 +980,12 @@ fn process_pending_commands(bot: &Client, shared: &Arc<SharedRuntime>) {
         return;
     }
     for command in shared.take_commands() {
+        if !shared.ready.load(Ordering::Acquire)
+            && !matches!(&command.command, BackendCommand::Respawn)
+        {
+            shared.enqueue_command(command);
+            continue;
+        }
         handle_command(bot, shared, command);
     }
 }
@@ -1066,9 +1099,9 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                 shared.active_movement.store(false, Ordering::Release);
                 *shared.active_movement_id.lock() = None;
                 shared.movement_generation.fetch_add(1, Ordering::AcqRel);
-                bot.walk(WalkDirection::None);
-                bot.set_jumping(false);
-                bot.set_crouching(false);
+                if try_set_movement_flags(&bot, false, false) {
+                    bot.walk(WalkDirection::None);
+                }
                 shared.emit(
                     BackendEventKind::Lifecycle,
                     FactSource::ServerObserved,
@@ -1094,8 +1127,16 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                 FactSource::ServerObserved,
                 json!({"type":"connection_failed", "error":format!("{error:?}")}),
             );
-            // 初次连接失败时没有可安全复用的已登录 client；让上层得到明确错误并结束。
-            bot.exit();
+            if shared.connection_epoch() > 1 {
+                // 重连尝试可能早于 Paper 完成保存/重新监听；ConnectionFailed
+                // 本身不触发 Azalea 的 SwarmEvent::Disconnect，因此显式断开这个
+                // 空连接，让统一重连状态机继续按 delay 重试，而不是把一次拒绝
+                // 误当成整个后端失败。
+                bot.disconnect();
+            } else {
+                // 初次连接失败时没有可安全复用的已登录 client；让上层得到明确错误并结束。
+                bot.exit();
+            }
         }
         Event::AddPlayer(info) => shared.emit(
             BackendEventKind::PlayerList,
