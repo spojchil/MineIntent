@@ -191,7 +191,7 @@ TS oracle 共 7 个 test，本批严格迁移前 6 个：
 ### 迁移内容
 
 - `registry.ts:43-133`：冻结 definition 副本并校验 description/schema revision、audience/dependency 重复、字段元数据/source kind、正数 limits、pagination 与 selector kind。
-- `registry.ts:135-200`：重复 provider id、seal/register/read 时序使用结构化错误；公开 provider/descriptor/revision/version 读取均要求 sealed，`seal` 使用内部 descriptor snapshot，符合本批“seal 前拒绝读取”的明确要求。
+- `registry.ts:135-200`：重复 provider id、seal/register/read 时序使用结构化错误；descriptor 在 seal 前可读，provider/revision/version 读取要求 sealed，`seal` 与公开调用使用同一确定性 descriptor 构造。
 - provider 以 `Arc` 持有，registry state 以 `RwLock` 保护；调用 `definition()` 在加锁前完成，返回 provider 后 availability/read 不持 registry lock，锁内不调用 provider/user code。
 - descriptor 按 wire id、field id 的 JavaScript UTF-16 字符串顺序确定性排列；catalog canonical copy 另将 audiences/fieldIds 排序，不改变公开 descriptor 中原 audience 顺序。
 - SHA-256 输入严格为紧凑 JSON：根字段 `targetMinecraftVersion/providers`，descriptor 字段 `id/description/schemaRevision/audiences/fieldIds`；digest 取小写十六进制前 16 位。固定 fixture 得到 `catalog:1.21.1:5c2f95176291633f`，并以本地 Node 内置 `crypto` 离线交叉核对。
@@ -223,3 +223,12 @@ Rust 另有 7 条 contract/characterization，不冒充 TS 对应项：
 - `cargo test --workspace --offline`：115 passed（本批新增 8），doc tests 通过。
 - `cargo check --workspace --offline`：通过。
 - 未迁：access-policy、reference/cursor store、provider 实现、catalog service/runtime/facade 组装及 backend gaps；本批没有扩展到任何 provider/user 行为。
+
+## 2026-08-01｜registry 独立审查返修
+
+- 对齐 `registry.ts:141-149`：`register()` 先在不调用 provider 的读锁 preflight 检查 sealed；释放锁后才读取、冻结、验证 definition；最后在写锁内再次检查 sealed，覆盖并发 seal 竞态。provider/user code 始终不在 registry lock 内执行。
+- 对齐 `registry.ts:157,175-185`：公开 `descriptors()` 在未 seal 时即可返回当前已注册 provider 的确定性 descriptor；`provider()`、`catalogRevision()`、`targetMinecraftVersion()` 继续要求 sealed。
+- 新增 `review_fix_unsealed_descriptors_are_readable_while_provider_requires_seal`：未 seal descriptor 成功且 provider 返回 `NotSealed`。
+- 新增 `review_fix_sealed_register_does_not_read_provider_definition`：计数 provider 在 sealed register 上直接得到 `Sealed`，definition 调用数保持 0。
+- 定向 `information_registry`：6 passed。
+- `cargo +stable fmt --all --check`：通过；`cargo test --workspace --offline`：117 passed、doc tests 通过；`cargo check --workspace --offline`：通过。

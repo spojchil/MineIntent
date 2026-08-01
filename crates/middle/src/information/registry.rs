@@ -121,12 +121,25 @@ impl InformationRegistry {
         Self::default()
     }
 
-    /// Copies and validates the provider definition before taking the registry lock. Provider code
-    /// is therefore never called while registry state is locked.
+    /// Checks `sealed` without calling provider code, releases that read lock, then copies and
+    /// validates the definition. The write-lock check below closes the concurrent-seal race, so
+    /// provider code is never called while registry state is locked.
     pub fn register(
         &self,
         provider: Arc<dyn InformationProvider>,
     ) -> Result<(), InformationRegistryError> {
+        {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| InformationRegistryError::LockPoisoned {
+                    operation: "preflight register",
+                })?;
+            if state.sealed {
+                return Err(InformationRegistryError::Sealed);
+            }
+        }
+
         let definition = freeze_definition(provider.definition());
         validate_definition(&definition)?;
         let id = interface_id_name(definition.id).to_owned();
@@ -216,7 +229,6 @@ impl InformationRegistry {
             .map_err(|_| InformationRegistryError::LockPoisoned {
                 operation: "read descriptors",
             })?;
-        require_sealed(&state)?;
         Ok(descriptors_unchecked(&state))
     }
 
@@ -269,7 +281,7 @@ fn descriptors_unchecked(state: &RegistryState) -> Vec<InformationProviderDescri
         .providers
         .values()
         .map(|provider| {
-            let definition = provider.definition();
+            let definition = &provider.definition;
             let mut field_ids: Vec<_> = definition.fields.keys().cloned().collect();
             field_ids.sort_by(|left, right| js_string_cmp(left, right));
             InformationProviderDescriptor {

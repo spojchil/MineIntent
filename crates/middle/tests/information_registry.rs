@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use mineintent_contracts::minecraft::{BoxFuture, OperationControl};
 use mineintent_middle::information::{
@@ -30,6 +36,39 @@ impl InformationValueSchema for NumberSchema {
 
 struct FakeProvider {
     definition: InformationProviderDefinition,
+}
+
+struct CountingDefinitionProvider {
+    definition: InformationProviderDefinition,
+    definition_calls: Arc<AtomicUsize>,
+}
+
+impl InformationProvider for CountingDefinitionProvider {
+    fn definition(&self) -> &InformationProviderDefinition {
+        self.definition_calls.fetch_add(1, Ordering::SeqCst);
+        &self.definition
+    }
+
+    fn availability(&self, _context: &InformationProviderContext<'_>) -> ProviderAvailability {
+        ProviderAvailability {
+            overall: InformationCatalogEntryAvailability::Available,
+            information_revision: 1,
+            fields: BTreeMap::new(),
+        }
+    }
+
+    fn read<'a>(
+        &'a self,
+        _context: InformationProviderContext<'a>,
+        _request: ProviderReadRequest,
+        _control: OperationControl,
+    ) -> BoxFuture<'a, Result<ProviderReadResult, InformationProviderError>> {
+        Box::pin(async {
+            Err(InformationProviderError::Failed {
+                message: "unused review fixture read".to_owned(),
+            })
+        })
+    }
 }
 
 impl InformationProvider for FakeProvider {
@@ -332,10 +371,6 @@ fn rust_contract_registry_reads_require_seal_and_lifecycle_errors_do_not_panic()
     registry
         .register(provider(InformationInterfaceId::CurrentStatus))
         .expect("provider should register");
-    assert!(matches!(
-        registry.descriptors(),
-        Err(InformationRegistryError::NotSealed)
-    ));
     assert_eq!(
         registry.catalog_revision(),
         Err(InformationRegistryError::NotSealed)
@@ -357,6 +392,45 @@ fn rust_contract_registry_reads_require_seal_and_lifecycle_errors_do_not_panic()
         registry.seal("1.21.1"),
         Err(InformationRegistryError::AlreadySealed)
     );
+}
+
+#[test]
+fn review_fix_unsealed_descriptors_are_readable_while_provider_requires_seal() {
+    let registry = InformationRegistry::new();
+    registry
+        .register(provider(InformationInterfaceId::CurrentStatus))
+        .expect("provider should register");
+
+    let descriptors = registry
+        .descriptors()
+        .expect("TS descriptors are readable before seal");
+    assert_eq!(descriptors.len(), 1);
+    assert_eq!(descriptors[0].id, InformationInterfaceId::CurrentStatus);
+    assert_eq!(descriptors[0].field_ids, ["value"]);
+    assert!(matches!(
+        registry.provider(InformationInterfaceId::CurrentStatus),
+        Err(InformationRegistryError::NotSealed)
+    ));
+}
+
+#[test]
+fn review_fix_sealed_register_does_not_read_provider_definition() {
+    let registry = InformationRegistry::new();
+    registry
+        .register(provider(InformationInterfaceId::CurrentStatus))
+        .expect("provider should register");
+    registry.seal("1.21.1").expect("registry should seal");
+
+    let definition_calls = Arc::new(AtomicUsize::new(0));
+    let provider: Arc<dyn InformationProvider> = Arc::new(CountingDefinitionProvider {
+        definition: definition(InformationInterfaceId::F3Information),
+        definition_calls: Arc::clone(&definition_calls),
+    });
+    assert_eq!(
+        registry.register(provider),
+        Err(InformationRegistryError::Sealed)
+    );
+    assert_eq!(definition_calls.load(Ordering::SeqCst), 0);
 }
 
 fn interface_name(id: InformationInterfaceId) -> &'static str {
