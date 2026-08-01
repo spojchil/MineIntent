@@ -12,10 +12,8 @@ use super::{
         InformationAudience, InformationGrant, InformationInterfaceId,
         InformationInvalidationEvent, InformationScopeSnapshot, InformationSelectorRef,
     },
-    ref_store::{
-        clone_bounded_json, format_utc_millis, is_expired, InformationRefClock,
-        SystemInformationRefClock,
-    },
+    support::{clone_bounded_json, format_utc_millis, is_expired},
+    InformationClock, SystemInformationClock,
 };
 
 pub const DEFAULT_MAX_CURSOR_ENTRIES: usize = 2_048;
@@ -31,7 +29,7 @@ pub struct InformationCursorStoreOptions {
     pub max_entries_per_interface: usize,
     pub max_page_state_bytes: usize,
     pub ttl_ms: u64,
-    pub clock: Arc<dyn InformationRefClock>,
+    pub clock: Arc<dyn InformationClock>,
 }
 
 impl Default for InformationCursorStoreOptions {
@@ -42,7 +40,7 @@ impl Default for InformationCursorStoreOptions {
             max_entries_per_interface: DEFAULT_MAX_CURSOR_ENTRIES_PER_INTERFACE,
             max_page_state_bytes: DEFAULT_MAX_CURSOR_PAGE_STATE_BYTES,
             ttl_ms: DEFAULT_CURSOR_TTL_MS,
-            clock: Arc::new(SystemInformationRefClock),
+            clock: Arc::new(SystemInformationClock),
         }
     }
 }
@@ -55,6 +53,8 @@ pub enum InformationCursorStoreError {
     InvalidMetadata,
     #[error("information cursor capacity exceeded")]
     CapacityExceeded,
+    /// Parity-reserved for the TypeScript `unknown` input; current Rust callers provide a
+    /// `serde_json::Value`, so this cannot be produced by the public API.
     #[error("information cursor page state must be JSON serializable")]
     PageStateNotJsonSerializable,
     #[error("information cursor page state exceeds its byte limit ({actual} > {maximum})")]

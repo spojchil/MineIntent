@@ -354,3 +354,27 @@ TS 本批 **2/2 tests**：
 - `cargo test --workspace --offline`：156 passed，doc tests 通过。
 - `cargo check --workspace --all-targets --offline` 与 `cargo +stable fmt --all -- --check`：通过。
 - 剩余未迁：provider、runtime、context-composer，以及上述 runtime:179 阶段 4 组合回归。
+
+## 2026-08-01｜阶段 2 Information 中立 support 整理返修
+
+### 范围与结构
+
+- 开始基线：`aef6811`，worktree clean；实现代理未联网，supplies/vendor/移植计划只读，未生成 TS/JS，未进入 provider/runtime/context-composer/kernel。主会话审查时只读核对了官方 `boa-dev/ryu-js` 与仓内 vendored `ryu` 的核心实现，临时 checkout 仅位于 gitignored `target` 并在交付前删除。
+- 新增 crate-private `information/support.rs`，统一承载 clock、UTC millisecond parse/format/expiry 与 bounded JSON clone；ref/cursor/policy 不再跨模块依赖 `ref_store` 私有 helper。
+- information 根公开中立 `InformationClock/SystemInformationClock`；ref-store 公开兼容 alias `InformationRefClock/SystemInformationRefClock`，旧 trait/type 名与中立类型是同一项。ref/cursor options 的公开字段均使用 `Arc<dyn InformationClock>`。
+- 更新 information 模块文档为阶段 1/2 已落地边界；`PayloadNotJsonSerializable` 与 `PageStateNotJsonSerializable` 明确标注为 TypeScript `unknown` parity-reserved，当前 `serde_json::Value` Rust API 不可达。公开 wire DTO/serde 未改变。
+
+### Date.parse 与 JSON.stringify parity
+
+- 中立 parser 保留既有 RFC3339/offset/毫秒语义，并新增 ECMAScript 标准 `YYYY-MM-DD` 按 UTC midnight 解析；`2026-07-13` 固定为 `1783900800000`。完全无效字符串仍返回 None，使 access-policy 保持 JavaScript NaN 比较的“不因 expiry 误拒绝”。
+- access-policy source-characterization 新增 date-only 过期拒绝；ref-store 新增 date-only `validUntil` 可签发并在固定 UTC midnight 到期的 oracle characterization。
+- bounded JSON 使用自定义 `serde_json::Formatter`：所有 `Value::Number` 先按 JavaScript Number 的 IEEE-754/NumberToString 语义输出，再以该紧凑 UTF-8 JSON 计 byte cap 和 clone；整数也先转 JS Number，`-0` 归一为 `0`。初稿以 `f64::to_string` 取得 shortest digits 的“完全 parity”判断过早：随机差分暴露 tie-case 后，已改为直接依赖仓内既有 `ryu 1.0.23`，由 `ryu::Buffer::format_finite` 取得与 ECMAScript Ryu 实现一致的 shortest digits，再保留既有指数阈值、负零与整数 `.0` 转换。`Cargo.lock` 仅机械补入 `mineintent-middle -> ryu` 的直接依赖边，包版本本身未变化。
+- 本地 Node 只读表征：`1.0 -> "1"`/1 byte，`-0 -> "0"`/1，`1e-6 -> "0.000001"`/8，`1e21 -> "1e+21"`/5；包含上述四值及嵌套数组的 fixture 为 85 bytes。生产与测试没有留下 Node/TS/JS 文件。
+- support 单元回归另锁定 `1e-7`、`1e20` 阈值、`9007199254740993 -> 9007199254740992` 的 JS safe-integer rounding，以及 bits `0x43179085685d83c9 -> 1658206780088562.2` 的 shortest-decimal tie-case；ref/cursor 均验证嵌套数值 clone 与 84 reject/85 accept 临界 byte cap。临时 Rust 探针通过 stdin 调用本机 Node（未在源码树留下 JS/TS），对确定性随机 **249865** 个有限 f64 比较，结果 `samples=249865 outputs=249865 mismatches=0`。
+
+### 锁边界与验证
+
+- ref-store 新增 counting-clock 回归：空 store 首次 issue 只在 entries mutex 前取时一次，TTL 使用该值；resolve 在精确边界第二次取时并过期。cursor 原有同类回归继续通过。
+- Information 相关测试共 57 passed：support 2、access-policy 7、contracts/schema 7、cursor 8、geometry 6、ref-store 12、registry 6、scope/trace 4、source-ports 5。`cargo test --package mineintent-middle --offline` 总计 83 passed。
+- `cargo test --workspace --offline`：161 passed，doc tests 通过；`cargo check --workspace --all-targets --offline`、对应 `--locked` 检查与 `cargo +stable fmt --all -- --check`：通过。
+- 本次无范围阻塞项；阶段 4 的 provider/runtime/context-composer 与 `runtime.test.ts:179` 仍按原 gate deferred。

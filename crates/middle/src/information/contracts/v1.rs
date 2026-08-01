@@ -839,6 +839,8 @@ pub enum InformationReferenceIssueError {
     ActiveScreenRevisionRequired,
     #[error("information reference capacity exceeded")]
     CapacityExceeded,
+    /// Parity-reserved for the TypeScript `unknown` input; the Rust contract already owns a
+    /// `serde_json::Value`, so this cannot be produced by current public callers.
     #[error("information reference payload must be JSON serializable")]
     PayloadNotJsonSerializable,
     #[error("information reference payload exceeds its byte limit ({actual} > {maximum})")]

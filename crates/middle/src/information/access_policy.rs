@@ -11,7 +11,7 @@ use super::{
         InformationAllowedInterfaces, InformationGrant, InformationProviderDescriptor,
         InformationScopeSnapshot,
     },
-    ref_store::parse_rfc3339_millis,
+    support::parse_javascript_date_millis,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,8 +165,8 @@ impl InformationAccessPolicy for InMemoryInformationAccessPolicy {
 
 fn is_expired(valid_until: Option<&str>, now: &str) -> bool {
     valid_until
-        .and_then(parse_rfc3339_millis)
-        .zip(parse_rfc3339_millis(now))
+        .and_then(parse_javascript_date_millis)
+        .zip(parse_javascript_date_millis(now))
         .is_some_and(|(valid_until, now)| valid_until <= now)
 }
 
