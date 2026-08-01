@@ -1795,6 +1795,7 @@ name = "mineintent-middle"
 version = "0.0.1"
 dependencies = [
  "mineintent-contracts",
+ "ryu",
  "serde",
  "serde_json",
  "sha2",

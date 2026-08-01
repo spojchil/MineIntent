@@ -1,5 +1,5 @@
 use std::sync::{
-    atomic::{AtomicI64, Ordering},
+    atomic::{AtomicI64, AtomicUsize, Ordering},
     Arc,
 };
 
@@ -42,6 +42,36 @@ impl FixedClock {
 impl InformationRefClock for FixedClock {
     fn now_millis(&self) -> i64 {
         self.now.load(Ordering::SeqCst)
+    }
+}
+
+struct CountingClock {
+    calls: AtomicUsize,
+    first: i64,
+    later: i64,
+}
+
+impl CountingClock {
+    fn new(first: i64, later: i64) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            first,
+            later,
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl InformationRefClock for CountingClock {
+    fn now_millis(&self) -> i64 {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.first
+        } else {
+            self.later
+        }
     }
 }
 
@@ -293,6 +323,118 @@ fn review_fix_ref_issuer_is_a_fallible_object_safe_provider_port() {
         second_port.issue(item_request(3, false)),
         Err(InformationReferenceIssueError::CapacityExceeded)
     );
+}
+
+#[test]
+fn cleanup_ref_issue_samples_clock_once_and_uses_that_value_for_ttl() {
+    let clock = Arc::new(CountingClock::new(
+        FIXED_NOW_MS,
+        FIXED_NOW_MS + DEFAULT_REFERENCE_TTL_MS as i64,
+    ));
+    let store = InformationRefStore::new(options(clock.clone())).expect("valid clock options");
+    let reference = issuer(
+        &store,
+        InformationInterfaceId::InventoryInformation,
+        "model-1",
+        grant(),
+        scope(),
+    )
+    .issue(item_request(1, false))
+    .expect("reference should issue");
+    assert_eq!(
+        clock.calls(),
+        1,
+        "empty-store issue must sample the user clock before locking exactly once"
+    );
+
+    assert_eq!(store.resolve(resolve_input(reference)), Ok(None));
+    assert_eq!(clock.calls(), 2, "resolve samples the TTL boundary once");
+}
+
+#[test]
+fn source_characterization_date_only_valid_until_uses_utc_date_parse_semantics() {
+    let clock = Arc::new(FixedClock::new(FIXED_NOW_MS));
+    let store = InformationRefStore::new(options(clock)).expect("valid date-only options");
+    let mut request = item_request(1, false);
+    request.valid_until = Some("2026-07-14".to_owned());
+    let reference = issuer(
+        &store,
+        InformationInterfaceId::InventoryInformation,
+        "model-1",
+        grant(),
+        scope(),
+    )
+    .issue(request)
+    .expect("ECMAScript date-only timestamp should be accepted");
+    assert_eq!(reference.valid_until.as_deref(), Some("2026-07-14"));
+    assert_eq!(
+        store.resolve(resolve_input(reference)),
+        Ok(None),
+        "date-only midnight is expired at the fixed current instant"
+    );
+}
+
+#[test]
+fn cleanup_reference_payload_uses_javascript_number_and_byte_semantics() {
+    let payload = json!({
+        "one": 1.0,
+        "negativeZero": -0.0,
+        "tiny": 1e-6,
+        "huge": 1e21,
+        "nested": [1.0, -0.0, 1e-6, 1e21],
+    });
+    let rejected = InformationRefStore::new(InformationRefStoreOptions {
+        max_payload_bytes: 84,
+        ..InformationRefStoreOptions::default()
+    })
+    .expect("valid rejected boundary");
+    let request = InformationReferenceIssueRequest {
+        payload: payload.clone(),
+        ..item_request(1, false)
+    };
+    assert_eq!(
+        issuer(
+            &rejected,
+            InformationInterfaceId::InventoryInformation,
+            "model-1",
+            grant(),
+            scope(),
+        )
+        .issue(request),
+        Err(InformationReferenceIssueError::PayloadByteLimitExceeded {
+            actual: 85,
+            maximum: 84,
+        })
+    );
+
+    let accepted = InformationRefStore::new(InformationRefStoreOptions {
+        max_payload_bytes: 85,
+        ..InformationRefStoreOptions::default()
+    })
+    .expect("valid accepted boundary");
+    let request = InformationReferenceIssueRequest {
+        payload,
+        ..item_request(1, false)
+    };
+    let reference = issuer(
+        &accepted,
+        InformationInterfaceId::InventoryInformation,
+        "model-1",
+        grant(),
+        scope(),
+    )
+    .issue(request)
+    .expect("Node-characterized 85-byte payload should pass");
+    let normalized = accepted
+        .resolve(resolve_input(reference))
+        .expect("numeric resolve should work")
+        .expect("numeric reference should resolve");
+    assert_eq!(normalized["one"].as_u64(), Some(1));
+    assert_eq!(normalized["negativeZero"].as_u64(), Some(0));
+    assert_eq!(normalized["tiny"].as_f64(), Some(1e-6));
+    assert_eq!(normalized["huge"].as_f64(), Some(1e21));
+    assert_eq!(normalized["nested"][0].as_u64(), Some(1));
+    assert_eq!(normalized["nested"][1].as_u64(), Some(0));
 }
 
 #[test]

@@ -145,6 +145,19 @@ fn source_characterization_expiry_denies_only_when_both_timestamps_parse() {
         ),
         InformationAuthorizationResult::Allowed
     );
+    candidate.valid_until = Some("2026-07-13".to_owned());
+    assert_eq!(
+        authorize(
+            &policy,
+            &candidate,
+            &provider,
+            InformationAuthorizationOperation::Read,
+            &["health"],
+            &scope,
+        ),
+        DENIED,
+        "ECMAScript date-only input is UTC midnight and already expired"
+    );
     candidate.valid_until = Some("2026-07-13T00:00:00.000Z".to_owned());
     let mut invalid_now = scope;
     invalid_now.captured_at = "invalid-now".to_owned();

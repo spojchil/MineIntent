@@ -1,7 +1,7 @@
-//! A 独占的 Information 集成边界命名空间。
+//! A 独占的 Information 协议与阶段 1/2 叶子实现。
 //!
-//! 本模块只承载 Information 的协议、纯数学和 source-port 边界。provider/store/runtime
-//! 与 viewport 投影 kernel 不属于这一层。
+//! 当前包含协议、纯数学、source-port、registry、scope/trace、ref/cursor store 与访问策略。
+//! provider、runtime、context composer 与 viewport 投影 kernel 尚未迁入。
 
 pub mod access_policy;
 pub mod contracts;
@@ -12,3 +12,7 @@ pub mod registry;
 pub mod scope;
 pub mod source_ports;
 pub mod trace;
+
+mod support;
+
+pub use support::{InformationClock, SystemInformationClock};

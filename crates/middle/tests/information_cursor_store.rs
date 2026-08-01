@@ -17,7 +17,7 @@ use mineintent_middle::information::{
         DEFAULT_MAX_CURSOR_ENTRIES_PER_INTERFACE, DEFAULT_MAX_CURSOR_ENTRIES_PER_PRINCIPAL,
         DEFAULT_MAX_CURSOR_PAGE_STATE_BYTES,
     },
-    ref_store::InformationRefClock,
+    InformationClock,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -40,7 +40,7 @@ impl FixedClock {
     }
 }
 
-impl InformationRefClock for FixedClock {
+impl InformationClock for FixedClock {
     fn now_millis(&self) -> i64 {
         self.now.load(Ordering::SeqCst)
     }
@@ -66,7 +66,7 @@ impl CountingClock {
     }
 }
 
-impl InformationRefClock for CountingClock {
+impl InformationClock for CountingClock {
     fn now_millis(&self) -> i64 {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             self.first
@@ -145,7 +145,7 @@ fn resolve_input(cursor: String) -> InformationCursorResolveInput {
     }
 }
 
-fn options(clock: Arc<dyn InformationRefClock>) -> InformationCursorStoreOptions {
+fn options(clock: Arc<dyn InformationClock>) -> InformationCursorStoreOptions {
     InformationCursorStoreOptions {
         clock,
         ..InformationCursorStoreOptions::default()
@@ -444,6 +444,45 @@ fn contract_all_invalidations_match_cursor_specific_oracle_semantics() {
 
 #[test]
 fn contract_page_state_limit_counts_utf8_json_bytes() {
+    let js_numbers = json!({
+        "one": 1.0,
+        "negativeZero": -0.0,
+        "tiny": 1e-6,
+        "huge": 1e21,
+        "nested": [1.0, -0.0, 1e-6, 1e21],
+    });
+    let numeric_rejected = InformationCursorStore::new(InformationCursorStoreOptions {
+        max_page_state_bytes: 84,
+        ..InformationCursorStoreOptions::default()
+    })
+    .expect("valid numeric byte options");
+    assert_eq!(
+        numeric_rejected.issue(issue_input(js_numbers.clone())),
+        Err(InformationCursorStoreError::PageStateByteLimitExceeded {
+            actual: 85,
+            maximum: 84,
+        })
+    );
+    let numeric_accepted = InformationCursorStore::new(InformationCursorStoreOptions {
+        max_page_state_bytes: 85,
+        ..InformationCursorStoreOptions::default()
+    })
+    .expect("valid numeric boundary");
+    let cursor = numeric_accepted
+        .issue(issue_input(js_numbers))
+        .expect("Node-characterized 85-byte state should pass");
+    let normalized = numeric_accepted
+        .resolve(resolve_input(cursor))
+        .expect("numeric resolve should work")
+        .expect("numeric cursor should resolve")
+        .state;
+    assert_eq!(normalized["one"].as_u64(), Some(1));
+    assert_eq!(normalized["negativeZero"].as_u64(), Some(0));
+    assert_eq!(normalized["tiny"].as_f64(), Some(1e-6));
+    assert_eq!(normalized["huge"].as_f64(), Some(1e21));
+    assert_eq!(normalized["nested"][0].as_u64(), Some(1));
+    assert_eq!(normalized["nested"][1].as_u64(), Some(0));
+
     let value = json!({"x": "界"});
     assert_eq!(
         serde_json::to_vec(&value)
