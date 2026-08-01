@@ -82,7 +82,7 @@ test('scheduler rate limits and preserves segment order', async () => {
     onEvent: event => events.push(`${event.type}:${'requestId' in event ? event.requestId : ''}`),
   })
   scheduler.schedule({ id: 'reply', text: '我去拿一些木头回来' })
-  await wait(30)
+  await waitUntil(() => sent.join('') === '我去拿一些木头回来')
   assert.equal(sent.join(''), '我去拿一些木头回来')
   assert.equal(events[0], 'scheduled:reply')
   scheduler.stop()
@@ -103,3 +103,9 @@ test('scheduler stop cancels queued speech before it is sent', async () => {
 })
 
 function wait(ms: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, ms)) }
+
+// 轮询到条件成立或超过截止时间：断言「最终发生」，不依赖慢机器上的绝对时延。
+async function waitUntil(condition: () => boolean, deadlineMs = 2000): Promise<void> {
+  const start = Date.now()
+  while (!condition() && Date.now() - start < deadlineMs) await wait(5)
+}
