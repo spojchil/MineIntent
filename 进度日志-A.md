@@ -86,3 +86,49 @@ Mutation：
 - `cargo test --workspace --offline`：通过；backend 13、I01 26、I02 17，共 56 条测试通过，doc tests 通过。
 - `cargo check --workspace --offline`：通过。
 - 仅修改 I01 的 `config.rs`、`api.rs`、专属测试与本日志；manifest、`lib.rs`、I02、B 模块、backend、`Cargo.lock` 均无变更。
+
+## 2026-08-01｜P1-A Information contracts/schema 第一批
+
+### 基线、oracle 与边界
+
+- 开始基线：`ad65f7a 构建：预留 P1 middle 并行模块`，worktree `port/a-world-info` clean。
+- 只读 oracle 固定为 `supplies/mineintent-main@6fb3ed0c007601b4e1eb1cb0a9d10525ac2a2467`。
+- 本提交只修改 `crates/middle/src/information/mod.rs`、`information/contracts/**`、`tests/information_contracts_schema.rs` 与本日志；未修改 manifest/lock、`src/lib.rs`、I02、backend、B 模块或只读目录。
+- `contracts/v1.ts:3-205` 的枚举全集、catalog/selector/query/help/read/error wire DTO，`v1.ts:218-379` 的 grant/caller、字段 schema 抽象、provider/ref SPI、session/invalidation/trace DTO 已冻结。异构 `Partial<T>`/generic selector/page state 在对象安全边界擦除为严格 JSON value/map，不包含 provider 实现或 registry。
+- `v1.ts:206-216` 的 scope 直接复用 P0 I02 `InformationScopeSnapshot`；基础 unavailable reason 提供到 I02 facade reason 的显式转换，没有改动冻结契约。
+- `schemas.ts:10-55` 对应闭合 enum、literal/version discriminator、strict object、UTF-16 字符长度、数组上限、selector/page 整数约束与 UTC ISO datetime parser。optional 表示缺省而非显式 `null`；请求整数接受 JS 中等价的 `1.0`，拒绝负数、非整数和超出 safe-integer 的值。
+- provider/ref/value-schema trait 均为对象安全边界；异步 provider read 复用 P0 的 `BoxFuture + OperationControl`，未引入 executor、timer、线程、通道或新依赖。
+
+### `schemas.test.ts` 逐断言映射
+
+TS oracle 共 **1 个 test / 5 条 assert**，集中对应 Rust `information_request_schemas_are_strict_and_versioned`：
+
+1. `contracts/schemas.test.ts:9-11`：最小 `list_interfaces` 成功。
+2. `contracts/schemas.test.ts:12-15`：catalog 伪造 `audience` 因 strict unknown-field 失败。
+3. `contracts/schemas.test.ts:16-21`：`current_status`/`status:1`/`health` read 成功。
+4. `contracts/schemas.test.ts:22-28`：read 伪造 `worldId` 因 strict unknown-field 失败。
+5. `contracts/schemas.test.ts:29-32`：未知 `interfaceId` 的 help 失败。
+
+Rust 另有 6 个边界测试，不冒充 TS 对应项：
+
+- `exported_v1_enumerations_are_complete_and_strict`：17/3/8/9/5/11 项公开全集及闭合枚举。
+- `query_parser_preserves_unicode_and_optional_fields`：Unicode、空 help fields、缺省 optional、显式 null 拒绝。
+- `selector_and_page_constraints_match_the_zod_schema`：selector/page 边界、JS 整数 `1.0`、safe integer、日历日期。
+- `exported_selector_parser_is_strict_and_versioned`：selector v1、unknown-field 与错误版本拒绝。
+- `representative_wire_dtos_reject_unknown_fields`：非请求 wire DTO 同样 strict。
+- `provider_spi_traits_are_object_safe`：provider/value-schema/ref issuer 三个 trait 可构造 trait object 类型。
+
+### 验证
+
+- `cargo test --package mineintent-middle --offline --test information_contracts_schema`：7 passed。
+- `cargo +stable fmt --all --check`：通过。
+- `cargo test --workspace --offline`：85 passed（backend 13、agent contracts 14、capability contracts 8、I01 26、I02 17、本批 7），doc tests 通过。
+- `cargo check --workspace --offline`：通过。
+- `git diff --check`：通过；提交前范围检查无越界文件。
+
+### 本批明确未迁
+
+- `geometry.ts`、self-vitals/inventory/sound source ports、`perception.ts:1-89` 留给下一批，当前未创建相应模块或测试。
+- `perception.ts:91+` viewport 投影 kernel 明确禁止进入本批；backend viewport 仍是唯一 kernel。
+- stores、provider 实现、catalog/registry、reference/cursor store、runtime/facade 组装及 backend 11 项行为缺口均未实现。
+- memory 继续受 `DELTA-01/Q12` gate 约束，未进入 Information contracts/schema。
