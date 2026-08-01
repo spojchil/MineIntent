@@ -214,3 +214,8 @@
 | `cargo check --workspace --offline` | 通过。 |
 | `cargo +stable fmt --all --check` | 通过。 |
 | `git diff --check` | 通过。 |
+
+### 维护审查返修：可选 summary 拒绝 null
+
+- `JobOutcome.summary` 保持缺省时为 `None`、序列化时省略；字段一旦出现，只接受 string，显式 `null` 严格拒绝，与 TS `summary?: string` 对齐。
+- `execution` contracts 中没有其他 `Option` 字段；arbiter API 与行为未改。额外 contract test 同时断言 omitted 接受和 `null` 拒绝。

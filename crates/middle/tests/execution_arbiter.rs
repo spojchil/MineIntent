@@ -240,6 +240,18 @@ fn additional_execution_contracts_are_strict_and_keep_outcomes_narrow() {
             "state": "failed"
         })
     );
+    let omitted_summary: JobOutcome = serde_json::from_value(json!({
+        "jobId": "00000000-0000-4000-8000-000000000002",
+        "state": "failed"
+    }))
+    .unwrap();
+    assert_eq!(omitted_summary.summary, None);
+    assert!(serde_json::from_value::<JobOutcome>(json!({
+        "jobId": "00000000-0000-4000-8000-000000000002",
+        "state": "failed",
+        "summary": null
+    }))
+    .is_err());
     assert!(serde_json::from_value::<JobOutcome>(json!({
         "jobId": "00000000-0000-4000-8000-000000000002",
         "state": "running",
