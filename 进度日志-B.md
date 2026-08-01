@@ -287,6 +287,33 @@
 | `cargo +stable fmt --all -- --check` | 通过。 |
 | `git diff --check` | 通过。 |
 
+- 提交尝试被共享 worktree 元数据 ACL 阻塞：`git add` 无法创建主仓库 `.git/worktrees/MineIntent-backend-rs-B/index.lock`（Permission denied）；无文件暂存、无提交，`index.lock` 当前不存在。代码与测试变更保留在工作树，待维护者恢复 Git 元数据写权限后提交。
+
+## 2026-08-01｜Issue #127 单文本 memory 修订（AgentRunner/v4 延后）
+
+### 实现边界
+
+- 本批只实现 `crates/middle/src/memory/**` 与对应 contract/characterization tests；没有实现 AgentRunner，也没有修改 `crates/contracts` 的 I03 v3。`agent-context v4` 留到取得明确契约提交后处理，避免提前改变默认 wire。
+- append 严格形成 `current + text`；空 text 是 no-op，不创建文件、不备份。replace 要求 `old_text` 非空且非重叠出现次数恰为 1，`new_text` 为空只删除锚点；rewrite 允许空全文并强制创建/写入文件。
+- M09 备份使用 `<memory>.bak` 与 `<memory>.bak.1` 两代滚动；每次实际写入前先轮转并复制旧文件，备份与临时文件均 flush/sync，Unix 文件模式为 `0600`。
+- Unix 使用 `rename` 原子替换；Windows 使用 `ReplaceFileW`/`MoveFileExW` 的 write-through 路径，生产路径不再 `remove_file(target)`。路径级 Tokio 锁注册表覆盖独立构造的 `MemoryStore`，串行化完整 read-modify-write。
+- `memories.json` 按旧 TS `mineintent.memory-file.v1` 的完整 strict schema（含 protocol/id/worldId/kind/summary/keywords/evidence/createdAt/status）校验；按 `createdAt`、UUID 稳定排序，渲染为 `summary (createdAt)`，首次迁移保留 legacy 备份。
+
+### 测试与门禁
+
+- `memory_store` 包含 append/no-op/rewrite、0/1/多锚点、空 new_text、备份轮转、严格 legacy/schema、确定性排序、独立 store 并发、Unix 0600 与外部编辑测试。
+- mutation：临时把 `count != 1` 改为 `count == 0`，锚点重复测试按预期失败；已恢复实现。
+- AgentRunner 与 `agent-context v4` 明确登记为后续批次，contracts 工作树恢复干净。
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test -p mineintent-middle --test memory_store --locked --offline` | 通过；9/9。 |
+| `cargo test --workspace --all-targets --locked --offline` | 通过；包含 backend 13、contracts 14+8+26+17、memory 9 及既有 middle 测试。 |
+| `cargo check --workspace --all-targets --locked --offline` | 通过。 |
+| `cargo fmt --all -- --check` | 通过。 |
+| `cargo +stable fmt --all -- --check` | 通过。 |
+| `git diff --check` | 通过。 |
+
 - 首次将全部门禁串在一个 PowerShell 调用时触及 120 秒工具时限，未产生失败诊断；拆分为以上独立命令后均明确通过。
 
 ## 2026-08-01｜阶段 2 B 范围整理返修
@@ -320,3 +347,20 @@
 | `cargo check --workspace --all-targets --offline` | 通过。 |
 | `cargo +stable fmt --all -- --check` | 通过。 |
 | `git diff --check` | 通过。 |
+
+## 2026-08-02｜MemoryStore 维护侧独立审查修订
+
+### 审查发现与修复
+
+- 对照只读 TS oracle 的 Zod v4 schema 后发现，代理版错误拒绝空 `keywords`，并把 `createdAt` 放宽为偏移时区/无效日历日/闰秒；UUID 也只做宽松 `Uuid::parse_str`。现已精确收紧为 Zod v4 规则：空 keywords 合法，UUID 必须满足 RFC 版本/variant（另保留 nil/max 特例），datetime 只接受 `Z`、允许可选秒数/小数并校验闰年与真实日期。
+- Zod 字符串上限按 JavaScript UTF-16 code unit 计数，不再用 Rust Unicode scalar 数量；迁移排序按真实 UTC 日期时间与小数秒比较，相同时以 UUID 决定顺序，避免 `...00.1Z` 被字典序排到 `...00Z` 前。
+- 唯一锚点计数覆盖重叠出现位置（如 `aa` 在 `aaa` 中为 2）；备份与临时路径改为直接追加 `OsString` 后缀，避免非 Unicode 路径经过 `display()` 发生有损改写。
+- Windows 官方文档明确 `REPLACEFILE_WRITE_THROUGH` 不受支持，且无 backup 参数的 `ReplaceFileW` 某些失败码可能移动原目标。生产替换已改为同卷 `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`；临时文件仍先 `flush/sync_all`，且任何路径都不预删目标。Unix 继续使用同卷 `rename`。
+
+### 独立测试与门禁
+
+- memory 定向测试扩为 11 条：新增 Zod UUID/datetime/空 keywords/UTF-16 边界、可选秒与小数秒的真实时间排序，并补上重叠锚点。
+- mutation：临时把 UTF-16 长度退化为 `chars().count()`，新增 schema 测试按预期在 501 个 emoji 的 summary 上失败；恢复后 11/11 通过。
+- `cargo test --workspace --all-targets --locked --offline`：通过，共 185 条测试。
+- `cargo check --workspace --all-targets --locked --offline`、`cargo fmt --all -- --check`、`git diff --check`：通过。
+- AgentRunner 与 `agent-context v4` 仍按 Issue #127 段登记延后，本次没有修改 contracts/manifest/lock。
