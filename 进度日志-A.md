@@ -508,3 +508,47 @@ TS 本批 **2/2 tests**：
 - mutation：临时交换 `READ_PLAN` 前两项，运行具名 `composer_uses_fixed_order_exact_schema_fields_and_shared_control`；按预期失败，实际首个请求为 `inventory_information`，期望为 `current_status`。已恢复，具名测试复跑通过。
 - 恢复后：`cargo test -p mineintent-middle --test information_context_composer --locked --offline` 为 6 passed；`cargo test -p mineintent-middle --test information_runtime --locked --offline` 为 16 passed；`cargo test -p mineintent-middle --all-targets --locked --offline` 为 144 passed；`cargo +stable fmt --all -- --check` 与 `git diff --check` 通过。
 - deferred：实际 viewport provider/backend adapter、后续 `InformationFacade` 组装及原子 `read_viewport`；本批不扩张冻结 contracts，不修改 manifest/lock。
+
+## 2026-08-02｜P1-A 阶段 4 VIEW-01/VIEW-02 Information viewport wrapper
+
+### 范围与生产实现
+
+- 开始时 git status --short --branch 仅显示分支 port/a-information-adapters，工作树无用户改动；本批只写 crates/middle/src/information/**、crates/middle/tests/information_viewport_provider.rs 与本日志。没有修改 crates/backend/**、crates/contracts/**、manifest/lock、B/A2、supplies、vendor 或移植计划。
+- 新增并从 crates/middle/src/information/providers/mod.rs 导出 ViewportInformationProvider。构造函数只接受 Arc<dyn MinecraftBackendApi>；provider 不依赖 backend concrete 类型、perception source port、几何扫描或第二套 viewport trait。
+- 每次 read 只调用一次 backend.observation_source()，把调用方同一个 OperationControl move 给该 source 的一次 read_viewport(control)，然后从同一个 ViewportRead 选择请求字段。没有读取 snapshot()、self_pose、list_tracked_entities、read_block 等旧拆分 seam。ViewportProjection 的坐标、舍入、排序、实体名称、legend、truncated 与可见性均直接 serde_json 投影，不再计算或改写。
+- 五字段、definition 中文描述、viewport-information:10、participant、connection+world dependencies、5/65536/5000 limits、field precision/source kind 与 viewport-provider.v3/current_perception 均逐项按 TS provider 对齐。nullable block 直接序列化为 JSON null，没有转成 unavailable；FactSource 仍留在 backend 原子 DTO，不进入模型可见 values。
+- ViewportRead.revision 同时作为本次 informationRevision 与 sourceRevision。availability 初始为 0，只读原子 fetch_max 的最近成功发布 revision；不会触发 backend read，逆序完成不会倒退。序列化/映射失败发生在发布前，错误不会更新 availability。
+- BackendError::Cancelled/DeadlineExceeded 精确映射到 provider 公共 error enum；其余 observation-source/backend 错误保留 Display 诊断文本并稳定映射 Failed，不 panic、不吞错、不伪造空投影。
+
+### TS viewport-provider.test.ts 7/7 逐条归属
+
+1. viewport-provider.test.ts:40 viewport provider satisfies its five-field contract → ts_viewport_provider_satisfies_the_five_field_contract；复用既有 Rust provider contract helper，覆盖五字段、requested/value-unavailable 关系与运行期 schema。
+2. viewport-provider.test.ts:45 positions are world-absolute... → wrapper passthrough 断言位于 viewport_provider_projects_requested_subset_from_one_atomic_read_and_preserves_wire_metadata；backend 几何/first-hit 归 crates/backend/src/viewport.rs::tests::projection_uses_absolute_coordinates_and_first_hit，middle 没有复制 world fixture。
+3. viewport-provider.test.ts:68 selects the exposed-face predicate... → backend kernel 所有权；当前 backend 没有专门的 flat-ground exposed-face 回归测试，viewport::tests::opaque_wall_blocks_far_blocks_and_entities 只覆盖墙体遮挡，不能冒充 exposed-face 覆盖。本批不在 middle 复制扫描。
+4. viewport-provider.test.ts:88 a player named after a mob stays distinguishable... → wrapper 的 player 原样保留/普通实体不发该字段由 viewport_provider_preserves_nullable_blocks_legend_players_and_truncated 覆盖；实体分类和 name/username 生产仍属 backend kernel，当前没有专门的同名 player/species backend 回归，未冒充覆盖。
+5. viewport-provider.test.ts:111 a read that fills the entity cap says so → wrapper 保留 kernel 给出的 items/truncated 由同一 Rust test 覆盖；实体数量上限属于 backend kernel，当前 backend 没有专门的 cap fixture，未在 middle 重做 9-entity 扫描。
+6. viewport-provider.test.ts:125 revision test → viewport_availability_is_side_effect_free_and_never_moves_backwards；原 TS pose/snapshot hash 不复活。backend 原子 revision 回归为 runtime::tests::read_viewport_returns_projection_source_and_unique_revision 与 runtime::tests::read_viewport_revision_is_unique_for_concurrent_successes。
+7. viewport-provider.test.ts:160 entities-only abort → wrapper 的 cancellation/deadline mapping 由 viewport_provider_maps_cancellation_deadline_and_backend_errors 覆盖；kernel checkpoint/不扫描边界已由 runtime::tests::read_viewport_preflight_cancel_and_deadline_do_not_scan 与 runtime::tests::read_viewport_observes_cancellation_and_deadline_during_projection 覆盖。没有在 middle 复制实体扫描。
+
+### 新增 Rust-only wrapper regressions
+
+- rust_contract_viewport_definition_and_runtime_schemas_match_oracle：五字段 definition、中文 metadata、limits、严格/普通 zod object 的 strip/strict、nullable block 与 runtime schema。
+- viewport_provider_projects_requested_subset_from_one_atomic_read_and_preserves_wire_metadata：字段子集、单次 atomic read、absolute frame passthrough、source/schema-related metadata、observedAt、evidence、page-state wire 与旧 split seam 计数。
+- viewport_provider_preserves_nullable_blocks_legend_players_and_truncated：JSON null、legend、玩家字段、普通实体字段缺席和 truncated 原样保留。
+- viewport_provider_gets_the_latest_observation_source_once_per_read、viewport_provider_passes_the_original_operation_control_to_atomic_read：每次重新获取 source、同一 read 不混 source、不二次 read、control identity 与 legacy calls 为零。
+- viewport_provider_maps_cancellation_deadline_and_backend_errors：取消、deadline、普通 read error 与 observation-source error 的结构化映射。
+- viewport_availability_is_side_effect_free_and_never_moves_backwards：初始 0、availability 无副作用、成功发布与并发逆序完成的 monotonic revision。
+
+### Mutation 与验证
+
+- mutation 1：临时把 provider 的一次 read_viewport(control) 改为两次（第二次使用 clone 后的 control），运行 viewport_provider_projects_requested_subset_from_one_atomic_read_and_preserves_wire_metadata；按预期失败，fake source 返回 Failed: unexpected viewport read。已恢复为一次调用，定向 viewport 8/8 通过。
+- mutation 2：临时把 revision fetch_max 改为 plain store，运行 viewport_availability_is_side_effect_free_and_never_moves_backwards；按预期失败，逆序完成后实际 availability 为 7、期望 8。已恢复为 fetch_max。
+- cargo test -p mineintent-middle --test information_viewport_provider --locked --offline：8 passed。
+- cargo test -p mineintent-middle --all-targets --locked --offline：通过；cargo test --workspace --all-targets --locked --offline：通过。backend 当前 29 项通过，其中包括上面列出的 viewport/runtime kernel tests；contracts I02 17 项通过。
+- cargo check --workspace --all-targets --locked --offline、cargo fmt --all -- --check、cargo +stable fmt --all -- --check、git diff --check：全部通过。
+
+### 风险与 deferred
+
+- 当前交付只完成 middle Information wrapper；实际 backend MinecraftBackendApi facade wiring、Information registry/runtime 组装、InformationFacade、app/真实 adapter 尚未接入，属于后续集成工作，不能以本批 fake-backed 测试替代。
+- backend 当前缺少 exposed-face flat-ground、entity cap、player/species collision 的专门 kernel regression；这些保持 backend 责任并 deferred，本批明确没有把 wrapper passthrough 断言写成几何覆盖。
+- 未 commit、未 push、未创建 PR。
