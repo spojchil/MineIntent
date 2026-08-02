@@ -396,3 +396,12 @@
 - mutation：分别把每响应上限改为 9、移除 run-wide seen-ID 检查、移除结果顺序检查，对应测试均按预期失败；已全部恢复。
 - `cargo test -p mineintent-middle --all-targets --locked --offline`、middle all-target check、nightly/stable fmt 与 `git diff --check` 均通过。
 - 本批不宣称完整 `AgentRunner`：同一 deadline 的 async 驱动、`ToolDispatcher` 顺序执行与逐调用 panic 围栏、closing leak guard、transcript v1、外部 prompt/composer、context v4/MemoryStore 接线仍待后续批次。
+
+## 2026-08-02｜Agent async 驱动与控制边界
+
+- 增加 `AgentLoopDriver<Model, Tools>`，把纯 `AgentRun` 接到现有 `ModelProvider` 与 `ToolDispatcher`；每轮 model request 重用同一组工具定义，所有模型/工具调用传入同一个 `ExecutionControl` 与绝对 deadline。
+- 驱动器在 provider/dispatcher future 外层同时等待取消通知和 Tokio deadline timer；任一分支就绪后再调用 `check_at(Instant::now())`，保持“取消优先于 deadline”。timer/取消获胜会丢弃阻塞 future，不依赖具体 provider 自觉轮询。
+- tool-call 严格按模型数组顺序逐个 await；非运行控制类 `AgentError` 转为配对 failed result。同步构造 panic 与异步 poll panic 都被逐调用围栏转换为 `tool_dispatch_panicked`，不会杀死整个 run；provider panic 则成为结构化 `provider_failed`。
+- 5 条 driver 回归覆盖同一 deadline、串行且全执行、错误/panic N 进 N 出、deadline 主动 drop 阻塞 provider、取消唤醒/drop，以及取消与过期同时成立时取消优先。
+- mutation：移除 async poll panic 围栏后 panic 回归按预期失败；把内部 timer 延后 5 秒后 deadline 回归由外层 1 秒 watchdog 杀死；均已恢复。
+- 仍延后：实现 `AgentRunner` trait 的 context/prompt 组装、context v4/MemoryStore、closing leak guard 与 transcript v1。
