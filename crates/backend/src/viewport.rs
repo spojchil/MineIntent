@@ -4,8 +4,9 @@
 //! `BlockReadResult` 只提供绝对坐标上的观察原语，投影层再做视锥、暴露面和
 //! 遮挡射线判断。算法参数与主仓库 `source-ports/perception.ts` 对齐。
 
-use std::{cell::RefCell, cmp::Ordering, collections::HashMap, f64::consts::PI};
+use std::{cmp::Ordering, collections::HashMap, f64::consts::PI};
 
+use mineintent_contracts::minecraft::BackendError;
 use serde::{Deserialize, Serialize};
 
 use crate::snapshot::{
@@ -262,18 +263,46 @@ pub fn project<F>(
 where
     F: Fn(BlockPosition) -> BlockReadResult,
 {
-    options.validate()?;
+    project_with_checkpoint(pose, entities, read_block, options, || Ok(())).map_err(|error| {
+        match error {
+            BackendError::InvalidCommand { message, .. } => message,
+            other => other.to_string(),
+        }
+    })
+}
+
+/// Generate a projection while exposing real cancellation/deadline checkpoints
+/// to the caller. The callback runs before each expensive geometry phase and
+/// before every block/ray read; an error exits the scan immediately.
+pub fn project_with_checkpoint<F, C>(
+    pose: &PoseSnapshot,
+    entities: &[ProtocolEntitySnapshot],
+    mut read_block: F,
+    options: &ViewportOptions,
+    mut checkpoint: C,
+) -> Result<ViewportProjection, BackendError>
+where
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), BackendError>,
+{
+    options
+        .validate()
+        .map_err(|message| BackendError::InvalidCommand {
+            field: "viewport".to_owned(),
+            message,
+        })?;
+    checkpoint()?;
     // 一个投影会反复读取同一体素：候选扫描、暴露面邻居和多条射线都会经过
     // 它。RuntimeObservationSource 的单次 read_block 还会创建完整 DTO，局部
     // 缓存既减少世界锁竞争，也避免同一块状态被重复转换。
-    let block_cache = RefCell::new(HashMap::<(i32, i32, i32), BlockReadResult>::new());
-    let read_cached = |position: BlockPosition| {
+    let mut block_cache = HashMap::<(i32, i32, i32), BlockReadResult>::new();
+    let mut read_cached = |position: BlockPosition| {
         let key = (position.x, position.y, position.z);
-        if let Some(result) = block_cache.borrow().get(&key).cloned() {
+        if let Some(result) = block_cache.get(&key).cloned() {
             return result;
         }
         let result = read_block(position);
-        block_cache.borrow_mut().insert(key, result.clone());
+        block_cache.insert(key, result.clone());
         result
     };
     let eye = Point3 {
@@ -282,10 +311,19 @@ where
         z: pose.position.z,
     };
     let axes = view_axes(pose.yaw, pose.pitch);
-    let standing_on_block = standing_on_block(&read_cached, pose);
-    let looked_at_block = raycast_looked_at_block(&read_cached, eye, pose, options);
-    let visible_entities = visible_entities(&read_cached, entities, eye, axes, options);
-    let visible_blocks = visible_blocks(&read_cached, pose, eye, axes, options);
+    let standing_on_block = standing_on_block(&mut read_cached, pose, &mut checkpoint)?;
+    let looked_at_block =
+        raycast_looked_at_block(&mut read_cached, eye, pose, options, &mut checkpoint)?;
+    let visible_entities = visible_entities(
+        &mut read_cached,
+        entities,
+        eye,
+        axes,
+        options,
+        &mut checkpoint,
+    )?;
+    let visible_blocks =
+        visible_blocks(&mut read_cached, pose, eye, axes, options, &mut checkpoint)?;
 
     Ok(ViewportProjection {
         frame: ViewportFrame {
@@ -337,26 +375,38 @@ fn view_axes(yaw_degrees: f32, pitch_degrees: f32) -> ViewAxes {
     }
 }
 
-fn standing_on_block<F>(read_block: &F, pose: &PoseSnapshot) -> Option<ViewportBlock>
+fn standing_on_block<F, C>(
+    read_block: &mut F,
+    pose: &PoseSnapshot,
+    checkpoint: &mut C,
+) -> Result<Option<ViewportBlock>, BackendError>
 where
-    F: Fn(BlockPosition) -> BlockReadResult,
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), BackendError>,
 {
+    checkpoint()?;
     let position = BlockPosition {
         x: pose.position.x.floor() as i32,
         y: pose.position.y.floor() as i32 - 1,
         z: pose.position.z.floor() as i32,
     };
-    match read_cell(read_block, position.clone()) {
-        BlockCell::Loaded => read_loaded_snapshot(read_block, position),
-        BlockCell::Empty | BlockCell::Unloaded => None,
+    match read_cell(read_block, position.clone(), checkpoint)? {
+        BlockCell::Loaded => read_loaded_snapshot(read_block, position, checkpoint),
+        BlockCell::Empty | BlockCell::Unloaded => Ok(None),
     }
 }
 
-fn read_loaded_snapshot<F>(read_block: &F, position: BlockPosition) -> Option<ViewportBlock>
+fn read_loaded_snapshot<F, C>(
+    read_block: &mut F,
+    position: BlockPosition,
+    checkpoint: &mut C,
+) -> Result<Option<ViewportBlock>, BackendError>
 where
-    F: Fn(BlockPosition) -> BlockReadResult,
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), BackendError>,
 {
-    match read_block(position.clone()) {
+    checkpoint()?;
+    Ok(match read_block(position.clone()) {
         BlockReadResult::Loaded { block } if is_visible_block(&block) => Some(ViewportBlock {
             name: block.name,
             position: [position.x, position.y, position.z],
@@ -364,43 +414,51 @@ where
         BlockReadResult::Loaded { .. }
         | BlockReadResult::Unloaded
         | BlockReadResult::OutOfWorld => None,
-    }
+    })
 }
 
-fn raycast_looked_at_block<F>(
-    read_block: &F,
+fn raycast_looked_at_block<F, C>(
+    read_block: &mut F,
     eye: Point3,
     pose: &PoseSnapshot,
     options: &ViewportOptions,
-) -> Option<ViewportBlock>
+    checkpoint: &mut C,
+) -> Result<Option<ViewportBlock>, BackendError>
 where
-    F: Fn(BlockPosition) -> BlockReadResult,
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), BackendError>,
 {
+    checkpoint()?;
     let direction = view_axes(pose.yaw, pose.pitch).forward;
-    match first_hit(
-        read_block,
-        eye,
-        direction,
-        options.looked_at_max_distance,
-        RayProperty::Visible,
-    ) {
-        RayOutcome::Hit(BlockHit { voxel, name }) => Some(ViewportBlock {
-            name,
-            position: [voxel.x, voxel.y, voxel.z],
-        }),
-        RayOutcome::Clear | RayOutcome::Unloaded => None,
-    }
+    Ok(
+        match first_hit(
+            read_block,
+            eye,
+            direction,
+            options.looked_at_max_distance,
+            RayProperty::Visible,
+            checkpoint,
+        )? {
+            RayOutcome::Hit(BlockHit { voxel, name }) => Some(ViewportBlock {
+                name,
+                position: [voxel.x, voxel.y, voxel.z],
+            }),
+            RayOutcome::Clear | RayOutcome::Unloaded => None,
+        },
+    )
 }
 
-fn visible_blocks<F>(
-    read_block: &F,
+fn visible_blocks<F, C>(
+    read_block: &mut F,
     pose: &PoseSnapshot,
     eye: Point3,
     axes: ViewAxes,
     options: &ViewportOptions,
-) -> VisibleBlocksResult
+    checkpoint: &mut C,
+) -> Result<VisibleBlocksResult, BackendError>
 where
-    F: Fn(BlockPosition) -> BlockReadResult,
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), BackendError>,
 {
     let self_voxel = BlockPosition {
         x: pose.position.x.floor() as i32,
@@ -421,8 +479,11 @@ where
 
     // 和主仓库一样先用 section AABB 做保守剔除，避免对背后的方块执行体素级射线。
     for sx in section_of(lowest.x)..=section_of(highest.x) {
+        checkpoint()?;
         for sz in section_of(lowest.z)..=section_of(highest.z) {
+            checkpoint()?;
             for sy in section_of(lowest.y)..=section_of(highest.y) {
+                checkpoint()?;
                 let bounds = AxisAlignedBox {
                     min: Point3 {
                         x: f64::from(sx * SECTION_SIZE),
@@ -450,6 +511,7 @@ where
                 for x in x_start..=x_end {
                     for z in z_start..=z_end {
                         for y in y_start..=y_end {
+                            checkpoint()?;
                             let position = BlockPosition { x, y, z };
                             let center = Point3 {
                                 x: f64::from(x) + 0.5,
@@ -474,7 +536,8 @@ where
                                     &position,
                                     distance,
                                     options.predicate,
-                                )
+                                    checkpoint,
+                                )?
                             {
                                 continue;
                             }
@@ -493,21 +556,24 @@ where
         .take(options.block_limit)
         .map(|(_, position, name)| (name, position.x, position.y, position.z))
         .collect();
-    VisibleBlocksResult { blocks, truncated }
+    Ok(VisibleBlocksResult { blocks, truncated })
 }
 
-fn visible_entities<F>(
-    read_block: &F,
+fn visible_entities<F, C>(
+    read_block: &mut F,
     entities: &[ProtocolEntitySnapshot],
     eye: Point3,
     axes: ViewAxes,
     options: &ViewportOptions,
-) -> VisibleEntitiesResult
+    checkpoint: &mut C,
+) -> Result<VisibleEntitiesResult, BackendError>
 where
-    F: Fn(BlockPosition) -> BlockReadResult,
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), BackendError>,
 {
     let mut candidates = Vec::new();
     for entity in entities.iter().filter(|entity| entity.valid) {
+        checkpoint()?;
         let width = f64::from(entity.width.max(0.01));
         let height = f64::from(entity.height.max(0.01));
         let half_width = width / 2.0;
@@ -538,9 +604,10 @@ where
         let mut visible = point_inside_box(eye, bounds);
         if !visible {
             for point in box_visibility_samples(bounds) {
+                checkpoint()?;
                 let point_delta = subtract(point, eye);
                 if inside_frustum(axes, point_delta, options)
-                    && line_is_clear(read_block, eye, point)
+                    && line_is_clear(read_block, eye, point, checkpoint)?
                 {
                     visible = true;
                     break;
@@ -584,31 +651,42 @@ where
             },
         )
         .collect();
-    VisibleEntitiesResult { items, truncated }
+    Ok(VisibleEntitiesResult { items, truncated })
 }
 
-fn is_visible_candidate<F>(
-    read_block: &F,
+fn is_visible_candidate<F, C>(
+    read_block: &mut F,
     eye: Point3,
     voxel: &BlockPosition,
     distance: f64,
     predicate: VisibilityPredicate,
-) -> bool
+    checkpoint: &mut C,
+) -> Result<bool, BackendError>
 where
-    F: Fn(BlockPosition) -> BlockReadResult,
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), BackendError>,
 {
-    match predicate {
-        VisibilityPredicate::ExposedFace => exposed_face_reaches_eye(read_block, eye, voxel),
-        VisibilityPredicate::BlockCentre => {
-            has_exposed_face(read_block, voxel)
-                && line_reaches_voxel(read_block, eye, voxel, distance)
+    checkpoint()?;
+    Ok(match predicate {
+        VisibilityPredicate::ExposedFace => {
+            exposed_face_reaches_eye(read_block, eye, voxel, checkpoint)?
         }
-    }
+        VisibilityPredicate::BlockCentre => {
+            has_exposed_face(read_block, voxel, checkpoint)?
+                && line_reaches_voxel(read_block, eye, voxel, distance, checkpoint)?
+        }
+    })
 }
 
-fn exposed_face_reaches_eye<F>(read_block: &F, eye: Point3, voxel: &BlockPosition) -> bool
+fn exposed_face_reaches_eye<F, C>(
+    read_block: &mut F,
+    eye: Point3,
+    voxel: &BlockPosition,
+    checkpoint: &mut C,
+) -> Result<bool, BackendError>
 where
-    F: Fn(BlockPosition) -> BlockReadResult,
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), BackendError>,
 {
     let center = Point3 {
         x: f64::from(voxel.x) + 0.5,
@@ -617,11 +695,12 @@ where
     };
     let mut candidates = Vec::new();
     for normal in FACE_NORMALS {
+        checkpoint()?;
         let face = add(center, scale(normal, 0.5));
         let to_eye = subtract(eye, face);
         let reach = length(to_eye);
         if reach == 0.0 {
-            return true;
+            return Ok(true);
         }
         let squareness = dot(normal, to_eye) / reach;
         if squareness <= 0.0 {
@@ -632,95 +711,131 @@ where
             y: voxel.y + normal.y as i32,
             z: voxel.z + normal.z as i32,
         };
-        match read_cell(read_block, neighbor.clone()) {
+        match read_cell(read_block, neighbor.clone(), checkpoint)? {
             BlockCell::Unloaded => continue,
-            BlockCell::Loaded if cell_occludes(read_block, neighbor) => continue,
+            BlockCell::Loaded if cell_occludes(read_block, neighbor, checkpoint)? => continue,
             BlockCell::Loaded | BlockCell::Empty => {}
         }
         candidates.push((squareness, add(face, scale(normal, FACE_EPSILON))));
     }
     candidates.sort_by(|left, right| right.0.partial_cmp(&left.0).unwrap_or(Ordering::Equal));
-    candidates
-        .into_iter()
-        .any(|(_, target)| line_is_clear(read_block, eye, target))
+    for (_, target) in candidates {
+        checkpoint()?;
+        if line_is_clear(read_block, eye, target, checkpoint)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
-fn has_exposed_face<F>(read_block: &F, voxel: &BlockPosition) -> bool
+fn has_exposed_face<F, C>(
+    read_block: &mut F,
+    voxel: &BlockPosition,
+    checkpoint: &mut C,
+) -> Result<bool, BackendError>
 where
-    F: Fn(BlockPosition) -> BlockReadResult,
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), BackendError>,
 {
-    FACE_NORMALS.iter().any(|normal| {
+    for normal in FACE_NORMALS {
+        checkpoint()?;
         let neighbor = BlockPosition {
             x: voxel.x + normal.x as i32,
             y: voxel.y + normal.y as i32,
             z: voxel.z + normal.z as i32,
         };
-        match read_cell(read_block, neighbor.clone()) {
+        let exposed = match read_cell(read_block, neighbor.clone(), checkpoint)? {
             BlockCell::Unloaded => false,
-            BlockCell::Loaded => !cell_occludes(read_block, neighbor),
+            BlockCell::Loaded => !cell_occludes(read_block, neighbor, checkpoint)?,
             BlockCell::Empty => true,
+        };
+        if exposed {
+            return Ok(true);
         }
-    })
+    }
+    Ok(false)
 }
 
-fn line_reaches_voxel<F>(read_block: &F, eye: Point3, voxel: &BlockPosition, distance: f64) -> bool
+fn line_reaches_voxel<F, C>(
+    read_block: &mut F,
+    eye: Point3,
+    voxel: &BlockPosition,
+    distance: f64,
+    checkpoint: &mut C,
+) -> Result<bool, BackendError>
 where
-    F: Fn(BlockPosition) -> BlockReadResult,
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), BackendError>,
 {
+    checkpoint()?;
     if distance == 0.0 {
-        return true;
+        return Ok(true);
     }
     let center = Point3 {
         x: f64::from(voxel.x) + 0.5,
         y: f64::from(voxel.y) + 0.5,
         z: f64::from(voxel.z) + 0.5,
     };
-    match first_hit(
-        read_block,
-        eye,
-        normalize(subtract(center, eye), distance),
-        distance + RAY_STEP,
-        RayProperty::Occludes,
-    ) {
-        RayOutcome::Clear => true,
-        RayOutcome::Hit(hit) => same_voxel(&hit.voxel, voxel),
-        RayOutcome::Unloaded => false,
-    }
+    Ok(
+        match first_hit(
+            read_block,
+            eye,
+            normalize(subtract(center, eye), distance),
+            distance + RAY_STEP,
+            RayProperty::Occludes,
+            checkpoint,
+        )? {
+            RayOutcome::Clear => true,
+            RayOutcome::Hit(hit) => same_voxel(&hit.voxel, voxel),
+            RayOutcome::Unloaded => false,
+        },
+    )
 }
 
-fn line_is_clear<F>(read_block: &F, origin: Point3, target: Point3) -> bool
+fn line_is_clear<F, C>(
+    read_block: &mut F,
+    origin: Point3,
+    target: Point3,
+    checkpoint: &mut C,
+) -> Result<bool, BackendError>
 where
-    F: Fn(BlockPosition) -> BlockReadResult,
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), BackendError>,
 {
+    checkpoint()?;
     let delta = subtract(target, origin);
     let distance = length(delta);
     if distance == 0.0 {
-        return true;
+        return Ok(true);
     }
-    matches!(
+    Ok(matches!(
         first_hit(
             read_block,
             origin,
             normalize(delta, distance),
             (distance - RAY_STEP).max(0.0),
             RayProperty::Occludes,
-        ),
+            checkpoint,
+        )?,
         RayOutcome::Clear
-    )
+    ))
 }
 
-fn first_hit<F>(
-    read_block: &F,
+fn first_hit<F, C>(
+    read_block: &mut F,
     origin: Point3,
     direction: Point3,
     max_distance: f64,
     property: RayProperty,
-) -> RayOutcome
+    checkpoint: &mut C,
+) -> Result<RayOutcome, BackendError>
 where
-    F: Fn(BlockPosition) -> BlockReadResult,
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), BackendError>,
 {
     let steps = (max_distance / RAY_STEP).floor() as i32;
     for step in 1..=steps {
+        checkpoint()?;
         let distance = f64::from(step) * RAY_STEP;
         let voxel = BlockPosition {
             x: (origin.x + direction.x * distance).floor() as i32,
@@ -730,27 +845,33 @@ where
         let block = match read_block(voxel.clone()) {
             BlockReadResult::Loaded { block } => block,
             BlockReadResult::OutOfWorld => continue,
-            BlockReadResult::Unloaded => return RayOutcome::Unloaded,
+            BlockReadResult::Unloaded => return Ok(RayOutcome::Unloaded),
         };
         let hits = match property {
             RayProperty::Visible => is_visible_block(&block),
             RayProperty::Occludes => is_occluding_block(&block),
         };
         if hits {
-            return RayOutcome::Hit(BlockHit {
+            return Ok(RayOutcome::Hit(BlockHit {
                 voxel,
                 name: block.name,
-            });
+            }));
         }
     }
-    RayOutcome::Clear
+    Ok(RayOutcome::Clear)
 }
 
-fn read_cell<F>(read_block: &F, position: BlockPosition) -> BlockCell
+fn read_cell<F, C>(
+    read_block: &mut F,
+    position: BlockPosition,
+    checkpoint: &mut C,
+) -> Result<BlockCell, BackendError>
 where
-    F: Fn(BlockPosition) -> BlockReadResult,
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), BackendError>,
 {
-    match read_block(position) {
+    checkpoint()?;
+    Ok(match read_block(position) {
         BlockReadResult::Loaded { block } => {
             if is_visible_block(&block) {
                 BlockCell::Loaded
@@ -760,18 +881,24 @@ where
         }
         BlockReadResult::OutOfWorld => BlockCell::Empty,
         BlockReadResult::Unloaded => BlockCell::Unloaded,
-    }
+    })
 }
 
-fn cell_occludes<F>(read_block: &F, position: BlockPosition) -> bool
+fn cell_occludes<F, C>(
+    read_block: &mut F,
+    position: BlockPosition,
+    checkpoint: &mut C,
+) -> Result<bool, BackendError>
 where
-    F: Fn(BlockPosition) -> BlockReadResult,
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), BackendError>,
 {
-    match read_block(position) {
+    checkpoint()?;
+    Ok(match read_block(position) {
         BlockReadResult::Loaded { block } => is_occluding_block(&block),
         BlockReadResult::Unloaded => true,
         BlockReadResult::OutOfWorld => false,
-    }
+    })
 }
 
 fn is_visible_block(block: &ProtocolBlockSnapshot) -> bool {

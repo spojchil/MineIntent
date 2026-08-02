@@ -26,7 +26,15 @@ use azalea::{
     swarm::{DefaultSwarmPlugins, Swarm, SwarmBuilder, SwarmEvent},
     Client, DefaultPlugins, Event, SprintDirection, WalkDirection,
 };
-use mineintent_contracts::minecraft::BackendError;
+use mineintent_contracts::minecraft::{
+    BackendError, BackendFailure, BackendFailureCode, BoxFuture, FactSource as ContractFactSource,
+    OperationControl, ViewportBlock as ContractViewportBlock,
+    ViewportFrame as ContractViewportFrame, ViewportLegend as ContractViewportLegend,
+    ViewportProjection as ContractViewportProjection, ViewportRead as ContractViewportRead,
+    ViewportSelfPose as ContractViewportSelfPose, VisibleBlocksView as ContractVisibleBlocksView,
+    VisibleEntitiesView as ContractVisibleEntitiesView,
+    VisibleEntityView as ContractVisibleEntityView,
+};
 use serde_json::json;
 use tokio::sync::{mpsc, Notify};
 
@@ -40,7 +48,10 @@ use crate::{
         BlockReadResult, MinecraftSnapshotV1, PoseSnapshot, ProtocolEntitySnapshot,
         TrackedPlayerSnapshot, Vec3Value,
     },
-    viewport::{project as project_viewport, ViewportOptions, ViewportProjection},
+    viewport::{
+        project as project_viewport, project_with_checkpoint as project_viewport_with_checkpoint,
+        ViewportBlock, ViewportOptions, ViewportProjection,
+    },
 };
 
 #[derive(Clone, Debug)]
@@ -150,6 +161,38 @@ struct ObservationSubscriber {
     sender: mpsc::UnboundedSender<BackendEventEnvelope>,
 }
 
+type SharedWorld = Arc<parking_lot::RwLock<azalea::world::World>>;
+
+/// The observation values used by one viewport capture share one short-lived
+/// generation lock. The world itself remains behind its own read/write lock;
+/// this lock only binds the world handle, snapshot, source and entities to one
+/// published capture.
+struct ObservationState {
+    world: Option<SharedWorld>,
+    snapshot: Option<MinecraftSnapshotV1>,
+    source: Option<FactSource>,
+    tracked_entities: Vec<ProtocolEntitySnapshot>,
+    generation: u64,
+}
+
+impl Default for ObservationState {
+    fn default() -> Self {
+        Self {
+            world: None,
+            snapshot: None,
+            source: None,
+            tracked_entities: Vec::new(),
+            generation: 0,
+        }
+    }
+}
+
+impl ObservationState {
+    fn bump_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+}
+
 struct SharedRuntime {
     writer: parking_lot::Mutex<EventWriter>,
     swarm: parking_lot::Mutex<Option<Swarm>>,
@@ -159,12 +202,10 @@ struct SharedRuntime {
     subscribers: parking_lot::Mutex<Vec<mpsc::UnboundedSender<BackendEventEnvelope>>>,
     observation_subscribers: parking_lot::Mutex<Vec<ObservationSubscriber>>,
     next_observation_subscription_id: AtomicU64,
-    world: parking_lot::Mutex<Option<Arc<parking_lot::RwLock<azalea::world::World>>>>,
+    observation: parking_lot::RwLock<ObservationState>,
     reported_dimension: parking_lot::Mutex<Option<String>>,
-    snapshot: parking_lot::Mutex<Option<MinecraftSnapshotV1>>,
-    snapshot_source: parking_lot::Mutex<Option<FactSource>>,
-    tracked_entities: parking_lot::Mutex<Vec<ProtocolEntitySnapshot>>,
     snapshot_revision: AtomicU64,
+    viewport_revision: AtomicU64,
     lifecycle_revision: AtomicU64,
     command_revision: AtomicU64,
     tick_revision: AtomicU64,
@@ -192,12 +233,10 @@ impl SharedRuntime {
             subscribers: parking_lot::Mutex::new(Vec::new()),
             observation_subscribers: parking_lot::Mutex::new(Vec::new()),
             next_observation_subscription_id: AtomicU64::new(0),
-            world: parking_lot::Mutex::new(None),
+            observation: parking_lot::RwLock::new(ObservationState::default()),
             reported_dimension: parking_lot::Mutex::new(None),
-            snapshot: parking_lot::Mutex::new(None),
-            snapshot_source: parking_lot::Mutex::new(None),
-            tracked_entities: parking_lot::Mutex::new(Vec::new()),
             snapshot_revision: AtomicU64::new(0),
+            viewport_revision: AtomicU64::new(0),
             lifecycle_revision: AtomicU64::new(0),
             command_revision: AtomicU64::new(0),
             tick_revision: AtomicU64::new(0),
@@ -338,16 +377,29 @@ impl SharedRuntime {
         *self.swarm.lock() = Some(swarm);
     }
 
-    fn set_world(&self, world: Arc<parking_lot::RwLock<azalea::world::World>>) {
-        *self.world.lock() = Some(world);
+    fn set_world(&self, world: SharedWorld) {
+        let mut observation = self.observation.write();
+        let replaced = observation
+            .world
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(current, &world));
+        observation.world = Some(world);
+        if replaced {
+            observation.snapshot = None;
+            observation.source = None;
+            observation.tracked_entities.clear();
+        }
+        observation.bump_generation();
     }
 
     fn clear_observations(&self) {
-        *self.world.lock() = None;
         *self.reported_dimension.lock() = None;
-        *self.snapshot.lock() = None;
-        *self.snapshot_source.lock() = None;
-        self.tracked_entities.lock().clear();
+        let mut observation = self.observation.write();
+        observation.world = None;
+        observation.snapshot = None;
+        observation.source = None;
+        observation.tracked_entities.clear();
+        observation.bump_generation();
     }
 
     fn mark_disconnected(&self, reason: Option<String>) {
@@ -394,6 +446,7 @@ impl SharedRuntime {
         force: bool,
         source: FactSource,
     ) -> Option<MinecraftSnapshotV1> {
+        let capture_generation = self.observation.read().generation;
         let (process_session_id, connection_epoch, connection_attempt_id) = self.context();
         let next_revision = self.snapshot_revision.load(Ordering::Acquire) + 1;
         let Some(candidate) = capture(
@@ -410,24 +463,36 @@ impl SharedRuntime {
             // 伪造成坐标，也不能调用 query_self 触发 panic。
             return None;
         };
-        *self.tracked_entities.lock() = capture_tracked_entities(bot);
-        let mut current = self.snapshot.lock();
-        let changed = current
+        let entities = capture_tracked_entities(bot);
+        if self.connection_epoch() != connection_epoch {
+            return None;
+        }
+        let mut observation = self.observation.write();
+        if observation.generation != capture_generation
+            || self.connection_epoch() != connection_epoch
+        {
+            return None;
+        }
+        let changed = observation
+            .snapshot
             .as_ref()
             .is_none_or(|previous| !previous.same_state_as(&candidate));
+        observation.tracked_entities = entities;
         if force || changed {
             self.snapshot_revision
                 .store(next_revision, Ordering::Release);
-            *current = Some(candidate.clone());
-            *self.snapshot_source.lock() = Some(source);
+            observation.snapshot = Some(candidate.clone());
+            observation.source = Some(source);
+            observation.bump_generation();
             Some(candidate)
         } else {
+            observation.bump_generation();
             None
         }
     }
 
     fn stored_snapshot(&self) -> Option<MinecraftSnapshotV1> {
-        self.snapshot.lock().clone()
+        self.observation.read().snapshot.clone()
     }
 
     fn emit_snapshot(&self, snapshot: MinecraftSnapshotV1, source: FactSource) {
@@ -488,7 +553,7 @@ impl RuntimeHandle {
     /// 返回当前 `snapshot()` 的事实来源；调用方不得把 `client_predicted`
     /// 快照当作服务端确认状态。
     pub fn snapshot_source(&self) -> Option<FactSource> {
-        *self.shared.snapshot_source.lock()
+        self.shared.observation.read().source
     }
 
     pub fn subscribe(&self) -> mpsc::UnboundedReceiver<BackendEventEnvelope> {
@@ -664,10 +729,35 @@ impl Drop for RuntimeObservationSubscription {
     }
 }
 
+const MAX_VIEWPORT_CAPTURE_ATTEMPTS: usize = 3;
+
+#[derive(Clone)]
+struct ViewportCapture {
+    generation: u64,
+    world: SharedWorld,
+    pose: PoseSnapshot,
+    entities: Vec<ProtocolEntitySnapshot>,
+    source: FactSource,
+}
+
+enum ViewportReadAttempt {
+    Complete(ContractViewportRead),
+    Retry,
+}
+
+enum ViewportProjectionWorkerResult {
+    Complete {
+        capture: ViewportCapture,
+        projection: ViewportProjection,
+    },
+    Retry,
+}
+
 /// 对齐 MineIntent `ProtocolObservationSource` 的只读 concrete observation seam。
 ///
-/// `bound_epoch` 是创建 source 时捕获的值；本类型暂不实现 contracts 中包含
-/// VIEW-02 原子 `read_viewport` 的完整 trait，避免用旧 viewport 结果伪装原子读。
+/// `bound_epoch` 是创建 source 时捕获的值；本类型没有实现 contracts 中完整的
+/// `ProtocolObservationSource` trait。VIEW-02 的 `read_viewport` 是本 backend 的
+/// concrete atomic seam，subscription 仍是本文件已有的 backend concrete seam。
 #[derive(Clone)]
 pub struct RuntimeObservationSource {
     shared: Arc<SharedRuntime>,
@@ -694,8 +784,9 @@ impl RuntimeObservationSource {
         self.ensure_current_epoch()?;
         let pose = self
             .shared
+            .observation
+            .read()
             .snapshot
-            .lock()
             .as_ref()
             .map(|snapshot| PoseSnapshot {
                 position: snapshot.self_snapshot.position.clone(),
@@ -710,17 +801,16 @@ impl RuntimeObservationSource {
 
     pub fn snapshot_source(&self) -> Result<Option<FactSource>, BackendError> {
         self.ensure_current_epoch()?;
-        let source = *self.shared.snapshot_source.lock();
+        let source = self.shared.observation.read().source;
         self.ensure_current_epoch()?;
         Ok(source)
     }
 
     pub fn list_tracked_players(&self) -> Result<Vec<TrackedPlayerSnapshot>, BackendError> {
         self.ensure_current_epoch()?;
-        let players = self
-            .shared
+        let observation = self.shared.observation.read();
+        let players = observation
             .snapshot
-            .lock()
             .as_ref()
             .map(|snapshot| snapshot.tracked_players.clone())
             .unwrap_or_default();
@@ -730,7 +820,7 @@ impl RuntimeObservationSource {
 
     pub fn list_tracked_entities(&self) -> Result<Vec<ProtocolEntitySnapshot>, BackendError> {
         self.ensure_current_epoch()?;
-        let entities = self.shared.tracked_entities.lock().clone();
+        let entities = self.shared.observation.read().tracked_entities.clone();
         self.ensure_current_epoch()?;
         Ok(entities)
     }
@@ -738,7 +828,9 @@ impl RuntimeObservationSource {
     /// 对齐 MineIntent viewport 的只读投影；所有坐标仍是 Minecraft 世界绝对坐标。
     ///
     /// 投影不会把本地缓存的方块直接宣称为可见：它会对视锥内候选执行暴露面和
-    /// 遮挡射线判断。调用方如需携带事实来源，应同时读取 `snapshot_source()`。
+    /// 遮挡射线判断。这个旧方法保留可配置 kernel 的 backend seam，但不是 atomic
+    /// VIEW-02 seam；它不会携带与 projection 同次 capture 的 source/revision。
+    /// 需要三项一致结果时必须使用 `read_viewport(OperationControl)`。
     pub fn viewport(
         &self,
         options: &ViewportOptions,
@@ -748,7 +840,7 @@ impl RuntimeObservationSource {
             return Ok(None);
         };
         let entities = self.list_tracked_entities()?;
-        let Some(world) = self.shared.world.lock().clone() else {
+        let Some(world) = self.shared.observation.read().world.clone() else {
             self.ensure_current_epoch()?;
             return Ok(None);
         };
@@ -786,7 +878,7 @@ impl RuntimeObservationSource {
         after_read: impl FnOnce(),
     ) -> Result<BlockReadResult, BackendError> {
         self.ensure_current_epoch()?;
-        let Some(world) = self.shared.world.lock().clone() else {
+        let Some(world) = self.shared.observation.read().world.clone() else {
             after_read();
             self.ensure_current_epoch()?;
             return Ok(BlockReadResult::Unloaded);
@@ -796,6 +888,217 @@ impl RuntimeObservationSource {
         after_read();
         self.ensure_current_epoch()?;
         Ok(result)
+    }
+
+    /// Read one coherent viewport capture and attach its provenance and read
+    /// revision. The default options deliberately stay in the backend kernel;
+    /// callers that need custom options may use the legacy non-atomic `viewport`
+    /// method, but cannot combine it with `snapshot_source()` to form this seam.
+    pub fn read_viewport(
+        &self,
+        control: OperationControl,
+    ) -> BoxFuture<'_, Result<ContractViewportRead, BackendError>> {
+        Box::pin(async move {
+            control.preflight("read_viewport")?;
+            for attempt in 0..MAX_VIEWPORT_CAPTURE_ATTEMPTS {
+                match self.read_viewport_attempt(&control).await? {
+                    ViewportReadAttempt::Complete(read) => return Ok(read),
+                    ViewportReadAttempt::Retry if attempt + 1 < MAX_VIEWPORT_CAPTURE_ATTEMPTS => {
+                        control.preflight("read_viewport")?;
+                        tokio::task::yield_now().await;
+                    }
+                    ViewportReadAttempt::Retry => {}
+                }
+            }
+            control.preflight("read_viewport")?;
+            self.ensure_current_epoch()?;
+            Err(BackendError::NotReady {
+                state: "viewport_capture_changed".to_owned(),
+            })
+        })
+    }
+
+    async fn read_viewport_attempt(
+        &self,
+        control: &OperationControl,
+    ) -> Result<ViewportReadAttempt, BackendError> {
+        self.ensure_current_epoch()?;
+        control.preflight("read_viewport")?;
+
+        let (world, initial_generation) = {
+            let observation = self.shared.observation.read();
+            let writer = self.shared.writer.lock();
+            if writer.connection_epoch != self.bound_epoch {
+                return Err(BackendError::StaleEpoch {
+                    bound_epoch: self.bound_epoch,
+                    current_epoch: writer.connection_epoch,
+                });
+            }
+            if !self.shared.ready.load(Ordering::Acquire) {
+                return Err(BackendError::NotReady {
+                    state: "not_ready".to_owned(),
+                });
+            }
+            if observation.snapshot.is_none() {
+                return Err(BackendError::NotReady {
+                    state: "viewport_snapshot_unavailable".to_owned(),
+                });
+            }
+            if observation.source.is_none() {
+                return Err(BackendError::NotReady {
+                    state: "viewport_source_unavailable".to_owned(),
+                });
+            }
+            let Some(world) = observation.world.clone() else {
+                return Err(BackendError::NotReady {
+                    state: "viewport_world_unavailable".to_owned(),
+                });
+            };
+            (world, observation.generation)
+        };
+
+        control.preflight("read_viewport")?;
+        let projection_shared = self.shared.clone();
+        let projection_world = world.clone();
+        let projection_initial_generation = initial_generation;
+        let projection_bound_epoch = self.bound_epoch;
+        let projection_control = control.clone();
+        let mut projection_task = tokio::task::spawn_blocking(move || {
+            // Acquire the world-owned read guard before cloning the state
+            // values. This makes the world view and the published metadata one
+            // capture while keeping the shared observation lock short-lived.
+            let world_read = projection_world.read();
+            let capture = {
+                let observation = projection_shared.observation.read();
+                let writer = projection_shared.writer.lock();
+                if writer.connection_epoch != projection_bound_epoch {
+                    return Err(BackendError::StaleEpoch {
+                        bound_epoch: projection_bound_epoch,
+                        current_epoch: writer.connection_epoch,
+                    });
+                }
+                if !projection_shared.ready.load(Ordering::Acquire) {
+                    return Err(BackendError::NotReady {
+                        state: "not_ready".to_owned(),
+                    });
+                }
+                if observation.generation != projection_initial_generation
+                    || !observation
+                        .world
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &projection_world))
+                {
+                    return Ok(ViewportProjectionWorkerResult::Retry);
+                }
+                let Some(snapshot) = observation.snapshot.as_ref() else {
+                    return Err(BackendError::NotReady {
+                        state: "viewport_snapshot_unavailable".to_owned(),
+                    });
+                };
+                if snapshot.connection_epoch != writer.connection_epoch {
+                    return Err(BackendError::NotReady {
+                        state: "viewport_snapshot_epoch_mismatch".to_owned(),
+                    });
+                }
+                let Some(source) = observation.source else {
+                    return Err(BackendError::NotReady {
+                        state: "viewport_source_unavailable".to_owned(),
+                    });
+                };
+                ViewportCapture {
+                    generation: observation.generation,
+                    world: projection_world.clone(),
+                    pose: PoseSnapshot {
+                        position: snapshot.self_snapshot.position.clone(),
+                        velocity: snapshot.self_snapshot.velocity.clone(),
+                        yaw: snapshot.self_snapshot.yaw,
+                        pitch: snapshot.self_snapshot.pitch,
+                        on_ground: snapshot.self_snapshot.on_ground,
+                    },
+                    entities: observation.tracked_entities.clone(),
+                    source,
+                }
+            };
+            projection_control.preflight("read_viewport")?;
+            let projection = project_viewport_with_checkpoint(
+                &capture.pose,
+                &capture.entities,
+                |position| read_block_from_world(&world_read, position),
+                &ViewportOptions::default(),
+                || projection_control.preflight("read_viewport"),
+            )?;
+            Ok(ViewportProjectionWorkerResult::Complete {
+                capture,
+                projection,
+            })
+        });
+        let cancellation = control.cancelled();
+        let deadline = async {
+            if let Some(deadline) = control.deadline_elapsed() {
+                deadline.await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::pin!(cancellation);
+        tokio::pin!(deadline);
+        let worker_result = tokio::select! {
+            result = &mut projection_task => result
+                .map_err(|error| BackendError::BackendFailure {
+                    failure: BackendFailure {
+                        code: BackendFailureCode::ProtocolError,
+                        message: format!("viewport projection task failed: {error}"),
+                        retryable: true,
+                    },
+                })??,
+            _ = &mut cancellation => {
+                projection_task.abort();
+                return Err(control_wakeup_error(control));
+            }
+            _ = &mut deadline => {
+                projection_task.abort();
+                return Err(control_wakeup_error(control));
+            }
+        };
+        let (capture, projection) = match worker_result {
+            ViewportProjectionWorkerResult::Complete {
+                capture,
+                projection,
+            } => (capture, projection),
+            ViewportProjectionWorkerResult::Retry => return Ok(ViewportReadAttempt::Retry),
+        };
+        control.preflight("read_viewport")?;
+
+        let observation = self.shared.observation.read();
+        let writer = self.shared.writer.lock();
+        if writer.connection_epoch != self.bound_epoch {
+            return Err(BackendError::StaleEpoch {
+                bound_epoch: self.bound_epoch,
+                current_epoch: writer.connection_epoch,
+            });
+        }
+        if !self.shared.ready.load(Ordering::Acquire) {
+            return Err(BackendError::NotReady {
+                state: "not_ready".to_owned(),
+            });
+        }
+        if observation.generation != capture.generation
+            || !observation
+                .world
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &capture.world))
+        {
+            return Ok(ViewportReadAttempt::Retry);
+        }
+        if observation.source != Some(capture.source) {
+            return Ok(ViewportReadAttempt::Retry);
+        }
+        let revision = self.shared.viewport_revision.fetch_add(1, Ordering::AcqRel) + 1;
+        Ok(ViewportReadAttempt::Complete(ContractViewportRead {
+            projection: contract_viewport_projection(projection),
+            source: contract_fact_source(capture.source),
+            revision,
+        }))
     }
 
     pub fn subscribe(&self) -> Result<RuntimeObservationSubscription, BackendError> {
@@ -811,6 +1114,71 @@ impl RuntimeObservationSource {
             receiver,
             closed: false,
         })
+    }
+}
+
+fn contract_fact_source(source: FactSource) -> ContractFactSource {
+    match source {
+        FactSource::Commanded => ContractFactSource::Commanded,
+        FactSource::ClientPredicted => ContractFactSource::ClientPredicted,
+        FactSource::ServerObserved => ContractFactSource::ServerObserved,
+    }
+}
+
+fn control_wakeup_error(control: &OperationControl) -> BackendError {
+    match control.preflight("read_viewport") {
+        Err(error) => error,
+        Ok(()) => BackendError::BackendFailure {
+            failure: BackendFailure {
+                code: BackendFailureCode::ProtocolError,
+                message: "read_viewport control woke without cancellation or deadline".to_owned(),
+                retryable: true,
+            },
+        },
+    }
+}
+
+fn contract_viewport_projection(projection: ViewportProjection) -> ContractViewportProjection {
+    ContractViewportProjection {
+        frame: ContractViewportFrame {
+            coordinates:
+                mineintent_contracts::minecraft::ViewportCoordinateSystem::MinecraftWorldAbsolute,
+            self_pose: ContractViewportSelfPose {
+                position: projection.frame.self_pose.position,
+                yaw_degrees: projection.frame.self_pose.yaw_degrees,
+                pitch_degrees: projection.frame.self_pose.pitch_degrees,
+            },
+            legend: ContractViewportLegend {
+                visible_entities: projection.frame.legend.visible_entities,
+                visible_blocks: projection.frame.legend.visible_blocks,
+            },
+        },
+        standing_on_block: projection.standing_on_block.map(contract_viewport_block),
+        looked_at_block: projection.looked_at_block.map(contract_viewport_block),
+        visible_entities: ContractVisibleEntitiesView {
+            items: projection
+                .visible_entities
+                .items
+                .into_iter()
+                .map(|entity| ContractVisibleEntityView {
+                    entity_type: entity.entity_type,
+                    player: entity.player,
+                    position: entity.position,
+                })
+                .collect(),
+            truncated: projection.visible_entities.truncated,
+        },
+        visible_blocks: ContractVisibleBlocksView {
+            blocks: projection.visible_blocks.blocks,
+            truncated: projection.visible_blocks.truncated,
+        },
+    }
+}
+
+fn contract_viewport_block(block: ViewportBlock) -> ContractViewportBlock {
+    ContractViewportBlock {
+        name: block.name,
+        position: block.position.map(f64::from),
     }
 }
 
@@ -1505,8 +1873,143 @@ fn validate_run_config(config: &RunConfig) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use std::{future::pending, sync::atomic::AtomicUsize};
+
     use super::*;
     use crate::snapshot::{ExperienceSnapshot, InventorySnapshot, SelfSnapshot, WorldSnapshot};
+    use mineintent_contracts::minecraft::{CancellationSignal, Deadline};
+
+    struct TestCancellation {
+        checks: AtomicUsize,
+        trigger_at: Option<usize>,
+        cancel_on_trigger: bool,
+        cancelled: AtomicBool,
+        triggered: AtomicBool,
+        action: Option<Arc<dyn Fn() + Send + Sync>>,
+    }
+
+    impl TestCancellation {
+        fn new(
+            initially_cancelled: bool,
+            trigger_at: Option<usize>,
+            cancel_on_trigger: bool,
+            action: Option<Arc<dyn Fn() + Send + Sync>>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                checks: AtomicUsize::new(0),
+                trigger_at,
+                cancel_on_trigger,
+                cancelled: AtomicBool::new(initially_cancelled),
+                triggered: AtomicBool::new(false),
+                action,
+            })
+        }
+    }
+
+    impl CancellationSignal for TestCancellation {
+        fn is_cancelled(&self) -> bool {
+            let check = self.checks.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.trigger_at == Some(check) && !self.triggered.swap(true, Ordering::SeqCst) {
+                if let Some(action) = &self.action {
+                    action();
+                }
+                if self.cancel_on_trigger {
+                    self.cancelled.store(true, Ordering::SeqCst);
+                }
+            }
+            self.cancelled.load(Ordering::SeqCst)
+        }
+
+        fn cancelled(&self) -> BoxFuture<'_, ()> {
+            Box::pin(pending())
+        }
+    }
+
+    struct TestDeadline {
+        checks: AtomicUsize,
+        trigger_at: Option<usize>,
+        elapsed: AtomicBool,
+        triggered: AtomicBool,
+        action: Option<Arc<dyn Fn() + Send + Sync>>,
+    }
+
+    impl TestDeadline {
+        fn new(
+            initially_elapsed: bool,
+            trigger_at: Option<usize>,
+            action: Option<Arc<dyn Fn() + Send + Sync>>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                checks: AtomicUsize::new(0),
+                trigger_at,
+                elapsed: AtomicBool::new(initially_elapsed),
+                triggered: AtomicBool::new(false),
+                action,
+            })
+        }
+    }
+
+    impl Deadline for TestDeadline {
+        fn has_elapsed(&self) -> bool {
+            let check = self.checks.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.trigger_at == Some(check) && !self.triggered.swap(true, Ordering::SeqCst) {
+                if let Some(action) = &self.action {
+                    action();
+                }
+                self.elapsed.store(true, Ordering::SeqCst);
+            }
+            self.elapsed.load(Ordering::SeqCst)
+        }
+
+        fn elapsed(&self) -> BoxFuture<'_, ()> {
+            Box::pin(pending())
+        }
+    }
+
+    fn test_control(
+        cancellation: Arc<TestCancellation>,
+        deadline: Option<Arc<TestDeadline>>,
+    ) -> OperationControl {
+        OperationControl::new(
+            cancellation,
+            deadline.map(|value| value as Arc<dyn Deadline>),
+        )
+    }
+
+    fn empty_world() -> SharedWorld {
+        Arc::new(parking_lot::RwLock::new(azalea::world::World::default()))
+    }
+
+    fn install_viewport_observation(
+        handle: &RuntimeHandle,
+        snapshot: MinecraftSnapshotV1,
+        source: FactSource,
+        entities: Vec<ProtocolEntitySnapshot>,
+        world: SharedWorld,
+    ) {
+        let mut observation = handle.shared.observation.write();
+        observation.world = Some(world);
+        observation.snapshot = Some(snapshot);
+        observation.source = Some(source);
+        observation.tracked_entities = entities;
+        observation.bump_generation();
+        handle.shared.ready.store(true, Ordering::Release);
+    }
+
+    fn ready_viewport_source() -> (RuntimeHandle, RuntimeObservationSource, SharedWorld) {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        handle.shared.begin_connection_attempt();
+        let world = empty_world();
+        install_viewport_observation(
+            &handle,
+            observation_snapshot(1),
+            FactSource::ServerObserved,
+            vec![observation_entity("entity-7")],
+            world.clone(),
+        );
+        let source = handle.observation_source();
+        (handle, source, world)
+    }
 
     #[test]
     fn command_validation_matches_motor_boundary() {
@@ -1743,6 +2246,227 @@ mod tests {
         }
     }
 
+    fn snapshot_at(epoch: u64, x: f64, y: f64, z: f64) -> MinecraftSnapshotV1 {
+        let mut snapshot = observation_snapshot(epoch);
+        snapshot.self_snapshot.position = Vec3Value { x, y, z };
+        snapshot
+    }
+
+    fn no_deadline_control() -> OperationControl {
+        test_control(TestCancellation::new(false, None, false, None), None)
+    }
+
+    #[tokio::test]
+    async fn read_viewport_returns_projection_source_and_unique_revision() {
+        let (_handle, source, _world) = ready_viewport_source();
+
+        let first = source
+            .read_viewport(no_deadline_control())
+            .await
+            .expect("ready viewport read should succeed");
+        assert_eq!(first.projection.frame.self_pose.position, [1.0, 64.0, 2.0]);
+        assert_eq!(
+            first.source,
+            mineintent_contracts::minecraft::FactSource::ServerObserved
+        );
+        assert!(first.revision > 0);
+
+        let second = source
+            .read_viewport(no_deadline_control())
+            .await
+            .expect("second ready viewport read should succeed");
+        assert!(second.revision > first.revision);
+        assert_eq!(second.projection, first.projection);
+        assert_eq!(second.source, first.source);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn read_viewport_revision_is_unique_for_concurrent_successes() {
+        let (_handle, source, _world) = ready_viewport_source();
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let source = source.clone();
+            tasks.push(tokio::spawn(async move {
+                source
+                    .read_viewport(no_deadline_control())
+                    .await
+                    .expect("concurrent viewport read should succeed")
+                    .revision
+            }));
+        }
+
+        let mut revisions = Vec::new();
+        for task in tasks {
+            revisions.push(task.await.expect("viewport task should not panic"));
+        }
+        revisions.sort_unstable();
+        assert!(revisions.windows(2).all(|window| window[0] < window[1]));
+    }
+
+    #[tokio::test]
+    async fn read_viewport_preflight_cancel_and_deadline_do_not_scan() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        handle.shared.begin_connection_attempt();
+        let source = handle.observation_source();
+
+        let cancellation = TestCancellation::new(true, None, false, None);
+        let cancelled = source
+            .read_viewport(test_control(cancellation.clone(), None))
+            .await;
+        assert_eq!(
+            cancelled,
+            Err(BackendError::Cancelled {
+                operation: "read_viewport".to_owned()
+            })
+        );
+        assert_eq!(cancellation.checks.load(Ordering::SeqCst), 1);
+
+        let deadline_cancellation = TestCancellation::new(false, None, false, None);
+        let deadline = TestDeadline::new(true, None, None);
+        let expired = source
+            .read_viewport(test_control(
+                deadline_cancellation.clone(),
+                Some(deadline.clone()),
+            ))
+            .await;
+        assert_eq!(
+            expired,
+            Err(BackendError::DeadlineExceeded {
+                operation: "read_viewport".to_owned()
+            })
+        );
+        assert_eq!(deadline_cancellation.checks.load(Ordering::SeqCst), 1);
+        assert_eq!(deadline.checks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn read_viewport_observes_cancellation_and_deadline_during_projection() {
+        let (_handle, source, _world) = ready_viewport_source();
+
+        let cancellation = TestCancellation::new(false, Some(7), true, None);
+        let cancelled = source
+            .read_viewport(test_control(cancellation.clone(), None))
+            .await;
+        assert_eq!(
+            cancelled,
+            Err(BackendError::Cancelled {
+                operation: "read_viewport".to_owned()
+            })
+        );
+        assert!(cancellation.checks.load(Ordering::SeqCst) >= 7);
+
+        let deadline_cancellation = TestCancellation::new(false, None, false, None);
+        let deadline = TestDeadline::new(false, Some(7), None);
+        let expired = source
+            .read_viewport(test_control(deadline_cancellation, Some(deadline.clone())))
+            .await;
+        assert_eq!(
+            expired,
+            Err(BackendError::DeadlineExceeded {
+                operation: "read_viewport".to_owned()
+            })
+        );
+        assert!(deadline.checks.load(Ordering::SeqCst) >= 7);
+    }
+
+    #[tokio::test]
+    async fn read_viewport_retries_when_capture_generation_changes() {
+        let (handle, source, world) = ready_viewport_source();
+        let replacement = snapshot_at(1, 9.0, 64.0, 10.0);
+        let shared = handle.shared.clone();
+        let action: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let mut observation = shared.observation.write();
+            observation.snapshot = Some(replacement.clone());
+            observation.source = Some(FactSource::ClientPredicted);
+            observation.tracked_entities = vec![observation_entity("replacement")];
+            observation.world = Some(world.clone());
+            observation.bump_generation();
+        });
+        let trigger = TestCancellation::new(false, Some(4), false, Some(action));
+
+        let read = source
+            .read_viewport(test_control(trigger, None))
+            .await
+            .expect("a changed capture should be retried, not mixed");
+        assert_eq!(read.projection.frame.self_pose.position, [9.0, 64.0, 10.0]);
+        assert_eq!(
+            read.source,
+            mineintent_contracts::minecraft::FactSource::ClientPredicted
+        );
+    }
+
+    #[tokio::test]
+    async fn read_viewport_rejects_epoch_change_after_capture() {
+        let (handle, source, _world) = ready_viewport_source();
+        let shared = handle.shared.clone();
+        let action: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            shared.begin_connection_attempt();
+        });
+        let trigger = TestCancellation::new(false, Some(4), false, Some(action));
+
+        let read = source.read_viewport(test_control(trigger, None)).await;
+        assert_eq!(
+            read,
+            Err(BackendError::StaleEpoch {
+                bound_epoch: 1,
+                current_epoch: 2,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn read_viewport_rejects_missing_ready_capture_parts() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        handle.shared.begin_connection_attempt();
+        let source = handle.observation_source();
+        handle.shared.ready.store(true, Ordering::Release);
+
+        let missing_snapshot = source.read_viewport(no_deadline_control()).await;
+        assert_eq!(
+            missing_snapshot,
+            Err(BackendError::NotReady {
+                state: "viewport_snapshot_unavailable".to_owned()
+            })
+        );
+
+        let world = empty_world();
+        {
+            let mut observation = handle.shared.observation.write();
+            observation.snapshot = Some(observation_snapshot(1));
+            observation.source = None;
+            observation.world = Some(world.clone());
+            observation.bump_generation();
+        }
+        let missing_source = source.read_viewport(no_deadline_control()).await;
+        assert_eq!(
+            missing_source,
+            Err(BackendError::NotReady {
+                state: "viewport_source_unavailable".to_owned()
+            })
+        );
+
+        {
+            let mut observation = handle.shared.observation.write();
+            observation.source = Some(FactSource::ServerObserved);
+            observation.bump_generation();
+        }
+        let ready = source.read_viewport(no_deadline_control()).await;
+        assert!(ready.is_ok());
+
+        {
+            let mut observation = handle.shared.observation.write();
+            observation.world = None;
+            observation.bump_generation();
+        }
+        let missing_world = source.read_viewport(no_deadline_control()).await;
+        assert_eq!(
+            missing_world,
+            Err(BackendError::NotReady {
+                state: "viewport_world_unavailable".to_owned()
+            })
+        );
+    }
+
     fn emit_test_fact(handle: &RuntimeHandle, kind: BackendEventKind) {
         handle.shared.emit(
             kind,
@@ -1758,12 +2482,15 @@ mod tests {
         let source = handle.observation_source();
         assert_eq!(source.epoch(), 1);
 
-        *handle.shared.snapshot.lock() = Some(observation_snapshot(1));
-        handle
-            .shared
-            .tracked_entities
-            .lock()
-            .push(observation_entity("entity-7"));
+        {
+            let mut observation = handle.shared.observation.write();
+            observation.snapshot = Some(observation_snapshot(1));
+            observation.source = Some(FactSource::ServerObserved);
+            observation
+                .tracked_entities
+                .push(observation_entity("entity-7"));
+            observation.bump_generation();
+        }
 
         let pose = source
             .self_pose()
