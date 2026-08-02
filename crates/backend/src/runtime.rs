@@ -28,27 +28,31 @@ use azalea::{
 };
 use mineintent_contracts::capability::validate_directed_positions;
 use mineintent_contracts::minecraft::{
-    parse_block_property_value, BackendError, BackendEventEnvelope as ContractBackendEventEnvelope,
+    parse_block_property_value, BackendClose, BackendCloseError, BackendError,
+    BackendEventEnvelope as ContractBackendEventEnvelope,
     BackendEventKind as ContractBackendEventKind,
-    BackendEventMetadata as ContractBackendEventMetadata, BackendFailure, BackendFailureCode,
+    BackendEventMetadata as ContractBackendEventMetadata, BackendEventPayload, BackendFailure,
+    BackendFailureCode, BackendKick, BackendLifecyclePayload,
     BlockBoundingBox as ContractBlockBoundingBox, BlockPosition as ContractBlockPosition,
-    BlockReadResult as ContractBlockReadResult, BoxFuture, DirectedViewportError,
+    BlockReadResult as ContractBlockReadResult, BoxFuture, ChatPosition, DirectedViewportError,
     DirectedViewportProjection, EntityEquipmentSnapshot as ContractEntityEquipmentSnapshot,
     FactSource as ContractFactSource, ObservationEvent, ObservationEventListener, OperationControl,
     ProtocolBlockEvent as ContractProtocolBlockEvent,
     ProtocolBlockSnapshot as ContractProtocolBlockSnapshot,
-    ProtocolEntityEvent as ContractProtocolEntityEvent,
+    ProtocolChatEvent as ContractProtocolChatEvent,
     ProtocolEntitySnapshot as ContractProtocolEntitySnapshot, ProtocolObservationSource,
-    ProtocolSoundPayload as ContractProtocolSoundPayload, SelfPose as ContractSelfPose,
-    Subscription, Vec3Value as ContractVec3Value, ViewportBlock as ContractViewportBlock,
-    ViewportFrame as ContractViewportFrame, ViewportLegend as ContractViewportLegend,
-    ViewportProjection as ContractViewportProjection, ViewportRead as ContractViewportRead,
-    ViewportSelfPose as ContractViewportSelfPose, VisibleBlocksView as ContractVisibleBlocksView,
+    ProtocolPlayerListEvent as ContractProtocolPlayerListEvent,
+    ProtocolSelfEvent as ContractProtocolSelfEvent,
+    ProtocolSnapshotChangedEvent as ContractProtocolSnapshotChangedEvent, RelativeMovementFlags,
+    SelfPose as ContractSelfPose, Subscription, Vec3Value as ContractVec3Value,
+    ViewportBlock as ContractViewportBlock, ViewportFrame as ContractViewportFrame,
+    ViewportLegend as ContractViewportLegend, ViewportProjection as ContractViewportProjection,
+    ViewportRead as ContractViewportRead, ViewportSelfPose as ContractViewportSelfPose,
+    VisibleBlocksView as ContractVisibleBlocksView,
     VisibleEntitiesView as ContractVisibleEntitiesView,
     VisibleEntityView as ContractVisibleEntityView,
 };
-use serde_json::json;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::{
     protocol::{
@@ -56,8 +60,8 @@ use crate::{
         FactSource, MotorDirection, BACKEND_COMMAND_PROTOCOL,
     },
     snapshot::{
-        block_snapshot, capture, capture_pose, capture_tracked_entities, BlockBoundingBox,
-        BlockPosition, BlockReadResult, MinecraftSnapshotV1, PoseSnapshot, ProtocolBlockSnapshot,
+        block_snapshot, capture, capture_tracked_entities, BlockBoundingBox, BlockPosition,
+        BlockReadResult, MinecraftSnapshotV1, PoseSnapshot, ProtocolBlockSnapshot,
         ProtocolEntitySnapshot, TrackedPlayerSnapshot, Vec3Value,
     },
     viewport::{
@@ -75,6 +79,7 @@ pub struct RunConfig {
     pub world_id: String,
     pub duration: Duration,
     pub reconnect_delay: Duration,
+    pub reconnect_enabled: bool,
     /// 仅用于本地验收 M2；正式集成通过 `RuntimeHandle::send_chat`。
     pub initial_chat: Option<String>,
 }
@@ -93,6 +98,7 @@ impl Default for RunConfig {
             world_id: "paper-local-world".to_owned(),
             duration: Duration::from_secs(30),
             reconnect_delay: Duration::from_secs(5),
+            reconnect_enabled: true,
             initial_chat: None,
         }
     }
@@ -141,25 +147,21 @@ impl EventWriter {
         )
     }
 
-    fn emit(
-        &mut self,
-        kind: BackendEventKind,
-        source: FactSource,
-        payload: serde_json::Value,
-    ) -> BackendEventEnvelope {
+    fn emit(&mut self, source: FactSource, payload: BackendEventPayload) -> BackendEventEnvelope {
         self.next_id += 1;
-        let event = BackendEventEnvelope::new_with_dimension(
-            format!("event-{}", self.next_id),
-            kind,
-            self.process_session_id.clone(),
-            self.connection_epoch,
-            self.connection_attempt_id.clone(),
-            self.world_id.clone(),
-            self.dimension.clone(),
+        BackendEventEnvelope::from_payload(
+            mineintent_contracts::minecraft::BackendEventMetadata {
+                id: format!("event-{}", self.next_id),
+                occurred_at: now_utc().to_rfc3339(),
+                process_session_id: self.process_session_id.clone(),
+                connection_epoch: self.connection_epoch,
+                connection_attempt_id: self.connection_attempt_id.clone(),
+                world_id: self.world_id.clone(),
+                dimension: self.dimension.clone(),
+            },
             source,
             payload,
-        );
-        event
+        )
     }
 }
 
@@ -341,13 +343,20 @@ impl ObservationState {
     }
 }
 
+enum ActiveMovementRegistration {
+    Started { cancel_signal: Option<Arc<Notify>> },
+    Cancelled,
+}
+
 struct SharedRuntime {
     writer: parking_lot::Mutex<EventWriter>,
     event_dispatch: parking_lot::Mutex<EventDispatchState>,
     swarm: parking_lot::Mutex<Option<Swarm>>,
     shutdown: Arc<Notify>,
+    reconnect_cancel: Arc<Notify>,
+    shutdown_requested: AtomicBool,
     config: RunConfig,
-    commands: parking_lot::Mutex<VecDeque<BackendCommandEnvelope>>,
+    commands: parking_lot::Mutex<VecDeque<QueuedCommand>>,
     subscribers: parking_lot::Mutex<Vec<mpsc::UnboundedSender<BackendEventEnvelope>>>,
     observation_subscribers: parking_lot::Mutex<Vec<ObservationSubscriber>>,
     next_observation_subscription_id: AtomicU64,
@@ -359,16 +368,43 @@ struct SharedRuntime {
     command_revision: AtomicU64,
     tick_revision: AtomicU64,
     movement_generation: AtomicU64,
+    /// Serializes command admission with stop/disconnect marking.  The lock
+    /// is deliberately held only while changing admission state; actuator
+    /// calls and completion callbacks never run under it.
+    command_admission: parking_lot::Mutex<()>,
     active_movement: AtomicBool,
     active_movement_id: parking_lot::Mutex<Option<String>>,
+    active_movement_cancel_signal: parking_lot::Mutex<Option<Arc<Notify>>>,
+    active_movement_completion: parking_lot::Mutex<Option<Arc<CommandCompletionState>>>,
+    /// A Move can be between its active declaration and its first actuator
+    /// call.  Stop must wait for that registration window to close before it
+    /// emits stopped/shuts down.
+    active_movement_registration: AtomicBool,
     timer_started: AtomicBool,
     initial_chat_sent: AtomicBool,
     death_reported: AtomicBool,
     disconnect_reported: AtomicBool,
+    stopped_reported: AtomicBool,
+    faulted_reported: AtomicBool,
+    last_close: parking_lot::Mutex<Option<BackendClose>>,
+    last_failure: parking_lot::Mutex<Option<BackendFailure>>,
+    stop_reason: parking_lot::Mutex<Option<String>>,
     reconnect_pending: AtomicBool,
+    reconnect_add_pending: AtomicBool,
+    reconnect_attempt_token: AtomicU64,
     attempt_epoch_reserved: AtomicBool,
     ready: AtomicBool,
     stopping: AtomicBool,
+    #[cfg(test)]
+    active_movement_registration_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    event_admission_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    finalize_stop_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    event_broadcast_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    disconnect_cleanup_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl SharedRuntime {
@@ -378,6 +414,8 @@ impl SharedRuntime {
             event_dispatch: parking_lot::Mutex::new(EventDispatchState::default()),
             swarm: parking_lot::Mutex::new(None),
             shutdown: Arc::new(Notify::new()),
+            reconnect_cancel: Arc::new(Notify::new()),
+            shutdown_requested: AtomicBool::new(false),
             config,
             commands: parking_lot::Mutex::new(VecDeque::new()),
             subscribers: parking_lot::Mutex::new(Vec::new()),
@@ -391,34 +429,95 @@ impl SharedRuntime {
             command_revision: AtomicU64::new(0),
             tick_revision: AtomicU64::new(0),
             movement_generation: AtomicU64::new(0),
+            command_admission: parking_lot::Mutex::new(()),
             active_movement: AtomicBool::new(false),
             active_movement_id: parking_lot::Mutex::new(None),
+            active_movement_cancel_signal: parking_lot::Mutex::new(None),
+            active_movement_completion: parking_lot::Mutex::new(None),
+            active_movement_registration: AtomicBool::new(false),
             timer_started: AtomicBool::new(false),
             initial_chat_sent: AtomicBool::new(false),
             death_reported: AtomicBool::new(false),
             disconnect_reported: AtomicBool::new(false),
+            stopped_reported: AtomicBool::new(false),
+            faulted_reported: AtomicBool::new(false),
+            last_close: parking_lot::Mutex::new(None),
+            last_failure: parking_lot::Mutex::new(None),
+            stop_reason: parking_lot::Mutex::new(None),
             reconnect_pending: AtomicBool::new(false),
+            reconnect_add_pending: AtomicBool::new(false),
+            reconnect_attempt_token: AtomicU64::new(0),
             attempt_epoch_reserved: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
+            #[cfg(test)]
+            active_movement_registration_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            event_admission_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            finalize_stop_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            event_broadcast_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            disconnect_cleanup_hook: parking_lot::Mutex::new(None),
         }
     }
 
-    fn emit(&self, kind: BackendEventKind, source: FactSource, payload: serde_json::Value) {
+    /// Construct and enqueue one event. The caller may hold command admission,
+    /// but this function never drains the queue or invokes a subscriber.
+    fn enqueue_event(&self, source: FactSource, payload: BackendEventPayload) -> bool {
+        let kind = payload.kind();
         if matches!(kind, BackendEventKind::Lifecycle) {
             self.lifecycle_revision.fetch_add(1, Ordering::AcqRel);
         }
+        let mut dispatch = self.event_dispatch.lock();
+        let event = {
+            let mut writer = self.writer.lock();
+            writer.emit(source, payload)
+        };
+        dispatch.enqueue(event)
+    }
+
+    #[cfg(test)]
+    fn emit(&self, source: FactSource, payload: BackendEventPayload) {
+        let should_drain = self.enqueue_event(source, payload);
+        if should_drain {
+            self.drain_events();
+        }
+    }
+
+    /// Normal product/protocol events must linearize their admission check and
+    /// queue insertion. Stop takes the same lock, so a losing late event is
+    /// discarded before it can appear after `stopped`.
+    fn emit_if_running(&self, source: FactSource, payload: BackendEventPayload) -> bool {
         let should_drain = {
-            let mut dispatch = self.event_dispatch.lock();
-            let event = {
-                let mut writer = self.writer.lock();
-                writer.emit(kind, source, payload)
+            let _admission = self.command_admission.lock();
+            let Some(should_drain) = self.enqueue_event_if_running_locked(source, payload) else {
+                return false;
             };
-            dispatch.enqueue(event)
+            should_drain
         };
         if should_drain {
             self.drain_events();
         }
+        true
+    }
+
+    fn enqueue_event_if_running_locked(
+        &self,
+        source: FactSource,
+        payload: BackendEventPayload,
+    ) -> Option<bool> {
+        if !self.command_execution_allowed_without_lock() {
+            return None;
+        }
+        #[cfg(test)]
+        self.invoke_event_admission_hook();
+        Some(self.enqueue_event(source, payload))
+    }
+
+    fn lifecycle_event_allowed_without_lock(&self) -> bool {
+        !self.stopping.load(Ordering::Acquire) && !self.stopped_reported.load(Ordering::Acquire)
     }
 
     /// 排水期间不持有 dispatch 或 observation registry 锁。callback 内重新
@@ -447,6 +546,8 @@ impl SharedRuntime {
             let mut subscribers = self.subscribers.lock();
             subscribers.retain(|subscriber| subscriber.send(event.clone()).is_ok());
         }
+        #[cfg(test)]
+        self.invoke_event_broadcast_hook();
 
         let observation_kind = matches!(
             event.kind,
@@ -499,47 +600,118 @@ impl SharedRuntime {
     /// 在发起网络连接前分配身份，并保证该身份下的第一条生命周期事件就是
     /// `connection_requested`。dispatch 锁覆盖身份分配、事件编号和广播，避免
     /// 其他生产者把事件插入新 attempt 与请求事件之间。
-    fn begin_connection_attempt(&self) {
-        self.attempt_epoch_reserved.store(true, Ordering::Release);
-        self.disconnect_reported.store(false, Ordering::Release);
-        self.clear_observations();
-        self.lifecycle_revision.fetch_add(1, Ordering::AcqRel);
-
+    fn begin_connection_attempt(&self) -> bool {
         let should_drain = {
-            let mut dispatch = self.event_dispatch.lock();
-            let event = {
-                let mut writer = self.writer.lock();
-                writer.new_attempt();
-                let attempt = writer.connection_epoch;
-                writer.emit(
-                    BackendEventKind::Lifecycle,
-                    FactSource::Commanded,
-                    json!({
-                        "type":"connection_requested",
-                        "attempt":attempt,
-                        "username":self.config.username,
-                        "host":self.config.host,
-                        "port":self.config.port
-                    }),
-                )
+            let _admission = self.command_admission.lock();
+            let Some(should_drain) = self.begin_connection_attempt_locked(None) else {
+                return false;
             };
-            dispatch.enqueue(event)
+            should_drain
         };
         if should_drain {
             self.drain_events();
         }
+        true
+    }
+
+    fn begin_connection_attempt_locked(&self, reconnect_token: Option<u64>) -> Option<bool> {
+        if self.stopping.load(Ordering::Acquire) {
+            return None;
+        }
+        if let Some(token) = reconnect_token {
+            if self.reconnect_attempt_token.load(Ordering::Acquire) != token {
+                return None;
+            }
+            self.reconnect_add_pending.store(true, Ordering::Release);
+        }
+        self.attempt_epoch_reserved.store(true, Ordering::Release);
+        self.disconnect_reported.store(false, Ordering::Release);
+        self.stopped_reported.store(false, Ordering::Release);
+        self.faulted_reported.store(false, Ordering::Release);
+        self.shutdown_requested.store(false, Ordering::Release);
+        *self.stop_reason.lock() = None;
+        *self.last_close.lock() = None;
+        *self.last_failure.lock() = None;
+        self.clear_observations();
+        self.lifecycle_revision.fetch_add(1, Ordering::AcqRel);
+
+        let mut dispatch = self.event_dispatch.lock();
+        let event = {
+            let mut writer = self.writer.lock();
+            writer.new_attempt();
+            let attempt = writer.connection_epoch;
+            writer.emit(
+                FactSource::Commanded,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionRequested {
+                    attempt: attempt as u32,
+                }),
+            )
+        };
+        Some(dispatch.enqueue(event))
     }
 
     /// `Event::Init` 消费连接发起前预留的身份，而不是再创建一个 epoch。
     /// 防御性 fallback 仍走同一入口，确保即使 Azalea 新增调用路径，也先有
     /// `connection_requested`，随后才发 transport 生命周期事件。
-    fn consume_attempt_for_transport_init(&self) {
+    fn consume_attempt_for_transport_init(&self) -> bool {
         if !self.attempt_epoch_reserved.swap(false, Ordering::AcqRel) {
-            self.begin_connection_attempt();
+            if !self.begin_connection_attempt() {
+                return false;
+            }
             self.attempt_epoch_reserved.store(false, Ordering::Release);
+        }
+        let _admission = self.command_admission.lock();
+        if self.stopping.load(Ordering::Acquire) {
+            return false;
         }
         self.disconnect_reported.store(false, Ordering::Release);
         self.clear_observations();
+        true
+    }
+
+    fn claim_reconnect(&self) -> bool {
+        let _admission = self.command_admission.lock();
+        if self.stopping.load(Ordering::Acquire)
+            || self.reconnect_pending.swap(true, Ordering::AcqRel)
+        {
+            return false;
+        }
+        true
+    }
+
+    fn admit_reconnect_attempt(&self) -> Option<u64> {
+        let (token, should_drain) = {
+            let _admission = self.command_admission.lock();
+            if self.stopping.load(Ordering::Acquire)
+                || !self.reconnect_pending.load(Ordering::Acquire)
+            {
+                return None;
+            }
+            let token = self.reconnect_attempt_token.fetch_add(1, Ordering::AcqRel) + 1;
+            let Some(should_drain) = self.begin_connection_attempt_locked(Some(token)) else {
+                return None;
+            };
+            (token, should_drain)
+        };
+        if should_drain {
+            self.drain_events();
+        }
+        Some(token)
+    }
+
+    fn reconnect_add_is_allowed(&self, token: u64) -> bool {
+        let _admission = self.command_admission.lock();
+        !self.stopping.load(Ordering::Acquire)
+            && self.reconnect_add_pending.load(Ordering::Acquire)
+            && self.reconnect_attempt_token.load(Ordering::Acquire) == token
+    }
+
+    fn finish_reconnect_attempt(&self, token: u64) {
+        let _admission = self.command_admission.lock();
+        if self.reconnect_attempt_token.load(Ordering::Acquire) == token {
+            self.reconnect_add_pending.store(false, Ordering::Release);
+        }
+        self.reconnect_pending.store(false, Ordering::Release);
     }
 
     fn context(&self) -> (String, u64, String) {
@@ -552,20 +724,38 @@ impl SharedRuntime {
         self.reported_dimension.lock().replace(dimension)
     }
 
+    fn set_dimension_if_running(&self, dimension: impl Into<String>) -> bool {
+        let _admission = self.command_admission.lock();
+        if !self.command_execution_allowed_without_lock() {
+            return false;
+        }
+        self.set_dimension(dimension);
+        true
+    }
+
     fn observe_dimension(&self, dimension: impl Into<String>) {
         let dimension = dimension.into();
-        if let Some(previous) = self.set_dimension(dimension.clone()) {
-            if previous != dimension {
-                self.emit(
-                    BackendEventKind::Lifecycle,
-                    FactSource::ServerObserved,
-                    json!({
-                        "type":"dimension_changed",
-                        "from":previous,
-                        "to":dimension
-                    }),
-                );
+        let should_drain = {
+            let _admission = self.command_admission.lock();
+            if !self.command_execution_allowed_without_lock() {
+                return;
             }
+            let Some(previous) = self.set_dimension(dimension.clone()) else {
+                return;
+            };
+            if previous == dimension {
+                return;
+            }
+            self.enqueue_event(
+                FactSource::ServerObserved,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::DimensionChanged {
+                    from: previous,
+                    to: dimension,
+                }),
+            )
+        };
+        if should_drain {
+            self.drain_events();
         }
     }
 
@@ -603,11 +793,20 @@ impl SharedRuntime {
         state.wait_for_quiescence();
     }
 
-    fn set_swarm(&self, swarm: Swarm) {
+    fn set_swarm(&self, swarm: Swarm) -> bool {
+        let _admission = self.command_admission.lock();
+        if self.stopping.load(Ordering::Acquire) || self.stopped_reported.load(Ordering::Acquire) {
+            return false;
+        }
         *self.swarm.lock() = Some(swarm);
+        true
     }
 
-    fn set_world(&self, world: SharedWorld) {
+    fn set_world_if_running(&self, world: SharedWorld) -> bool {
+        let _admission = self.command_admission.lock();
+        if !self.command_execution_allowed_without_lock() {
+            return false;
+        }
         let mut observation = self.observation.write();
         let replaced = observation
             .world
@@ -620,6 +819,7 @@ impl SharedRuntime {
             observation.tracked_entities.clear();
         }
         observation.bump_generation();
+        true
     }
 
     fn clear_observations(&self) {
@@ -632,19 +832,437 @@ impl SharedRuntime {
         observation.bump_generation();
     }
 
-    fn mark_disconnected(&self, reason: Option<String>) {
-        self.ready.store(false, Ordering::Release);
-        self.active_movement.store(false, Ordering::Release);
-        *self.active_movement_id.lock() = None;
-        self.movement_generation.fetch_add(1, Ordering::AcqRel);
-        self.clear_observations();
-        if !self.disconnect_reported.swap(true, Ordering::AcqRel) {
-            self.emit(
-                BackendEventKind::Lifecycle,
-                FactSource::ServerObserved,
-                json!({"type":"connection_closed", "reason":reason}),
-            );
+    fn close_evidence(&self, reason: Option<String>) -> CloseEvidence {
+        let text = reason.clone().unwrap_or_default();
+        let lower = text.to_ascii_lowercase();
+        if text == "deliberate_stop" {
+            return CloseEvidence {
+                code: "deliberate_stop".to_owned(),
+                retryable: false,
+                deliberate: true,
+                kick: None,
+                error: None,
+                end_reason: Some(text),
+                failure: None,
+            };
         }
+
+        // A component attached to Event::Disconnect is already kick evidence;
+        // its wording must not downgrade an unclassified kick to a retryable
+        // ordinary connection end.
+        let during_login = !self.ready.load(Ordering::Acquire);
+        let server_shutdown = lower.contains("server_shutdown")
+            || lower.contains("server shutdown")
+            || lower.contains("server closed")
+            || lower.contains("server restarting");
+        if server_shutdown {
+            return CloseEvidence {
+                code: "server_shutdown".to_owned(),
+                retryable: true,
+                deliberate: false,
+                kick: reason.map(|text| BackendKick { text, during_login }),
+                error: None,
+                end_reason: Some(text),
+                failure: None,
+            };
+        }
+        if lower.contains("banned")
+            || lower.contains("whitelist")
+            || lower.contains("invalid session")
+            || lower.contains("authentication")
+            || lower.contains("not authenticated")
+        {
+            let failure_code = if lower.contains("auth") || lower.contains("session") {
+                BackendFailureCode::AuthenticationFailed
+            } else {
+                BackendFailureCode::PermissionDenied
+            };
+            return CloseEvidence {
+                code: "permission_denied".to_owned(),
+                retryable: false,
+                deliberate: false,
+                kick: Some(BackendKick {
+                    text: text.clone(),
+                    during_login,
+                }),
+                error: None,
+                end_reason: Some(text.clone()),
+                failure: Some(BackendFailure {
+                    code: failure_code,
+                    message: text,
+                    retryable: false,
+                }),
+            };
+        }
+        if reason.is_some() {
+            return CloseEvidence {
+                code: "unclassified_kick".to_owned(),
+                retryable: false,
+                deliberate: false,
+                kick: reason.map(|text| BackendKick { text, during_login }),
+                error: None,
+                end_reason: Some(text.clone()),
+                failure: Some(BackendFailure {
+                    code: BackendFailureCode::PermissionDenied,
+                    message: text,
+                    retryable: false,
+                }),
+            };
+        }
+        CloseEvidence {
+            code: "connection_ended".to_owned(),
+            retryable: true,
+            deliberate: false,
+            kick: None,
+            error: None,
+            end_reason: None,
+            failure: None,
+        }
+    }
+
+    fn emit_transport_connected(&self) {
+        self.emit_if_running(
+            FactSource::ServerObserved,
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected),
+        );
+    }
+
+    fn emit_logged_in(&self, version: impl Into<String>, dimension: String) {
+        let version = version.into();
+        let should_drain = {
+            let _admission = self.command_admission.lock();
+            if !self.command_execution_allowed_without_lock() {
+                return;
+            }
+            self.set_dimension(dimension.clone());
+            self.enqueue_event(
+                FactSource::ServerObserved,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::LoggedIn {
+                    version,
+                    dimension,
+                }),
+            )
+        };
+        if should_drain {
+            self.drain_events();
+        }
+    }
+
+    fn emit_ready(&self, snapshot_revision: u64) {
+        let should_drain = {
+            let _admission = self.command_admission.lock();
+            if !self.command_execution_allowed_without_lock() {
+                return;
+            }
+            self.ready.store(true, Ordering::Release);
+            self.enqueue_event(
+                FactSource::ServerObserved,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::Ready {
+                    snapshot_revision,
+                }),
+            )
+        };
+        if should_drain {
+            self.drain_events();
+        }
+    }
+
+    #[cfg(test)]
+    fn admit_death(&self) -> bool {
+        let should_drain = {
+            let _admission = self.command_admission.lock();
+            if !self.command_execution_allowed_without_lock()
+                || self.death_reported.swap(true, Ordering::AcqRel)
+            {
+                return false;
+            }
+            self.ready.store(false, Ordering::Release);
+            self.enqueue_event(
+                FactSource::ServerObserved,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::Died),
+            )
+        };
+        if should_drain {
+            self.drain_events();
+        }
+        true
+    }
+
+    /// Claim Death and finish all synchronous local movement cleanup before
+    /// making `died` visible to subscribers. The event queue may already have
+    /// another drainer, so enqueueing first and draining later would still let
+    /// a re-entrant stop callback run before the physical release.
+    fn admit_death_and_release(&self, release_inputs: impl FnOnce() -> bool) -> Option<bool> {
+        let (released, should_drain) = {
+            let _admission = self.command_admission.lock();
+            if !self.command_execution_allowed_without_lock()
+                || self.death_reported.swap(true, Ordering::AcqRel)
+            {
+                return None;
+            }
+            self.ready.store(false, Ordering::Release);
+
+            let movement_id = self.active_movement_id.lock().clone();
+            let had_movement = movement_id.is_some()
+                || self.active_movement_completion.lock().is_some()
+                || self.active_movement_registration.load(Ordering::Acquire);
+            let completion = self.active_movement_completion.lock().clone();
+            let cancel_signal = self.active_movement_cancel_signal.lock().clone();
+            if had_movement {
+                self.movement_generation.fetch_add(1, Ordering::AcqRel);
+                if let Some(completion) = completion.as_ref() {
+                    completion.cancel("movement stopped by death".to_owned(), true);
+                }
+                if let Some(signal) = cancel_signal.as_ref() {
+                    signal.notify_one();
+                }
+            }
+
+            // This closure is synchronous and runs before `died` is enqueued;
+            // no subscriber/callback can run while command admission is held.
+            let released = release_inputs();
+            self.active_movement.store(false, Ordering::Release);
+            *self.active_movement_id.lock() = None;
+            self.active_movement_cancel_signal.lock().take();
+            self.active_movement_completion.lock().take();
+            self.active_movement_registration
+                .store(false, Ordering::Release);
+            if let Some(completion) = completion {
+                finish_command(
+                    &Some(completion),
+                    if released {
+                        Err(BackendError::Cancelled {
+                            operation: "movement stopped by death".to_owned(),
+                        })
+                    } else {
+                        Err(command_component_failure("death move"))
+                    },
+                );
+            }
+            let should_drain = self.enqueue_event(
+                FactSource::ServerObserved,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::Died),
+            );
+            (released, should_drain)
+        };
+        if should_drain {
+            self.drain_events();
+        }
+        Some(released)
+    }
+
+    #[cfg(test)]
+    fn emit_died(&self) {
+        let _ = self.admit_death();
+    }
+
+    fn emit_respawn_transition_started(&self, from_dimension: String) {
+        self.emit_if_running(
+            FactSource::Commanded,
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::RespawnTransitionStarted {
+                from_dimension,
+            }),
+        );
+    }
+
+    fn emit_respawned(&self, dimension: String) {
+        self.emit_if_running(
+            FactSource::ServerObserved,
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::Respawned { dimension }),
+        );
+    }
+
+    fn mark_disconnected(&self, reason: Option<String>) -> BackendClose {
+        self.mark_disconnected_evidence(self.close_evidence(reason))
+    }
+
+    fn mark_connection_failed(&self, error: String) -> BackendClose {
+        self.mark_disconnected_evidence(CloseEvidence {
+            code: "connection_failed".to_owned(),
+            retryable: true,
+            deliberate: false,
+            kick: None,
+            error: Some(BackendCloseError {
+                name: "connection_failed".to_owned(),
+                message: error.clone(),
+                code: None,
+            }),
+            end_reason: Some(error.clone()),
+            failure: Some(BackendFailure {
+                code: BackendFailureCode::ProtocolError,
+                message: error,
+                retryable: true,
+            }),
+        })
+    }
+
+    fn mark_disconnected_evidence(&self, evidence: CloseEvidence) -> BackendClose {
+        let (close, should_drain, duplicate_cleanup) = {
+            let _admission = self.command_admission.lock();
+            if self.stopped_reported.load(Ordering::Acquire) {
+                return self
+                    .last_close
+                    .lock()
+                    .clone()
+                    .unwrap_or_else(|| BackendClose {
+                        epoch: self.connection_epoch(),
+                        at: now_utc().to_rfc3339(),
+                        code: "connection_ended".to_owned(),
+                        retryable: true,
+                        deliberate: false,
+                        kick: None,
+                        error: None,
+                        end_reason: None,
+                    });
+            }
+
+            // Once stop has won admission, a late Azalea disconnect cannot
+            // replace the caller's deliberate close evidence.
+            let evidence = if self.stopping.load(Ordering::Acquire) && !evidence.deliberate {
+                CloseEvidence {
+                    code: "deliberate_stop".to_owned(),
+                    retryable: false,
+                    deliberate: true,
+                    kick: None,
+                    error: None,
+                    end_reason: Some("deliberate_stop".to_owned()),
+                    failure: None,
+                }
+            } else {
+                evidence
+            };
+
+            // Publish the disconnect bit and enqueue close under one admission
+            // point. The queue is drained only after this lock is released.
+            if self.disconnect_reported.swap(true, Ordering::AcqRel) {
+                let close = self
+                    .last_close
+                    .lock()
+                    .clone()
+                    .unwrap_or_else(|| BackendClose {
+                        epoch: self.connection_epoch(),
+                        at: now_utc().to_rfc3339(),
+                        code: "connection_ended".to_owned(),
+                        retryable: true,
+                        deliberate: false,
+                        kick: None,
+                        error: None,
+                        end_reason: None,
+                    });
+                (close, false, true)
+            } else {
+                self.ready.store(false, Ordering::Release);
+                let close = BackendClose {
+                    epoch: self.connection_epoch(),
+                    at: now_utc().to_rfc3339(),
+                    code: evidence.code,
+                    retryable: evidence.retryable,
+                    deliberate: evidence.deliberate,
+                    kick: evidence.kick,
+                    error: evidence.error,
+                    end_reason: evidence.end_reason,
+                };
+                *self.last_close.lock() = Some(close.clone());
+                *self.last_failure.lock() = evidence.failure;
+
+                // Seal and clean the attempt before making its close visible.
+                // Stop takes the same admission lock, so it cannot enqueue or
+                // drain `stopped` between close admission and local cleanup.
+                #[cfg(test)]
+                self.invoke_disconnect_cleanup_hook();
+                self.cancel_active_movement(true);
+                self.cancel_pending_commands();
+                self.clear_observations();
+
+                let should_drain = self.enqueue_event(
+                    FactSource::ServerObserved,
+                    BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionClosed {
+                        close: close.clone(),
+                    }),
+                );
+                (close, should_drain, false)
+            }
+        };
+
+        // A duplicate can race a registration that is finishing after the
+        // first disconnect. Repeating cleanup is harmless and helps that
+        // registration converge, while the first close already completed its
+        // mandatory cleanup under admission above.
+        if duplicate_cleanup {
+            self.cancel_active_movement(true);
+            self.cancel_pending_commands();
+            self.clear_observations();
+        }
+        if should_drain {
+            self.drain_events();
+        }
+        close
+    }
+
+    fn failure_for_close(&self, close: &BackendClose) -> BackendFailure {
+        let recorded = self.last_failure.lock().clone();
+        // A fatal classification is stronger than the reconnect policy.  In
+        // particular, permission/auth/version failures must remain visible
+        // instead of being rewritten as `reconnect_disabled`.
+        if let Some(failure) = recorded.as_ref().filter(|failure| !failure.retryable) {
+            return failure.clone();
+        }
+        if close.retryable && !self.config.reconnect_enabled {
+            return BackendFailure {
+                code: BackendFailureCode::ReconnectDisabled,
+                message: format!("reconnect disabled after close {}", close.code),
+                retryable: false,
+            };
+        }
+        recorded.unwrap_or_else(|| BackendFailure {
+            code: BackendFailureCode::ProtocolError,
+            message: format!("backend closed with non-retryable code {}", close.code),
+            retryable: false,
+        })
+    }
+
+    fn emit_faulted(&self, failure: BackendFailure) -> bool {
+        let should_drain = {
+            let _admission = self.command_admission.lock();
+            if !self.lifecycle_event_allowed_without_lock()
+                || self.faulted_reported.swap(true, Ordering::AcqRel)
+            {
+                return false;
+            }
+            self.enqueue_event(
+                FactSource::ServerObserved,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::Faulted { failure }),
+            )
+        };
+        if should_drain {
+            self.drain_events();
+        }
+        true
+    }
+
+    fn emit_reconnect_scheduled(&self, close: &BackendClose) -> Option<Duration> {
+        let delay = self.config.reconnect_delay;
+        let should_drain = {
+            let _admission = self.command_admission.lock();
+            if !self.lifecycle_event_allowed_without_lock() {
+                return None;
+            }
+            self.enqueue_event(
+                FactSource::ClientPredicted,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::ReconnectScheduled {
+                    attempt: self.connection_epoch() as u32 + 1,
+                    retry_at: (now_utc()
+                        + chrono::Duration::from_std(delay)
+                            .unwrap_or_else(|_| chrono::Duration::zero()))
+                    .to_rfc3339(),
+                    close_code: close.code.clone(),
+                }),
+            )
+        };
+        if should_drain {
+            self.drain_events();
+        }
+        Some(delay)
     }
 
     fn exit_swarm(&self) -> bool {
@@ -659,15 +1277,419 @@ impl SharedRuntime {
     fn request_shutdown(&self) {
         // `notify_one` 会保留一个 permit，即使 stop() 发生在 run() 开始
         // select 之前，也不会因为时序而永久等待。
+        self.shutdown_requested.store(true, Ordering::Release);
         self.shutdown.notify_one();
     }
 
-    fn enqueue_command(&self, command: BackendCommandEnvelope) {
-        self.commands.lock().push_back(command);
+    #[cfg(test)]
+    fn set_active_movement_registration_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.active_movement_registration_hook.lock() = hook;
     }
 
-    fn take_commands(&self) -> Vec<BackendCommandEnvelope> {
-        self.commands.lock().drain(..).collect()
+    #[cfg(test)]
+    fn invoke_active_movement_registration_hook(&self) {
+        let hook = self.active_movement_registration_hook.lock().take();
+        if let Some(hook) = hook {
+            // Never invoke a test seam while holding its registry lock.  The
+            // hook intentionally may call stop() re-entrantly.
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_event_admission_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.event_admission_hook.lock() = hook;
+    }
+
+    #[cfg(test)]
+    fn invoke_event_admission_hook(&self) {
+        let hook = self.event_admission_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_finalize_stop_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.finalize_stop_hook.lock() = hook;
+    }
+
+    #[cfg(test)]
+    fn invoke_finalize_stop_hook(&self) {
+        let hook = self.finalize_stop_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_event_broadcast_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.event_broadcast_hook.lock() = hook;
+    }
+
+    #[cfg(test)]
+    fn invoke_event_broadcast_hook(&self) {
+        let hook = self.event_broadcast_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_disconnect_cleanup_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.disconnect_cleanup_hook.lock() = hook;
+    }
+
+    #[cfg(test)]
+    fn invoke_disconnect_cleanup_hook(&self) {
+        let hook = self.disconnect_cleanup_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn command_execution_allowed(&self) -> bool {
+        let _admission = self.command_admission.lock();
+        self.command_execution_allowed_without_lock()
+    }
+
+    fn with_command_admission<T>(&self, actuator: impl FnOnce() -> T) -> Result<T, ()> {
+        let _admission = self.command_admission.lock();
+        if !self.command_execution_allowed_without_lock() {
+            return Err(());
+        }
+        // The closure contains only synchronous actuator operations.  It does
+        // not await, emit events, or invoke completion callbacks while the
+        // admission lock is held.
+        Ok(actuator())
+    }
+
+    /// ConnectionFailed has already sealed the current attempt, so the normal
+    /// command predicate (which rejects a disconnected attempt) is too
+    /// narrow. This admits only the local disconnect actuator while keeping
+    /// stop/stopped linearization on the same lock.
+    fn with_disconnect_admission<T>(&self, actuator: impl FnOnce() -> T) -> Result<T, ()> {
+        let _admission = self.command_admission.lock();
+        if self.stopping.load(Ordering::Acquire) || self.stopped_reported.load(Ordering::Acquire) {
+            return Err(());
+        }
+        Ok(actuator())
+    }
+
+    fn with_active_movement_admission<T>(
+        &self,
+        command_id: &str,
+        generation: u64,
+        completion: &Option<Arc<CommandCompletionState>>,
+        actuator: impl FnOnce() -> T,
+    ) -> Result<T, ()> {
+        let _admission = self.command_admission.lock();
+        if !self.command_execution_allowed_without_lock()
+            || self.movement_generation.load(Ordering::Acquire) != generation
+            || self.active_movement_id.lock().as_deref() != Some(command_id)
+            || completion
+                .as_ref()
+                .is_some_and(|completion| completion.cancelled.load(Ordering::Acquire))
+        {
+            return Err(());
+        }
+        Ok(actuator())
+    }
+
+    fn finalize_stop_if_ready(&self) {
+        let should_drain = {
+            let _admission = self.command_admission.lock();
+            if !self.stopping.load(Ordering::Acquire)
+                || self.active_movement_registration.load(Ordering::Acquire)
+                || self.active_movement_completion.lock().is_some()
+                || self.active_movement_id.lock().is_some()
+            {
+                return;
+            }
+
+            // The readiness check precedes taking the reason and both are
+            // serialized with every cleanup caller. A second finalizer can no
+            // longer observe an empty reason while the first one is about to
+            // put it back.
+            #[cfg(test)]
+            self.invoke_finalize_stop_hook();
+
+            let Some(reason) = self.stop_reason.lock().take() else {
+                return;
+            };
+            if self.stopped_reported.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let should_drain = self.enqueue_event(
+                FactSource::Commanded,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::Stopped {
+                    reason: reason.clone(),
+                }),
+            );
+            should_drain
+        };
+        if should_drain {
+            self.drain_events();
+        }
+        self.request_shutdown();
+    }
+
+    fn enqueue_command_if_running(&self, command: BackendCommandEnvelope) -> Result<(), String> {
+        let _admission = self.command_admission.lock();
+        if self.stopping.load(Ordering::Acquire) {
+            return Err("runtime is stopping".to_owned());
+        }
+        self.commands.lock().push_back(QueuedCommand {
+            envelope: command,
+            completion: None,
+        });
+        Ok(())
+    }
+
+    fn enqueue_command_with_completion_if_running(
+        &self,
+        command: BackendCommandEnvelope,
+        completion: Arc<CommandCompletionState>,
+    ) -> Result<(), String> {
+        let _admission = self.command_admission.lock();
+        if self.stopping.load(Ordering::Acquire) {
+            return Err("runtime is stopping".to_owned());
+        }
+        self.commands.lock().push_back(QueuedCommand {
+            envelope: command,
+            completion: Some(completion),
+        });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn pop_command(&self) -> Option<QueuedCommand> {
+        self.commands.lock().pop_front()
+    }
+
+    #[cfg(test)]
+    fn requeue_front(&self, command: QueuedCommand) {
+        self.commands.lock().push_front(command);
+    }
+
+    fn next_command_for_processing(&self) -> Option<QueuedCommand> {
+        self.next_command_for_processing_with_hook(|| {})
+    }
+
+    fn next_command_for_processing_with_hook(
+        &self,
+        before_decision: impl FnOnce(),
+    ) -> Option<QueuedCommand> {
+        let mut commands = self.commands.lock();
+        before_decision();
+        let should_defer = commands.front().is_some_and(|command| {
+            !self.ready.load(Ordering::Acquire)
+                && !matches!(&command.envelope.command, BackendCommand::Respawn)
+        });
+        if should_defer {
+            return None;
+        }
+        let command = commands.pop_front()?;
+        Some(command)
+    }
+
+    fn cancel_pending_commands(&self) {
+        for command in self.commands.lock().drain(..) {
+            if let Some(completion) = command.completion {
+                completion.cancel(format!("command:{}", command.envelope.id), false);
+            }
+        }
+    }
+
+    /// Declare a Move before touching the Azalea actuator.  The admission
+    /// lock covers the only state transition that must be atomic with stop or
+    /// disconnect: checking that the command may start and marking the
+    /// registration window as live.  The rest of the registration is allowed
+    /// to run without that lock so cancellation never waits on a callback or
+    /// a bot operation.
+    fn register_active_movement(
+        &self,
+        command_id: &str,
+        generation: u64,
+        duration_ms: u64,
+        completion: &Option<Arc<CommandCompletionState>>,
+    ) -> ActiveMovementRegistration {
+        let admitted = {
+            let _admission = self.command_admission.lock();
+            if self.command_execution_allowed_without_lock() {
+                self.active_movement_registration
+                    .store(true, Ordering::Release);
+                self.active_movement.store(true, Ordering::Release);
+                *self.active_movement_id.lock() = Some(command_id.to_owned());
+                true
+            } else {
+                false
+            }
+        };
+        if !admitted {
+            if let Some(completion) = completion {
+                completion.cancel(format!("command:{command_id}"), false);
+            }
+            return ActiveMovementRegistration::Cancelled;
+        }
+
+        #[cfg(test)]
+        self.invoke_active_movement_registration_hook();
+
+        let cancel_signal = (duration_ms > 0).then(|| Arc::new(Notify::new()));
+        *self.active_movement_cancel_signal.lock() = cancel_signal.clone();
+        if let (Some(completion), Some(signal)) = (completion.as_ref(), cancel_signal.as_ref()) {
+            completion.begin_active_release(signal.clone());
+            *self.active_movement_completion.lock() = Some(completion.clone());
+        }
+
+        let cancelled = !self.command_execution_allowed()
+            || completion
+                .as_ref()
+                .is_some_and(|completion| completion.cancelled.load(Ordering::Acquire));
+        if cancelled {
+            if let Some(completion) = completion {
+                completion.cancel(format!("command:{command_id}"), true);
+            }
+            self.clear_registered_active_movement(
+                command_id,
+                generation,
+                &cancel_signal,
+                completion,
+            );
+            finish_command(
+                completion,
+                Err(BackendError::Cancelled {
+                    operation: format!("command:{command_id}"),
+                }),
+            );
+            self.finish_active_movement_registration();
+            return ActiveMovementRegistration::Cancelled;
+        }
+
+        ActiveMovementRegistration::Started { cancel_signal }
+    }
+
+    fn command_execution_allowed_without_lock(&self) -> bool {
+        !self.stopping.load(Ordering::Acquire) && !self.disconnect_reported.load(Ordering::Acquire)
+    }
+
+    fn clear_registered_active_movement(
+        &self,
+        command_id: &str,
+        generation: u64,
+        cancel_signal: &Option<Arc<Notify>>,
+        completion: &Option<Arc<CommandCompletionState>>,
+    ) -> bool {
+        let owns_active_id = self.movement_generation.load(Ordering::Acquire) == generation
+            && self.active_movement_id.lock().as_deref() == Some(command_id);
+        if owns_active_id {
+            self.active_movement.store(false, Ordering::Release);
+            *self.active_movement_id.lock() = None;
+        }
+
+        if let Some(expected_signal) = cancel_signal {
+            let mut current_signal = self.active_movement_cancel_signal.lock();
+            if current_signal
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, expected_signal))
+            {
+                current_signal.take();
+            }
+        }
+        if let Some(expected_completion) = completion {
+            let mut current_completion = self.active_movement_completion.lock();
+            if current_completion
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, expected_completion))
+            {
+                current_completion.take();
+            }
+        }
+        owns_active_id
+    }
+
+    fn clear_idle_movement_state(&self, generation: u64) {
+        let _admission = self.command_admission.lock();
+        if self.movement_generation.load(Ordering::Acquire) != generation
+            || self.active_movement_registration.load(Ordering::Acquire)
+            || self.active_movement.load(Ordering::Acquire)
+            || self.active_movement_id.lock().is_some()
+        {
+            return;
+        }
+        self.active_movement_cancel_signal.lock().take();
+        self.active_movement_completion.lock().take();
+    }
+
+    fn finish_active_movement_registration(&self) {
+        self.active_movement_registration
+            .store(false, Ordering::Release);
+        self.finalize_stop_if_ready();
+    }
+
+    fn cancel_registered_active_movement(
+        &self,
+        command_id: &str,
+        generation: u64,
+        cancel_signal: &Option<Arc<Notify>>,
+        completion: &Option<Arc<CommandCompletionState>>,
+    ) {
+        if let Some(completion) = completion {
+            completion.cancel(format!("command:{command_id}"), true);
+        }
+        self.clear_registered_active_movement(command_id, generation, cancel_signal, completion);
+        finish_command(
+            completion,
+            Err(BackendError::Cancelled {
+                operation: format!("command:{command_id}"),
+            }),
+        );
+        self.active_movement_registration
+            .store(false, Ordering::Release);
+        self.finalize_stop_if_ready();
+    }
+
+    fn cancel_active_movement(
+        &self,
+        release_on_cancel: bool,
+    ) -> Option<Arc<CommandCompletionState>> {
+        if !release_on_cancel {
+            self.movement_generation.fetch_add(1, Ordering::AcqRel);
+        }
+        let completion = self.active_movement_completion.lock().clone();
+        let cancel_signal = self.active_movement_cancel_signal.lock().clone();
+        if let Some(completion) = completion.as_ref() {
+            completion.cancel(
+                "movement superseded or stopped".to_owned(),
+                release_on_cancel,
+            );
+        }
+        if let Some(signal) = cancel_signal.as_ref() {
+            signal.notify_one();
+        }
+        let deferred_release = release_on_cancel
+            && (cancel_signal.is_some()
+                || completion
+                    .as_ref()
+                    .is_some_and(|completion| completion.active_release.load(Ordering::Acquire)));
+        if !deferred_release {
+            self.active_movement.store(false, Ordering::Release);
+            if let Some(completion) = completion.as_ref() {
+                let mut active = self.active_movement_completion.lock();
+                if active
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, completion))
+                {
+                    active.take();
+                }
+            }
+            self.active_movement_cancel_signal.lock().take();
+            *self.active_movement_id.lock() = None;
+        } else {
+            self.active_movement_cancel_signal.lock().take();
+        }
+        completion
     }
 
     fn refresh_snapshot(
@@ -695,6 +1717,10 @@ impl SharedRuntime {
         };
         let entities = capture_tracked_entities(bot);
         if self.connection_epoch() != connection_epoch {
+            return None;
+        }
+        let _admission = self.command_admission.lock();
+        if !self.command_execution_allowed_without_lock() {
             return None;
         }
         let mut observation = self.observation.write();
@@ -726,40 +1752,40 @@ impl SharedRuntime {
     }
 
     fn emit_snapshot(&self, snapshot: MinecraftSnapshotV1, source: FactSource) {
-        self.emit(
-            BackendEventKind::SnapshotChanged,
+        self.emit_if_running(
             source,
-            json!({"type":"snapshot", "snapshot":snapshot}),
-        );
-    }
-
-    fn emit_predicted_pose(&self, bot: &Client, command_id: &str) {
-        let Some(pose): Option<PoseSnapshot> = capture_pose(bot) else {
-            return;
-        };
-        self.emit(
-            BackendEventKind::Motor,
-            FactSource::ClientPredicted,
-            json!({"type":"predicted_pose", "commandId":command_id, "pose":pose}),
+            BackendEventPayload::SnapshotChanged(ContractProtocolSnapshotChangedEvent {
+                group: "world".to_owned(),
+                snapshot_revision: snapshot.snapshot_revision,
+            }),
         );
     }
 
     fn initiate_stop(&self, reason: &str) {
-        if self.stopping.swap(true, Ordering::AcqRel) {
-            return;
+        {
+            // Make stop admission atomic with the start of a Move
+            // registration.  Once either side owns this short lock, the
+            // other side has a clear linearization point and stopped cannot
+            // be finalized in the registration gap.
+            let _admission = self.command_admission.lock();
+            if self.stopping.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            *self.stop_reason.lock() = Some(reason.to_owned());
+            self.reconnect_add_pending.store(false, Ordering::Release);
+            self.reconnect_attempt_token.fetch_add(1, Ordering::AcqRel);
+            self.reconnect_pending.store(false, Ordering::Release);
+            self.ready.store(false, Ordering::Release);
         }
-        self.emit(
-            BackendEventKind::Lifecycle,
-            FactSource::Commanded,
-            json!({"type":"stopping", "reason":reason}),
-        );
-        let signal_sent = self.exit_swarm();
-        self.emit(
-            BackendEventKind::Lifecycle,
-            FactSource::Commanded,
-            json!({"type":"shutdown_requested", "swarmAvailable":signal_sent}),
-        );
-        self.request_shutdown();
+        self.reconnect_cancel.notify_one();
+        self.cancel_pending_commands();
+        if self.connection_epoch() > 0 && !self.disconnect_reported.load(Ordering::Acquire) {
+            self.mark_disconnected(Some("deliberate_stop".to_owned()));
+        } else {
+            self.cancel_active_movement(true);
+        }
+        self.exit_swarm();
+        self.finalize_stop_if_ready();
     }
 }
 
@@ -807,8 +1833,26 @@ impl RuntimeHandle {
             ));
         }
         validate_command(&command.command)?;
-        self.shared.enqueue_command(command);
-        Ok(())
+        self.shared.enqueue_command_if_running(command)
+    }
+
+    fn send_command_with_completion(
+        &self,
+        command: BackendCommand,
+    ) -> Result<CommandCompletion, String> {
+        validate_command(&command)?;
+        let envelope = self.next_command(command);
+        let (completion, state) = CommandCompletion::channel(envelope.id.clone());
+        match self
+            .shared
+            .enqueue_command_with_completion_if_running(envelope, state.clone())
+        {
+            Ok(()) => Ok(completion),
+            Err(error) => {
+                state.cancel(format!("command:{}", completion.command_id), false);
+                Err(error)
+            }
+        }
     }
 
     fn next_command(&self, command: BackendCommand) -> BackendCommandEnvelope {
@@ -827,15 +1871,20 @@ impl RuntimeHandle {
         }))
     }
 
-    /// 发送与主仓库 motor `lookRelative` 同语义的相对视角输入。
-    pub fn look_relative(&self, yaw_degrees: f32, pitch_degrees: f32) -> Result<(), String> {
-        self.send_command(self.next_command(BackendCommand::LookRelative {
+    /// 发送与主仓库 motor `lookRelative` 同语义的相对视角输入，并返回一次性完成 future。
+    pub fn look_relative(
+        &self,
+        yaw_degrees: f32,
+        pitch_degrees: f32,
+    ) -> Result<CommandCompletion, String> {
+        self.send_command_with_completion(BackendCommand::LookRelative {
             yaw_degrees,
             pitch_degrees,
-        }))
+        })
     }
 
-    /// 发送按键式移动输入；校验范围与主仓库 motor 的 50–1500ms 边界一致。
+    /// 发送按键式移动输入；校验范围与主仓库 motor 的 50–1500ms 边界一致，
+    /// 并返回在释放动作完成时 resolve 的 future。
     pub fn move_input(
         &self,
         directions: Vec<MotorDirection>,
@@ -843,19 +1892,19 @@ impl RuntimeHandle {
         sprint: Option<bool>,
         jump: Option<bool>,
         crouch: Option<bool>,
-    ) -> Result<(), String> {
-        self.send_command(self.next_command(BackendCommand::Move {
+    ) -> Result<CommandCompletion, String> {
+        self.send_command_with_completion(BackendCommand::Move {
             directions,
             duration_ms,
             sprint,
             jump,
             crouch,
-        }))
+        })
     }
 
     /// 释放全部移动/跳跃/潜行输入。
-    pub fn release_all(&self) -> Result<(), String> {
-        self.send_command(self.next_command(BackendCommand::ReleaseAll))
+    pub fn release_all(&self) -> Result<CommandCompletion, String> {
+        self.send_command_with_completion(BackendCommand::ReleaseAll)
     }
 
     /// 显式请求服务端执行重生；死亡后不会由运行时自动触发。
@@ -1659,7 +2708,7 @@ fn contract_block_read_result(result: BlockReadResult) -> ContractBlockReadResul
 fn contract_event_metadata(event: &BackendEventEnvelope) -> ContractBackendEventMetadata {
     ContractBackendEventMetadata {
         id: event.id.clone(),
-        occurred_at: event.occurred_at.to_rfc3339(),
+        occurred_at: event.occurred_at.clone(),
         process_session_id: event.process_session_id.clone(),
         connection_epoch: event.connection_epoch,
         connection_attempt_id: event.connection_attempt_id.clone(),
@@ -1680,58 +2729,160 @@ fn contract_event_kind(kind: BackendEventKind) -> ContractBackendEventKind {
 fn observation_event_from_backend(event: &BackendEventEnvelope) -> Option<ObservationEvent> {
     let metadata = contract_event_metadata(event);
     let source = contract_fact_source(event.source);
-    let parse_error = |error: serde_json::Error| {
-        eprintln!(
-            "typed observation payload deferred: producer remains deferred; event_id={}; kind={:?}; error={}",
-            event.id, event.kind, error
-        );
-    };
-
-    match event.kind {
-        BackendEventKind::Entity => {
-            match serde_json::from_value::<ContractProtocolEntityEvent>(event.payload.clone()) {
-                Ok(payload) => Some(ObservationEvent::Entity(ContractBackendEventEnvelope::new(
-                    metadata,
-                    contract_event_kind(event.kind),
-                    source,
-                    payload,
-                ))),
-                Err(error) => {
-                    parse_error(error);
-                    None
-                }
-            }
+    match (&event.kind, &event.payload) {
+        (BackendEventKind::Entity, BackendEventPayload::Entity(payload)) => {
+            Some(ObservationEvent::Entity(ContractBackendEventEnvelope::new(
+                metadata,
+                contract_event_kind(event.kind),
+                source,
+                payload.clone(),
+            )))
         }
-        BackendEventKind::Block => {
-            match serde_json::from_value::<ContractProtocolBlockEvent>(event.payload.clone()) {
-                Ok(payload) => Some(ObservationEvent::Block(ContractBackendEventEnvelope::new(
-                    metadata,
-                    contract_event_kind(event.kind),
-                    source,
-                    payload,
-                ))),
-                Err(error) => {
-                    parse_error(error);
-                    None
-                }
-            }
+        (BackendEventKind::Block, BackendEventPayload::Block(payload)) => {
+            Some(ObservationEvent::Block(ContractBackendEventEnvelope::new(
+                metadata,
+                contract_event_kind(event.kind),
+                source,
+                payload.clone(),
+            )))
         }
-        BackendEventKind::Sound => {
-            match serde_json::from_value::<ContractProtocolSoundPayload>(event.payload.clone()) {
-                Ok(payload) => Some(ObservationEvent::Sound(ContractBackendEventEnvelope::new(
-                    metadata,
-                    contract_event_kind(event.kind),
-                    source,
-                    payload,
-                ))),
-                Err(error) => {
-                    parse_error(error);
-                    None
-                }
-            }
+        (BackendEventKind::Sound, BackendEventPayload::Sound(payload)) => {
+            Some(ObservationEvent::Sound(ContractBackendEventEnvelope::new(
+                metadata,
+                contract_event_kind(event.kind),
+                source,
+                payload.clone(),
+            )))
         }
         _ => None,
     }
+}
+
+struct CommandCompletionState {
+    sender: parking_lot::Mutex<Option<oneshot::Sender<Result<(), BackendError>>>>,
+    cancelled: AtomicBool,
+    active_release: AtomicBool,
+    release_on_cancel: AtomicBool,
+    cancel_signal: parking_lot::Mutex<Option<Arc<Notify>>>,
+    settled: AtomicBool,
+    settled_signal: Notify,
+}
+
+impl CommandCompletionState {
+    fn finish(&self, result: Result<(), BackendError>) {
+        if self.settled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.active_release.store(false, Ordering::Release);
+        if let Some(sender) = self.sender.lock().take() {
+            let _ = sender.send(result);
+        }
+        self.settled_signal.notify_one();
+    }
+
+    fn set_cancel_signal(&self, signal: Arc<Notify>) {
+        let already_cancelled = self.cancelled.load(Ordering::Acquire);
+        *self.cancel_signal.lock() = Some(signal.clone());
+        if already_cancelled {
+            signal.notify_one();
+        }
+    }
+
+    fn begin_active_release(&self, signal: Arc<Notify>) {
+        self.active_release.store(true, Ordering::Release);
+        self.set_cancel_signal(signal);
+    }
+
+    #[cfg(test)]
+    async fn wait_settled(&self) {
+        while !self.settled.load(Ordering::Acquire) {
+            self.settled_signal.notified().await;
+        }
+    }
+
+    fn cancel(&self, operation: String, release_on_cancel: bool) {
+        self.cancelled.store(true, Ordering::Release);
+        self.release_on_cancel
+            .fetch_or(release_on_cancel, Ordering::AcqRel);
+        if let Some(signal) = self.cancel_signal.lock().as_ref() {
+            signal.notify_one();
+        }
+        // An active Move owns the physical release.  Its task finishes the
+        // oneshot only after inputs and active state have been cleared.  A
+        // queued/superseded command has no physical work left and settles now.
+        if !self.active_release.load(Ordering::Acquire)
+            || !self.release_on_cancel.load(Ordering::Acquire)
+        {
+            self.finish(Err(BackendError::Cancelled { operation }));
+        }
+    }
+}
+
+/// Minimal command completion seam used by the runtime motor queue.
+///
+/// It is intentionally not a backend facade: callers only get the command id,
+/// cancellation, and one ordered result for the queued motor action.
+pub struct CommandCompletion {
+    command_id: String,
+    receiver: oneshot::Receiver<Result<(), BackendError>>,
+    state: Arc<CommandCompletionState>,
+}
+
+impl CommandCompletion {
+    fn channel(command_id: String) -> (Self, Arc<CommandCompletionState>) {
+        let (sender, receiver) = oneshot::channel();
+        let state = Arc::new(CommandCompletionState {
+            sender: parking_lot::Mutex::new(Some(sender)),
+            cancelled: AtomicBool::new(false),
+            active_release: AtomicBool::new(false),
+            release_on_cancel: AtomicBool::new(false),
+            cancel_signal: parking_lot::Mutex::new(None),
+            settled: AtomicBool::new(false),
+            settled_signal: Notify::new(),
+        });
+        (
+            Self {
+                command_id,
+                receiver,
+                state: state.clone(),
+            },
+            state,
+        )
+    }
+
+    pub fn command_id(&self) -> &str {
+        &self.command_id
+    }
+
+    pub fn cancel(&self) {
+        self.state
+            .cancel(format!("command:{}", self.command_id), true);
+    }
+
+    pub async fn wait(self) -> Result<(), BackendError> {
+        match self.receiver.await {
+            Ok(result) => result,
+            Err(_) => Err(BackendError::Cancelled {
+                operation: format!("command:{}", self.command_id),
+            }),
+        }
+    }
+}
+
+struct QueuedCommand {
+    envelope: BackendCommandEnvelope,
+    completion: Option<Arc<CommandCompletionState>>,
+}
+
+#[derive(Clone, Debug)]
+struct CloseEvidence {
+    code: String,
+    retryable: bool,
+    deliberate: bool,
+    kick: Option<BackendKick>,
+    error: Option<BackendCloseError>,
+    end_reason: Option<String>,
+    failure: Option<BackendFailure>,
 }
 
 fn event_epoch(event: &ObservationEvent) -> u64 {
@@ -1912,7 +3063,6 @@ fn reset_spawn_marker_on_world_loaded(
 fn record_respawn_packet(
     trigger: On<azalea::packet::game::SendGamePacketEvent>,
     state: Res<SwarmState>,
-    query: Query<Option<&azalea::InGameState>>,
 ) {
     let azalea::protocol::packets::game::ServerboundGamePacket::ClientCommand(packet) =
         &trigger.event().packet
@@ -1925,15 +3075,15 @@ fn record_respawn_packet(
     ) {
         return;
     }
-    // 这是本地明确请求实际发出的协议包；只有后续 Spawn 才算服务端确认。
-    let in_game = query
-        .get(trigger.event().sent_by)
-        .is_ok_and(|value| value.is_some());
-    state.shared.emit(
-        BackendEventKind::Lifecycle,
-        FactSource::Commanded,
-        json!({"type":"respawn_packet_dispatched", "inGameState":in_game}),
-    );
+    // 这是本地明确请求的重生过渡；只有后续 Spawn 才算服务端确认。
+    let from_dimension = state
+        .shared
+        .writer
+        .lock()
+        .dimension
+        .clone()
+        .unwrap_or_else(|| "unknown".to_owned());
+    state.shared.emit_respawn_transition_started(from_dimension);
 }
 
 fn record_server_position_corrections(
@@ -1948,35 +3098,33 @@ fn record_server_position_corrections(
         };
         // 这是服务端主动校正玩家位置的协议事实；它不代表每个 tick
         // 都有一个服务端坐标包，因此客户端预测轨迹仍单独记录。
-        state.shared.emit(
-            BackendEventKind::SelfState,
+        state.shared.emit_if_running(
             FactSource::ServerObserved,
-            json!({
-                "type":"server_position_correction",
-                "teleportId":packet.id,
-                "position":Vec3Value {
+            BackendEventPayload::SelfState(ContractProtocolSelfEvent::ServerPositionCorrection {
+                teleport_id: packet.id,
+                position: ContractVec3Value {
                     x: packet.change.pos.x,
                     y: packet.change.pos.y,
                     z: packet.change.pos.z,
                 },
-                "velocity":Vec3Value {
+                velocity: ContractVec3Value {
                     x: packet.change.delta.x,
                     y: packet.change.delta.y,
                     z: packet.change.delta.z,
                 },
-                "yaw":packet.change.look_direction.y_rot(),
-                "pitch":packet.change.look_direction.x_rot(),
-                "relative":{
-                    "x":packet.relative.x,
-                    "y":packet.relative.y,
-                    "z":packet.relative.z,
-                    "yaw":packet.relative.y_rot,
-                    "pitch":packet.relative.x_rot,
-                    "deltaX":packet.relative.delta_x,
-                    "deltaY":packet.relative.delta_y,
-                    "deltaZ":packet.relative.delta_z,
-                    "rotateDelta":packet.relative.rotate_delta
-                }
+                yaw: packet.change.look_direction.y_rot(),
+                pitch: packet.change.look_direction.x_rot(),
+                relative: RelativeMovementFlags {
+                    x: packet.relative.x,
+                    y: packet.relative.y,
+                    z: packet.relative.z,
+                    yaw: packet.relative.y_rot,
+                    pitch: packet.relative.x_rot,
+                    delta_x: packet.relative.delta_x,
+                    delta_y: packet.relative.delta_y,
+                    delta_z: packet.relative.delta_z,
+                    rotate_delta: packet.relative.rotate_delta,
+                },
             }),
         );
     }
@@ -2047,37 +3195,135 @@ fn try_set_movement_flags(bot: &Client, jumping: bool, crouching: bool) -> bool 
     .is_ok()
 }
 
-fn handle_command(bot: &Client, shared: &Arc<SharedRuntime>, envelope: BackendCommandEnvelope) {
+fn finish_command(
+    completion: &Option<Arc<CommandCompletionState>>,
+    result: Result<(), BackendError>,
+) {
+    if let Some(completion) = completion {
+        completion.finish(result);
+    }
+}
+
+fn reject_command_after_stop(
+    shared: &Arc<SharedRuntime>,
+    command_id: &str,
+    completion: &Option<Arc<CommandCompletionState>>,
+) -> bool {
+    if shared.command_execution_allowed() {
+        return false;
+    }
+    finish_command(
+        completion,
+        Err(BackendError::Cancelled {
+            operation: format!("command:{command_id}"),
+        }),
+    );
+    true
+}
+
+fn command_component_failure(operation: &str) -> BackendError {
+    BackendError::BackendFailure {
+        failure: BackendFailure {
+            code: BackendFailureCode::ProtocolError,
+            message: format!("{operation} requires an active local player"),
+            retryable: true,
+        },
+    }
+}
+
+/// Release one active Move and settle its completion only after the physical
+/// release attempt and the shared active-state cleanup have both completed.
+/// The actuator is injected so the ordering seam is testable without creating
+/// an Azalea client; production supplies the real walk/flag release closure.
+fn release_active_movement_and_finish(
+    shared: &Arc<SharedRuntime>,
+    command_id: &str,
+    generation: u64,
+    completion: &Option<Arc<CommandCompletionState>>,
+    release_inputs: impl FnOnce() -> bool,
+    failure_operation: &str,
+    result_if_released: Result<(), BackendError>,
+) {
+    let released = {
+        let _admission = shared.command_admission.lock();
+        let owns_movement = shared.movement_generation.load(Ordering::Acquire) == generation
+            && shared.active_movement_id.lock().as_deref() == Some(command_id);
+        if !owns_movement {
+            return;
+        }
+        // Serialize the physical release with command admission.  This is a
+        // short synchronous actuator section; completion settlement and stop
+        // finalization remain outside the lock.
+        release_inputs()
+    };
+    let result = if released {
+        result_if_released
+    } else {
+        Err(command_component_failure(failure_operation))
+    };
+    // Keep the active completion/id visible to stop until the physical release
+    // result has been settled. A stop racing this section must defer stopped;
+    // the generation/id checks below prevent an old task from clearing a new
+    // movement that was admitted after its release.
+    finish_command(completion, result);
+    {
+        let _admission = shared.command_admission.lock();
+        if shared.clear_registered_active_movement(command_id, generation, &None, completion) {
+            shared.active_movement_cancel_signal.lock().take();
+        }
+    }
+    shared.finalize_stop_if_ready();
+}
+
+fn handle_command(bot: &Client, shared: &Arc<SharedRuntime>, queued: QueuedCommand) {
+    let QueuedCommand {
+        envelope,
+        completion,
+    } = queued;
     let command_id = envelope.id;
+    if completion
+        .as_ref()
+        .is_some_and(|completion| completion.cancelled.load(Ordering::Acquire))
+    {
+        return;
+    }
+    if reject_command_after_stop(shared, &command_id, &completion) {
+        return;
+    }
     match envelope.command {
         BackendCommand::SendChat { message } => {
-            bot.chat(message.clone());
-            shared.emit(
-                BackendEventKind::Chat,
-                FactSource::Commanded,
-                json!({"type":"sent", "commandId":command_id, "plainText":message}),
-            );
+            match shared.with_command_admission(|| bot.chat(message)) {
+                Ok(()) => finish_command(&completion, Ok(())),
+                Err(()) => {
+                    finish_command(
+                        &completion,
+                        Err(BackendError::Cancelled {
+                            operation: format!("command:{command_id}"),
+                        }),
+                    );
+                }
+            }
         }
         BackendCommand::LookRelative {
             yaw_degrees,
             pitch_degrees,
         } => {
-            let direction = bot.direction();
-            bot.set_direction(
-                direction.y_rot() - yaw_degrees,
-                (direction.x_rot() - pitch_degrees).clamp(-90.0, 90.0),
-            );
-            shared.emit(
-                BackendEventKind::Motor,
-                FactSource::Commanded,
-                json!({
-                    "type":"look_relative",
-                    "commandId":command_id,
-                    "yawDegrees":yaw_degrees,
-                    "pitchDegrees":pitch_degrees
-                }),
-            );
-            shared.emit_predicted_pose(bot, &command_id);
+            let result = shared.with_command_admission(|| {
+                let direction = bot.direction();
+                bot.set_direction(
+                    direction.y_rot() - yaw_degrees,
+                    (direction.x_rot() - pitch_degrees).clamp(-90.0, 90.0),
+                );
+            });
+            match result {
+                Ok(()) => finish_command(&completion, Ok(())),
+                Err(()) => finish_command(
+                    &completion,
+                    Err(BackendError::Cancelled {
+                        operation: format!("command:{command_id}"),
+                    }),
+                ),
+            }
         }
         BackendCommand::Move {
             directions,
@@ -2086,79 +3332,199 @@ fn handle_command(bot: &Client, shared: &Arc<SharedRuntime>, envelope: BackendCo
             jump,
             crouch,
         } => {
+            shared.cancel_active_movement(false);
             let direction = direction_for(&directions);
             let generation = shared.movement_generation.fetch_add(1, Ordering::AcqRel) + 1;
-            shared.active_movement.store(true, Ordering::Release);
-            *shared.active_movement_id.lock() = Some(command_id.clone());
-            if sprint.unwrap_or(false) {
-                if let Some(sprint_direction) = sprint_direction(direction) {
-                    bot.sprint(sprint_direction);
-                } else {
-                    bot.walk(direction);
+            let registration =
+                shared.register_active_movement(&command_id, generation, duration_ms, &completion);
+            let ActiveMovementRegistration::Started { cancel_signal } = registration else {
+                return;
+            };
+
+            // The cancellation/generation check and the first actuator call
+            // share one admission point. A cancellation that wins cannot
+            // touch the bot; an actuator that wins leaves the same generation
+            // for the release task to clean up.
+            let actuator_result =
+                shared.with_active_movement_admission(&command_id, generation, &completion, || {
+                    if sprint.unwrap_or(false) {
+                        if let Some(sprint_direction) = sprint_direction(direction) {
+                            bot.sprint(sprint_direction);
+                        } else {
+                            bot.walk(direction);
+                        }
+                    } else {
+                        bot.walk(direction);
+                    }
+                    if !try_set_movement_flags(bot, jump.unwrap_or(false), crouch.unwrap_or(false))
+                    {
+                        bot.walk(WalkDirection::None);
+                        return false;
+                    }
+                    if duration_ms == 0 {
+                        bot.walk(WalkDirection::None);
+                    }
+                    true
+                });
+            let started = match actuator_result {
+                Ok(started) => started,
+                Err(()) => {
+                    shared.cancel_registered_active_movement(
+                        &command_id,
+                        generation,
+                        &cancel_signal,
+                        &completion,
+                    );
+                    return;
                 }
-            } else {
-                bot.walk(direction);
-            }
-            if !try_set_movement_flags(bot, jump.unwrap_or(false), crouch.unwrap_or(false)) {
+            };
+
+            if !started {
+                shared.clear_registered_active_movement(
+                    &command_id,
+                    generation,
+                    &cancel_signal,
+                    &completion,
+                );
+                finish_command(&completion, Err(command_component_failure("move")));
+                shared.finish_active_movement_registration();
                 return;
             }
-            shared.emit(
-                BackendEventKind::Motor,
-                FactSource::Commanded,
-                json!({
-                    "type":"move_started",
-                    "commandId":command_id,
-                    "directions":directions,
-                    "durationMs":duration_ms,
-                    "sprint":sprint,
-                    "jump":jump,
-                    "crouch":crouch
-                }),
-            );
-            shared.emit_predicted_pose(bot, &command_id);
 
             if duration_ms == 0 {
-                bot.walk(WalkDirection::None);
-                shared.active_movement.store(false, Ordering::Release);
-                *shared.active_movement_id.lock() = None;
+                shared.clear_registered_active_movement(
+                    &command_id,
+                    generation,
+                    &cancel_signal,
+                    &completion,
+                );
+                finish_command(&completion, Ok(()));
+                shared.finish_active_movement_registration();
             } else {
+                let cancel_signal = cancel_signal.expect("duration-positive move signal");
                 let bot_to_stop = bot.clone();
                 let shared = shared.clone();
-                let command_id = command_id.clone();
+                let task_shared = shared.clone();
+                let completion_for_task = completion.clone();
                 tokio::task::spawn_local(async move {
-                    tokio::time::sleep(Duration::from_millis(duration_ms)).await;
-                    if shared.movement_generation.load(Ordering::Acquire) == generation
-                        && !shared.stopping.load(Ordering::Acquire)
-                    {
-                        if try_set_movement_flags(&bot_to_stop, false, false) {
-                            bot_to_stop.walk(WalkDirection::None);
-                            shared.active_movement.store(false, Ordering::Release);
-                            *shared.active_movement_id.lock() = None;
-                            shared.emit(
-                                BackendEventKind::Motor,
-                                FactSource::Commanded,
-                                json!({"type":"move_released", "commandId":command_id}),
+                    let duration = tokio::time::sleep(Duration::from_millis(duration_ms));
+                    tokio::pin!(duration);
+                    tokio::select! {
+                        _ = &mut duration => {
+                            let cancelled = completion_for_task
+                                .as_ref()
+                                .is_some_and(|completion| completion.cancelled.load(Ordering::Acquire))
+                                || task_shared.stopping.load(Ordering::Acquire);
+                            release_active_movement_and_finish(
+                                &task_shared,
+                                &command_id,
+                                generation,
+                                &completion_for_task,
+                                || {
+                                    let released = try_set_movement_flags(&bot_to_stop, false, false);
+                                    bot_to_stop.walk(WalkDirection::None);
+                                    released
+                                },
+                                "move release",
+                                if cancelled {
+                                    Err(BackendError::Cancelled {
+                                        operation: format!("command:{command_id}"),
+                                    })
+                                } else {
+                                    Ok(())
+                                },
                             );
-                            shared.emit_predicted_pose(&bot_to_stop, &command_id);
+                        }
+                        _ = cancel_signal.notified() => {
+                            release_active_movement_and_finish(
+                                &task_shared,
+                                &command_id,
+                                generation,
+                                &completion_for_task,
+                                || {
+                                    let released = try_set_movement_flags(&bot_to_stop, false, false);
+                                    bot_to_stop.walk(WalkDirection::None);
+                                    released
+                                },
+                                "cancel move",
+                                Err(BackendError::Cancelled {
+                                    operation: format!("command:{command_id}"),
+                                }),
+                            );
                         }
                     }
                 });
+                shared.finish_active_movement_registration();
             }
         }
         BackendCommand::ReleaseAll => {
-            shared.movement_generation.fetch_add(1, Ordering::AcqRel);
-            shared.active_movement.store(false, Ordering::Release);
-            *shared.active_movement_id.lock() = None;
-            if !try_set_movement_flags(bot, false, false) {
-                return;
+            let previous_id = shared.active_movement_id.lock().clone();
+            let previous_generation = shared.movement_generation.load(Ordering::Acquire);
+            let previous_completion = shared
+                .cancel_active_movement(true)
+                .map(Some)
+                .unwrap_or(None);
+            if let Some(previous_id) = previous_id {
+                release_active_movement_and_finish(
+                    shared,
+                    &previous_id,
+                    previous_generation,
+                    &previous_completion,
+                    || {
+                        let released = try_set_movement_flags(bot, false, false);
+                        bot.walk(WalkDirection::None);
+                        released
+                    },
+                    "release_all move",
+                    Err(BackendError::Cancelled {
+                        operation: format!("command:{previous_id}"),
+                    }),
+                );
+            } else {
+                let released = match shared.with_command_admission(|| {
+                    let released = try_set_movement_flags(bot, false, false);
+                    bot.walk(WalkDirection::None);
+                    released
+                }) {
+                    Ok(released) => released,
+                    Err(()) => {
+                        finish_command(
+                            &completion,
+                            Err(BackendError::Cancelled {
+                                operation: format!("command:{command_id}"),
+                            }),
+                        );
+                        return;
+                    }
+                };
+                shared.clear_idle_movement_state(previous_generation);
+                finish_command(
+                    &previous_completion,
+                    if released {
+                        Err(BackendError::Cancelled {
+                            operation: "movement released by release_all".to_owned(),
+                        })
+                    } else {
+                        Err(command_component_failure("release_all move"))
+                    },
+                );
             }
-            bot.walk(WalkDirection::None);
-            shared.emit(
-                BackendEventKind::Motor,
-                FactSource::Commanded,
-                json!({"type":"released_all", "commandId":command_id}),
-            );
-            shared.emit_predicted_pose(bot, &command_id);
+            match shared.with_command_admission(|| {
+                let released = try_set_movement_flags(bot, false, false);
+                bot.walk(WalkDirection::None);
+                released
+            }) {
+                Ok(true) => finish_command(&completion, Ok(())),
+                Ok(false) => {
+                    finish_command(&completion, Err(command_component_failure("release_all")))
+                }
+                Err(()) => finish_command(
+                    &completion,
+                    Err(BackendError::Cancelled {
+                        operation: format!("command:{command_id}"),
+                    }),
+                ),
+            }
         }
         BackendCommand::Respawn => {
             // 服务端的死亡包与 waitingForRespawn 状态可能跨一个网络 tick；
@@ -2168,25 +3534,22 @@ fn handle_command(bot: &Client, shared: &Arc<SharedRuntime>, envelope: BackendCo
             let delayed_shared = shared.clone();
             tokio::task::spawn_local(async move {
                 tokio::time::sleep(RESPAWN_SETTLE_DELAY).await;
-                if delayed_shared.stopping.load(Ordering::Acquire)
-                    || delayed_bot
+                let _ = delayed_shared.with_command_admission(|| {
+                    if delayed_bot
                         .try_query_self::<&LocalEntity, _>(|_| ())
                         .is_err()
-                {
-                    return;
-                }
-                delayed_bot
-                    .ecs
-                    .write()
-                    .write_message(azalea::respawn::PerformRespawnEvent {
-                        entity: delayed_bot.entity,
-                    });
+                    {
+                        return;
+                    }
+                    delayed_bot
+                        .ecs
+                        .write()
+                        .write_message(azalea::respawn::PerformRespawnEvent {
+                            entity: delayed_bot.entity,
+                        });
+                });
             });
-            shared.emit(
-                BackendEventKind::Lifecycle,
-                FactSource::Commanded,
-                json!({"type":"respawn_requested", "commandId":command_id}),
-            );
+            finish_command(&completion, Ok(()));
         }
     }
 }
@@ -2196,13 +3559,7 @@ fn process_pending_commands(bot: &Client, shared: &Arc<SharedRuntime>) {
     if !bot.logged_in() {
         return;
     }
-    for command in shared.take_commands() {
-        if !shared.ready.load(Ordering::Acquire)
-            && !matches!(&command.command, BackendCommand::Respawn)
-        {
-            shared.enqueue_command(command);
-            continue;
-        }
+    while let Some(command) = shared.next_command_for_processing() {
         handle_command(bot, shared, command);
     }
 }
@@ -2210,6 +3567,9 @@ fn process_pending_commands(bot: &Client, shared: &Arc<SharedRuntime>) {
 async fn handle_client(bot: Client, event: Event, state: BotState) {
     let shared = &state.shared;
     if matches!(event, Event::Spawn | Event::Tick) {
+        if !shared.command_execution_allowed() {
+            return;
+        }
         process_pending_commands(&bot, &state.shared);
     }
     match event {
@@ -2217,61 +3577,78 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             // Swarm 重连在某些路径复用已有本地玩家事件发送器，不一定再次发出
             // Event::Init；重连调度器会预留 epoch，若 Init 到达则消费该预留，避免
             // 同一次握手被错误地记成两个 epoch。
-            shared.consume_attempt_for_transport_init();
-            shared.emit(
-                BackendEventKind::Lifecycle,
-                FactSource::ServerObserved,
-                json!({"type":"transport_initialized"}),
-            );
+            if !shared.consume_attempt_for_transport_init() || !shared.command_execution_allowed() {
+                return;
+            }
+            shared.emit_transport_connected();
         }
-        Event::Login => shared.emit(
-            BackendEventKind::Lifecycle,
-            FactSource::ServerObserved,
-            json!({"type":"logged_in", "version":"26.1.2", "protocol":775}),
-        ),
+        Event::Login => {
+            if !shared.command_execution_allowed() {
+                return;
+            }
+            let dimension = bot
+                .try_query_self::<Option<&azalea::world::WorldName>, _>(|world_name| {
+                    world_name
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "minecraft:overworld".to_owned())
+                })
+                .unwrap_or_else(|_| "minecraft:overworld".to_owned());
+            if !shared.command_execution_allowed() {
+                return;
+            }
+            shared.emit_logged_in("26.1.2", dimension);
+        }
         Event::Spawn => {
-            let was_dead = shared.death_reported.load(Ordering::Acquire);
-            shared.ready.store(true, Ordering::Release);
-            shared.death_reported.store(false, Ordering::Release);
-            shared.set_world(bot.world());
+            if !shared.command_execution_allowed() {
+                return;
+            }
+            let (spawn_allowed, was_dead) = {
+                let _admission = shared.command_admission.lock();
+                let was_dead = shared.death_reported.load(Ordering::Acquire);
+                if !shared.command_execution_allowed_without_lock() {
+                    (false, was_dead)
+                } else {
+                    shared.ready.store(true, Ordering::Release);
+                    shared.death_reported.store(false, Ordering::Release);
+                    (true, was_dead)
+                }
+            };
+            if !spawn_allowed {
+                return;
+            }
+            if !shared.set_world_if_running(bot.world()) {
+                return;
+            }
             let snapshot = shared.refresh_snapshot(&bot, true, FactSource::ServerObserved);
             if let Some(snapshot) = snapshot.as_ref() {
-                shared.set_dimension(snapshot.world.dimension.clone());
+                if !shared.set_dimension_if_running(snapshot.world.dimension.clone()) {
+                    return;
+                }
             }
-            shared.emit(
-                BackendEventKind::Lifecycle,
-                FactSource::ServerObserved,
-                json!({
-                    "type":"ready",
-                    "snapshotRevision":snapshot.as_ref().map_or(0, |value| value.snapshot_revision)
-                }),
-            );
             if let Some(snapshot) = snapshot {
                 if was_dead {
-                    shared.emit(
-                        BackendEventKind::Lifecycle,
-                        FactSource::ServerObserved,
-                        json!({
-                            "type":"respawned",
-                            "dimension":snapshot.world.dimension
-                        }),
-                    );
+                    shared.emit_respawned(snapshot.world.dimension.clone());
                 }
+                shared.emit_ready(snapshot.snapshot_revision);
                 shared.emit_snapshot(snapshot, FactSource::ServerObserved);
+            } else {
+                shared.emit_ready(shared.snapshot_revision.load(Ordering::Acquire));
             }
 
-            if !shared.initial_chat_sent.swap(true, Ordering::AcqRel) {
-                if let Some(message) = shared.config.initial_chat.clone() {
-                    bot.chat(message.clone());
-                    shared.emit(
-                        BackendEventKind::Chat,
-                        FactSource::Commanded,
-                        json!({"type":"sent", "plainText":message, "origin":"cli"}),
-                    );
+            let _ = shared.with_command_admission(|| {
+                if !shared.initial_chat_sent.swap(true, Ordering::AcqRel) {
+                    if let Some(message) = shared.config.initial_chat.clone() {
+                        bot.chat(message);
+                    }
                 }
-            }
+            });
 
-            if !shared.timer_started.swap(true, Ordering::AcqRel) {
+            let start_timer = {
+                let _admission = shared.command_admission.lock();
+                shared.command_execution_allowed_without_lock()
+                    && !shared.timer_started.swap(true, Ordering::AcqRel)
+            };
+            if start_timer {
                 let duration = shared.config.duration;
                 let shared = state.shared.clone();
                 tokio::task::spawn_local(async move {
@@ -2280,49 +3657,32 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                 });
             }
         }
-        Event::KeepAlive(id) => {
-            shared.emit(
-                BackendEventKind::KeepAlive,
+        Event::KeepAlive(_id) => {}
+        Event::Chat(packet) => {
+            shared.emit_if_running(
                 FactSource::ServerObserved,
-                json!({"type":"received", "id":id}),
-            );
-            // azalea 在收到同一包的处理器中立即发送 ServerboundKeepAlive；这里把
-            // 该主动协议动作单独记为 commanded，不把它混进服务端事实。
-            shared.emit(
-                BackendEventKind::KeepAlive,
-                FactSource::Commanded,
-                json!({"type":"acknowledged_by_azalea", "id":id}),
+                BackendEventPayload::Chat(ContractProtocolChatEvent {
+                    sender_username: packet.sender(),
+                    plain_text: packet.content(),
+                    position: Some(ChatPosition::Chat),
+                    verified: None,
+                }),
             );
         }
-        Event::Chat(packet) => shared.emit(
-            BackendEventKind::Chat,
-            FactSource::ServerObserved,
-            json!({
-                "senderUsername": packet.sender(),
-                "plainText": packet.content(),
-                "rawText": packet.message().to_string(),
-                "receivedAt": now_utc(),
-            }),
-        ),
         Event::Death(_) => {
-            if !shared.death_reported.swap(true, Ordering::AcqRel) {
-                shared.ready.store(false, Ordering::Release);
-                shared.active_movement.store(false, Ordering::Release);
-                *shared.active_movement_id.lock() = None;
-                shared.movement_generation.fetch_add(1, Ordering::AcqRel);
-                if try_set_movement_flags(&bot, false, false) {
+            if shared
+                .admit_death_and_release(|| {
+                    let released = try_set_movement_flags(&bot, false, false);
                     bot.walk(WalkDirection::None);
-                }
-                shared.emit(
-                    BackendEventKind::Lifecycle,
-                    FactSource::ServerObserved,
-                    json!({"type":"died"}),
-                );
-                if let Some(snapshot) =
-                    shared.refresh_snapshot(&bot, true, FactSource::ServerObserved)
-                {
-                    shared.emit_snapshot(snapshot, FactSource::ServerObserved);
-                }
+                    released
+                })
+                .is_none()
+            {
+                return;
+            }
+            if let Some(snapshot) = shared.refresh_snapshot(&bot, true, FactSource::ServerObserved)
+            {
+                shared.emit_snapshot(snapshot, FactSource::ServerObserved);
             }
         }
         Event::Disconnect(reason) => {
@@ -2332,56 +3692,52 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             // 更新运行时状态，不再向已失效的实体投递 walk/jump/crouch 消息。
         }
         Event::ConnectionFailed(error) => {
-            shared.ready.store(false, Ordering::Release);
-            shared.emit(
-                BackendEventKind::Error,
-                FactSource::ServerObserved,
-                json!({"type":"connection_failed", "error":format!("{error:?}")}),
-            );
-            if shared.connection_epoch() > 1 {
-                // 重连尝试可能早于 Paper 完成保存/重新监听；ConnectionFailed
-                // 本身不触发 Azalea 的 SwarmEvent::Disconnect，因此显式断开这个
-                // 空连接，让统一重连状态机继续按 delay 重试，而不是把一次拒绝
-                // 误当成整个后端失败。
-                bot.disconnect();
-            } else {
-                // 初次连接失败时没有可安全复用的已登录 client；让上层得到明确错误并结束。
-                bot.exit();
-            }
+            shared.mark_connection_failed(format!("{error:?}"));
+            // ConnectionFailed 不一定伴随单独的 swarm disconnect；显式断开让
+            // 统一的 close/reconnect 分支接管，不把内部错误泄漏成旧 error kind。
+            let _ = shared.with_disconnect_admission(|| bot.disconnect());
         }
-        Event::AddPlayer(info) => shared.emit(
-            BackendEventKind::PlayerList,
-            FactSource::ServerObserved,
-            json!({"type":"player_list_add", "uuid":info.uuid, "username":info.profile.name}),
-        ),
-        Event::RemovePlayer(info) => shared.emit(
-            BackendEventKind::PlayerList,
-            FactSource::ServerObserved,
-            json!({"type":"player_list_remove", "uuid":info.uuid, "username":info.profile.name}),
-        ),
-        Event::UpdatePlayer(info) => shared.emit(
-            BackendEventKind::PlayerList,
-            FactSource::ServerObserved,
-            json!({"type":"player_list_update", "uuid":info.uuid, "username":info.profile.name}),
-        ),
-        Event::ReceiveChunk(position) => shared.emit(
-            BackendEventKind::Block,
-            FactSource::ServerObserved,
-            json!({"type":"chunk_loaded", "chunkX":position.x, "chunkZ":position.z}),
-        ),
+        Event::AddPlayer(info) => {
+            shared.emit_if_running(
+                FactSource::ServerObserved,
+                BackendEventPayload::PlayerList(ContractProtocolPlayerListEvent::Add {
+                    uuid: info.uuid.to_string(),
+                    username: info.profile.name,
+                }),
+            );
+        }
+        Event::RemovePlayer(info) => {
+            shared.emit_if_running(
+                FactSource::ServerObserved,
+                BackendEventPayload::PlayerList(ContractProtocolPlayerListEvent::Remove {
+                    uuid: info.uuid.to_string(),
+                    username: info.profile.name,
+                }),
+            );
+        }
+        Event::UpdatePlayer(info) => {
+            shared.emit_if_running(
+                FactSource::ServerObserved,
+                BackendEventPayload::PlayerList(ContractProtocolPlayerListEvent::Update {
+                    uuid: info.uuid.to_string(),
+                    username: info.profile.name,
+                }),
+            );
+        }
+        Event::ReceiveChunk(position) => {
+            shared.emit_if_running(
+                FactSource::ServerObserved,
+                BackendEventPayload::Block(ContractProtocolBlockEvent::ChunkLoaded {
+                    chunk_x: position.x,
+                    chunk_z: position.z,
+                }),
+            );
+        }
         Event::Tick => {
-            if shared.ready.load(Ordering::Acquire) {
+            if shared.command_execution_allowed() && shared.ready.load(Ordering::Acquire) {
                 let tick = shared.tick_revision.fetch_add(1, Ordering::AcqRel);
                 if tick % 5 != 0 {
                     return;
-                }
-                if shared.active_movement.load(Ordering::Acquire) {
-                    let command_id = shared
-                        .active_movement_id
-                        .lock()
-                        .clone()
-                        .unwrap_or_else(|| "movement-tick".to_owned());
-                    shared.emit_predicted_pose(&bot, &command_id);
                 }
                 if let Some(snapshot) =
                     shared.refresh_snapshot(&bot, false, FactSource::ClientPredicted)
@@ -2399,36 +3755,65 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
 async fn handle_swarm(swarm: Swarm, event: SwarmEvent, state: SwarmState) {
     let shared = state.shared;
     if matches!(event, SwarmEvent::Init) {
-        shared.set_swarm(swarm.clone());
+        if !shared.set_swarm(swarm.clone()) {
+            return;
+        }
     }
     if let SwarmEvent::Disconnect(account, join_opts) = event {
-        if shared.stopping.load(Ordering::Acquire)
-            || shared.reconnect_pending.swap(true, Ordering::AcqRel)
-        {
+        if !shared.claim_reconnect() {
+            return;
+        }
+        if shared.stopping.load(Ordering::Acquire) {
+            shared.reconnect_pending.store(false, Ordering::Release);
             return;
         }
 
         // SwarmEvent::Disconnect 是重连状态机的兜底边界：azalea 在复用
         // LocalPlayerEvents 时可能没有再发出 Event::Disconnect。
-        shared.mark_disconnected(None);
-        let delay = shared.config.reconnect_delay;
-        shared.emit(
-            BackendEventKind::Lifecycle,
-            FactSource::Commanded,
-            json!({"type":"reconnect_scheduled", "delayMs":delay.as_millis()}),
-        );
+        let close = shared.mark_disconnected(None);
+        if shared.stopping.load(Ordering::Acquire) || close.deliberate {
+            shared.reconnect_pending.store(false, Ordering::Release);
+            return;
+        }
+        if !close.retryable || !shared.config.reconnect_enabled {
+            shared.emit_faulted(shared.failure_for_close(&close));
+            shared.request_shutdown();
+            shared.reconnect_pending.store(false, Ordering::Release);
+            return;
+        }
+        let Some(delay) = shared.emit_reconnect_scheduled(&close) else {
+            shared.finish_reconnect_attempt(0);
+            return;
+        };
+        let reconnect_cancel = shared.reconnect_cancel.clone();
         tokio::task::spawn_local(async move {
-            tokio::time::sleep(delay).await;
-            if shared.stopping.load(Ordering::Acquire) {
-                shared.reconnect_pending.store(false, Ordering::Release);
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = reconnect_cancel.notified() => {
+                    shared.finish_reconnect_attempt(0);
+                    return;
+                }
+            }
+            let Some(token) = shared.admit_reconnect_attempt() else {
+                shared.finish_reconnect_attempt(0);
+                return;
+            };
+            if !shared.reconnect_add_is_allowed(token) {
+                shared.finish_reconnect_attempt(token);
                 return;
             }
-            shared.begin_connection_attempt();
             let state = BotState {
                 shared: shared.clone(),
             };
-            let _ = swarm.add_with_opts(&account, state, &join_opts).await;
-            shared.reconnect_pending.store(false, Ordering::Release);
+            // Do not drop add_with_opts after its first poll: it may already
+            // have started Client::start_client. Stop invalidates the token
+            // and exits the swarm; once this future returns, an invalid token
+            // explicitly disconnects the returned client as the final guard.
+            let client = swarm.add_with_opts(&account, state, &join_opts).await;
+            if !shared.reconnect_add_is_allowed(token) {
+                client.disconnect();
+            }
+            shared.finish_reconnect_attempt(token);
         });
     }
 }
@@ -2447,7 +3832,9 @@ pub async fn run_with_handle(
     validate_run_config(&config)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let shared = handle.shared.clone();
-    shared.begin_connection_attempt();
+    if !shared.begin_connection_attempt() {
+        return Ok(());
+    }
     let account = Account::offline(&config.username);
     let socket: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     let address = ResolvedAddr {
@@ -2525,7 +3912,10 @@ mod tests {
         BackendEventProtocol as ContractBackendEventProtocol,
         BlockPropertyValue as ContractBlockPropertyValue, CancellationSignal, Deadline,
         HeardSoundType as ContractHeardSoundType,
+        ProtocolEntityEvent as ContractProtocolEntityEvent,
+        ProtocolSoundPayload as ContractProtocolSoundPayload,
         ProtocolSoundSource as ContractProtocolSoundSource,
+        ProtocolWorldEvent as ContractProtocolWorldEvent,
     };
 
     struct TestCancellation {
@@ -2814,6 +4204,396 @@ mod tests {
         assert!(validate_run_config(&config).is_ok());
     }
 
+    #[tokio::test]
+    async fn command_completion_seam_reports_fifo_success_failure_and_shutdown_cancel() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let first = handle
+            .look_relative(10.0, -5.0)
+            .expect("look command should enqueue");
+        let second = handle
+            .move_input(vec![MotorDirection::Forward], 100, None, None, None)
+            .expect("move command should enqueue");
+        let third = handle
+            .release_all()
+            .expect("release command should enqueue");
+        assert_eq!(first.command_id(), "command-1");
+        assert_eq!(second.command_id(), "command-2");
+        assert_eq!(third.command_id(), "command-3");
+
+        let first_queued = handle.shared.pop_command().expect("first queue item");
+        let second_queued = handle.shared.pop_command().expect("second queue item");
+        let third_queued = handle.shared.pop_command().expect("third queue item");
+        assert_eq!(first_queued.envelope.id, "command-1");
+        assert_eq!(second_queued.envelope.id, "command-2");
+        assert_eq!(third_queued.envelope.id, "command-3");
+
+        finish_command(&first_queued.completion, Ok(()));
+        finish_command(
+            &second_queued.completion,
+            Err(BackendError::BackendFailure {
+                failure: BackendFailure {
+                    code: BackendFailureCode::ProtocolError,
+                    message: "synthetic movement failure".to_owned(),
+                    retryable: true,
+                },
+            }),
+        );
+        handle.shared.requeue_front(third_queued);
+        handle.shared.cancel_pending_commands();
+
+        assert_eq!(first.wait().await, Ok(()));
+        assert!(matches!(
+            second.wait().await,
+            Err(BackendError::BackendFailure {
+                failure: BackendFailure {
+                    code: BackendFailureCode::ProtocolError,
+                    ..
+                }
+            })
+        ));
+        assert!(matches!(
+            third.wait().await,
+            Err(BackendError::Cancelled { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn runtime_stop_admission_linearizes_enqueue_and_settles_completion() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let producer_handle = handle.clone();
+        let (result_tx, result_rx) = std_mpsc::channel();
+        let producer = thread::spawn(move || {
+            let result = producer_handle.look_relative(1.0, 2.0);
+            result_tx
+                .send(result)
+                .expect("command producer result should be delivered");
+        });
+
+        for _ in 0..100_000 {
+            if !handle.shared.commands.lock().is_empty() {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert!(
+            !handle.shared.commands.lock().is_empty(),
+            "producer must enqueue before stop wins the admission lock"
+        );
+        handle.stop("enqueue_race_stop");
+        producer.join().expect("command producer should not panic");
+
+        let completion = result_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("completion enqueue result");
+        let completion = completion.expect("enqueue that won must return a completion");
+        assert!(matches!(
+            completion.wait().await,
+            Err(BackendError::Cancelled { .. })
+        ));
+        assert!(handle.shared.commands.lock().is_empty());
+
+        let stopped_first = RuntimeHandle::new(RunConfig::default());
+        stopped_first.stop("already_stopped");
+        assert!(stopped_first.send_chat("not queued").is_err());
+        assert!(stopped_first.look_relative(0.0, 0.0).is_err());
+        assert!(stopped_first.shared.commands.lock().is_empty());
+    }
+
+    #[test]
+    fn global_stream_excludes_keep_alive_motor_error_and_commanded_chat() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+
+        handle
+            .send_chat("commanded chat stays local")
+            .expect("commanded chat should enqueue locally");
+        let _look = handle
+            .look_relative(10.0, 5.0)
+            .expect("look completion should enqueue locally");
+        let _move = handle
+            .move_input(vec![MotorDirection::Forward], 100, None, None, None)
+            .expect("move completion should enqueue locally");
+        let _release = handle
+            .release_all()
+            .expect("release completion should enqueue locally");
+
+        assert!(events.try_recv().is_err());
+        assert_eq!(handle.shared.commands.lock().len(), 4);
+        assert_eq!(
+            mineintent_contracts::minecraft::BackendEventKind::PRODUCT_KINDS.len(),
+            9
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_stop_during_move_registration_cancels_before_any_actuator() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle.shared.begin_connection_attempt();
+        let _request = events.try_recv().expect("connection request");
+
+        let (completion, state) = CommandCompletion::channel("command-registration".to_owned());
+        let stop_handle = handle.clone();
+        handle
+            .shared
+            .set_active_movement_registration_hook(Some(Arc::new(move || {
+                stop_handle.stop("registration_stop")
+            })));
+
+        let generation = handle
+            .shared
+            .movement_generation
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
+        let registration = handle.shared.register_active_movement(
+            "command-registration",
+            generation,
+            250,
+            &Some(state.clone()),
+        );
+
+        assert!(matches!(
+            registration,
+            ActiveMovementRegistration::Cancelled
+        ));
+        assert!(!handle.shared.active_movement.load(Ordering::Acquire));
+        assert!(handle.shared.active_movement_id.lock().is_none());
+        assert!(handle.shared.active_movement_cancel_signal.lock().is_none());
+        assert!(handle.shared.active_movement_completion.lock().is_none());
+        assert!(!handle
+            .shared
+            .active_movement_registration
+            .load(Ordering::Acquire));
+
+        let closed = events.try_recv().expect("close precedes stopped");
+        assert_eq!(payload_json(&closed)["type"], "connection_closed");
+        let stopped = events
+            .try_recv()
+            .expect("stopped waits for registration cleanup");
+        assert_eq!(payload_json(&stopped)["type"], "stopped");
+        assert_eq!(payload_json(&stopped)["reason"], "registration_stop");
+        assert!(handle.shared.shutdown_requested.load(Ordering::Acquire));
+        assert!(matches!(
+            completion.wait().await,
+            Err(BackendError::Cancelled { .. })
+        ));
+    }
+
+    #[test]
+    fn runtime_stop_during_move_registration_without_completion_cleans_signal() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle.shared.begin_connection_attempt();
+        let _request = events.try_recv().expect("connection request");
+
+        let stop_handle = handle.clone();
+        handle
+            .shared
+            .set_active_movement_registration_hook(Some(Arc::new(move || {
+                stop_handle.stop("registration_without_completion")
+            })));
+        let generation = handle
+            .shared
+            .movement_generation
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
+        let registration = handle.shared.register_active_movement(
+            "command-registration-no-completion",
+            generation,
+            250,
+            &None,
+        );
+
+        assert!(matches!(
+            registration,
+            ActiveMovementRegistration::Cancelled
+        ));
+        assert!(!handle.shared.active_movement.load(Ordering::Acquire));
+        assert!(handle.shared.active_movement_id.lock().is_none());
+        assert!(handle.shared.active_movement_cancel_signal.lock().is_none());
+        assert!(handle.shared.active_movement_completion.lock().is_none());
+        assert_eq!(
+            payload_json(&events.try_recv().expect("close event"))["type"],
+            "connection_closed"
+        );
+        assert_eq!(
+            payload_json(&events.try_recv().expect("stopped event"))["type"],
+            "stopped"
+        );
+        assert!(handle.shared.shutdown_requested.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn active_move_completion_cancel_notifies_release_and_finishes_once() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let (completion, state) = CommandCompletion::channel("command-active".to_owned());
+        let signal = Arc::new(Notify::new());
+        state.begin_active_release(signal.clone());
+        *handle.shared.active_movement_completion.lock() = Some(state.clone());
+        handle.shared.active_movement.store(true, Ordering::Release);
+        *handle.shared.active_movement_id.lock() = Some("command-active".to_owned());
+
+        let release_attempted = Arc::new(AtomicBool::new(false));
+        let release_saw_active = Arc::new(AtomicBool::new(false));
+        let release_saw_pending_completion = Arc::new(AtomicBool::new(false));
+        let release_attempted_by_task = release_attempted.clone();
+        let release_saw_active_by_task = release_saw_active.clone();
+        let release_saw_pending_by_task = release_saw_pending_completion.clone();
+        let task_shared = handle.shared.clone();
+        let task_state = state.clone();
+        let release_waiter = tokio::spawn(async move {
+            signal.notified().await;
+            let completion_for_task = Some(task_state.clone());
+            release_active_movement_and_finish(
+                &task_shared,
+                "command-active",
+                0,
+                &completion_for_task,
+                || {
+                    release_attempted_by_task.store(true, Ordering::Release);
+                    release_saw_active_by_task.store(
+                        task_shared.active_movement.load(Ordering::Acquire)
+                            && task_shared.active_movement_id.lock().as_deref()
+                                == Some("command-active"),
+                        Ordering::Release,
+                    );
+                    release_saw_pending_by_task
+                        .store(task_state.sender.lock().is_some(), Ordering::Release);
+                    true
+                },
+                "cancel move",
+                Err(BackendError::Cancelled {
+                    operation: "command:command-active".to_owned(),
+                }),
+            );
+        });
+
+        completion.cancel();
+        completion.cancel();
+        assert!(
+            state.sender.lock().is_some(),
+            "active cancellation must defer completion until release"
+        );
+        tokio::time::timeout(StdDuration::from_secs(1), release_waiter)
+            .await
+            .expect("active movement cancellation must run the release seam")
+            .expect("release waiter should not panic");
+
+        assert!(release_attempted.load(Ordering::Acquire));
+        assert!(release_saw_active.load(Ordering::Acquire));
+        assert!(release_saw_pending_completion.load(Ordering::Acquire));
+        assert!(!handle.shared.active_movement.load(Ordering::Acquire));
+        assert!(handle.shared.active_movement_id.lock().is_none());
+        assert!(state.sender.lock().is_none());
+        assert!(matches!(
+            completion.wait().await,
+            Err(BackendError::Cancelled { .. })
+        ));
+    }
+
+    #[test]
+    fn active_move_cancellation_wins_first_actuator_admission() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        handle.shared.begin_connection_attempt();
+        let (completion, state) = CommandCompletion::channel("command-first-actuator".to_owned());
+        let generation = handle
+            .shared
+            .movement_generation
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
+        let registration = handle.shared.register_active_movement(
+            "command-first-actuator",
+            generation,
+            250,
+            &Some(state.clone()),
+        );
+        assert!(matches!(
+            registration,
+            ActiveMovementRegistration::Started { .. }
+        ));
+
+        completion.cancel();
+        let actuator_called = Arc::new(AtomicBool::new(false));
+        let called = actuator_called.clone();
+        let result = handle.shared.with_active_movement_admission(
+            "command-first-actuator",
+            generation,
+            &Some(state.clone()),
+            || {
+                called.store(true, Ordering::Release);
+            },
+        );
+        assert!(result.is_err());
+        assert!(!actuator_called.load(Ordering::Acquire));
+        let cancel_signal = handle.shared.active_movement_cancel_signal.lock().clone();
+        handle.shared.cancel_registered_active_movement(
+            "command-first-actuator",
+            generation,
+            &cancel_signal,
+            &Some(state.clone()),
+        );
+        assert!(state.sender.lock().is_none());
+    }
+
+    #[test]
+    fn not_ready_command_head_cannot_be_overtaken_by_a_later_enqueue() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let first = handle
+            .look_relative(1.0, 2.0)
+            .expect("first command should enqueue");
+        let barrier = Arc::new(Barrier::new(2));
+        let producer_started = Arc::new(AtomicBool::new(false));
+        let producer_done = Arc::new(AtomicBool::new(false));
+        let (producer_id_tx, producer_id_rx) = std_mpsc::channel();
+        let producer_handle = handle.clone();
+        let producer_barrier = barrier.clone();
+        let producer_started_flag = producer_started.clone();
+        let producer_done_flag = producer_done.clone();
+        let producer = thread::spawn(move || {
+            producer_barrier.wait();
+            producer_started_flag.store(true, Ordering::Release);
+            let second = producer_handle
+                .release_all()
+                .expect("concurrent later command should enqueue");
+            producer_id_tx
+                .send(second.command_id().to_owned())
+                .expect("producer id should be delivered");
+            producer_done_flag.store(true, Ordering::Release);
+        });
+
+        assert!(handle
+            .shared
+            .next_command_for_processing_with_hook(|| {
+                barrier.wait();
+                while !producer_started.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                assert!(
+                    !producer_done.load(Ordering::Acquire),
+                    "producer must still be blocked by the queue lock"
+                );
+            })
+            .is_none());
+        producer
+            .join()
+            .expect("concurrent producer should not panic");
+        let second_id = producer_id_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("later command id");
+
+        let first_queued = handle.shared.pop_command().expect("deferred head");
+        let second_queued = handle.shared.pop_command().expect("later queue item");
+        assert_eq!(first_queued.envelope.id, first.command_id());
+        assert_eq!(second_queued.envelope.id, second_id);
+        handle.shared.requeue_front(second_queued);
+        handle.shared.requeue_front(first_queued);
+        handle.shared.cancel_pending_commands();
+    }
+
+    fn payload_json(event: &BackendEventEnvelope) -> serde_json::Value {
+        serde_json::to_value(&event.payload).expect("strict v2 payload is serializable")
+    }
+
     #[test]
     fn connection_request_preallocates_and_init_reuses_each_attempt_identity() {
         let handle = RuntimeHandle::new(RunConfig::default());
@@ -2824,15 +4604,15 @@ mod tests {
         let first_request = events.try_recv().expect("首次连接请求事件");
         assert_eq!(first_request.connection_epoch, 1);
         assert_eq!(first_request.connection_attempt_id, "attempt-1");
-        assert_eq!(first_request.payload["type"], "connection_requested");
-        assert_eq!(first_request.payload["attempt"], 1);
+        let first_payload = payload_json(&first_request);
+        assert_eq!(first_payload["type"], "connection_requested");
+        assert_eq!(first_payload["attempt"], 1);
         assert!(first_request.dimension.is_none());
 
         handle.shared.consume_attempt_for_transport_init();
         handle.shared.emit(
-            BackendEventKind::Lifecycle,
             FactSource::ServerObserved,
-            json!({"type":"transport_initialized"}),
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected),
         );
         let first_init = events.try_recv().expect("首次连接初始化事件");
         assert_eq!(
@@ -2850,8 +4630,9 @@ mod tests {
         );
         assert_eq!(second_request.connection_epoch, 2);
         assert_eq!(second_request.connection_attempt_id, "attempt-2");
-        assert_eq!(second_request.payload["type"], "connection_requested");
-        assert_eq!(second_request.payload["attempt"], 2);
+        let second_payload = payload_json(&second_request);
+        assert_eq!(second_payload["type"], "connection_requested");
+        assert_eq!(second_payload["attempt"], 2);
         assert!(second_request.dimension.is_none());
 
         handle.shared.consume_attempt_for_transport_init();
@@ -2870,9 +4651,11 @@ mod tests {
 
         assert_eq!(handle.shared.set_dimension("minecraft:overworld"), None);
         handle.shared.emit(
-            BackendEventKind::World,
             FactSource::ServerObserved,
-            json!({"type":"world_observed"}),
+            BackendEventPayload::World(ContractProtocolWorldEvent::GameChanged {
+                dimension: Some("minecraft:overworld".to_owned()),
+                game_mode: Some("survival".to_owned()),
+            }),
         );
         let world_event = events.try_recv().expect("世界事件");
         assert_eq!(
@@ -2898,10 +4681,790 @@ mod tests {
         handle.shared.observe_dimension("minecraft:the_nether");
 
         let changed = events.try_recv().expect("维度变化事件");
-        assert_eq!(changed.payload["type"], "dimension_changed");
-        assert_eq!(changed.payload["from"], "minecraft:overworld");
-        assert_eq!(changed.payload["to"], "minecraft:the_nether");
+        let changed_payload = payload_json(&changed);
+        assert_eq!(changed_payload["type"], "dimension_changed");
+        assert_eq!(changed_payload["from"], "minecraft:overworld");
+        assert_eq!(changed_payload["to"], "minecraft:the_nether");
         assert_eq!(changed.dimension.as_deref(), Some("minecraft:the_nether"));
+    }
+
+    #[test]
+    fn runtime_ready_death_respawn_and_dimension_lifecycle_order_is_typed() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle.shared.begin_connection_attempt();
+        let _request = events.try_recv().expect("connection request");
+
+        handle.shared.emit_transport_connected();
+        handle
+            .shared
+            .emit_logged_in("26.1.2", "minecraft:overworld".to_owned());
+        handle.shared.emit_ready(7);
+        handle.shared.emit_died();
+        handle
+            .shared
+            .emit_respawn_transition_started("minecraft:overworld".to_owned());
+        handle
+            .shared
+            .emit_respawned("minecraft:overworld".to_owned());
+        handle.shared.observe_dimension("minecraft:the_nether");
+
+        let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            emitted
+                .iter()
+                .map(|event| payload_json(event)["type"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            vec![
+                "transport_connected".to_owned(),
+                "logged_in".to_owned(),
+                "ready".to_owned(),
+                "died".to_owned(),
+                "respawn_transition_started".to_owned(),
+                "respawned".to_owned(),
+                "dimension_changed".to_owned(),
+            ]
+        );
+        assert_eq!(payload_json(&emitted[1])["version"], "26.1.2");
+        assert_eq!(
+            payload_json(&emitted[1])["dimension"],
+            "minecraft:overworld"
+        );
+        assert_eq!(payload_json(&emitted[2])["snapshotRevision"], 7);
+        assert_eq!(
+            payload_json(&emitted[4])["fromDimension"],
+            "minecraft:overworld"
+        );
+        assert_eq!(
+            payload_json(&emitted[5])["dimension"],
+            "minecraft:overworld"
+        );
+        assert_eq!(payload_json(&emitted[6])["from"], "minecraft:overworld");
+        assert_eq!(payload_json(&emitted[6])["to"], "minecraft:the_nether");
+        assert_eq!(emitted[2].dimension.as_deref(), Some("minecraft:overworld"));
+        assert_eq!(
+            emitted[6].dimension.as_deref(),
+            Some("minecraft:the_nether")
+        );
+    }
+
+    #[test]
+    fn stopped_runtime_rejects_late_attempt_and_ready_without_resurrection() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle.stop("late_event_stop");
+        let stopped = events.try_recv().expect("stopped event");
+        assert_eq!(payload_json(&stopped)["type"], "stopped");
+        assert!(handle.shared.shutdown_requested.load(Ordering::Acquire));
+
+        assert!(!handle.shared.begin_connection_attempt());
+        assert!(!handle.shared.consume_attempt_for_transport_init());
+        handle.shared.emit_transport_connected();
+        handle
+            .shared
+            .emit_logged_in("26.1.2", "minecraft:overworld".to_owned());
+        handle.shared.emit_ready(99);
+        assert!(!handle.shared.ready.load(Ordering::Acquire));
+        assert!(handle.shared.stopped_reported.load(Ordering::Acquire));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn finalize_stop_ready_protocol_has_no_lost_wakeup_between_finalizers() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle.shared.stopping.store(true, Ordering::Release);
+        *handle.shared.stop_reason.lock() = Some("lost_wakeup_regression".to_owned());
+
+        let (hook_reached_tx, hook_reached_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let release_rx = Arc::new(StdMutex::new(Some(release_rx)));
+        handle.shared.set_finalize_stop_hook(Some(Arc::new({
+            let release_rx = release_rx.clone();
+            move || {
+                hook_reached_tx
+                    .send(())
+                    .expect("finalizer hook should be reached");
+                release_rx
+                    .lock()
+                    .expect("release gate lock")
+                    .take()
+                    .expect("only the first finalizer owns the gate")
+                    .recv()
+                    .expect("release gate should open");
+            }
+        })));
+
+        let first_shared = handle.shared.clone();
+        let first = thread::spawn(move || first_shared.finalize_stop_if_ready());
+        hook_reached_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("first finalizer must reach the readiness gate");
+
+        let (second_attempt_tx, second_attempt_rx) = std_mpsc::channel();
+        let (second_done_tx, second_done_rx) = std_mpsc::channel();
+        let second_shared = handle.shared.clone();
+        let second = thread::spawn(move || {
+            second_attempt_tx
+                .send(())
+                .expect("second finalizer attempt should be observable");
+            second_shared.finalize_stop_if_ready();
+            second_done_tx
+                .send(())
+                .expect("second finalizer should finish");
+        });
+        second_attempt_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("second finalizer should attempt while first owns admission");
+        assert!(
+            second_done_rx.try_recv().is_err(),
+            "second finalizer must wait instead of observing an empty reason"
+        );
+
+        release_tx.send(()).expect("release first finalizer");
+        first.join().expect("first finalizer should not panic");
+        second.join().expect("second finalizer should not panic");
+
+        let stopped = events.try_recv().expect("stopped must not be lost");
+        assert_eq!(payload_json(&stopped)["type"], "stopped");
+        assert_eq!(payload_json(&stopped)["reason"], "lost_wakeup_regression");
+        assert!(events.try_recv().is_err());
+        assert!(handle.shared.shutdown_requested.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn running_event_admission_enqueue_precedes_stop_terminal_event() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle.shared.begin_connection_attempt();
+        let _request = events.try_recv().expect("connection request");
+
+        let (event_checked_tx, event_checked_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let release_rx = Arc::new(StdMutex::new(Some(release_rx)));
+        handle.shared.set_event_admission_hook(Some(Arc::new({
+            let release_rx = release_rx.clone();
+            move || {
+                event_checked_tx
+                    .send(())
+                    .expect("event admission hook should be reached");
+                release_rx
+                    .lock()
+                    .expect("event release gate lock")
+                    .take()
+                    .expect("only one event admission owns the gate")
+                    .recv()
+                    .expect("event release gate should open");
+            }
+        })));
+
+        let event_shared = handle.shared.clone();
+        let emitter = thread::spawn(move || {
+            event_shared.emit_if_running(
+                FactSource::ServerObserved,
+                BackendEventPayload::World(ContractProtocolWorldEvent::GameChanged {
+                    dimension: Some("minecraft:overworld".to_owned()),
+                    game_mode: Some("survival".to_owned()),
+                }),
+            )
+        });
+        event_checked_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("event must hold admission between check and enqueue");
+
+        let (stop_attempt_tx, stop_attempt_rx) = std_mpsc::channel();
+        let stop_handle = handle.clone();
+        let stopper = thread::spawn(move || {
+            stop_attempt_tx
+                .send(())
+                .expect("stop attempt should be observable");
+            stop_handle.stop("event_admission_stop");
+        });
+        stop_attempt_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("stop must attempt while event owns admission");
+
+        release_tx.send(()).expect("release event admission");
+        assert!(emitter.join().expect("event emitter should not panic"));
+        stopper.join().expect("stopper should not panic");
+
+        let kinds = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| payload_json(&event)["type"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                "game_changed".to_owned(),
+                "connection_closed".to_owned(),
+                "stopped".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn stop_cannot_overtake_first_disconnect_cleanup() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle.shared.begin_connection_attempt();
+        let _request = events.try_recv().expect("connection request");
+        handle.shared.observation.write().world = Some(empty_world());
+        handle
+            .send_chat("queued before disconnect")
+            .expect("pre-disconnect command should queue");
+
+        let (cleanup_reached_tx, cleanup_reached_rx) = std_mpsc::channel();
+        let (release_cleanup_tx, release_cleanup_rx) = std_mpsc::channel();
+        let release_cleanup_rx = Arc::new(StdMutex::new(Some(release_cleanup_rx)));
+        handle.shared.set_disconnect_cleanup_hook(Some(Arc::new({
+            let release_cleanup_rx = release_cleanup_rx.clone();
+            move || {
+                cleanup_reached_tx
+                    .send(())
+                    .expect("disconnect cleanup hook should be reached");
+                release_cleanup_rx
+                    .lock()
+                    .expect("disconnect cleanup gate lock")
+                    .take()
+                    .expect("only the first disconnect owns the gate")
+                    .recv()
+                    .expect("disconnect cleanup gate should open");
+            }
+        })));
+
+        let disconnect_shared = handle.shared.clone();
+        let disconnect = thread::spawn(move || {
+            disconnect_shared.mark_disconnected(Some("Server closed".to_owned()))
+        });
+        cleanup_reached_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("first disconnect must reach cleanup while holding admission");
+
+        let (stop_attempt_tx, stop_attempt_rx) = std_mpsc::channel();
+        let (stop_done_tx, stop_done_rx) = std_mpsc::channel();
+        let stop_handle = handle.clone();
+        let stopper = thread::spawn(move || {
+            stop_attempt_tx
+                .send(())
+                .expect("stop attempt should be observable");
+            stop_handle.stop("disconnect_cleanup_race");
+            stop_done_tx.send(()).expect("stop completion signal");
+        });
+        stop_attempt_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("stop must attempt while disconnect owns admission");
+        assert!(
+            stop_done_rx
+                .recv_timeout(StdDuration::from_millis(50))
+                .is_err(),
+            "stopped must not overtake first-disconnect cleanup"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "close is not visible before cleanup"
+        );
+
+        release_cleanup_tx
+            .send(())
+            .expect("release disconnect cleanup");
+        let close = disconnect
+            .join()
+            .expect("disconnect thread should not panic");
+        assert_eq!(close.code, "server_shutdown");
+        stopper.join().expect("stop thread should not panic");
+        stop_done_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("stop should finish after cleanup");
+
+        let closed = events.try_recv().expect("close event after cleanup");
+        let stopped = events.try_recv().expect("stopped event after cleanup");
+        assert_eq!(payload_json(&closed)["type"], "connection_closed");
+        assert_eq!(payload_json(&stopped)["type"], "stopped");
+        assert!(handle.shared.observation.read().world.is_none());
+        assert!(handle.shared.commands.lock().is_empty());
+        assert!(handle.shared.shutdown_requested.load(Ordering::Acquire));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn died_broadcast_reentrant_stop_has_no_post_stopped_actuator() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle.shared.begin_connection_attempt();
+        let _request = events.try_recv().expect("connection request");
+
+        let callback_handle = handle.clone();
+        handle
+            .shared
+            .set_event_broadcast_hook(Some(Arc::new(move || {
+                callback_handle.stop("died_callback_stop");
+            })));
+        let actuator_called = Arc::new(AtomicBool::new(false));
+        let actuator_after_stop = Arc::new(AtomicBool::new(false));
+        let called = actuator_called.clone();
+        let after_stop = actuator_after_stop.clone();
+        let result = handle.shared.admit_death_and_release(|| {
+            if handle.shared.stopping.load(Ordering::Acquire) {
+                after_stop.store(true, Ordering::Release);
+            }
+            called.store(true, Ordering::Release);
+            true
+        });
+
+        assert_eq!(result, Some(true));
+        assert!(actuator_called.load(Ordering::Acquire));
+        assert!(
+            !actuator_after_stop.load(Ordering::Acquire),
+            "Death actuator must finish before a re-entrant died callback can stop"
+        );
+        let kinds = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| payload_json(&event)["type"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                "died".to_owned(),
+                "connection_closed".to_owned(),
+                "stopped".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn stop_wins_before_late_death_claim_without_actuator_or_event() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle.stop("late_death_stop");
+        let _stopped = events.try_recv().expect("stop event");
+        let actuator_called = Arc::new(AtomicBool::new(false));
+        let called = actuator_called.clone();
+        assert_eq!(
+            handle.shared.admit_death_and_release(|| {
+                called.store(true, Ordering::Release);
+                true
+            }),
+            None
+        );
+        assert!(!actuator_called.load(Ordering::Acquire));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_admitted_reconnect_add_intent_and_preserves_terminal_state() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle
+            .shared
+            .reconnect_pending
+            .store(true, Ordering::Release);
+        let token = handle
+            .shared
+            .admit_reconnect_attempt()
+            .expect("reconnect should be admitted before stop");
+        let request = events.try_recv().expect("reconnect connection request");
+        assert_eq!(payload_json(&request)["type"], "connection_requested");
+        assert!(handle.shared.reconnect_add_is_allowed(token));
+
+        handle.stop("cancel_reconnect_add");
+        assert!(!handle.shared.reconnect_add_is_allowed(token));
+        assert!(!handle.shared.reconnect_add_pending.load(Ordering::Acquire));
+        assert!(!handle.shared.reconnect_pending.load(Ordering::Acquire));
+        assert!(handle.shared.shutdown_requested.load(Ordering::Acquire));
+        assert!(handle.shared.stopped_reported.load(Ordering::Acquire));
+        tokio::time::timeout(
+            StdDuration::from_secs(1),
+            handle.shared.reconnect_cancel.notified(),
+        )
+        .await
+        .expect("stop must wake a pending reconnect add task");
+
+        let event_count_after_stop = std::iter::from_fn(|| events.try_recv().ok()).count();
+        assert_eq!(
+            event_count_after_stop, 2,
+            "close then stopped after admitted attempt"
+        );
+        assert!(!handle.shared.begin_connection_attempt());
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn stop_wins_before_reconnect_attempt_admission() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        handle.stop("stop_before_reconnect");
+        handle
+            .shared
+            .reconnect_pending
+            .store(true, Ordering::Release);
+        assert!(handle.shared.admit_reconnect_attempt().is_none());
+        assert!(!handle.shared.reconnect_add_pending.load(Ordering::Acquire));
+        assert!(handle.shared.shutdown_requested.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn runtime_retryable_close_then_reconnect_reuses_the_sealed_close_code() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle.shared.begin_connection_attempt();
+        let _request = events.try_recv().expect("connection request");
+
+        let close = handle
+            .shared
+            .mark_disconnected(Some("Server restarting".to_owned()));
+        assert_eq!(close.code, "server_shutdown");
+        assert!(close.retryable);
+        assert!(!close.deliberate);
+        handle.shared.emit_reconnect_scheduled(&close);
+
+        let closed = events.try_recv().expect("connection closed event");
+        let scheduled = events.try_recv().expect("reconnect scheduled event");
+        assert_eq!(payload_json(&closed)["type"], "connection_closed");
+        assert_eq!(payload_json(&closed)["close"]["code"], close.code);
+        assert_eq!(payload_json(&scheduled)["type"], "reconnect_scheduled");
+        assert_eq!(payload_json(&scheduled)["closeCode"], close.code);
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn runtime_fatal_close_emits_faulted_without_reconnect_disabled_rewrite() {
+        let mut config = RunConfig::default();
+        config.reconnect_enabled = false;
+        let handle = RuntimeHandle::new(config);
+        let mut events = handle.subscribe();
+        handle.shared.begin_connection_attempt();
+        let _request = events.try_recv().expect("connection request");
+
+        let close = handle
+            .shared
+            .mark_disconnected(Some("You are banned from this server".to_owned()));
+        let failure = handle.shared.failure_for_close(&close);
+        assert_eq!(failure.code, BackendFailureCode::PermissionDenied);
+        assert!(!failure.retryable);
+        handle.shared.emit_faulted(failure);
+
+        let closed = events.try_recv().expect("fatal close event");
+        let faulted = events.try_recv().expect("faulted event");
+        assert_eq!(payload_json(&closed)["type"], "connection_closed");
+        assert_eq!(payload_json(&closed)["close"]["code"], "permission_denied");
+        assert_eq!(payload_json(&faulted)["type"], "faulted");
+        assert_eq!(
+            payload_json(&faulted)["failure"]["code"],
+            "permission_denied"
+        );
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn runtime_invalid_session_close_uses_permission_denied_with_authentication_failure() {
+        let mut config = RunConfig::default();
+        config.reconnect_enabled = false;
+        let handle = RuntimeHandle::new(config);
+        let mut events = handle.subscribe();
+        handle.shared.begin_connection_attempt();
+        let _request = events.try_recv().expect("connection request");
+
+        let close = handle
+            .shared
+            .mark_disconnected(Some("Invalid session".to_owned()));
+        assert_eq!(close.code, "permission_denied");
+        assert!(!close.retryable);
+        assert!(close.kick.is_some());
+        let failure = handle.shared.failure_for_close(&close);
+        assert_eq!(failure.code, BackendFailureCode::AuthenticationFailed);
+        assert!(!failure.retryable);
+        handle.shared.emit_faulted(failure);
+
+        let closed = events.try_recv().expect("invalid-session close event");
+        let faulted = events.try_recv().expect("invalid-session fault event");
+        assert_eq!(payload_json(&closed)["close"]["code"], "permission_denied");
+        assert_eq!(
+            payload_json(&faulted)["failure"]["code"],
+            "authentication_failed"
+        );
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn runtime_disconnect_kick_text_does_not_infer_forced_timeout_or_version_codes() {
+        let cases = [
+            ("server_shutdown", "server_shutdown", true, None),
+            (
+                "Unsupported version",
+                "unclassified_kick",
+                false,
+                Some(BackendFailureCode::PermissionDenied),
+            ),
+            (
+                "Timed out",
+                "unclassified_kick",
+                false,
+                Some(BackendFailureCode::PermissionDenied),
+            ),
+        ];
+        for (reason, expected_code, retryable, failure_code) in cases {
+            let handle = RuntimeHandle::new(RunConfig::default());
+            handle.shared.begin_connection_attempt();
+            let close = handle.shared.mark_disconnected(Some(reason.to_owned()));
+            assert_eq!(close.code, expected_code, "reason={reason}");
+            assert_eq!(close.retryable, retryable, "reason={reason}");
+            assert_eq!(
+                handle.shared.failure_for_close(&close).code,
+                failure_code.unwrap_or(BackendFailureCode::ProtocolError),
+                "reason={reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_unclassified_disconnect_component_is_fatal_not_reconnectable() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle.shared.begin_connection_attempt();
+        let _request = events.try_recv().expect("connection request");
+
+        let close = handle
+            .shared
+            .mark_disconnected(Some("Removed by an administrator".to_owned()));
+        assert_eq!(close.code, "unclassified_kick");
+        assert!(!close.retryable);
+        assert!(close.kick.is_some());
+        let failure = handle.shared.failure_for_close(&close);
+        assert_eq!(failure.code, BackendFailureCode::PermissionDenied);
+        assert!(!failure.retryable);
+        assert!(!handle.shared.config.reconnect_enabled || !close.retryable);
+        handle.shared.emit_faulted(failure);
+
+        let _closed = events.try_recv().expect("unclassified kick close event");
+        let faulted = events.try_recv().expect("unclassified kick fault event");
+        assert_eq!(payload_json(&faulted)["type"], "faulted");
+        assert!(
+            events.try_recv().is_err(),
+            "fatal kick must not schedule reconnect"
+        );
+    }
+
+    #[test]
+    fn runtime_connection_failed_retains_error_and_disabled_retry_is_distinct() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle.shared.begin_connection_attempt();
+        let _request = events.try_recv().expect("connection request");
+        let close = handle
+            .shared
+            .mark_connection_failed("tcp reset by peer".to_owned());
+        let closed = events.try_recv().expect("connection failed close event");
+        assert_eq!(payload_json(&closed)["close"]["code"], "connection_failed");
+        assert_eq!(
+            payload_json(&closed)["close"]["error"]["message"],
+            "tcp reset by peer"
+        );
+        assert_eq!(
+            handle.shared.failure_for_close(&close).code,
+            BackendFailureCode::ProtocolError
+        );
+    }
+
+    #[test]
+    fn runtime_retryable_close_with_disabled_reconnect_emits_reconnect_disabled() {
+        let mut config = RunConfig::default();
+        config.reconnect_enabled = false;
+        let handle = RuntimeHandle::new(config);
+        let mut events = handle.subscribe();
+        handle.shared.begin_connection_attempt();
+        let _request = events.try_recv().expect("connection request");
+        let close = handle
+            .shared
+            .mark_disconnected(Some("Server closed".to_owned()));
+        assert!(close.retryable);
+        assert_eq!(
+            handle.shared.failure_for_close(&close).code,
+            BackendFailureCode::ReconnectDisabled
+        );
+    }
+
+    #[test]
+    fn runtime_expected_stop_closes_then_stops_after_local_cleanup_with_reason() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle.shared.begin_connection_attempt();
+        let _request = events.try_recv().expect("connection request");
+        handle.shared.set_dimension("minecraft:overworld");
+        handle.shared.observation.write().world = Some(empty_world());
+
+        handle.stop("operator_requested");
+        let closed = events.try_recv().expect("expected close event");
+        let stopped = events.try_recv().expect("stopped event");
+        assert_eq!(payload_json(&closed)["type"], "connection_closed");
+        assert_eq!(payload_json(&closed)["close"]["code"], "deliberate_stop");
+        assert_eq!(payload_json(&closed)["close"]["deliberate"], true);
+        assert_eq!(payload_json(&stopped)["type"], "stopped");
+        assert_eq!(payload_json(&stopped)["reason"], "operator_requested");
+        assert!(handle.shared.observation.read().world.is_none());
+        assert!(handle.shared.pop_command().is_none());
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_active_stop_defers_stopped_until_release_seam_finishes() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle.shared.begin_connection_attempt();
+        let _request = events.try_recv().expect("connection request");
+
+        let (completion, state) = CommandCompletion::channel("command-stop".to_owned());
+        state.begin_active_release(Arc::new(Notify::new()));
+        *handle.shared.active_movement_completion.lock() = Some(state.clone());
+        handle.shared.active_movement.store(true, Ordering::Release);
+        *handle.shared.active_movement_id.lock() = Some("command-stop".to_owned());
+
+        handle.stop("operator_requested");
+        let closed = events.try_recv().expect("close must precede deferred stop");
+        assert_eq!(payload_json(&closed)["type"], "connection_closed");
+        assert!(events.try_recv().is_err(), "stopped must wait for release");
+        assert!(!handle.shared.shutdown_requested.load(Ordering::Acquire));
+        assert!(state.sender.lock().is_some());
+
+        let completion_for_release = Some(state.clone());
+        release_active_movement_and_finish(
+            &handle.shared,
+            "command-stop",
+            0,
+            &completion_for_release,
+            || {
+                assert!(handle.shared.active_movement.load(Ordering::Acquire));
+                assert!(state.sender.lock().is_some());
+                true
+            },
+            "stop move",
+            Err(BackendError::Cancelled {
+                operation: "command:command-stop".to_owned(),
+            }),
+        );
+        state.wait_settled().await;
+        assert!(matches!(
+            completion.wait().await,
+            Err(BackendError::Cancelled { .. })
+        ));
+        assert!(!handle.shared.active_movement.load(Ordering::Acquire));
+        assert!(handle.shared.active_movement_id.lock().is_none());
+        assert!(handle.shared.shutdown_requested.load(Ordering::Acquire));
+        let stopped = events.try_recv().expect("stopped after release");
+        assert_eq!(payload_json(&stopped)["type"], "stopped");
+        assert_eq!(payload_json(&stopped)["reason"], "operator_requested");
+
+        handle.stop("duplicate_reason");
+        release_active_movement_and_finish(
+            &handle.shared,
+            "command-stop",
+            0,
+            &completion_for_release,
+            || panic!("a settled active move must not release twice"),
+            "stop move",
+            Err(BackendError::Cancelled {
+                operation: "command:command-stop".to_owned(),
+            }),
+        );
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_active_move_without_completion_stop_wakes_release_before_shutdown() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle.shared.begin_connection_attempt();
+        let _request = events.try_recv().expect("connection request");
+
+        let signal = Arc::new(Notify::new());
+        *handle.shared.active_movement_cancel_signal.lock() = Some(signal.clone());
+        handle.shared.active_movement.store(true, Ordering::Release);
+        *handle.shared.active_movement_id.lock() = Some("command-no-completion".to_owned());
+        let task_shared = handle.shared.clone();
+        let released = Arc::new(AtomicBool::new(false));
+        let released_by_task = released.clone();
+        let release_task = tokio::spawn(async move {
+            signal.notified().await;
+            let no_completion = None;
+            release_active_movement_and_finish(
+                &task_shared,
+                "command-no-completion",
+                0,
+                &no_completion,
+                || {
+                    assert!(task_shared.active_movement.load(Ordering::Acquire));
+                    released_by_task.store(true, Ordering::Release);
+                    true
+                },
+                "stop move",
+                Err(BackendError::Cancelled {
+                    operation: "command:command-no-completion".to_owned(),
+                }),
+            );
+        });
+
+        handle.stop("operator_requested");
+        let closed = events.try_recv().expect("close must be emitted");
+        assert_eq!(payload_json(&closed)["type"], "connection_closed");
+        assert!(
+            events.try_recv().is_err(),
+            "stopped waits for no-completion release"
+        );
+        assert!(!handle.shared.shutdown_requested.load(Ordering::Acquire));
+        assert!(handle.shared.active_movement.load(Ordering::Acquire));
+
+        tokio::time::timeout(StdDuration::from_secs(1), release_task)
+            .await
+            .expect("no-completion move cancellation must wake promptly")
+            .expect("release task should not panic");
+        assert!(released.load(Ordering::Acquire));
+        assert!(!handle.shared.active_movement.load(Ordering::Acquire));
+        assert!(handle.shared.active_movement_id.lock().is_none());
+        assert!(handle.shared.shutdown_requested.load(Ordering::Acquire));
+        let stopped = events
+            .try_recv()
+            .expect("stopped after no-completion release");
+        assert_eq!(payload_json(&stopped)["reason"], "operator_requested");
+    }
+
+    #[tokio::test]
+    async fn runtime_active_move_without_completion_disconnect_wakes_release() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle.shared.begin_connection_attempt();
+        let _request = events.try_recv().expect("connection request");
+        let signal = Arc::new(Notify::new());
+        *handle.shared.active_movement_cancel_signal.lock() = Some(signal.clone());
+        handle.shared.active_movement.store(true, Ordering::Release);
+        *handle.shared.active_movement_id.lock() = Some("command-disconnect".to_owned());
+        let task_shared = handle.shared.clone();
+        let release_task = tokio::spawn(async move {
+            signal.notified().await;
+            let no_completion = None;
+            release_active_movement_and_finish(
+                &task_shared,
+                "command-disconnect",
+                0,
+                &no_completion,
+                || true,
+                "disconnect move",
+                Err(BackendError::Cancelled {
+                    operation: "command:command-disconnect".to_owned(),
+                }),
+            );
+        });
+
+        let close = handle
+            .shared
+            .mark_disconnected(Some("Server closed".to_owned()));
+        assert_eq!(close.code, "server_shutdown");
+        assert_eq!(
+            payload_json(&events.try_recv().expect("close event"))["type"],
+            "connection_closed"
+        );
+        tokio::time::timeout(StdDuration::from_secs(1), release_task)
+            .await
+            .expect("disconnect must wake no-completion move")
+            .expect("release task should not panic");
+        assert!(!handle.shared.active_movement.load(Ordering::Acquire));
+        assert!(handle.shared.active_movement_id.lock().is_none());
+        assert!(events.try_recv().is_err());
     }
 
     #[test]
@@ -2954,11 +5517,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["event-2", "event-3", "event-4"]
         );
-        assert_eq!(delivered[0].payload["type"], "animation");
-        assert_eq!(delivered[1].payload["type"], "stopping");
-        assert_eq!(delivered[1].payload["reason"], "callback-stop");
-        assert_eq!(delivered[2].payload["type"], "shutdown_requested");
-        assert_eq!(delivered[2].payload["swarmAvailable"], false);
+        assert_eq!(payload_json(&delivered[0])["type"], "animation");
+        assert_eq!(payload_json(&delivered[1])["type"], "connection_closed");
+        assert_eq!(payload_json(&delivered[1])["close"]["deliberate"], true);
+        assert_eq!(payload_json(&delivered[2])["type"], "stopped");
+        assert_eq!(payload_json(&delivered[2])["reason"], "callback-stop");
         assert_eq!(&*stop_event_ids.lock(), &["event-2".to_owned()]);
         assert_eq!(
             other_events
@@ -3056,9 +5619,11 @@ mod tests {
                 start.wait();
                 for sequence in 0..EVENTS_PER_PRODUCER {
                     shared.emit(
-                        BackendEventKind::World,
                         FactSource::ServerObserved,
-                        json!({"producer":producer,"sequence":sequence}),
+                        BackendEventPayload::World(ContractProtocolWorldEvent::GameChanged {
+                            dimension: Some(format!("producer:{producer}")),
+                            game_mode: Some(format!("sequence:{sequence}")),
+                        }),
                     );
                 }
                 worker_finished
@@ -3117,8 +5682,9 @@ mod tests {
                 .expect("every attempt epoch must have an event");
             assert_eq!(event.kind, BackendEventKind::Lifecycle);
             assert_eq!(event.connection_attempt_id, format!("attempt-{epoch}"));
-            assert_eq!(event.payload["type"], "connection_requested");
-            assert_eq!(event.payload["attempt"], epoch);
+            let payload = payload_json(event);
+            assert_eq!(payload["type"], "connection_requested");
+            assert_eq!(payload["attempt"], epoch);
         }
     }
 
@@ -3807,12 +6373,10 @@ mod tests {
                 return;
             }
             self.handle.shared.emit(
-                BackendEventKind::Entity,
                 FactSource::ServerObserved,
                 valid_observation_payload(BackendEventKind::Entity),
             );
             self.handle.shared.emit(
-                BackendEventKind::Block,
                 FactSource::ServerObserved,
                 valid_observation_payload(BackendEventKind::Block),
             );
@@ -3884,49 +6448,116 @@ mod tests {
         }
     }
 
-    fn valid_observation_payload(kind: BackendEventKind) -> serde_json::Value {
+    fn valid_observation_payload(kind: BackendEventKind) -> BackendEventPayload {
         match kind {
             BackendEventKind::Entity => {
-                json!({"type":"animation", "entityKey":"entity-7", "animation":"swing"})
+                BackendEventPayload::Entity(ContractProtocolEntityEvent::Animation {
+                    entity_key: "entity-7".to_owned(),
+                    animation: "swing".to_owned(),
+                })
             }
             BackendEventKind::Block => {
-                json!({"type":"chunk_loaded", "chunkX":3, "chunkZ":-4})
+                BackendEventPayload::Block(ContractProtocolBlockEvent::ChunkLoaded {
+                    chunk_x: 3,
+                    chunk_z: -4,
+                })
             }
-            BackendEventKind::Sound => json!({
-                "type":"heard",
-                "soundKey":"minecraft:block.note_block.harp",
-                "soundName":"note_block.harp",
-                "soundId":12,
-                "category":"blocks",
-                "sourcePosition":{"x":1.5,"y":64.25,"z":-2.0},
-                "volume":0.75,
-                "pitch":1.25,
-                "protocolSource":"named_sound_effect"
+            BackendEventKind::Sound => BackendEventPayload::Sound(ContractProtocolSoundPayload {
+                event_type: mineintent_contracts::minecraft::HeardSoundType::Heard,
+                sound_key: "minecraft:block.note_block.harp".to_owned(),
+                sound_name: Some("note_block.harp".to_owned()),
+                sound_id: Some(12),
+                category: Some("blocks".to_owned()),
+                source_position: ContractVec3Value {
+                    x: 1.5,
+                    y: 64.25,
+                    z: -2.0,
+                },
+                volume: 0.75,
+                pitch: 1.25,
+                protocol_source:
+                    mineintent_contracts::minecraft::ProtocolSoundSource::NamedSoundEffect,
             }),
-            _ => json!({"type":"ignored"}),
+            BackendEventKind::Lifecycle => {
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected)
+            }
+            BackendEventKind::Chat => BackendEventPayload::Chat(ContractProtocolChatEvent {
+                sender_username: Some("Alex".to_owned()),
+                plain_text: "hello".to_owned(),
+                position: Some(ChatPosition::Chat),
+                verified: None,
+            }),
+            BackendEventKind::SelfState => BackendEventPayload::SelfState(
+                ContractProtocolSelfEvent::ServerPositionCorrection {
+                    teleport_id: 1,
+                    position: ContractVec3Value {
+                        x: 0.0,
+                        y: 64.0,
+                        z: 0.0,
+                    },
+                    velocity: ContractVec3Value {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    },
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    relative: RelativeMovementFlags {
+                        x: false,
+                        y: false,
+                        z: false,
+                        yaw: false,
+                        pitch: false,
+                        delta_x: false,
+                        delta_y: false,
+                        delta_z: false,
+                        rotate_delta: false,
+                    },
+                },
+            ),
+            BackendEventKind::World => {
+                BackendEventPayload::World(ContractProtocolWorldEvent::GameChanged {
+                    dimension: Some("minecraft:overworld".to_owned()),
+                    game_mode: Some("survival".to_owned()),
+                })
+            }
+            BackendEventKind::PlayerList => {
+                BackendEventPayload::PlayerList(ContractProtocolPlayerListEvent::Add {
+                    uuid: "uuid-1".to_owned(),
+                    username: "Alex".to_owned(),
+                })
+            }
+            BackendEventKind::SnapshotChanged => {
+                BackendEventPayload::SnapshotChanged(ContractProtocolSnapshotChangedEvent {
+                    group: "self".to_owned(),
+                    snapshot_revision: 1,
+                })
+            }
+            BackendEventKind::Overflow => BackendEventPayload::Overflow(
+                mineintent_contracts::minecraft::BackendOverflowPayload {
+                    event_type: mineintent_contracts::minecraft::OverflowType::Overflow,
+                    dropped_count: 1,
+                    dropped_kinds: vec![BackendEventKind::Entity],
+                },
+            ),
         }
     }
 
     fn emit_test_fact(handle: &RuntimeHandle, kind: BackendEventKind) {
-        handle.shared.emit(
-            kind,
-            FactSource::ServerObserved,
-            valid_observation_payload(kind),
-        );
+        handle
+            .shared
+            .emit(FactSource::ServerObserved, valid_observation_payload(kind));
     }
 
     fn emit_and_capture(
         handle: &RuntimeHandle,
-        kind: BackendEventKind,
-        payload: serde_json::Value,
+        payload: BackendEventPayload,
     ) -> BackendEventEnvelope {
         let mut events = handle.subscribe();
-        handle
-            .shared
-            .emit(kind, FactSource::ServerObserved, payload);
+        handle.shared.emit(FactSource::ServerObserved, payload);
         events
             .try_recv()
-            .expect("global v1 event should be emitted for adapter fixture")
+            .expect("global v2 event should be emitted for adapter fixture")
     }
 
     fn contract_event_kind(event: &ObservationEvent) -> ContractBackendEventKind {
@@ -3945,7 +6576,7 @@ mod tests {
         assert_eq!(typed.protocol, ContractBackendEventProtocol::V2);
         assert_eq!(typed.id, raw.id);
         assert_eq!(typed.kind, kind);
-        assert_eq!(typed.occurred_at, raw.occurred_at.to_rfc3339());
+        assert_eq!(typed.occurred_at, raw.occurred_at);
         assert_eq!(typed.process_session_id, raw.process_session_id);
         assert_eq!(typed.connection_epoch, raw.connection_epoch);
         assert_eq!(typed.connection_attempt_id, raw.connection_attempt_id);
@@ -4115,9 +6746,9 @@ mod tests {
         handle.shared.begin_connection_attempt();
         let source = handle.observation_source();
 
-        let result = source
-            .read_block_with_post_read_hook(BlockPosition { x: 0, y: 64, z: 0 }, || {
-                handle.shared.begin_connection_attempt()
+        let result =
+            source.read_block_with_post_read_hook(BlockPosition { x: 0, y: 64, z: 0 }, || {
+                handle.shared.begin_connection_attempt();
             });
         assert!(matches!(
             result,
@@ -4234,14 +6865,12 @@ mod tests {
         }
         for kind in [
             BackendEventKind::Lifecycle,
-            BackendEventKind::KeepAlive,
             BackendEventKind::Chat,
             BackendEventKind::SelfState,
             BackendEventKind::World,
             BackendEventKind::PlayerList,
             BackendEventKind::SnapshotChanged,
-            BackendEventKind::Motor,
-            BackendEventKind::Error,
+            BackendEventKind::Overflow,
         ] {
             emit_test_fact(&handle, kind);
         }
@@ -4284,7 +6913,7 @@ mod tests {
         handle.shared.begin_connection_attempt();
         let source = handle.observation_source();
         let result = source.subscribe_with_post_register_hook(Arc::new(NoopListener), || {
-            handle.shared.begin_connection_attempt()
+            handle.shared.begin_connection_attempt();
         });
         assert!(matches!(
             result,
@@ -4346,19 +6975,12 @@ mod tests {
         let expected_sound = contract_sound_fixture();
         let raw_entity = emit_and_capture(
             &handle,
-            BackendEventKind::Entity,
-            serde_json::to_value(&expected_entity).expect("entity payload should encode"),
+            BackendEventPayload::Entity(expected_entity.clone()),
         );
-        let raw_block = emit_and_capture(
-            &handle,
-            BackendEventKind::Block,
-            serde_json::to_value(&expected_block).expect("block payload should encode"),
-        );
-        let raw_sound = emit_and_capture(
-            &handle,
-            BackendEventKind::Sound,
-            serde_json::to_value(&expected_sound).expect("sound payload should encode"),
-        );
+        let raw_block =
+            emit_and_capture(&handle, BackendEventPayload::Block(expected_block.clone()));
+        let raw_sound =
+            emit_and_capture(&handle, BackendEventPayload::Sound(expected_sound.clone()));
 
         let observed = events.lock();
         assert_eq!(observed.len(), 3);
@@ -4386,7 +7008,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_observation_payload_is_fail_contained_and_does_not_fake_a_fact() {
+    fn typed_observation_payload_is_direct_and_kind_bound() {
         let handle = RuntimeHandle::new(RunConfig::default());
         handle.shared.begin_connection_attempt();
         let source = handle.observation_source();
@@ -4394,11 +7016,6 @@ mod tests {
         let _subscription =
             ProtocolObservationSource::subscribe(&source, listener).expect("subscribe");
 
-        emit_and_capture(
-            &handle,
-            BackendEventKind::Entity,
-            json!({"type":"not_a_protocol_entity_event"}),
-        );
         assert!(events.lock().is_empty());
         emit_test_fact(&handle, BackendEventKind::Entity);
         assert_eq!(events.lock().len(), 1);

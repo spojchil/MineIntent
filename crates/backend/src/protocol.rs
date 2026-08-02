@@ -2,8 +2,13 @@ use chrono::{DateTime, Utc};
 use serde::{de::Error as DeserializeError, Deserialize, Serialize};
 use serde_json::Value;
 
+pub use mineintent_contracts::minecraft::{
+    BackendEventEnvelope, BackendEventKind, BackendEventMetadata, BackendEventPayload,
+    BackendEventProtocol, BackendLifecyclePayload, FactSource,
+};
+
 /// 后端事件跨进程边界的版本号。
-pub const BACKEND_EVENT_PROTOCOL: &str = "mineintent.minecraft.backend-event.v1";
+pub const BACKEND_EVENT_PROTOCOL: &str = "mineintent.minecraft.backend-event.v2";
 /// 后端命令跨进程边界的版本号。
 pub const BACKEND_COMMAND_PROTOCOL: &str = "mineintent.minecraft.backend-command.v1";
 
@@ -13,101 +18,6 @@ pub fn now_utc() -> DateTime<Utc> {
         .expect("系统时间早于 Unix epoch")
         .as_millis() as i64;
     DateTime::<Utc>::from_timestamp_millis(millis).expect("系统时间超出 chrono 支持范围")
-}
-
-/// 一条数据的来源。预测数据永远不能伪装成服务端事实。
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FactSource {
-    Commanded,
-    ClientPredicted,
-    ServerObserved,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BackendEventKind {
-    Lifecycle,
-    KeepAlive,
-    Chat,
-    SelfState,
-    World,
-    PlayerList,
-    SnapshotChanged,
-    Entity,
-    Block,
-    Sound,
-    Motor,
-    Error,
-}
-
-/// 对齐 `MinecraftBackendApi` 事件语义的严格版本化信封。
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct BackendEventEnvelope {
-    pub protocol: String,
-    pub id: String,
-    pub kind: BackendEventKind,
-    pub occurred_at: DateTime<Utc>,
-    pub process_session_id: String,
-    pub connection_epoch: u64,
-    pub connection_attempt_id: String,
-    pub world_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dimension: Option<String>,
-    pub source: FactSource,
-    pub payload: Value,
-}
-
-impl BackendEventEnvelope {
-    pub fn new(
-        id: impl Into<String>,
-        kind: BackendEventKind,
-        process_session_id: impl Into<String>,
-        connection_epoch: u64,
-        connection_attempt_id: impl Into<String>,
-        world_id: impl Into<String>,
-        source: FactSource,
-        payload: Value,
-    ) -> Self {
-        Self::new_with_dimension(
-            id,
-            kind,
-            process_session_id,
-            connection_epoch,
-            connection_attempt_id,
-            world_id,
-            None,
-            source,
-            payload,
-        )
-    }
-
-    pub fn new_with_dimension(
-        id: impl Into<String>,
-        kind: BackendEventKind,
-        process_session_id: impl Into<String>,
-        connection_epoch: u64,
-        connection_attempt_id: impl Into<String>,
-        world_id: impl Into<String>,
-        dimension: Option<String>,
-        source: FactSource,
-        payload: Value,
-    ) -> Self {
-        Self {
-            protocol: BACKEND_EVENT_PROTOCOL.to_owned(),
-            id: id.into(),
-            kind,
-            occurred_at: now_utc(),
-            process_session_id: process_session_id.into(),
-            connection_epoch,
-            connection_attempt_id: connection_attempt_id.into(),
-            world_id: world_id.into(),
-            dimension,
-            source,
-            payload,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -262,42 +172,50 @@ mod tests {
 
     #[test]
     fn event_round_trip_keeps_fact_source() {
-        let event = BackendEventEnvelope::new(
-            "event-1",
-            BackendEventKind::KeepAlive,
-            "session-1",
-            1,
-            "attempt-1",
-            "world-1",
+        let event = BackendEventEnvelope::from_payload(
+            BackendEventMetadata {
+                id: "event-1".to_owned(),
+                occurred_at: "2026-08-01T00:00:00Z".to_owned(),
+                process_session_id: "session-1".to_owned(),
+                connection_epoch: 1,
+                connection_attempt_id: "attempt-1".to_owned(),
+                world_id: "world-1".to_owned(),
+                dimension: None,
+            },
             FactSource::ServerObserved,
-            serde_json::json!({"id": 42}),
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected),
         );
         let encoded = serde_json::to_string(&event).expect("事件应能编码");
         assert!(encoded.contains("processSessionId"));
         assert!(!encoded.contains("dimension"));
         let decoded: BackendEventEnvelope = serde_json::from_str(&encoded).expect("事件应能解码");
         assert_eq!(decoded.source, FactSource::ServerObserved);
-        assert_eq!(decoded.payload["id"], 42);
-        assert_eq!(decoded.protocol, BACKEND_EVENT_PROTOCOL);
+        assert!(matches!(
+            decoded.payload,
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected)
+        ));
+        assert_eq!(decoded.protocol, BackendEventProtocol::V2);
     }
 
     #[test]
-    fn event_dimension_is_captured_without_changing_the_v1_discriminator() {
-        let event = BackendEventEnvelope::new_with_dimension(
-            "event-2",
-            BackendEventKind::Lifecycle,
-            "session-1",
-            1,
-            "attempt-1",
-            "world-1",
-            Some("minecraft:overworld".to_owned()),
+    fn event_dimension_is_captured_with_the_v2_discriminator() {
+        let event = BackendEventEnvelope::from_payload(
+            BackendEventMetadata {
+                id: "event-2".to_owned(),
+                occurred_at: "2026-08-01T00:00:00Z".to_owned(),
+                process_session_id: "session-1".to_owned(),
+                connection_epoch: 1,
+                connection_attempt_id: "attempt-1".to_owned(),
+                world_id: "world-1".to_owned(),
+                dimension: Some("minecraft:overworld".to_owned()),
+            },
             FactSource::ServerObserved,
-            serde_json::json!({"type":"transport_connected"}),
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected),
         );
         let encoded = serde_json::to_value(&event).expect("event should encode");
         assert_eq!(encoded["protocol"], BACKEND_EVENT_PROTOCOL);
         assert_eq!(encoded["dimension"], "minecraft:overworld");
-        assert_eq!(event.protocol, BACKEND_EVENT_PROTOCOL);
+        assert_eq!(event.protocol, BackendEventProtocol::V2);
     }
 
     #[test]

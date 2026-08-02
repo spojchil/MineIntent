@@ -4,12 +4,12 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     AuthKind, BackendClose, BackendEventEnvelope, BackendEventKind, BackendEventMetadata,
-    BackendFailure, BackendFailureCode, BackendLifecyclePayload, BackendOverflowPayload,
-    BackendReady, BackendState, BackendTimeouts, BlockBoundingBox, Difficulty, FactSource,
-    GameMode, InventorySlotSnapshot, InventorySnapshot, MinecraftBackendConfig,
-    MinecraftIdentityConfig, MinecraftServerConfig, MinecraftSnapshotV1, MotorMoveDirection,
-    MoveInputRequest, OverflowType, ReconnectPolicy, SelfSnapshot, SnapshotProtocol,
-    StatusEffectSnapshot, TrackedPlayerSnapshot, Vec3Value, WorldSnapshot,
+    BackendEventPayload, BackendFailure, BackendFailureCode, BackendLifecyclePayload,
+    BackendOverflowPayload, BackendReady, BackendState, BackendTimeouts, BlockBoundingBox,
+    Difficulty, FactSource, GameMode, InventorySlotSnapshot, InventorySnapshot,
+    MinecraftBackendConfig, MinecraftIdentityConfig, MinecraftServerConfig, MinecraftSnapshotV1,
+    MotorMoveDirection, MoveInputRequest, OverflowType, ReconnectPolicy, SelfSnapshot,
+    SnapshotProtocol, StatusEffectSnapshot, TrackedPlayerSnapshot, Vec3Value, WorldSnapshot,
     TARGET_MINECRAFT_VERSION, TARGET_PROTOCOL_VERSION,
 };
 
@@ -369,16 +369,14 @@ pub fn fixture_sequences() -> BackendSequenceFixtures {
             },
         ),
     ];
-    let overflow = vec![BackendEventEnvelope::new(
+    let overflow = vec![BackendEventEnvelope::from_payload(
         metadata(14, 1, FIXTURE_ATTEMPT_ID, Some(FIXTURE_DIMENSION)),
-        BackendEventKind::Overflow,
         FactSource::ClientPredicted,
-        serde_json::to_value(BackendOverflowPayload {
+        BackendEventPayload::Overflow(BackendOverflowPayload {
             event_type: OverflowType::Overflow,
             dropped_count: 3,
             dropped_kinds: vec![BackendEventKind::Entity, BackendEventKind::Block],
-        })
-        .expect("fixture payload is serializable"),
+        }),
     )];
     BackendSequenceFixtures {
         ready,
@@ -423,11 +421,10 @@ fn lifecycle_event(
     source: FactSource,
     payload: BackendLifecyclePayload,
 ) -> BackendEventEnvelope {
-    BackendEventEnvelope::new(
+    BackendEventEnvelope::from_payload(
         metadata(sequence, epoch, attempt_id, dimension),
-        BackendEventKind::Lifecycle,
         source,
-        serde_json::to_value(payload).expect("fixture payload is serializable"),
+        BackendEventPayload::Lifecycle(payload),
     )
 }
 
