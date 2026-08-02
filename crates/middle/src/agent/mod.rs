@@ -22,4 +22,7 @@ pub use transcript::{
     FileTranscriptStore, TranscriptSink, TranscriptUsage, MAX_TRANSCRIPT_BYTES,
     MAX_TRANSCRIPT_CHARS, TRANSCRIPT_FILE_NAME, TRANSCRIPT_PROTOCOL,
 };
-pub use viewport::{NoRoundViewportSampler, RoundViewportSampler};
+pub use viewport::{
+    BackendRoundViewportSampler, FixedUtcTimestampSource, NoRoundViewportSampler,
+    RoundViewportSampler, SystemUtcTimestampSource, UtcTimestampSource,
+};
