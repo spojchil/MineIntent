@@ -145,6 +145,18 @@ impl ToolCapabilityRegistry {
 pub trait ToolDispatcher: Send + Sync {
     type Observation: Send;
 
+    /// Classifies a parsed invocation using the capability/resource registry.
+    ///
+    /// Implementations should return `None` when the invocation cannot be
+    /// resolved.  The agent driver never infers this from a tool name or JSON
+    /// arguments.  The driver isolates a classifier panic as the paired
+    /// `tool_dispatch_panicked` result without guessing a resource.  The
+    /// default keeps existing dispatchers source-compatible until the
+    /// production dispatcher is assembled.
+    fn resource(&self, _invocation: &ToolInvocation) -> Option<ExecutionResource> {
+        None
+    }
+
     fn dispatch<'a>(
         &'a self,
         invocation: ToolInvocation,

@@ -9,6 +9,7 @@ pub mod fixtures;
 mod ids;
 mod runner;
 mod tool;
+mod viewport;
 
 pub use context::{
     AgentContextProtocolV3, AgentContextProtocolV4, AgentDecisionContext, AgentDecisionContextV3,
@@ -31,3 +32,4 @@ pub use tool::{
     ModelUsage, RequiredNullable, ToolCallKey, ToolDefinitionType, ToolExecution, ToolInvocation,
     ToolResponseProtocol, WireToolDefinition,
 };
+pub use viewport::{ViewportFrameMessage, ViewportFrameProtocol, ViewportFrameWireError};

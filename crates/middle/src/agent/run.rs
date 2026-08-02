@@ -353,6 +353,27 @@ impl AgentRun {
         Ok(())
     }
 
+    /// Appends a model-visible message that was already constructed by the
+    /// driver/assembly layer.  Sampling and serialization stay outside this
+    /// provider-independent state machine; the state guard keeps the message
+    /// after the complete tool batch and before the next model request.
+    pub fn append_user_message(&mut self, message: JsonObject) -> Result<(), AgentError> {
+        if !matches!(self.state, RunState::NeedModel) {
+            return Err(AgentError::new(
+                AgentErrorCode::InvalidRequest,
+                "agent_run_not_ready_for_user_message",
+            ));
+        }
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            return Err(AgentError::new(
+                AgentErrorCode::InvalidRequest,
+                "agent_user_message_requires_user_role",
+            ));
+        }
+        self.messages.push(message);
+        Ok(())
+    }
+
     pub fn model_request_count(&self) -> usize {
         self.model_requests
     }

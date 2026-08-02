@@ -383,3 +383,35 @@ fn finish_reason_is_allowlisted_and_missing_or_null_is_accepted() {
         }
     }
 }
+
+#[test]
+fn constructed_round_frame_is_appended_after_every_tool_message() {
+    let mut run = new_run();
+    request_model(&mut run);
+    run.model_response(completion(json!({
+        "role": "assistant",
+        "tool_calls": [
+            call("body-one", json!("move_input"), json!("{}")),
+            call("body-two", json!("look_relative"), json!("{}")),
+        ],
+    })))
+    .expect("body batch is accepted");
+
+    let plans = request_tools(&mut run);
+    run.tool_results(complete_plans(plans))
+        .expect("tool messages are paired");
+    run.append_user_message(object(json!({
+        "role": "user",
+        "content": "{\"protocol\":\"mineintent.viewport-frame.v1\"}",
+    })))
+    .expect("driver-constructed user frame is accepted");
+
+    let messages = request_model(&mut run);
+    assert_eq!(messages[messages.len() - 3]["role"], "tool");
+    assert_eq!(messages[messages.len() - 2]["role"], "tool");
+    assert_eq!(messages[messages.len() - 1]["role"], "user");
+    assert!(messages[messages.len() - 1]["content"]
+        .as_str()
+        .expect("frame content")
+        .contains("mineintent.viewport-frame.v1"));
+}

@@ -9,13 +9,18 @@ use std::{
 use mineintent_contracts::{
     agent::{
         AgentError, AgentErrorCode, ExecutionControl, JsonObject, ModelProvider, ModelUsage, RunId,
-        ToolCallId, WireToolDefinition,
+        ToolCallId, ViewportFrameMessage, WireToolDefinition,
     },
-    capability::ToolDispatcher,
+    capability::{ExecutionResource, ToolDispatcher},
 };
 use serde::Serialize;
+use serde_json::json;
 
-use super::{AgentRun, AgentRunStep, AgentToolResult, ModelCompletion, PlannedToolCall};
+use super::transcript::utc_timestamp_now;
+use super::{
+    AgentRun, AgentRunStep, AgentToolResult, ModelCompletion, NoRoundViewportSampler,
+    PlannedToolCall, RoundViewportSampler,
+};
 
 /// 一轮 OpenAI-compatible completion 所需的 provider 无关输入。
 #[derive(Clone, Debug, PartialEq)]
@@ -33,14 +38,33 @@ pub struct AgentLoopOutcome {
 }
 
 /// 把纯 [`AgentRun`] 状态机接到进程内 model provider 与 tool dispatcher。
-pub struct AgentLoopDriver<Model, Tools> {
+pub struct AgentLoopDriver<Model, Tools, Sampler = NoRoundViewportSampler> {
     model: Model,
     tools: Tools,
+    viewport_sampler: Sampler,
 }
 
-impl<Model, Tools> AgentLoopDriver<Model, Tools> {
+impl<Model, Tools> AgentLoopDriver<Model, Tools, NoRoundViewportSampler> {
     pub fn new(model: Model, tools: Tools) -> Self {
-        Self { model, tools }
+        Self {
+            model,
+            tools,
+            viewport_sampler: NoRoundViewportSampler,
+        }
+    }
+}
+
+impl<Model, Tools, Sampler> AgentLoopDriver<Model, Tools, Sampler> {
+    pub fn new_with_viewport_sampler(
+        model: Model,
+        tools: Tools,
+        viewport_sampler: Sampler,
+    ) -> Self {
+        Self {
+            model,
+            tools,
+            viewport_sampler,
+        }
     }
 
     pub fn model(&self) -> &Model {
@@ -50,13 +74,18 @@ impl<Model, Tools> AgentLoopDriver<Model, Tools> {
     pub fn tools(&self) -> &Tools {
         &self.tools
     }
+
+    pub fn viewport_sampler(&self) -> &Sampler {
+        &self.viewport_sampler
+    }
 }
 
-impl<Model, Tools> AgentLoopDriver<Model, Tools>
+impl<Model, Tools, Sampler> AgentLoopDriver<Model, Tools, Sampler>
 where
     Model: ModelProvider<Request = AgentModelRequest, Response = ModelCompletion>,
     Tools: ToolDispatcher,
     Tools::Observation: Serialize,
+    Sampler: RoundViewportSampler,
 {
     /// 驱动已有的 run，所有 provider/dispatcher 调用共享调用者给定的 deadline。
     ///
@@ -96,9 +125,13 @@ where
                     run.model_response(completion)?;
                 }
                 AgentRunStep::CallTools { calls } => {
-                    let results = self.dispatch_in_order(calls, control).await?;
+                    let (results, body_dispatched) = self.dispatch_in_order(calls, control).await?;
                     control.check_at(Instant::now())?;
                     run.tool_results(results)?;
+                    if body_dispatched {
+                        let frame = self.sample_round_viewport(control).await?;
+                        run.append_user_message(frame)?;
+                    }
                 }
                 AgentRunStep::Done { closing, usage } => {
                     return Ok(AgentLoopOutcome { closing, usage });
@@ -111,14 +144,33 @@ where
         &self,
         calls: Vec<PlannedToolCall>,
         control: ExecutionControl<'_>,
-    ) -> Result<Vec<AgentToolResult>, AgentError> {
+    ) -> Result<(Vec<AgentToolResult>, bool), AgentError> {
         let mut results = Vec::with_capacity(calls.len());
+        let mut body_dispatched = false;
         for call in calls {
             control.check_at(Instant::now())?;
             match call {
                 PlannedToolCall::LocalResult(result) => results.push(result),
                 PlannedToolCall::Dispatch(invocation) => {
                     let tool_call_id = invocation.tool_call_id.clone();
+                    let resource =
+                        match catch_unwind(AssertUnwindSafe(|| self.tools.resource(&invocation))) {
+                            Ok(resource) => resource,
+                            Err(_) => {
+                                // Classification is part of the tool boundary. A
+                                // panic leaves the resource unknown, so pair the
+                                // call as a dispatch failure without dispatching
+                                // or counting it as a body action.
+                                results.push(tool_panic_result(tool_call_id));
+                                continue;
+                            }
+                        };
+                    if resource == Some(ExecutionResource::Body) {
+                        // Count before entering the dispatch future so ordinary
+                        // failures, resource busy, and both panic paths still
+                        // trigger exactly one post-batch sample.
+                        body_dispatched = true;
+                    }
                     let dispatch_future = match catch_unwind(AssertUnwindSafe(|| {
                         self.tools.dispatch(invocation, control)
                     })) {
@@ -149,7 +201,125 @@ where
                 }
             }
         }
-        Ok(results)
+        Ok((results, body_dispatched))
+    }
+
+    async fn sample_round_viewport(
+        &self,
+        control: ExecutionControl<'_>,
+    ) -> Result<JsonObject, AgentError> {
+        control.check_at(Instant::now())?;
+        let at = match catch_unwind(AssertUnwindSafe(|| self.viewport_sampler.timestamp())) {
+            Ok(at) => at,
+            Err(_) => {
+                control.check_at(Instant::now())?;
+                return unavailable_frame_message(utc_timestamp_now(), "viewport_sampler_panicked");
+            }
+        };
+        control.check_at(Instant::now())?;
+        if ViewportFrameMessage::validate_at(&at).is_err() {
+            return unavailable_frame_message(
+                utc_timestamp_now(),
+                "viewport_frame_timestamp_invalid",
+            );
+        }
+        let sample_future =
+            match catch_unwind(AssertUnwindSafe(|| self.viewport_sampler.sample(control))) {
+                Ok(future) => future,
+                Err(_) => {
+                    control.check_at(Instant::now())?;
+                    return unavailable_frame_message(at, "viewport_sampler_panicked");
+                }
+            };
+        let sampled = await_with_control(
+            catch_future_panic(
+                sample_future,
+                AgentErrorCode::ToolFailed,
+                "viewport_sampler_panicked",
+            ),
+            control,
+        )
+        .await;
+
+        match sampled {
+            Ok(viewport) => {
+                control.check_at(Instant::now())?;
+                let serialized = catch_unwind(AssertUnwindSafe(|| serde_json::to_value(viewport)));
+                match serialized {
+                    Ok(Ok(value)) if !value.is_null() => {
+                        let frame = match ViewportFrameMessage::success(at.clone(), value) {
+                            Ok(frame) => frame,
+                            Err(_) => {
+                                return unavailable_frame_message(
+                                    at,
+                                    "viewport_frame_serialization_failed",
+                                );
+                            }
+                        };
+                        match encode_user_frame(frame) {
+                            Ok(message) => Ok(message),
+                            Err(_) => {
+                                control.check_at(Instant::now())?;
+                                unavailable_frame_message(at, "viewport_frame_serialization_failed")
+                            }
+                        }
+                    }
+                    Ok(Ok(_)) => {
+                        control.check_at(Instant::now())?;
+                        unavailable_frame_message(at, "viewport_frame_null_payload")
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        control.check_at(Instant::now())?;
+                        unavailable_frame_message(at, "viewport_frame_serialization_failed")
+                    }
+                }
+            }
+            Err(error) if is_run_control_error(error.code) => Err(error),
+            Err(error) => {
+                control.check_at(Instant::now())?;
+                unavailable_frame_message(at, viewport_error_reason(&error))
+            }
+        }
+    }
+}
+
+fn encode_user_frame(frame: ViewportFrameMessage) -> Result<JsonObject, AgentError> {
+    let content = serde_json::to_string(&frame).map_err(|_| {
+        AgentError::new(
+            AgentErrorCode::ToolFailed,
+            "viewport_frame_serialization_failed",
+        )
+    })?;
+    Ok(json!({"role": "user", "content": content})
+        .as_object()
+        .cloned()
+        .unwrap_or_default())
+}
+
+fn unavailable_frame_message(
+    at: String,
+    reason: impl Into<String>,
+) -> Result<JsonObject, AgentError> {
+    let frame = ViewportFrameMessage::unavailable(at, reason.into()).map_err(|_| {
+        AgentError::new(
+            AgentErrorCode::ToolFailed,
+            "viewport_frame_serialization_failed",
+        )
+    })?;
+    encode_user_frame(frame)
+}
+
+fn viewport_error_reason(error: &AgentError) -> String {
+    let reason: String = error
+        .summary
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(128)
+        .collect();
+    if reason.trim().is_empty() {
+        error.code.to_string()
+    } else {
+        reason
     }
 }
 

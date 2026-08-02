@@ -7,6 +7,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 const PARTICIPANT_SYSTEM_V1: &str = include_str!("prompts/participant-system/v1.txt");
+const PARTICIPANT_SYSTEM_V2: &str = include_str!("prompts/participant-system/v2.txt");
 
 /// Errors from the closed, compile-time prompt catalog.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,6 +52,7 @@ pub fn template_text(
 ) -> Result<&'static str, PromptError> {
     match (key.as_str(), version.as_str()) {
         ("participant-system", "v1") => Ok(strip_one_file_terminator(PARTICIPANT_SYSTEM_V1)),
+        ("participant-system", "v2") => Ok(strip_one_file_terminator(PARTICIPANT_SYSTEM_V2)),
         _ => Err(PromptError::UnknownTemplate {
             key: key.as_str().to_owned(),
             version: version.as_str().to_owned(),

@@ -17,7 +17,8 @@ use serde::Serialize;
 
 use super::{
     initial_messages, summarize_error, AgentLoopDriver, AgentModelRequest, AgentRun,
-    AgentTranscriptRecord, FileTranscriptStore, ModelCompletion, TranscriptSink,
+    AgentTranscriptRecord, FileTranscriptStore, ModelCompletion, NoRoundViewportSampler,
+    RoundViewportSampler, TranscriptSink,
 };
 
 /// The concrete in-process runner assembled from one model provider and one
@@ -26,13 +27,13 @@ use super::{
 /// The model name is explicit assembly data.  It is not inferred from a
 /// template, context, or an implicit default, and is copied verbatim to the
 /// contract result after the loop completes.
-pub struct ConcreteAgentRunner<Model, Tools> {
-    driver: AgentLoopDriver<Model, Tools>,
+pub struct ConcreteAgentRunner<Model, Tools, Sampler = NoRoundViewportSampler> {
+    driver: AgentLoopDriver<Model, Tools, Sampler>,
     model_name: ModelName,
     transcript_sink: Option<Arc<dyn TranscriptSink>>,
 }
 
-impl<Model, Tools> ConcreteAgentRunner<Model, Tools> {
+impl<Model, Tools> ConcreteAgentRunner<Model, Tools, NoRoundViewportSampler> {
     pub fn new(model: Model, tools: Tools, model_name: ModelName) -> Self {
         Self {
             driver: AgentLoopDriver::new(model, tools),
@@ -77,8 +78,39 @@ impl<Model, Tools> ConcreteAgentRunner<Model, Tools> {
             transcript_sink: Some(sink),
         }
     }
+}
 
-    pub fn driver(&self) -> &AgentLoopDriver<Model, Tools> {
+impl<Model, Tools, Sampler> ConcreteAgentRunner<Model, Tools, Sampler> {
+    /// Constructs a runner with an explicitly assembled round viewport
+    /// sampler.  The sampler owns the time source and backend I/O seam.
+    pub fn with_viewport_sampler(
+        model: Model,
+        tools: Tools,
+        model_name: ModelName,
+        sampler: Sampler,
+    ) -> Self {
+        Self {
+            driver: AgentLoopDriver::new_with_viewport_sampler(model, tools, sampler),
+            model_name,
+            transcript_sink: None,
+        }
+    }
+
+    pub fn with_viewport_sampler_and_shared_transcript_sink(
+        model: Model,
+        tools: Tools,
+        model_name: ModelName,
+        sampler: Sampler,
+        sink: Arc<dyn TranscriptSink>,
+    ) -> Self {
+        Self {
+            driver: AgentLoopDriver::new_with_viewport_sampler(model, tools, sampler),
+            model_name,
+            transcript_sink: Some(sink),
+        }
+    }
+
+    pub fn driver(&self) -> &AgentLoopDriver<Model, Tools, Sampler> {
         &self.driver
     }
 
@@ -89,13 +121,15 @@ impl<Model, Tools> ConcreteAgentRunner<Model, Tools> {
 
 /// Name retained as an implementation-oriented alias for assembly code that
 /// calls the component an implementation rather than a concrete runner.
-pub type AgentRunnerImpl<Model, Tools> = ConcreteAgentRunner<Model, Tools>;
+pub type AgentRunnerImpl<Model, Tools, Sampler = NoRoundViewportSampler> =
+    ConcreteAgentRunner<Model, Tools, Sampler>;
 
-impl<Model, Tools> ContractRunner for ConcreteAgentRunner<Model, Tools>
+impl<Model, Tools, Sampler> ContractRunner for ConcreteAgentRunner<Model, Tools, Sampler>
 where
     Model: ModelProvider<Request = AgentModelRequest, Response = ModelCompletion>,
     Tools: ToolDispatcher,
     Tools::Observation: Serialize,
+    Sampler: RoundViewportSampler,
 {
     type Context = JsonAgentDecisionContextV4;
 
@@ -130,7 +164,7 @@ where
     }
 }
 
-impl<Model, Tools> ConcreteAgentRunner<Model, Tools> {
+impl<Model, Tools, Sampler> ConcreteAgentRunner<Model, Tools, Sampler> {
     fn append_transcript(
         &self,
         run: &AgentRun,

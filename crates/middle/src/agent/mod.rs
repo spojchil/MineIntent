@@ -8,6 +8,7 @@ mod prompt;
 mod run;
 mod runner;
 mod transcript;
+mod viewport;
 
 pub use driver::{AgentLoopDriver, AgentLoopOutcome, AgentModelRequest};
 pub use prompt::{initial_messages, system_prompt, template_text, PromptError};
@@ -21,3 +22,4 @@ pub use transcript::{
     FileTranscriptStore, TranscriptSink, TranscriptUsage, MAX_TRANSCRIPT_BYTES,
     MAX_TRANSCRIPT_CHARS, TRANSCRIPT_FILE_NAME, TRANSCRIPT_PROTOCOL,
 };
+pub use viewport::{NoRoundViewportSampler, RoundViewportSampler};
