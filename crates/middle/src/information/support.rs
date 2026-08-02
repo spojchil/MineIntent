@@ -31,16 +31,21 @@ pub(crate) fn clone_bounded_json<E>(
     not_serializable: impl Fn() -> E,
     too_large: impl Fn(usize, usize) -> E,
 ) -> Result<Value, E> {
-    let mut serializer =
-        serde_json::Serializer::with_formatter(Vec::new(), JavaScriptJsonFormatter);
-    value
-        .serialize(&mut serializer)
-        .map_err(|_| not_serializable())?;
-    let serialized = serializer.into_inner();
+    let serialized = javascript_json_bytes(value).map_err(|_| not_serializable())?;
     if serialized.len() > maximum {
         return Err(too_large(serialized.len(), maximum));
     }
     serde_json::from_slice(&serialized).map_err(|_| not_serializable())
+}
+
+/// Returns the UTF-8 bytes of the JSON representation used by JavaScript `JSON.stringify` for
+/// the JSON-compatible values crossing the information boundary.  In particular this keeps
+/// integer/float rendering aligned with the ref/cursor byte guards.
+pub(crate) fn javascript_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, ()> {
+    let mut serializer =
+        serde_json::Serializer::with_formatter(Vec::new(), JavaScriptJsonFormatter);
+    value.serialize(&mut serializer).map_err(|_| ())?;
+    Ok(serializer.into_inner())
 }
 
 #[derive(Clone, Copy, Debug, Default)]
