@@ -26,13 +26,14 @@ use azalea::{
     swarm::{DefaultSwarmPlugins, Swarm, SwarmBuilder, SwarmEvent},
     Client, DefaultPlugins, Event, SprintDirection, WalkDirection,
 };
+use mineintent_contracts::capability::validate_directed_positions;
 use mineintent_contracts::minecraft::{
-    BackendError, BackendEventEnvelope as ContractBackendEventEnvelope,
+    parse_block_property_value, BackendError, BackendEventEnvelope as ContractBackendEventEnvelope,
     BackendEventKind as ContractBackendEventKind,
     BackendEventMetadata as ContractBackendEventMetadata, BackendFailure, BackendFailureCode,
     BlockBoundingBox as ContractBlockBoundingBox, BlockPosition as ContractBlockPosition,
-    BlockPropertyValue as ContractBlockPropertyValue, BlockReadResult as ContractBlockReadResult,
-    BoxFuture, EntityEquipmentSnapshot as ContractEntityEquipmentSnapshot,
+    BlockReadResult as ContractBlockReadResult, BoxFuture, DirectedViewportError,
+    DirectedViewportProjection, EntityEquipmentSnapshot as ContractEntityEquipmentSnapshot,
     FactSource as ContractFactSource, ObservationEvent, ObservationEventListener, OperationControl,
     ProtocolBlockEvent as ContractProtocolBlockEvent,
     ProtocolBlockSnapshot as ContractProtocolBlockSnapshot,
@@ -60,8 +61,9 @@ use crate::{
         ProtocolEntitySnapshot, TrackedPlayerSnapshot, Vec3Value,
     },
     viewport::{
-        project as project_viewport, project_with_checkpoint as project_viewport_with_checkpoint,
-        ViewportBlock, ViewportOptions, ViewportProjection,
+        project as project_viewport, project_directed as project_directed_viewport,
+        project_with_checkpoint as project_viewport_with_checkpoint, ViewportBlock,
+        ViewportOptions, ViewportProjection,
     },
 };
 
@@ -963,16 +965,32 @@ struct ViewportCapture {
 }
 
 enum ViewportReadAttempt {
-    Complete(ContractViewportRead),
+    Complete(ViewportReadComplete),
     Retry,
+}
+
+enum ViewportReadComplete {
+    Full(ContractViewportRead),
+    Directed(DirectedViewportProjection),
+}
+
+#[derive(Clone)]
+enum ViewportProjectionRequest {
+    Full,
+    Directed(Vec<ContractBlockPosition>),
 }
 
 enum ViewportProjectionWorkerResult {
     Complete {
         capture: ViewportCapture,
-        projection: ViewportProjection,
+        projection: ViewportKernelProjection,
     },
     Retry,
+}
+
+enum ViewportKernelProjection {
+    Full(ViewportProjection),
+    Directed(DirectedViewportProjection),
 }
 
 /// 对齐 MineIntent `ProtocolObservationSource` 的只读 concrete observation seam。
@@ -1153,9 +1171,19 @@ impl RuntimeObservationSource {
     ) -> BoxFuture<'_, Result<ContractViewportRead, BackendError>> {
         Box::pin(async move {
             control.preflight("read_viewport")?;
+            let request = ViewportProjectionRequest::Full;
             for attempt in 0..MAX_VIEWPORT_CAPTURE_ATTEMPTS {
-                match self.read_viewport_attempt(&control).await? {
-                    ViewportReadAttempt::Complete(read) => return Ok(read),
+                match self
+                    .read_viewport_attempt(&control, request.clone())
+                    .await
+                    .map_err(backend_error_from_directed)?
+                {
+                    ViewportReadAttempt::Complete(ViewportReadComplete::Full(read)) => {
+                        return Ok(read)
+                    }
+                    ViewportReadAttempt::Complete(ViewportReadComplete::Directed(_)) => {
+                        unreachable!("full request cannot produce directed projection")
+                    }
                     ViewportReadAttempt::Retry if attempt + 1 < MAX_VIEWPORT_CAPTURE_ATTEMPTS => {
                         control.preflight("read_viewport")?;
                         tokio::task::yield_now().await;
@@ -1171,51 +1199,103 @@ impl RuntimeObservationSource {
         })
     }
 
+    /// Read directed coordinates against the same atomic capture and viewport kernel as full.
+    /// NEW-08 `OutOfWorld` remains a separate error variant and is never converted to a reason.
+    pub fn read_directed_viewport(
+        &self,
+        positions: Vec<ContractBlockPosition>,
+        control: OperationControl,
+    ) -> BoxFuture<'_, Result<DirectedViewportProjection, DirectedViewportError>> {
+        Box::pin(async move {
+            control.preflight("read_directed_viewport")?;
+            let tuples = positions
+                .iter()
+                .map(|position| (position.x, position.y, position.z))
+                .collect::<Vec<_>>();
+            validate_directed_positions(&tuples).map_err(|message| {
+                DirectedViewportError::Backend(BackendError::InvalidCommand {
+                    field: "positions".to_owned(),
+                    message,
+                })
+            })?;
+            let request = ViewportProjectionRequest::Directed(positions);
+            for attempt in 0..MAX_VIEWPORT_CAPTURE_ATTEMPTS {
+                match self
+                    .read_viewport_attempt(&control, request.clone())
+                    .await?
+                {
+                    ViewportReadAttempt::Complete(ViewportReadComplete::Directed(projection)) => {
+                        return Ok(projection)
+                    }
+                    ViewportReadAttempt::Complete(ViewportReadComplete::Full(_)) => {
+                        unreachable!("directed request cannot produce full projection")
+                    }
+                    ViewportReadAttempt::Retry if attempt + 1 < MAX_VIEWPORT_CAPTURE_ATTEMPTS => {
+                        control.preflight("read_directed_viewport")?;
+                        tokio::task::yield_now().await;
+                    }
+                    ViewportReadAttempt::Retry => {}
+                }
+            }
+            control.preflight("read_directed_viewport")?;
+            self.ensure_current_epoch()?;
+            Err(DirectedViewportError::Backend(BackendError::NotReady {
+                state: "viewport_capture_changed".to_owned(),
+            }))
+        })
+    }
+
     async fn read_viewport_attempt(
         &self,
         control: &OperationControl,
-    ) -> Result<ViewportReadAttempt, BackendError> {
+        request: ViewportProjectionRequest,
+    ) -> Result<ViewportReadAttempt, DirectedViewportError> {
         self.ensure_current_epoch()?;
-        control.preflight("read_viewport")?;
+        let operation = match &request {
+            ViewportProjectionRequest::Full => "read_viewport",
+            ViewportProjectionRequest::Directed(_) => "read_directed_viewport",
+        };
+        control.preflight(operation)?;
 
         let (world, initial_generation) = {
             let observation = self.shared.observation.read();
             let writer = self.shared.writer.lock();
             if writer.connection_epoch != self.bound_epoch {
-                return Err(BackendError::StaleEpoch {
+                return Err(DirectedViewportError::Backend(BackendError::StaleEpoch {
                     bound_epoch: self.bound_epoch,
                     current_epoch: writer.connection_epoch,
-                });
+                }));
             }
             if !self.shared.ready.load(Ordering::Acquire) {
-                return Err(BackendError::NotReady {
+                return Err(DirectedViewportError::Backend(BackendError::NotReady {
                     state: "not_ready".to_owned(),
-                });
+                }));
             }
             if observation.snapshot.is_none() {
-                return Err(BackendError::NotReady {
+                return Err(DirectedViewportError::Backend(BackendError::NotReady {
                     state: "viewport_snapshot_unavailable".to_owned(),
-                });
+                }));
             }
             if observation.source.is_none() {
-                return Err(BackendError::NotReady {
+                return Err(DirectedViewportError::Backend(BackendError::NotReady {
                     state: "viewport_source_unavailable".to_owned(),
-                });
+                }));
             }
             let Some(world) = observation.world.clone() else {
-                return Err(BackendError::NotReady {
+                return Err(DirectedViewportError::Backend(BackendError::NotReady {
                     state: "viewport_world_unavailable".to_owned(),
-                });
+                }));
             };
             (world, observation.generation)
         };
 
-        control.preflight("read_viewport")?;
+        control.preflight(operation)?;
         let projection_shared = self.shared.clone();
         let projection_world = world.clone();
         let projection_initial_generation = initial_generation;
         let projection_bound_epoch = self.bound_epoch;
         let projection_control = control.clone();
+        let projection_request = request;
         let mut projection_task = tokio::task::spawn_blocking(move || {
             // Acquire the world-owned read guard before cloning the state
             // values. This makes the world view and the published metadata one
@@ -1225,15 +1305,15 @@ impl RuntimeObservationSource {
                 let observation = projection_shared.observation.read();
                 let writer = projection_shared.writer.lock();
                 if writer.connection_epoch != projection_bound_epoch {
-                    return Err(BackendError::StaleEpoch {
+                    return Err(DirectedViewportError::Backend(BackendError::StaleEpoch {
                         bound_epoch: projection_bound_epoch,
                         current_epoch: writer.connection_epoch,
-                    });
+                    }));
                 }
                 if !projection_shared.ready.load(Ordering::Acquire) {
-                    return Err(BackendError::NotReady {
+                    return Err(DirectedViewportError::Backend(BackendError::NotReady {
                         state: "not_ready".to_owned(),
-                    });
+                    }));
                 }
                 if observation.generation != projection_initial_generation
                     || !observation
@@ -1244,19 +1324,19 @@ impl RuntimeObservationSource {
                     return Ok(ViewportProjectionWorkerResult::Retry);
                 }
                 let Some(snapshot) = observation.snapshot.as_ref() else {
-                    return Err(BackendError::NotReady {
+                    return Err(DirectedViewportError::Backend(BackendError::NotReady {
                         state: "viewport_snapshot_unavailable".to_owned(),
-                    });
+                    }));
                 };
                 if snapshot.connection_epoch != writer.connection_epoch {
-                    return Err(BackendError::NotReady {
+                    return Err(DirectedViewportError::Backend(BackendError::NotReady {
                         state: "viewport_snapshot_epoch_mismatch".to_owned(),
-                    });
+                    }));
                 }
                 let Some(source) = observation.source else {
-                    return Err(BackendError::NotReady {
+                    return Err(DirectedViewportError::Backend(BackendError::NotReady {
                         state: "viewport_source_unavailable".to_owned(),
-                    });
+                    }));
                 };
                 ViewportCapture {
                     generation: observation.generation,
@@ -1272,14 +1352,32 @@ impl RuntimeObservationSource {
                     source,
                 }
             };
-            projection_control.preflight("read_viewport")?;
-            let projection = project_viewport_with_checkpoint(
-                &capture.pose,
-                &capture.entities,
-                |position| read_block_from_world(&world_read, position),
-                &ViewportOptions::default(),
-                || projection_control.preflight("read_viewport"),
-            )?;
+            projection_control.preflight(operation)?;
+            let projection = match projection_request {
+                ViewportProjectionRequest::Full => ViewportKernelProjection::Full(
+                    project_viewport_with_checkpoint(
+                        &capture.pose,
+                        &capture.entities,
+                        |position| read_block_from_world(&world_read, position),
+                        &ViewportOptions::default(),
+                        || projection_control.preflight(operation),
+                    )
+                    .map_err(DirectedViewportError::Backend)?,
+                ),
+                ViewportProjectionRequest::Directed(positions) => {
+                    let positions = positions
+                        .into_iter()
+                        .map(|position| [position.x, position.y, position.z])
+                        .collect::<Vec<_>>();
+                    ViewportKernelProjection::Directed(project_directed_viewport(
+                        &capture.pose,
+                        &positions,
+                        |position| read_block_from_world(&world_read, position),
+                        &ViewportOptions::default(),
+                        || projection_control.preflight(operation),
+                    )?)
+                }
+            };
             Ok(ViewportProjectionWorkerResult::Complete {
                 capture,
                 projection,
@@ -1297,20 +1395,24 @@ impl RuntimeObservationSource {
         tokio::pin!(deadline);
         let worker_result = tokio::select! {
             result = &mut projection_task => result
-                .map_err(|error| BackendError::BackendFailure {
+                .map_err(|error| DirectedViewportError::Backend(BackendError::BackendFailure {
                     failure: BackendFailure {
                         code: BackendFailureCode::ProtocolError,
                         message: format!("viewport projection task failed: {error}"),
                         retryable: true,
                     },
-                })??,
+                }))??,
             _ = &mut cancellation => {
                 projection_task.abort();
-                return Err(control_wakeup_error(control));
+                return Err(DirectedViewportError::Backend(control_wakeup_error(
+                    control, operation,
+                )));
             }
             _ = &mut deadline => {
                 projection_task.abort();
-                return Err(control_wakeup_error(control));
+                return Err(DirectedViewportError::Backend(control_wakeup_error(
+                    control, operation,
+                )));
             }
         };
         let (capture, projection) = match worker_result {
@@ -1320,20 +1422,20 @@ impl RuntimeObservationSource {
             } => (capture, projection),
             ViewportProjectionWorkerResult::Retry => return Ok(ViewportReadAttempt::Retry),
         };
-        control.preflight("read_viewport")?;
+        control.preflight(operation)?;
 
         let observation = self.shared.observation.read();
         let writer = self.shared.writer.lock();
         if writer.connection_epoch != self.bound_epoch {
-            return Err(BackendError::StaleEpoch {
+            return Err(DirectedViewportError::Backend(BackendError::StaleEpoch {
                 bound_epoch: self.bound_epoch,
                 current_epoch: writer.connection_epoch,
-            });
+            }));
         }
         if !self.shared.ready.load(Ordering::Acquire) {
-            return Err(BackendError::NotReady {
+            return Err(DirectedViewportError::Backend(BackendError::NotReady {
                 state: "not_ready".to_owned(),
-            });
+            }));
         }
         if observation.generation != capture.generation
             || !observation
@@ -1347,11 +1449,19 @@ impl RuntimeObservationSource {
             return Ok(ViewportReadAttempt::Retry);
         }
         let revision = self.shared.viewport_revision.fetch_add(1, Ordering::AcqRel) + 1;
-        Ok(ViewportReadAttempt::Complete(ContractViewportRead {
-            projection: contract_viewport_projection(projection),
-            source: contract_fact_source(capture.source),
-            revision,
-        }))
+        let complete = match projection {
+            ViewportKernelProjection::Full(projection) => {
+                ViewportReadComplete::Full(ContractViewportRead {
+                    projection: contract_viewport_projection(projection),
+                    source: contract_fact_source(capture.source),
+                    revision,
+                })
+            }
+            ViewportKernelProjection::Directed(projection) => {
+                ViewportReadComplete::Directed(projection)
+            }
+        };
+        Ok(ViewportReadAttempt::Complete(complete))
     }
 
     fn subscribe_listener(
@@ -1422,6 +1532,14 @@ impl ProtocolObservationSource for RuntimeObservationSource {
     ) -> BoxFuture<'_, Result<ContractViewportRead, BackendError>> {
         // Fully qualify the inherent method so the trait adapter cannot recurse.
         RuntimeObservationSource::read_viewport(self, control)
+    }
+
+    fn read_directed_viewport(
+        &self,
+        positions: Vec<ContractBlockPosition>,
+        control: OperationControl,
+    ) -> BoxFuture<'_, Result<DirectedViewportProjection, DirectedViewportError>> {
+        RuntimeObservationSource::read_directed_viewport(self, positions, control)
     }
 }
 
@@ -1510,7 +1628,7 @@ fn contract_block_snapshot(block: ProtocolBlockSnapshot) -> ContractProtocolBloc
         properties: block
             .properties
             .into_iter()
-            .map(|(key, value)| (key, ContractBlockPropertyValue::String(value)))
+            .map(|(key, value)| (key, parse_block_property_value(&value)))
             .collect(),
         collision_shapes: block.collision_shapes,
         transparent_hint: block.transparent_hint,
@@ -1625,14 +1743,27 @@ fn contract_fact_source(source: FactSource) -> ContractFactSource {
     }
 }
 
-fn control_wakeup_error(control: &OperationControl) -> BackendError {
-    match control.preflight("read_viewport") {
+fn control_wakeup_error(control: &OperationControl, operation: &str) -> BackendError {
+    match control.preflight(operation) {
         Err(error) => error,
         Ok(()) => BackendError::BackendFailure {
             failure: BackendFailure {
                 code: BackendFailureCode::ProtocolError,
-                message: "read_viewport control woke without cancellation or deadline".to_owned(),
+                message: format!("{operation} control woke without cancellation or deadline"),
                 retryable: true,
+            },
+        },
+    }
+}
+
+fn backend_error_from_directed(error: DirectedViewportError) -> BackendError {
+    match error {
+        DirectedViewportError::Backend(error) => error,
+        DirectedViewportError::OutOfWorld { .. } => BackendError::BackendFailure {
+            failure: BackendFailure {
+                code: BackendFailureCode::ProtocolError,
+                message: "full viewport encountered an out-of-world ray coordinate".to_owned(),
+                retryable: false,
             },
         },
     }
@@ -1677,7 +1808,7 @@ fn contract_viewport_projection(projection: ViewportProjection) -> ContractViewp
 
 fn contract_viewport_block(block: ViewportBlock) -> ContractViewportBlock {
     ContractViewportBlock {
-        name: block.name,
+        block: block.block,
         position: block.position.map(f64::from),
     }
 }
@@ -2375,7 +2506,7 @@ fn validate_run_config(config: &RunConfig) -> Result<(), String> {
 mod tests {
     use std::{
         future::pending,
-        sync::{atomic::AtomicUsize, mpsc as std_mpsc, Barrier, Mutex as StdMutex},
+        sync::{atomic::AtomicUsize, mpsc as std_mpsc, Barrier, Condvar, Mutex as StdMutex},
         thread,
         time::Duration as StdDuration,
     };
@@ -2383,7 +2514,8 @@ mod tests {
     use super::*;
     use crate::snapshot::{ExperienceSnapshot, InventorySnapshot, SelfSnapshot, WorldSnapshot};
     use mineintent_contracts::minecraft::{
-        BackendEventProtocol as ContractBackendEventProtocol, CancellationSignal, Deadline,
+        BackendEventProtocol as ContractBackendEventProtocol,
+        BlockPropertyValue as ContractBlockPropertyValue, CancellationSignal, Deadline,
         HeardSoundType as ContractHeardSoundType,
         ProtocolSoundSource as ContractProtocolSoundSource,
     };
@@ -2472,6 +2604,98 @@ mod tests {
 
         fn elapsed(&self) -> BoxFuture<'_, ()> {
             Box::pin(pending())
+        }
+    }
+
+    struct WorkerWakeCancellation {
+        checks: AtomicUsize,
+        started: Notify,
+        worker_started: AtomicBool,
+        cancelled: AtomicBool,
+        wake: Arc<(StdMutex<()>, Condvar)>,
+    }
+
+    impl WorkerWakeCancellation {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                checks: AtomicUsize::new(0),
+                started: Notify::new(),
+                worker_started: AtomicBool::new(false),
+                cancelled: AtomicBool::new(false),
+                wake: Arc::new((StdMutex::new(()), Condvar::new())),
+            })
+        }
+    }
+
+    impl CancellationSignal for WorkerWakeCancellation {
+        fn is_cancelled(&self) -> bool {
+            let check = self.checks.fetch_add(1, Ordering::SeqCst) + 1;
+            if check == 4 {
+                self.worker_started.store(true, Ordering::SeqCst);
+                self.started.notify_one();
+                let (lock, wake) = &*self.wake;
+                let guard = lock.lock().expect("worker wake lock");
+                if !self.cancelled.load(Ordering::SeqCst) {
+                    let _ = wake
+                        .wait_timeout(guard, StdDuration::from_millis(100))
+                        .expect("worker wake wait");
+                }
+            }
+            self.cancelled.load(Ordering::SeqCst)
+        }
+
+        fn cancelled(&self) -> BoxFuture<'_, ()> {
+            Box::pin(async move {
+                self.started.notified().await;
+                self.cancelled.store(true, Ordering::SeqCst);
+                self.wake.1.notify_all();
+            })
+        }
+    }
+
+    struct WorkerWakeDeadline {
+        checks: AtomicUsize,
+        started: Notify,
+        worker_started: AtomicBool,
+        elapsed: AtomicBool,
+        wake: Arc<(StdMutex<()>, Condvar)>,
+    }
+
+    impl WorkerWakeDeadline {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                checks: AtomicUsize::new(0),
+                started: Notify::new(),
+                worker_started: AtomicBool::new(false),
+                elapsed: AtomicBool::new(false),
+                wake: Arc::new((StdMutex::new(()), Condvar::new())),
+            })
+        }
+    }
+
+    impl Deadline for WorkerWakeDeadline {
+        fn has_elapsed(&self) -> bool {
+            let check = self.checks.fetch_add(1, Ordering::SeqCst) + 1;
+            if check == 4 {
+                self.worker_started.store(true, Ordering::SeqCst);
+                self.started.notify_one();
+                let (lock, wake) = &*self.wake;
+                let guard = lock.lock().expect("worker wake lock");
+                if !self.elapsed.load(Ordering::SeqCst) {
+                    let _ = wake
+                        .wait_timeout(guard, StdDuration::from_millis(100))
+                        .expect("worker wake wait");
+                }
+            }
+            self.elapsed.load(Ordering::SeqCst)
+        }
+
+        fn elapsed(&self) -> BoxFuture<'_, ()> {
+            Box::pin(async move {
+                self.started.notified().await;
+                self.elapsed.store(true, Ordering::SeqCst);
+                self.wake.1.notify_all();
+            })
         }
     }
 
@@ -3009,6 +3233,204 @@ mod tests {
         assert!(second.revision > first.revision);
         assert_eq!(second.projection, first.projection);
         assert_eq!(second.source, first.source);
+    }
+
+    #[tokio::test]
+    async fn read_directed_viewport_uses_atomic_capture_and_revision_discipline() {
+        let (handle, source, _world) = ready_viewport_source();
+        let position = ContractBlockPosition { x: 0, y: 64, z: -1 };
+        let first = source
+            .read_directed_viewport(vec![position], no_deadline_control())
+            .await
+            .expect("directed unloaded target should still return a strict result");
+        assert!(first.seen.is_empty());
+        assert_eq!(first.unseen.len(), 1);
+        assert_eq!(first.unseen[0].at, [0, 64, -1]);
+        assert!(first.unseen[0]
+            .why
+            .contains(&mineintent_contracts::minecraft::DirectedWhy::ChunkNotLoaded));
+        assert!(first.unseen[0].by.is_none());
+        let revision = handle.shared.viewport_revision.load(Ordering::Acquire);
+
+        let second = source
+            .read_directed_viewport(vec![position], no_deadline_control())
+            .await
+            .expect("second directed read should succeed");
+        assert_eq!(second, first);
+        assert_eq!(
+            handle.shared.viewport_revision.load(Ordering::Acquire),
+            revision + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn read_directed_viewport_rejects_duplicates_and_out_of_world_without_reason_mapping() {
+        let (_handle, source, _world) = ready_viewport_source();
+        let duplicate = source
+            .read_directed_viewport(
+                vec![
+                    ContractBlockPosition { x: 0, y: 64, z: -1 },
+                    ContractBlockPosition { x: 0, y: 64, z: -1 },
+                ],
+                no_deadline_control(),
+            )
+            .await;
+        assert!(matches!(
+            duplicate,
+            Err(DirectedViewportError::Backend(BackendError::InvalidCommand {
+                field,
+                ..
+            })) if field == "positions"
+        ));
+
+        let handle = _handle;
+        {
+            let mut observation = handle.shared.observation.write();
+            observation.snapshot = Some(snapshot_at(1, 0.0, 9_999.0, 0.0));
+            observation.bump_generation();
+        }
+        let out_of_world = handle
+            .observation_source()
+            .read_directed_viewport(
+                vec![ContractBlockPosition {
+                    x: 0,
+                    y: 10_000,
+                    z: -1,
+                }],
+                no_deadline_control(),
+            )
+            .await;
+        assert!(matches!(
+            out_of_world,
+            Err(DirectedViewportError::OutOfWorld { position })
+                if position.y == 10_000
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_directed_viewport_cancel_and_deadline_keep_full_kernel_boundaries() {
+        let (_handle, source, _world) = ready_viewport_source();
+        let cancelled = source
+            .read_directed_viewport(
+                vec![ContractBlockPosition { x: 0, y: 64, z: -1 }],
+                test_control(TestCancellation::new(true, None, false, None), None),
+            )
+            .await;
+        assert_eq!(
+            cancelled,
+            Err(DirectedViewportError::Backend(BackendError::Cancelled {
+                operation: "read_directed_viewport".to_owned()
+            }))
+        );
+
+        let deadline = TestDeadline::new(true, None, None);
+        let expired = source
+            .read_directed_viewport(
+                vec![ContractBlockPosition { x: 0, y: 64, z: -1 }],
+                test_control(
+                    TestCancellation::new(false, None, false, None),
+                    Some(deadline),
+                ),
+            )
+            .await;
+        assert_eq!(
+            expired,
+            Err(DirectedViewportError::Backend(
+                BackendError::DeadlineExceeded {
+                    operation: "read_directed_viewport".to_owned()
+                }
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn read_directed_viewport_worker_wakeup_preserves_operation_name() {
+        let (_handle, source, _world) = ready_viewport_source();
+        let cancellation = WorkerWakeCancellation::new();
+        let cancelled = tokio::time::timeout(
+            Duration::from_secs(1),
+            source.read_directed_viewport(
+                vec![ContractBlockPosition { x: 0, y: 64, z: -1 }],
+                OperationControl::new(cancellation.clone(), None),
+            ),
+        )
+        .await
+        .expect("worker cancellation test must be bounded");
+        assert!(cancellation.worker_started.load(Ordering::SeqCst));
+        assert_eq!(
+            cancelled,
+            Err(DirectedViewportError::Backend(BackendError::Cancelled {
+                operation: "read_directed_viewport".to_owned()
+            }))
+        );
+
+        let (_handle, source, _world) = ready_viewport_source();
+        let deadline = WorkerWakeDeadline::new();
+        let expired = tokio::time::timeout(
+            Duration::from_secs(1),
+            source.read_directed_viewport(
+                vec![ContractBlockPosition { x: 0, y: 64, z: -1 }],
+                OperationControl::new(
+                    TestCancellation::new(false, None, false, None),
+                    Some(deadline.clone()),
+                ),
+            ),
+        )
+        .await
+        .expect("worker deadline test must be bounded");
+        assert!(deadline.worker_started.load(Ordering::SeqCst));
+        assert_eq!(
+            expired,
+            Err(DirectedViewportError::Backend(
+                BackendError::DeadlineExceeded {
+                    operation: "read_directed_viewport".to_owned()
+                }
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn read_directed_viewport_retries_generation_and_rejects_stale_epoch_atomically() {
+        let (handle, source, world) = ready_viewport_source();
+        let replacement = snapshot_at(1, 9.0, 64.0, 10.0);
+        let shared = handle.shared.clone();
+        let action: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let mut observation = shared.observation.write();
+            observation.snapshot = Some(replacement.clone());
+            observation.source = Some(FactSource::ClientPredicted);
+            observation.tracked_entities = vec![observation_entity("replacement")];
+            observation.world = Some(world.clone());
+            observation.bump_generation();
+        });
+        let trigger = TestCancellation::new(false, Some(4), false, Some(action));
+        let read = source
+            .read_directed_viewport(
+                vec![ContractBlockPosition { x: 0, y: 64, z: -1 }],
+                test_control(trigger, None),
+            )
+            .await
+            .expect("changed directed capture should retry");
+        assert_eq!(read.unseen[0].at, [0, 64, -1]);
+
+        let (handle, source, _world) = ready_viewport_source();
+        let shared = handle.shared.clone();
+        let action: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            shared.begin_connection_attempt();
+        });
+        let trigger = TestCancellation::new(false, Some(4), false, Some(action));
+        let stale = source
+            .read_directed_viewport(
+                vec![ContractBlockPosition { x: 0, y: 64, z: -1 }],
+                test_control(trigger, None),
+            )
+            .await;
+        assert!(matches!(
+            stale,
+            Err(DirectedViewportError::Backend(BackendError::StaleEpoch {
+                bound_epoch: 1,
+                current_epoch: 2,
+            }))
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

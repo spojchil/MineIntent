@@ -7,8 +7,8 @@ use std::{
 };
 
 use mineintent_contracts::minecraft::{
-    BackendError, BoxFuture, MinecraftBackendApi, OperationControl, ViewportProjection,
-    ViewportRead,
+    is_visible_block_property, BackendError, BoxFuture, MinecraftBackendApi, OperationControl,
+    ViewportProjection, ViewportRead,
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -178,7 +178,7 @@ fn definition() -> InformationProviderDefinition {
             (
                 "standingOnBlock".to_owned(),
                 InformationFieldDefinition {
-                    description: "脚下可见方块及其绝对体素坐标".to_owned(),
+                    description: "脚下可见方块（BlockInfo）及其绝对体素坐标".to_owned(),
                     value_schema: Arc::new(BlockSchema),
                     value_type: "object".to_owned(),
                     unit: None,
@@ -191,7 +191,8 @@ fn definition() -> InformationProviderDefinition {
             (
                 "lookedAtBlock".to_owned(),
                 InformationFieldDefinition {
-                    description: "准星射线首先命中的可见方块及其绝对体素坐标".to_owned(),
+                    description: "准星射线首先命中的可见方块（BlockInfo）及其绝对体素坐标"
+                        .to_owned(),
                     value_schema: Arc::new(BlockSchema),
                     value_type: "object".to_owned(),
                     unit: None,
@@ -220,7 +221,7 @@ fn definition() -> InformationProviderDefinition {
                 "visibleBlocks".to_owned(),
                 InformationFieldDefinition {
                     description:
-                        "可见方块（朝观察者的暴露面无遮挡可达）；每项为[名称,x,y,z]整数体素，按距离从近到远，可能截断"
+                        "可见方块（朝观察者的暴露面无遮挡可达）；每项为[BlockInfo,x,y,z]整数体素，BlockInfo 无视觉属性时为名称字符串，有属性时为完整白名单属性对象；按距离从近到远，可能截断"
                             .to_owned(),
                     value_schema: Arc::new(VisibleBlocksSchema),
                     value_type: "object".to_owned(),
@@ -357,9 +358,9 @@ impl InformationValueSchema for VisibleBlocksSchema {
             if tuple.len() != 4 {
                 return Err(error("visible block must be a four-item tuple"));
             }
-            parse_non_empty_string(&tuple[0])?;
+            parse_block_info(&tuple[0])?;
             for coordinate in &tuple[1..] {
-                parse_number(coordinate, None, None, false)?;
+                parse_number(coordinate, None, None, true)?;
             }
             parsed_blocks.push(Value::Array(tuple.clone()));
         }
@@ -379,14 +380,51 @@ fn parse_block(value: Value) -> Result<Value, InformationValueSchemaError> {
     if value.is_null() {
         return Ok(Value::Null);
     }
+    // The provider's outer value object keeps the existing strip semantics; the nested
+    // BlockInfo itself is strict about its name and global visual-property whitelist.
     let object = object(&value, "block")?;
-    let name = required(object, "name", "block name")?;
-    parse_non_empty_string(name)?;
+    let block = parse_block_info(required(object, "block", "block info")?)?;
     let position = parse_position(required(object, "position", "block position")?)?;
     Ok(Value::Object(Map::from_iter([
-        ("name".to_owned(), name.clone()),
+        ("block".to_owned(), block),
         ("position".to_owned(), position),
     ])))
+}
+
+fn parse_block_info(value: &Value) -> Result<Value, InformationValueSchemaError> {
+    if let Value::String(name) = value {
+        if name.is_empty() {
+            return Err(error("block name must not be empty"));
+        }
+        return Ok(value.clone());
+    }
+    let object = object(value, "block info")?;
+    let name = required(object, "name", "block info name")?;
+    parse_non_empty_string(name)?;
+    if object.len() < 2 {
+        return Err(error(
+            "block info object must include at least one visual property",
+        ));
+    }
+    let mut parsed = Map::new();
+    parsed.insert("name".to_owned(), name.clone());
+    for (property, property_value) in object {
+        if property == "name" {
+            continue;
+        }
+        if !is_visible_block_property(property) {
+            return Err(error(
+                "block info contains a non-visual or unknown property",
+            ));
+        }
+        match property_value {
+            Value::String(_) | Value::Bool(_) => {}
+            Value::Number(number) if number.as_f64().is_some() => {}
+            _ => return Err(error("block info property must be a scalar")),
+        }
+        parsed.insert(property.clone(), property_value.clone());
+    }
+    Ok(Value::Object(parsed))
 }
 
 fn parse_position(value: &Value) -> Result<Value, InformationValueSchemaError> {

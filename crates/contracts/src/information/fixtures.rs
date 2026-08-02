@@ -198,15 +198,15 @@ fn fixture_viewport_projection() -> ViewportProjection {
             },
             legend: ViewportLegend {
                 visible_entities: "items: {type, player?, position}; nearest first".to_owned(),
-                visible_blocks: "[block_name, x, y, z]; nearest first".to_owned(),
+                visible_blocks: "[BlockInfo, x, y, z]; nearest first".to_owned(),
             },
         },
         standing_on_block: Some(crate::minecraft::ViewportBlock {
-            name: "stone".to_owned(),
+            block: crate::minecraft::BlockInfo::bare("stone"),
             position: [1.0, 63.0, -3.0],
         }),
         looked_at_block: Some(crate::minecraft::ViewportBlock {
-            name: "glass".to_owned(),
+            block: crate::minecraft::BlockInfo::bare("glass"),
             position: [1.0, 65.0, -5.0],
         }),
         visible_entities: VisibleEntitiesView {
@@ -218,7 +218,7 @@ fn fixture_viewport_projection() -> ViewportProjection {
             truncated: false,
         },
         visible_blocks: VisibleBlocksView {
-            blocks: vec![("glass".to_owned(), 1, 65, -5)],
+            blocks: vec![(crate::minecraft::BlockInfo::bare("glass"), 1, 65, -5)],
             truncated: false,
         },
     }

@@ -4,9 +4,14 @@
 //! `BlockReadResult` 只提供绝对坐标上的观察原语，投影层再做视锥、暴露面和
 //! 遮挡射线判断。算法参数与主仓库 `source-ports/perception.ts` 对齐。
 
-use std::{cmp::Ordering, collections::HashMap, f64::consts::PI};
+use std::{cell::RefCell, cmp::Ordering, collections::HashMap, f64::consts::PI};
 
-use mineintent_contracts::minecraft::BackendError;
+use mineintent_contracts::capability::validate_directed_positions;
+use mineintent_contracts::minecraft::{
+    BackendError, BlockInfo, BlockInfoPresenterRegistry, BlockPosition as ContractBlockPosition,
+    DirectedOccluder, DirectedSeenBlock, DirectedUnseenBlock, DirectedViewportError,
+    DirectedViewportProjection, DirectedWhy,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::snapshot::{
@@ -21,6 +26,7 @@ const FACE_EPSILON: f64 = 0.01;
 const DEFAULT_VERTICAL_HALF_ANGLE: f64 = 35.0 * PI / 180.0;
 const DEFAULT_ASPECT_RATIO: f64 = 16.0 / 9.0;
 const DEFAULT_LOOKED_AT_DISTANCE: f64 = 4.5;
+const DIRECTED_MAX_DISTANCE: f64 = 32.0;
 
 /// 可见方块候选的几何谓词。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -126,7 +132,7 @@ pub struct ViewportFrame {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ViewportBlock {
-    pub name: String,
+    pub block: BlockInfo,
     pub position: [i32; 3],
 }
 
@@ -150,8 +156,8 @@ pub struct VisibleEntitiesResult {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VisibleBlocksResult {
-    /// `[block_name, x, y, z]`，与主仓库 viewport 的紧凑值对齐。
-    pub blocks: Vec<(String, i32, i32, i32)>,
+    /// `[BlockInfo, x, y, z]`，所有方块表示共用 `BlockInfo` serializer。
+    pub blocks: Vec<(BlockInfo, i32, i32, i32)>,
     pub truncated: bool,
 }
 
@@ -202,7 +208,7 @@ enum BlockCell {
 #[derive(Clone, Debug)]
 struct BlockHit {
     voxel: BlockPosition,
-    name: String,
+    block: BlockInfo,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -263,11 +269,13 @@ pub fn project<F>(
 where
     F: Fn(BlockPosition) -> BlockReadResult,
 {
-    project_with_checkpoint(pose, entities, read_block, options, || Ok(())).map_err(|error| {
-        match error {
-            BackendError::InvalidCommand { message, .. } => message,
-            other => other.to_string(),
-        }
+    let presenters = BlockInfoPresenterRegistry::default();
+    project_with_checkpoint_and_presenters(pose, entities, read_block, options, &presenters, || {
+        Ok(())
+    })
+    .map_err(|error| match error {
+        BackendError::InvalidCommand { message, .. } => message,
+        other => other.to_string(),
     })
 }
 
@@ -277,8 +285,33 @@ where
 pub fn project_with_checkpoint<F, C>(
     pose: &PoseSnapshot,
     entities: &[ProtocolEntitySnapshot],
+    read_block: F,
+    options: &ViewportOptions,
+    checkpoint: C,
+) -> Result<ViewportProjection, BackendError>
+where
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), BackendError>,
+{
+    let presenters = BlockInfoPresenterRegistry::default();
+    project_with_checkpoint_and_presenters(
+        pose,
+        entities,
+        read_block,
+        options,
+        &presenters,
+        checkpoint,
+    )
+}
+
+/// Full projection variant with an explicit presenter registry. All block slots and ray hits
+/// use this same registry and the same `BlockInfo` serializer.
+pub fn project_with_checkpoint_and_presenters<F, C>(
+    pose: &PoseSnapshot,
+    entities: &[ProtocolEntitySnapshot],
     mut read_block: F,
     options: &ViewportOptions,
+    presenters: &BlockInfoPresenterRegistry,
     mut checkpoint: C,
 ) -> Result<ViewportProjection, BackendError>
 where
@@ -311,19 +344,33 @@ where
         z: pose.position.z,
     };
     let axes = view_axes(pose.yaw, pose.pitch);
-    let standing_on_block = standing_on_block(&mut read_cached, pose, &mut checkpoint)?;
-    let looked_at_block =
-        raycast_looked_at_block(&mut read_cached, eye, pose, options, &mut checkpoint)?;
+    let standing_on_block = standing_on_block(&mut read_cached, pose, presenters, &mut checkpoint)?;
+    let looked_at_block = raycast_looked_at_block(
+        &mut read_cached,
+        eye,
+        pose,
+        options,
+        presenters,
+        &mut checkpoint,
+    )?;
     let visible_entities = visible_entities(
         &mut read_cached,
         entities,
         eye,
         axes,
         options,
+        presenters,
         &mut checkpoint,
     )?;
-    let visible_blocks =
-        visible_blocks(&mut read_cached, pose, eye, axes, options, &mut checkpoint)?;
+    let visible_blocks = visible_blocks(
+        &mut read_cached,
+        pose,
+        eye,
+        axes,
+        options,
+        presenters,
+        &mut checkpoint,
+    )?;
 
     Ok(ViewportProjection {
         frame: ViewportFrame {
@@ -339,7 +386,7 @@ where
             },
             legend: ViewportLegend {
                 visible_entities: "items 每项为 {type, player?, position}：type 是原版实体类型（玩家为 player），player 只有玩家才有，position 是 Minecraft 世界绝对坐标；按距离从近到远，truncated 为真表示更远处还有实体没列出".to_owned(),
-                visible_blocks: "[block_name, x, y, z]，同一坐标系的整数体素，按距离从近到远，可能截断".to_owned(),
+                visible_blocks: "[BlockInfo, x, y, z]；BlockInfo 无视觉属性时为方块名称字符串，有属性时为 name 加全部白名单属性的对象；同一坐标系的整数体素，按距离从近到远，可能截断".to_owned(),
             },
         },
         standing_on_block,
@@ -347,6 +394,314 @@ where
         visible_entities,
         visible_blocks,
     })
+}
+
+/// Directed projection in the same backend viewport kernel as full projection.
+///
+/// `OutOfWorld` is deliberately not representable as `chunk_not_loaded`; callers receive the
+/// independent internal error and must not turn it into a model-visible directed row.
+pub fn project_directed<F, C>(
+    pose: &PoseSnapshot,
+    positions: &[[i32; 3]],
+    read_block: F,
+    options: &ViewportOptions,
+    checkpoint: C,
+) -> Result<DirectedViewportProjection, DirectedViewportError>
+where
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), BackendError>,
+{
+    let presenters = BlockInfoPresenterRegistry::default();
+    project_directed_with_presenters(
+        pose,
+        positions,
+        read_block,
+        options,
+        &presenters,
+        checkpoint,
+    )
+}
+
+pub fn project_directed_with_presenters<F, C>(
+    pose: &PoseSnapshot,
+    positions: &[[i32; 3]],
+    mut read_block: F,
+    options: &ViewportOptions,
+    presenters: &BlockInfoPresenterRegistry,
+    mut checkpoint: C,
+) -> Result<DirectedViewportProjection, DirectedViewportError>
+where
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), BackendError>,
+{
+    let tuple_positions = positions
+        .iter()
+        .map(|[x, y, z]| (*x, *y, *z))
+        .collect::<Vec<_>>();
+    validate_directed_positions(&tuple_positions).map_err(|message| {
+        DirectedViewportError::Backend(BackendError::InvalidCommand {
+            field: "positions".to_owned(),
+            message,
+        })
+    })?;
+    options.validate().map_err(|message| {
+        DirectedViewportError::Backend(BackendError::InvalidCommand {
+            field: "viewport".to_owned(),
+            message,
+        })
+    })?;
+    checkpoint().map_err(DirectedViewportError::Backend)?;
+
+    let eye = Point3 {
+        x: pose.position.x,
+        y: pose.position.y + EYE_HEIGHT,
+        z: pose.position.z,
+    };
+    let axes = view_axes(pose.yaw, pose.pitch);
+    let mut block_cache = HashMap::<(i32, i32, i32), BlockReadResult>::new();
+    let out_of_world = RefCell::new(None);
+    let mut read_cached = |position: BlockPosition| {
+        let key = (position.x, position.y, position.z);
+        if let Some(result) = block_cache.get(&key).cloned() {
+            if matches!(&result, BlockReadResult::OutOfWorld) {
+                out_of_world.replace(Some(position));
+            }
+            return result;
+        }
+        let result = read_block(position);
+        if matches!(&result, BlockReadResult::OutOfWorld) {
+            out_of_world.replace(Some(BlockPosition {
+                x: key.0,
+                y: key.1,
+                z: key.2,
+            }));
+        }
+        block_cache.insert(key, result.clone());
+        result
+    };
+    let directed_max_distance = options.max_distance.min(DIRECTED_MAX_DISTANCE);
+    let mut seen = Vec::new();
+    let mut unseen = Vec::new();
+
+    for [x, y, z] in positions.iter().copied() {
+        checkpoint().map_err(DirectedViewportError::Backend)?;
+        let target = BlockPosition { x, y, z };
+        let center = Point3 {
+            x: f64::from(x) + 0.5,
+            y: f64::from(y) + 0.5,
+            z: f64::from(z) + 0.5,
+        };
+        let delta = subtract(center, eye);
+        let distance = length(delta);
+        let outside_fov = !inside_frustum(axes, delta, options);
+        let too_far = distance > directed_max_distance;
+
+        // Geometry is a hard privacy and work boundary. A target outside the view cone or
+        // beyond the directed distance limit is classified without consulting the world or
+        // tracing a ray, so arbitrary i32 coordinates remain O(1) work.
+        if outside_fov || too_far {
+            let mut why = Vec::new();
+            if outside_fov {
+                why.push(DirectedWhy::OutsideFov);
+            }
+            if too_far {
+                why.push(DirectedWhy::TooFar);
+            }
+            unseen.push(DirectedUnseenBlock {
+                at: [x, y, z],
+                why,
+                distance: too_far.then_some(distance),
+                max: too_far.then_some(directed_max_distance),
+                by: None,
+            });
+            continue;
+        }
+
+        let target_result = read_cached(target.clone());
+        let target_info = match &target_result {
+            BlockReadResult::Loaded { block } => {
+                Some(BlockInfo::from_raw_properties_with_registry(
+                    block.name.clone(),
+                    &block.properties,
+                    presenters,
+                ))
+            }
+            BlockReadResult::Unloaded => None,
+            BlockReadResult::OutOfWorld => {
+                return Err(DirectedViewportError::OutOfWorld {
+                    position: ContractBlockPosition {
+                        x: target.x,
+                        y: target.y,
+                        z: target.z,
+                    },
+                });
+            }
+        };
+        if let Some(position) = out_of_world.take() {
+            return Err(DirectedViewportError::OutOfWorld {
+                position: ContractBlockPosition {
+                    x: position.x,
+                    y: position.y,
+                    z: position.z,
+                },
+            });
+        }
+
+        let target_visible = match &target_result {
+            BlockReadResult::Loaded { .. } => is_visible_candidate(
+                &mut read_cached,
+                eye,
+                &target,
+                distance,
+                options.predicate,
+                presenters,
+                &mut checkpoint,
+            )
+            .map_err(DirectedViewportError::Backend)?,
+            BlockReadResult::Unloaded => false,
+            BlockReadResult::OutOfWorld => unreachable!("out-of-world target returned above"),
+        };
+        if let Some(position) = out_of_world.take() {
+            return Err(DirectedViewportError::OutOfWorld {
+                position: ContractBlockPosition {
+                    x: position.x,
+                    y: position.y,
+                    z: position.z,
+                },
+            });
+        }
+
+        if target_visible {
+            seen.push(DirectedSeenBlock {
+                at: [x, y, z],
+                block: target_info.expect("loaded target has block info"),
+            });
+            continue;
+        }
+
+        let ray = first_occluder_before_target(
+            &mut read_cached,
+            eye,
+            center,
+            &target,
+            presenters,
+            &mut checkpoint,
+        )?;
+        let mut why = Vec::new();
+        if outside_fov {
+            why.push(DirectedWhy::OutsideFov);
+        }
+        if too_far {
+            why.push(DirectedWhy::TooFar);
+        }
+        let mut by = None;
+        match ray {
+            DirectedRayOutcome::Hit(hit) => {
+                why.push(DirectedWhy::Occluded);
+                by = Some(DirectedOccluder {
+                    at: [hit.voxel.x, hit.voxel.y, hit.voxel.z],
+                    block: hit.block,
+                });
+            }
+            DirectedRayOutcome::Unloaded => why.push(DirectedWhy::ChunkNotLoaded),
+            DirectedRayOutcome::Clear if target_info.is_some() => why.push(DirectedWhy::Occluded),
+            DirectedRayOutcome::Clear => {}
+        }
+        if target_info.is_none() && !why.contains(&DirectedWhy::ChunkNotLoaded) {
+            why.push(DirectedWhy::ChunkNotLoaded);
+        }
+
+        if why.is_empty() {
+            seen.push(DirectedSeenBlock {
+                at: [x, y, z],
+                block: target_info.expect("loaded target has block info"),
+            });
+        } else {
+            unseen.push(DirectedUnseenBlock {
+                at: [x, y, z],
+                why,
+                distance: None,
+                max: None,
+                by,
+            });
+        }
+    }
+
+    let projection = DirectedViewportProjection { seen, unseen };
+    projection.validate().map_err(|message| {
+        DirectedViewportError::Backend(BackendError::InvalidCommand {
+            field: "directed".to_owned(),
+            message,
+        })
+    })?;
+    Ok(projection)
+}
+
+enum DirectedRayOutcome {
+    Hit(BlockHit),
+    Clear,
+    Unloaded,
+}
+
+fn first_occluder_before_target<F, C>(
+    read_block: &mut F,
+    origin: Point3,
+    target: Point3,
+    target_voxel: &BlockPosition,
+    presenters: &BlockInfoPresenterRegistry,
+    checkpoint: &mut C,
+) -> Result<DirectedRayOutcome, DirectedViewportError>
+where
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), BackendError>,
+{
+    checkpoint().map_err(DirectedViewportError::Backend)?;
+    let delta = subtract(target, origin);
+    let distance = length(delta);
+    if distance == 0.0 {
+        return Ok(DirectedRayOutcome::Clear);
+    }
+    let direction = normalize(delta, distance);
+    let steps = (distance / RAY_STEP).ceil() as i32;
+    for step in 1..=steps {
+        checkpoint().map_err(DirectedViewportError::Backend)?;
+        let travelled = f64::from(step) * RAY_STEP;
+        if travelled >= distance {
+            break;
+        }
+        let voxel = BlockPosition {
+            x: (origin.x + direction.x * travelled).floor() as i32,
+            y: (origin.y + direction.y * travelled).floor() as i32,
+            z: (origin.z + direction.z * travelled).floor() as i32,
+        };
+        if same_voxel(&voxel, target_voxel) {
+            break;
+        }
+        match read_block(voxel.clone()) {
+            BlockReadResult::Loaded { block } if is_occluding_block(&block) => {
+                return Ok(DirectedRayOutcome::Hit(BlockHit {
+                    voxel,
+                    block: BlockInfo::from_raw_properties_with_registry(
+                        block.name,
+                        &block.properties,
+                        presenters,
+                    ),
+                }));
+            }
+            BlockReadResult::Loaded { .. } => {}
+            BlockReadResult::Unloaded => return Ok(DirectedRayOutcome::Unloaded),
+            BlockReadResult::OutOfWorld => {
+                return Err(DirectedViewportError::OutOfWorld {
+                    position: ContractBlockPosition {
+                        x: voxel.x,
+                        y: voxel.y,
+                        z: voxel.z,
+                    },
+                });
+            }
+        }
+    }
+    Ok(DirectedRayOutcome::Clear)
 }
 
 fn view_axes(yaw_degrees: f32, pitch_degrees: f32) -> ViewAxes {
@@ -378,6 +733,7 @@ fn view_axes(yaw_degrees: f32, pitch_degrees: f32) -> ViewAxes {
 fn standing_on_block<F, C>(
     read_block: &mut F,
     pose: &PoseSnapshot,
+    presenters: &BlockInfoPresenterRegistry,
     checkpoint: &mut C,
 ) -> Result<Option<ViewportBlock>, BackendError>
 where
@@ -391,7 +747,7 @@ where
         z: pose.position.z.floor() as i32,
     };
     match read_cell(read_block, position.clone(), checkpoint)? {
-        BlockCell::Loaded => read_loaded_snapshot(read_block, position, checkpoint),
+        BlockCell::Loaded => read_loaded_snapshot(read_block, position, presenters, checkpoint),
         BlockCell::Empty | BlockCell::Unloaded => Ok(None),
     }
 }
@@ -399,6 +755,7 @@ where
 fn read_loaded_snapshot<F, C>(
     read_block: &mut F,
     position: BlockPosition,
+    presenters: &BlockInfoPresenterRegistry,
     checkpoint: &mut C,
 ) -> Result<Option<ViewportBlock>, BackendError>
 where
@@ -408,7 +765,11 @@ where
     checkpoint()?;
     Ok(match read_block(position.clone()) {
         BlockReadResult::Loaded { block } if is_visible_block(&block) => Some(ViewportBlock {
-            name: block.name,
+            block: BlockInfo::from_raw_properties_with_registry(
+                block.name,
+                &block.properties,
+                presenters,
+            ),
             position: [position.x, position.y, position.z],
         }),
         BlockReadResult::Loaded { .. }
@@ -422,6 +783,7 @@ fn raycast_looked_at_block<F, C>(
     eye: Point3,
     pose: &PoseSnapshot,
     options: &ViewportOptions,
+    presenters: &BlockInfoPresenterRegistry,
     checkpoint: &mut C,
 ) -> Result<Option<ViewportBlock>, BackendError>
 where
@@ -437,10 +799,11 @@ where
             direction,
             options.looked_at_max_distance,
             RayProperty::Visible,
+            presenters,
             checkpoint,
         )? {
-            RayOutcome::Hit(BlockHit { voxel, name }) => Some(ViewportBlock {
-                name,
+            RayOutcome::Hit(BlockHit { voxel, block }) => Some(ViewportBlock {
+                block,
                 position: [voxel.x, voxel.y, voxel.z],
             }),
             RayOutcome::Clear | RayOutcome::Unloaded => None,
@@ -454,6 +817,7 @@ fn visible_blocks<F, C>(
     eye: Point3,
     axes: ViewAxes,
     options: &ViewportOptions,
+    presenters: &BlockInfoPresenterRegistry,
     checkpoint: &mut C,
 ) -> Result<VisibleBlocksResult, BackendError>
 where
@@ -536,12 +900,21 @@ where
                                     &position,
                                     distance,
                                     options.predicate,
+                                    presenters,
                                     checkpoint,
                                 )?
                             {
                                 continue;
                             }
-                            candidates.push((distance, position, block.name));
+                            candidates.push((
+                                distance,
+                                position,
+                                BlockInfo::from_raw_properties_with_registry(
+                                    block.name,
+                                    &block.properties,
+                                    presenters,
+                                ),
+                            ));
                         }
                     }
                 }
@@ -554,7 +927,7 @@ where
     let blocks = candidates
         .into_iter()
         .take(options.block_limit)
-        .map(|(_, position, name)| (name, position.x, position.y, position.z))
+        .map(|(_, position, block)| (block, position.x, position.y, position.z))
         .collect();
     Ok(VisibleBlocksResult { blocks, truncated })
 }
@@ -565,6 +938,7 @@ fn visible_entities<F, C>(
     eye: Point3,
     axes: ViewAxes,
     options: &ViewportOptions,
+    presenters: &BlockInfoPresenterRegistry,
     checkpoint: &mut C,
 ) -> Result<VisibleEntitiesResult, BackendError>
 where
@@ -607,7 +981,7 @@ where
                 checkpoint()?;
                 let point_delta = subtract(point, eye);
                 if inside_frustum(axes, point_delta, options)
-                    && line_is_clear(read_block, eye, point, checkpoint)?
+                    && line_is_clear(read_block, eye, point, presenters, checkpoint)?
                 {
                     visible = true;
                     break;
@@ -660,6 +1034,7 @@ fn is_visible_candidate<F, C>(
     voxel: &BlockPosition,
     distance: f64,
     predicate: VisibilityPredicate,
+    presenters: &BlockInfoPresenterRegistry,
     checkpoint: &mut C,
 ) -> Result<bool, BackendError>
 where
@@ -669,11 +1044,11 @@ where
     checkpoint()?;
     Ok(match predicate {
         VisibilityPredicate::ExposedFace => {
-            exposed_face_reaches_eye(read_block, eye, voxel, checkpoint)?
+            exposed_face_reaches_eye(read_block, eye, voxel, presenters, checkpoint)?
         }
         VisibilityPredicate::BlockCentre => {
             has_exposed_face(read_block, voxel, checkpoint)?
-                && line_reaches_voxel(read_block, eye, voxel, distance, checkpoint)?
+                && line_reaches_voxel(read_block, eye, voxel, distance, presenters, checkpoint)?
         }
     })
 }
@@ -682,6 +1057,7 @@ fn exposed_face_reaches_eye<F, C>(
     read_block: &mut F,
     eye: Point3,
     voxel: &BlockPosition,
+    presenters: &BlockInfoPresenterRegistry,
     checkpoint: &mut C,
 ) -> Result<bool, BackendError>
 where
@@ -721,7 +1097,7 @@ where
     candidates.sort_by(|left, right| right.0.partial_cmp(&left.0).unwrap_or(Ordering::Equal));
     for (_, target) in candidates {
         checkpoint()?;
-        if line_is_clear(read_block, eye, target, checkpoint)? {
+        if line_is_clear(read_block, eye, target, presenters, checkpoint)? {
             return Ok(true);
         }
     }
@@ -761,6 +1137,7 @@ fn line_reaches_voxel<F, C>(
     eye: Point3,
     voxel: &BlockPosition,
     distance: f64,
+    presenters: &BlockInfoPresenterRegistry,
     checkpoint: &mut C,
 ) -> Result<bool, BackendError>
 where
@@ -783,6 +1160,7 @@ where
             normalize(subtract(center, eye), distance),
             distance + RAY_STEP,
             RayProperty::Occludes,
+            presenters,
             checkpoint,
         )? {
             RayOutcome::Clear => true,
@@ -796,6 +1174,7 @@ fn line_is_clear<F, C>(
     read_block: &mut F,
     origin: Point3,
     target: Point3,
+    presenters: &BlockInfoPresenterRegistry,
     checkpoint: &mut C,
 ) -> Result<bool, BackendError>
 where
@@ -815,6 +1194,7 @@ where
             normalize(delta, distance),
             (distance - RAY_STEP).max(0.0),
             RayProperty::Occludes,
+            presenters,
             checkpoint,
         )?,
         RayOutcome::Clear
@@ -827,6 +1207,7 @@ fn first_hit<F, C>(
     direction: Point3,
     max_distance: f64,
     property: RayProperty,
+    presenters: &BlockInfoPresenterRegistry,
     checkpoint: &mut C,
 ) -> Result<RayOutcome, BackendError>
 where
@@ -854,7 +1235,11 @@ where
         if hits {
             return Ok(RayOutcome::Hit(BlockHit {
                 voxel,
-                name: block.name,
+                block: BlockInfo::from_raw_properties_with_registry(
+                    block.name,
+                    &block.properties,
+                    presenters,
+                ),
             }));
         }
     }
@@ -1039,8 +1424,8 @@ fn section_of(value: i32) -> i32 {
 }
 
 fn compare_candidate(
-    left: &(f64, BlockPosition, String),
-    right: &(f64, BlockPosition, String),
+    left: &(f64, BlockPosition, BlockInfo),
+    right: &(f64, BlockPosition, BlockInfo),
 ) -> Ordering {
     left.0
         .partial_cmp(&right.0)
@@ -1216,7 +1601,7 @@ mod tests {
         assert_eq!(
             projection.looked_at_block,
             Some(ViewportBlock {
-                name: "stone".to_owned(),
+                block: BlockInfo::bare("stone"),
                 position: [0, 2, -1],
             })
         );
@@ -1236,7 +1621,7 @@ mod tests {
             .visible_blocks
             .blocks
             .iter()
-            .any(|block| block.0 == "stone" && block.3 == -1));
+            .any(|block| block.0.name == "stone" && block.3 == -1));
         assert!(!projection
             .visible_blocks
             .blocks
@@ -1252,5 +1637,262 @@ mod tests {
         options.max_distance = f64::NAN;
         let result = project(&pose(0.0), &[], fixture_read, &options);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn block_info_serialization_keeps_typed_visual_columns_and_excludes_internal_state() {
+        let properties = BTreeMap::from([
+            ("facing".to_owned(), "north".to_owned()),
+            ("lit".to_owned(), "false".to_owned()),
+            ("age".to_owned(), "3".to_owned()),
+            ("distance".to_owned(), "7".to_owned()),
+            ("persistent".to_owned(), "true".to_owned()),
+        ]);
+        let info = BlockInfo::from_raw_properties("oak_leaves", &properties);
+        assert_eq!(
+            serde_json::to_value(&info).unwrap(),
+            serde_json::json!({
+                "name": "oak_leaves",
+                "age": 3,
+                "facing": "north",
+                "lit": false
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(BlockInfo::bare("air")).unwrap(),
+            serde_json::json!("air")
+        );
+    }
+
+    #[test]
+    fn directed_kernel_reports_seen_air_four_reasons_and_first_occluder() {
+        let positions = [[1, 2, -1], [0, 2, -2], [3, 2, -5], [5, 2, 0]];
+        let result = project_directed(
+            &pose(0.0),
+            &positions,
+            |position| {
+                if position.x == 3 && position.y == 2 && position.z == -5 {
+                    BlockReadResult::Unloaded
+                } else {
+                    fixture_read(position)
+                }
+            },
+            &options(),
+            || Ok(()),
+        )
+        .expect("directed fixture should be classifiable");
+
+        assert_eq!(result.seen.len(), 1);
+        assert_eq!(result.seen[0].at, [1, 2, -1]);
+        assert_eq!(result.seen[0].block, BlockInfo::bare("air"));
+
+        let occluded = result
+            .unseen
+            .iter()
+            .find(|item| item.at == [0, 2, -2])
+            .expect("occluded target should be present");
+        assert_eq!(occluded.why, [DirectedWhy::Occluded]);
+        assert_eq!(occluded.distance, None);
+        assert_eq!(occluded.max, None);
+        let by = occluded.by.as_ref().expect("occluder should be reported");
+        assert_eq!(by.at, [0, 2, -1]);
+        assert_eq!(by.block, BlockInfo::bare("stone"));
+        let target_wire = serde_json::to_value(occluded).unwrap();
+        assert!(target_wire.get("block").is_none());
+
+        let unloaded = result
+            .unseen
+            .iter()
+            .find(|item| item.at == [3, 2, -5])
+            .expect("unloaded target should be present");
+        assert_eq!(
+            unloaded.why,
+            [DirectedWhy::Occluded, DirectedWhy::ChunkNotLoaded]
+        );
+        assert_eq!(unloaded.by.as_ref().unwrap().at, [0, 2, -1]);
+        assert!(unloaded.distance.is_none());
+        assert!(unloaded.max.is_none());
+
+        let outside = result
+            .unseen
+            .iter()
+            .find(|item| item.at == [5, 2, 0])
+            .expect("outside target should be present");
+        assert_eq!(outside.why, [DirectedWhy::OutsideFov]);
+    }
+
+    #[test]
+    fn directed_geometry_short_circuits_extreme_coordinates_without_reading() {
+        let positions = [
+            [i32::MAX, i32::MAX, i32::MAX],
+            [i32::MIN, i32::MIN, i32::MIN],
+        ];
+        let result = project_directed(
+            &pose(0.0),
+            &positions,
+            |_position| panic!("geometrically rejected directed target was read"),
+            &options(),
+            || Ok(()),
+        )
+        .expect("extreme directed coordinates should be classified without world access");
+
+        assert!(result.seen.is_empty());
+        assert_eq!(result.unseen.len(), positions.len());
+        assert!(result.unseen.iter().all(|item| {
+            item.why == [DirectedWhy::OutsideFov, DirectedWhy::TooFar]
+                && item.distance.is_some()
+                && item.max == Some(options().max_distance)
+                && item.by.is_none()
+        }));
+    }
+
+    #[test]
+    fn directed_clear_to_unloaded_target_reports_only_chunk_not_loaded() {
+        let target = [0, 2, -2];
+        let result = project_directed(
+            &pose(0.0),
+            &[target],
+            |position| {
+                if [position.x, position.y, position.z] == target {
+                    BlockReadResult::Unloaded
+                } else {
+                    BlockReadResult::Loaded {
+                        block: block("air", true),
+                    }
+                }
+            },
+            &options(),
+            || Ok(()),
+        )
+        .expect("clear unloaded target should be classified");
+
+        assert!(result.seen.is_empty());
+        assert_eq!(result.unseen.len(), 1);
+        assert_eq!(result.unseen[0].at, target);
+        assert_eq!(result.unseen[0].why, [DirectedWhy::ChunkNotLoaded]);
+        assert!(result.unseen[0].by.is_none());
+        assert!(serde_json::to_value(&result.unseen[0])
+            .unwrap()
+            .get("block")
+            .is_none());
+    }
+
+    #[test]
+    fn directed_exposed_face_matches_full_when_target_centre_is_blocked() {
+        let target = BlockPosition { x: 1, y: 2, z: -2 };
+        let wall = BlockPosition { x: 1, y: 2, z: -1 };
+        let read = |position: BlockPosition| {
+            if position == target || position == wall {
+                BlockReadResult::Loaded {
+                    block: block("stone", false),
+                }
+            } else {
+                BlockReadResult::Loaded {
+                    block: block("air", true),
+                }
+            }
+        };
+
+        let mut center_read = read;
+        let center_hit = first_occluder_before_target(
+            &mut center_read,
+            Point3 {
+                x: 0.5,
+                y: 2.62,
+                z: 0.5,
+            },
+            Point3 {
+                x: 1.5,
+                y: 2.5,
+                z: -1.5,
+            },
+            &target,
+            &BlockInfoPresenterRegistry::default(),
+            &mut || Ok(()),
+        )
+        .expect("centre ray should be classifiable");
+        assert!(matches!(
+            center_hit,
+            DirectedRayOutcome::Hit(BlockHit { voxel, .. }) if voxel == wall
+        ));
+
+        let full = project(&pose(0.0), &[], read, &options())
+            .expect("full projection should use the exposed-face predicate");
+        assert!(full
+            .visible_blocks
+            .blocks
+            .iter()
+            .any(|(_, x, y, z)| [*x, *y, *z] == [target.x, target.y, target.z]));
+
+        let directed = project_directed(
+            &pose(0.0),
+            &[[target.x, target.y, target.z]],
+            read,
+            &options(),
+            || Ok(()),
+        )
+        .expect("directed projection should reuse the full visibility predicate");
+        assert_eq!(directed.seen.len(), 1);
+        assert_eq!(directed.seen[0].at, [target.x, target.y, target.z]);
+        assert!(directed.unseen.is_empty());
+    }
+
+    #[test]
+    fn directed_kernel_reports_too_far_fields_and_stable_combined_reason_order() {
+        let result = project_directed(
+            &pose(0.0),
+            &[[0, 2, -40], [40, 2, 0]],
+            |_position| BlockReadResult::Loaded {
+                block: block("air", true),
+            },
+            &options(),
+            || Ok(()),
+        )
+        .expect("far fixture should be classifiable");
+        let too_far = result
+            .unseen
+            .iter()
+            .find(|item| item.at == [0, 2, -40])
+            .expect("too-far target should be present");
+        assert_eq!(too_far.why, [DirectedWhy::TooFar]);
+        assert!(too_far.distance.unwrap() > too_far.max.unwrap());
+        let combined = result
+            .unseen
+            .iter()
+            .find(|item| item.at == [40, 2, 0])
+            .expect("combined target should be present");
+        assert_eq!(combined.why, [DirectedWhy::OutsideFov, DirectedWhy::TooFar]);
+        assert!(combined.by.is_none());
+    }
+
+    #[test]
+    fn directed_kernel_rejects_duplicate_input_and_keeps_out_of_world_internal() {
+        let duplicate = project_directed(
+            &pose(0.0),
+            &[[1, 2, -1], [1, 2, -1]],
+            fixture_read,
+            &options(),
+            || Ok(()),
+        );
+        assert!(matches!(
+            duplicate,
+            Err(DirectedViewportError::Backend(BackendError::InvalidCommand {
+                field,
+                ..
+            })) if field == "positions"
+        ));
+
+        let out_of_world = project_directed(
+            &pose(0.0),
+            &[[0, 2, -1]],
+            |_position| BlockReadResult::OutOfWorld,
+            &options(),
+            || Ok(()),
+        );
+        assert!(matches!(
+            out_of_world,
+            Err(DirectedViewportError::OutOfWorld { position })
+                if position.y == 2
+        ));
     }
 }

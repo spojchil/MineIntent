@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use crate::minecraft::INITIAL_VISIBLE_BLOCK_PROPERTY_NAMES;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Map, Value};
 
@@ -78,7 +79,7 @@ pub enum ViewMode {
 pub type ViewPosition = (i32, i32, i32);
 
 /// directed 输入的保守初始批量上限；它是可调的输入预算，不是永久产品裁定。
-pub const MAX_DIRECTED_VIEW_POSITIONS: usize = 16;
+pub use crate::minecraft::MAX_DIRECTED_VIEW_POSITIONS;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ViewArguments {
@@ -116,20 +117,39 @@ impl<'de> Deserialize<'de> for ViewArguments {
                     "directed view requires at least one position",
                 ));
             }
-            (ViewMode::Directed, Some(positions))
-                if positions.len() > MAX_DIRECTED_VIEW_POSITIONS =>
-            {
-                return Err(serde::de::Error::custom(format!(
-                    "directed view accepts at most {MAX_DIRECTED_VIEW_POSITIONS} positions"
-                )));
-            }
             (ViewMode::Full, None) | (ViewMode::Directed, Some(_)) => {}
+        }
+
+        if let Some(positions) = positions.as_deref() {
+            validate_directed_positions(positions).map_err(serde::de::Error::custom)?;
         }
 
         Ok(Self {
             mode: raw.mode,
             positions,
         })
+    }
+}
+
+/// Validate the same directed input boundary used by runtime adapters.
+pub fn validate_directed_positions(positions: &[ViewPosition]) -> Result<(), String> {
+    if positions.is_empty() {
+        return Err("directed view requires at least one position".to_owned());
+    }
+    if positions.len() > MAX_DIRECTED_VIEW_POSITIONS {
+        return Err(format!(
+            "directed view accepts at most {MAX_DIRECTED_VIEW_POSITIONS} positions"
+        ));
+    }
+    let mut unique = HashSet::with_capacity(positions.len());
+    if positions
+        .iter()
+        .copied()
+        .all(|position| unique.insert(position))
+    {
+        Ok(())
+    } else {
+        Err("directed view positions must not contain duplicates".to_owned())
     }
 }
 
@@ -181,6 +201,7 @@ pub fn view_parameters_schema() -> Map<String, Value> {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": MAX_DIRECTED_VIEW_POSITIONS,
+                "uniqueItems": true,
                 "items": {
                     "description": "一个 Minecraft 方块体素坐标 [x, y, z]；每个分量都是 i32 范围内的整数。",
                     "type": "array",
@@ -197,6 +218,140 @@ pub fn view_parameters_schema() -> Map<String, Value> {
         "required": ["mode"],
         "additionalProperties": false
     }))
+}
+
+/// Strict model-visible wire description for the frozen directed result.
+///
+/// The conditional clauses mirror `DirectedUnseenBlock::validate`: the schema accepts
+/// optional combinations of reasons but keeps conditional fields attached to their reason.
+pub fn directed_view_result_schema() -> Map<String, Value> {
+    let block_info = block_info_schema();
+    let why = directed_why_schema();
+    let mut value = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["seen", "unseen"],
+        "additionalProperties": false,
+        "properties": {
+            "seen": {
+                "type": "array",
+                "maxItems": MAX_DIRECTED_VIEW_POSITIONS,
+                "items": {
+                    "type": "object",
+                    "required": ["at", "block"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "at": position_schema(),
+                        "block": block_info
+                    }
+                }
+            },
+            "unseen": {
+                "type": "array",
+                "maxItems": MAX_DIRECTED_VIEW_POSITIONS,
+                "items": {
+                    "type": "object",
+                    "required": ["at", "why"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "at": position_schema(),
+                        "why": why,
+                        "distance": {"type": "number"},
+                        "max": {"type": "number"},
+                        "by": {
+                            "type": "object",
+                            "required": ["at", "block"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "at": position_schema(),
+                                "block": block_info
+                            }
+                        }
+                    },
+                    "allOf": [
+                        {
+                            "if": {"properties": {"why": {"contains": {"const": "too_far"}}}},
+                            "then": {"required": ["distance", "max"]},
+                            "else": {"not": {"anyOf": [{"required": ["distance"]}, {"required": ["max"]}]}}
+                        },
+                        {
+                            "if": {"properties": {"why": {"contains": {"const": "occluded"}}}},
+                            "then": {},
+                            "else": {"not": {"required": ["by"]}}
+                        }
+                    ]
+                }
+            }
+        }
+    });
+    value["properties"]["seen"]["items"]["properties"]["block"] = block_info_schema();
+    value["properties"]["unseen"]["items"]["properties"]["by"]["properties"]["block"] =
+        block_info_schema();
+    object(value)
+}
+
+fn position_schema() -> Value {
+    json!({
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 3,
+        "items": {
+            "type": "integer",
+            "minimum": i32::MIN,
+            "maximum": i32::MAX
+        }
+    })
+}
+
+fn directed_why_schema() -> Value {
+    let reasons = ["outside_fov", "too_far", "occluded", "chunk_not_loaded"];
+    let canonical_choices = (1u8..(1u8 << reasons.len()))
+        .map(|mask| {
+            let why = reasons
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| mask & (1u8 << index) != 0)
+                .map(|(_, reason)| Value::String((*reason).to_owned()))
+                .collect::<Vec<_>>();
+            json!({"const": why})
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "description": "why uses the closed reason set in canonical order: outside_fov, too_far, occluded, chunk_not_loaded; any non-empty subset is allowed",
+        "type": "array",
+        "minItems": 1,
+        "maxItems": reasons.len(),
+        "uniqueItems": true,
+        "items": {
+            "type": "string",
+            "enum": reasons
+        },
+        "oneOf": canonical_choices
+    })
+}
+
+fn block_info_schema() -> Value {
+    let mut properties = Map::new();
+    properties.insert("name".to_owned(), json!({"type": "string", "minLength": 1}));
+    for property in INITIAL_VISIBLE_BLOCK_PROPERTY_NAMES {
+        properties.insert(
+            (*property).to_owned(),
+            json!({"type": ["string", "boolean", "integer", "number"]}),
+        );
+    }
+    json!({
+        "description": "无视觉属性时为方块名称字符串；有属性时为 name 加全部白名单属性的扁平对象。",
+        "oneOf": [
+            {"type": "string", "minLength": 1},
+            {
+                "type": "object",
+                "required": ["name"],
+                "properties": properties,
+                "minProperties": 2,
+                "additionalProperties": false
+            }
+        ]
+    })
 }
 
 fn deserialize_optional_non_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>

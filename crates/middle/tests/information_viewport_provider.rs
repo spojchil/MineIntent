@@ -1,7 +1,7 @@
 mod information_provider_contract_support;
 
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     future::pending,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -12,11 +12,12 @@ use std::{
 use information_provider_contract_support::{read, request, ProviderFixture};
 use mineintent_contracts::minecraft::{
     BackendError, BackendEventListener, BackendFailure, BackendFailureCode, BackendReady,
-    BackendState, BlockPosition, BlockReadResult, BoxFuture, CancellationSignal, FactSource,
-    MinecraftBackendApi, MinecraftMotorDriverApi, MinecraftSnapshotV1, ObservationEventListener,
-    OperationControl, ProtocolObservationSource, SelfPose, Subscription, ViewportBlock,
-    ViewportCoordinateSystem, ViewportFrame, ViewportLegend, ViewportProjection, ViewportRead,
-    ViewportSelfPose, VisibleBlocksView, VisibleEntitiesView, VisibleEntityView,
+    BackendState, BlockInfo, BlockPosition, BlockReadResult, BoxFuture, CancellationSignal,
+    DirectedViewportError, DirectedViewportProjection, FactSource, MinecraftBackendApi,
+    MinecraftMotorDriverApi, MinecraftSnapshotV1, ObservationEventListener, OperationControl,
+    ProtocolObservationSource, SelfPose, Subscription, ViewportBlock, ViewportCoordinateSystem,
+    ViewportFrame, ViewportLegend, ViewportProjection, ViewportRead, ViewportSelfPose,
+    VisibleBlocksView, VisibleEntitiesView, VisibleEntityView,
 };
 use mineintent_middle::information::{
     contracts::{
@@ -172,6 +173,19 @@ impl ProtocolObservationSource for FakeObservationSource {
             result
         })
     }
+
+    fn read_directed_viewport(
+        &self,
+        _positions: Vec<BlockPosition>,
+        _control: OperationControl,
+    ) -> BoxFuture<'_, Result<DirectedViewportProjection, DirectedViewportError>> {
+        self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Err(DirectedViewportError::Backend(test_backend_error(
+                "directed viewport was called",
+            )))
+        })
+    }
 }
 
 struct FakeBackend {
@@ -294,16 +308,16 @@ fn complete_projection(marker: &str) -> ViewportProjection {
                     "items 每项为 {type, player?, position}：type 是原版实体类型（玩家为 player），player 只有玩家才有，position 是 Minecraft 世界绝对坐标。按距离从近到远，truncated 为真表示更远处还有实体没列出"
                         .to_owned(),
                 visible_blocks:
-                    "[block_name, x, y, z]，同一坐标系的整数体素，按距离从近到远，可能截断"
+                    "[BlockInfo, x, y, z]；BlockInfo 无视觉属性时为方块名称字符串，有属性时为 name 加全部白名单属性的对象；同一坐标系的整数体素，按距离从近到远，可能截断"
                         .to_owned(),
             },
         },
         standing_on_block: Some(ViewportBlock {
-            name: format!("{marker}-standing"),
+            block: BlockInfo::bare(format!("{marker}-standing")),
             position: [1.0, 63.0, -3.0],
         }),
         looked_at_block: Some(ViewportBlock {
-            name: format!("{marker}-looked"),
+            block: BlockInfo::bare(format!("{marker}-looked")),
             position: [1.0, 65.0, -5.0],
         }),
         visible_entities: VisibleEntitiesView {
@@ -323,8 +337,8 @@ fn complete_projection(marker: &str) -> ViewportProjection {
         },
         visible_blocks: VisibleBlocksView {
             blocks: vec![
-                (format!("{marker}-block"), 1, 65, -5),
-                (format!("{marker}-far"), 2, 65, -5),
+                (BlockInfo::bare(format!("{marker}-block")), 1, 65, -5),
+                (BlockInfo::bare(format!("{marker}-far")), 2, 65, -5),
             ],
             truncated: true,
         },
@@ -410,7 +424,10 @@ fn rust_contract_viewport_definition_and_runtime_schemas_match_oracle() {
     assert_eq!(frame.notes, None);
 
     let standing = &definition.fields["standingOnBlock"];
-    assert_eq!(standing.description, "脚下可见方块及其绝对体素坐标");
+    assert_eq!(
+        standing.description,
+        "脚下可见方块（BlockInfo）及其绝对体素坐标"
+    );
     assert_eq!(standing.value_type, "object");
     assert_eq!(standing.precision, InformationPrecision::Inferred);
     assert_eq!(
@@ -421,7 +438,7 @@ fn rust_contract_viewport_definition_and_runtime_schemas_match_oracle() {
     let looked = &definition.fields["lookedAtBlock"];
     assert_eq!(
         looked.description,
-        "准星射线首先命中的可见方块及其绝对体素坐标"
+        "准星射线首先命中的可见方块（BlockInfo）及其绝对体素坐标"
     );
     assert_eq!(looked.precision, InformationPrecision::Inferred);
     assert_eq!(
@@ -444,7 +461,7 @@ fn rust_contract_viewport_definition_and_runtime_schemas_match_oracle() {
     let blocks = &definition.fields["visibleBlocks"];
     assert_eq!(
         blocks.description,
-        "可见方块（朝观察者的暴露面无遮挡可达）；每项为[名称,x,y,z]整数体素，按距离从近到远，可能截断"
+        "可见方块（朝观察者的暴露面无遮挡可达）；每项为[BlockInfo,x,y,z]整数体素，BlockInfo 无视觉属性时为名称字符串，有属性时为完整白名单属性对象；按距离从近到远，可能截断"
     );
     assert_eq!(blocks.value_type, "object");
     assert_eq!(blocks.precision, InformationPrecision::Inferred);
@@ -454,18 +471,40 @@ fn rust_contract_viewport_definition_and_runtime_schemas_match_oracle() {
     );
 
     let block_value = json!({
-        "name": "stone",
+        "block": "stone",
         "position": [1, 63, -3],
         "hidden": "zod object strips this"
     });
     assert_eq!(
         standing.value_schema.parse(block_value).unwrap(),
-        json!({"name": "stone", "position": [1, 63, -3]})
+        json!({"block": "stone", "position": [1, 63, -3]})
     );
     assert_eq!(
         standing.value_schema.parse(Value::Null).unwrap(),
         Value::Null
     );
+    let rich_block = json!({
+        "block": {"name": "furnace", "facing": "north", "lit": false},
+        "position": [1, 63, -3]
+    });
+    assert_eq!(
+        standing.value_schema.parse(rich_block.clone()).unwrap(),
+        rich_block
+    );
+    assert!(standing
+        .value_schema
+        .parse(json!({
+            "block": {"name": "furnace", "facing": "north", "lit": false, "distance": 7},
+            "position": [1, 63, -3]
+        }))
+        .is_err());
+    assert!(standing
+        .value_schema
+        .parse(json!({
+            "block": {"name": "stone"},
+            "position": [1, 63, -3]
+        }))
+        .is_err());
 
     let frame_value = serde_json::to_value(&complete_projection("schema").frame).unwrap();
     assert_eq!(
@@ -524,6 +563,74 @@ fn rust_contract_viewport_definition_and_runtime_schemas_match_oracle() {
             .unwrap(),
         json!({"blocks": [["stone", 1, 63, -3]], "truncated": false})
     );
+    assert_eq!(
+        block_list
+            .value_schema
+            .parse(json!({
+                "blocks": [[
+                    {"name": "furnace", "facing": "north", "lit": false},
+                    1,
+                    63,
+                    -3
+                ]],
+                "truncated": true
+            }))
+            .unwrap(),
+        json!({
+            "blocks": [[
+                {"name": "furnace", "facing": "north", "lit": false},
+                1,
+                63,
+                -3
+            ]],
+            "truncated": true
+        })
+    );
+}
+
+#[tokio::test]
+async fn viewport_full_three_block_slots_share_one_block_info_wire() {
+    let block = BlockInfo::from_property_values(
+        "furnace",
+        BTreeMap::from([
+            (
+                "facing".to_owned(),
+                mineintent_contracts::minecraft::BlockPropertyValue::String("north".to_owned()),
+            ),
+            (
+                "lit".to_owned(),
+                mineintent_contracts::minecraft::BlockPropertyValue::Boolean(false),
+            ),
+        ]),
+    );
+    let mut projection = complete_projection("shared");
+    projection.standing_on_block = Some(ViewportBlock {
+        block: block.clone(),
+        position: [1.0, 63.0, -3.0],
+    });
+    projection.looked_at_block = Some(ViewportBlock {
+        block: block.clone(),
+        position: [1.0, 65.0, -5.0],
+    });
+    projection.visible_blocks.blocks = vec![(block, 1, 65, -5)];
+    let source = Arc::new(FakeObservationSource::new(vec![ReadPlan::success(
+        ViewportRead {
+            projection,
+            source: FactSource::ServerObserved,
+            revision: 43,
+        },
+    )]));
+    let (provider, _backend) = provider_with_sources(vec![Ok(source_arc(source))]);
+    let result = read(
+        &provider,
+        &ProviderFixture::new(),
+        request(&["standingOnBlock", "lookedAtBlock", "visibleBlocks"]),
+    )
+    .await;
+    let expected = json!({"name":"furnace","facing":"north","lit":false});
+    assert_eq!(result.values["standingOnBlock"]["block"], expected);
+    assert_eq!(result.values["lookedAtBlock"]["block"], expected);
+    assert_eq!(result.values["visibleBlocks"]["blocks"][0][0], expected);
 }
 
 #[tokio::test]
@@ -564,7 +671,7 @@ async fn viewport_provider_projects_requested_subset_from_one_atomic_read_and_pr
     assert!(result.unavailable.is_empty());
     assert!(result.evidence_ids.is_empty());
     assert_eq!(result.next_page_state, None);
-    assert_eq!(result.values["lookedAtBlock"]["name"], "subset-looked");
+    assert_eq!(result.values["lookedAtBlock"]["block"], "subset-looked");
     assert_eq!(
         result.values["visibleBlocks"]["blocks"][0][0],
         "subset-block"
@@ -658,9 +765,9 @@ async fn viewport_provider_gets_the_latest_observation_source_once_per_read() {
     )
     .await;
 
-    assert_eq!(first.values["standingOnBlock"]["name"], "first-standing");
+    assert_eq!(first.values["standingOnBlock"]["block"], "first-standing");
     assert_eq!(first.values["visibleBlocks"]["blocks"][0][0], "first-block");
-    assert_eq!(second.values["standingOnBlock"]["name"], "second-standing");
+    assert_eq!(second.values["standingOnBlock"]["block"], "second-standing");
     assert_eq!(
         second.values["visibleBlocks"]["blocks"][0][0],
         "second-block"

@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     BackendError, BackendEventEnvelope, BackendState, BlockPosition, BlockReadResult,
-    MinecraftSnapshotV1, ProtocolBlockEvent, ProtocolEntityEvent, ProtocolEntitySnapshot,
-    ProtocolSoundPayload, SelfPose, ViewportRead,
+    DirectedViewportError, DirectedViewportProjection, MinecraftSnapshotV1, ProtocolBlockEvent,
+    ProtocolEntityEvent, ProtocolEntitySnapshot, ProtocolSoundPayload, SelfPose, ViewportRead,
 };
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -129,6 +129,13 @@ pub trait ProtocolObservationSource: Send + Sync {
         &self,
         control: OperationControl,
     ) -> BoxFuture<'_, Result<ViewportRead, BackendError>>;
+    /// Directed reads share the full viewport capture/kernel. `OutOfWorld` remains a separate
+    /// internal error and must not be translated into the closed model-visible reason enum.
+    fn read_directed_viewport(
+        &self,
+        positions: Vec<BlockPosition>,
+        control: OperationControl,
+    ) -> BoxFuture<'_, Result<DirectedViewportProjection, DirectedViewportError>>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

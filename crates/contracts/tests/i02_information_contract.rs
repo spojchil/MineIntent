@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use mineintent_contracts::{information::*, minecraft::*};
 use serde_json::{json, Value};
 
@@ -31,7 +33,7 @@ fn backend_ports_read_snapshot_straight_through() {
 #[test]
 fn perception_excludes_self_and_maps_block_loading() {
     let values = fixture().plain_values.viewport;
-    assert_eq!(values.standing_on_block.unwrap().name, "stone");
+    assert_eq!(values.standing_on_block.unwrap().block.name, "stone");
     assert_eq!(values.visible_entities.items.len(), 1);
     assert_eq!(
         values.visible_entities.items[0].player.as_deref(),
@@ -89,6 +91,68 @@ fn viewport_provider_satisfies_five_field_contract() {
     assert!(projection.looked_at_block.is_some());
     assert!(!projection.visible_entities.items.is_empty());
     assert!(!projection.visible_blocks.blocks.is_empty());
+}
+
+#[test]
+fn block_info_has_one_string_or_flat_object_wire_and_typed_whitelist_columns() {
+    let raw = BTreeMap::from([
+        ("facing".to_owned(), "north".to_owned()),
+        ("lit".to_owned(), "false".to_owned()),
+        ("age".to_owned(), "7".to_owned()),
+        ("moisture".to_owned(), "0.5".to_owned()),
+        ("distance".to_owned(), "3".to_owned()),
+        ("persistent".to_owned(), "true".to_owned()),
+        ("internal_state".to_owned(), "secret".to_owned()),
+    ]);
+    let info = BlockInfo::from_raw_properties("oak_leaves", &raw);
+    assert_eq!(
+        serde_json::to_value(&info).unwrap(),
+        json!({
+            "name": "oak_leaves",
+            "age": 7,
+            "facing": "north",
+            "lit": false,
+            "moisture": 0.5
+        })
+    );
+    assert!(!info.properties.contains_key("distance"));
+    assert!(!info.properties.contains_key("persistent"));
+    assert!(!info.properties.contains_key("internal_state"));
+
+    let bare = BlockInfo::from_raw_properties("air", &BTreeMap::new());
+    assert_eq!(serde_json::to_value(&bare).unwrap(), json!("air"));
+    assert_eq!(
+        serde_json::from_value::<BlockInfo>(json!("air")).unwrap(),
+        bare
+    );
+    assert_eq!(
+        serde_json::from_value::<BlockInfo>(serde_json::to_value(&info).unwrap()).unwrap(),
+        info
+    );
+    assert!(serde_json::from_value::<BlockInfo>(json!({"name": "stone"})).is_err());
+    assert!(
+        serde_json::from_str::<BlockInfo>(r#"{"name":"stone","lit":true,"lit":false}"#).is_err()
+    );
+}
+
+#[test]
+fn block_info_presenter_registry_is_empty_by_default_and_is_a_single_hook_path() {
+    let registry = BlockInfoPresenterRegistry::default();
+    assert!(registry.is_empty());
+
+    let mut registry = registry;
+    registry.register("wheat", |_name, properties| {
+        properties.insert(
+            "age".to_owned(),
+            BlockPropertyValue::String("mature".to_owned()),
+        );
+    });
+    let raw = BTreeMap::from([("age".to_owned(), "7".to_owned())]);
+    let info = BlockInfo::from_raw_properties_with_registry("wheat", &raw, &registry);
+    assert_eq!(
+        serde_json::to_value(info).unwrap(),
+        json!({"name":"wheat","age":"mature"})
+    );
 }
 
 #[test]

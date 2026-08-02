@@ -13,10 +13,15 @@ use mineintent_contracts::{
         ToolExecution, ToolInvocation, ToolResponseProtocol, WireToolDefinition,
     },
     capability::{
-        fixtures, move_input_parameters_schema, view_parameters_schema, CapabilityExecutionContext,
+        directed_view_result_schema, fixtures, move_input_parameters_schema,
+        validate_directed_positions, view_parameters_schema, CapabilityExecutionContext,
         CapabilityInvocation, ExecutionResource, MoveDirection, MoveInputArguments, ScopeGuard,
         ToolCapability, ToolCapabilityRegistry, ToolDispatcher, ToolResultProtocol, ViewArguments,
         ViewMode, MAX_DIRECTED_VIEW_POSITIONS,
+    },
+    minecraft::{
+        BlockInfo, DirectedOccluder, DirectedSeenBlock, DirectedUnseenBlock,
+        DirectedViewportProjection, DirectedWhy,
     },
 };
 use serde::de::DeserializeOwned;
@@ -175,7 +180,9 @@ fn view_arguments_have_full_and_directed_positive_examples() {
 
     let at_limit = json!({
         "mode": "directed",
-        "positions": vec![[0, 64, 0]; MAX_DIRECTED_VIEW_POSITIONS]
+        "positions": (0..MAX_DIRECTED_VIEW_POSITIONS)
+            .map(|x| [x as i32, 64, 0])
+            .collect::<Vec<_>>()
     });
     let _: ViewArguments = serde_json::from_value(at_limit).expect("initial batch limit is valid");
 }
@@ -236,6 +243,7 @@ fn view_arguments_reject_missing_null_unknown_cross_field_and_bad_positions() {
         json!({"mode": "directed", "positions": [[0, 64, "0"]]}),
         json!({"mode": "directed", "positions": [[0, 64, null]]}),
         json!({"mode": "directed", "positions": [null]}),
+        json!({"mode": "directed", "positions": [[0, 64, 0], [0, 64, 0]]}),
         json!({
             "mode": "directed",
             "positions": [[2147483648u64, 64u64, 0u64]]
@@ -271,6 +279,127 @@ fn view_arguments_reject_missing_null_unknown_cross_field_and_bad_positions() {
         "mineintent.tool-result.v1"
     );
     assert_rejected::<ToolResultProtocol>(json!("mineintent.tool-result.v0"));
+}
+
+#[test]
+fn directed_wire_is_strict_reasoned_and_does_not_leak_unseen_target_block() {
+    let projection = DirectedViewportProjection {
+        seen: vec![DirectedSeenBlock {
+            at: [0, 64, 0],
+            block: BlockInfo::bare("air"),
+        }],
+        unseen: vec![
+            DirectedUnseenBlock {
+                at: [1, 64, 0],
+                why: vec![DirectedWhy::OutsideFov, DirectedWhy::TooFar],
+                distance: Some(47.2),
+                max: Some(32.0),
+                by: None,
+            },
+            DirectedUnseenBlock {
+                at: [2, 64, 0],
+                why: vec![DirectedWhy::Occluded],
+                distance: None,
+                max: None,
+                by: Some(DirectedOccluder {
+                    at: [2, 64, -1],
+                    block: BlockInfo::bare("stone"),
+                }),
+            },
+        ],
+    };
+    let wire = serde_json::to_value(&projection).unwrap();
+    assert_eq!(wire["seen"][0]["block"], "air");
+    assert_eq!(wire["unseen"][0]["why"], json!(["outside_fov", "too_far"]));
+    assert_eq!(wire["unseen"][0]["distance"], 47.2);
+    assert_eq!(wire["unseen"][0]["max"], 32.0);
+    assert!(wire["unseen"][0].get("by").is_none());
+    assert_eq!(wire["unseen"][1]["by"]["block"], "stone");
+    assert!(wire["unseen"][1].get("block").is_none());
+
+    let invalid_reason = json!({
+        "seen": [],
+        "unseen": [{"at":[0,64,0],"why":["secret_reason"]}]
+    });
+    assert_rejected::<DirectedViewportProjection>(invalid_reason);
+    let invalid_distance = json!({
+        "seen": [],
+        "unseen": [{"at":[0,64,0],"why":["occluded"],"distance":2,"max":1}]
+    });
+    assert_rejected::<DirectedViewportProjection>(invalid_distance);
+    let invalid_by = json!({
+        "seen": [],
+        "unseen": [{"at":[0,64,0],"why":["outside_fov"],"by":{"at":[0,64,-1],"block":"stone"}}]
+    });
+    assert_rejected::<DirectedViewportProjection>(invalid_by);
+    let invalid_empty_block = json!({
+        "seen": [{"at":[0,64,0],"block":{"name":"stone"}}],
+        "unseen": []
+    });
+    assert_rejected::<DirectedViewportProjection>(invalid_empty_block);
+}
+
+#[test]
+fn directed_input_validation_and_output_schema_share_closed_limits() {
+    assert!(validate_directed_positions(&[(0, 64, 0); MAX_DIRECTED_VIEW_POSITIONS]).is_err());
+    assert!(validate_directed_positions(&[]).is_err());
+    assert!(validate_directed_positions(
+        &(0..MAX_DIRECTED_VIEW_POSITIONS)
+            .map(|x| (x as i32, 64, 0))
+            .collect::<Vec<_>>()
+    )
+    .is_ok());
+
+    let schema = Value::Object(directed_view_result_schema());
+    assert_eq!(schema["required"], json!(["seen", "unseen"]));
+    assert_eq!(
+        schema["properties"]["unseen"]["items"]["properties"]["why"]["items"]["enum"],
+        json!(["outside_fov", "too_far", "occluded", "chunk_not_loaded"])
+    );
+    let why_choices = schema["properties"]["unseen"]["items"]["properties"]["why"]["oneOf"]
+        .as_array()
+        .expect("directed why schema choices");
+    assert!(why_choices
+        .iter()
+        .any(|choice| choice["const"] == json!(["outside_fov", "occluded"])));
+    assert!(!why_choices
+        .iter()
+        .any(|choice| choice["const"] == json!(["occluded", "outside_fov"])));
+    assert_eq!(
+        schema["properties"]["unseen"]["items"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        schema["properties"]["seen"]["maxItems"],
+        MAX_DIRECTED_VIEW_POSITIONS
+    );
+    assert_eq!(
+        schema["properties"]["unseen"]["maxItems"],
+        MAX_DIRECTED_VIEW_POSITIONS
+    );
+    assert_eq!(
+        schema["properties"]["seen"]["items"]["properties"]["block"]["oneOf"][1]["minProperties"],
+        2
+    );
+    let too_many = json!({
+        "seen": (0..=MAX_DIRECTED_VIEW_POSITIONS)
+            .map(|x| json!({"at":[x as i32,64,0],"block":"air"}))
+            .collect::<Vec<_>>(),
+        "unseen": []
+    });
+    assert_rejected::<DirectedViewportProjection>(too_many);
+
+    // Each side remains below its individual schema max; only the combined DTO budget is
+    // exceeded. This prevents a per-array-only validation from replacing the frozen total 16.
+    let split_too_many = json!({
+        "seen": (0..8)
+            .map(|x| json!({"at":[x,64,0],"block":"air"}))
+            .collect::<Vec<_>>(),
+        "unseen": (8..=16)
+            .map(|x| json!({"at":[x,64,0],"why":["outside_fov"]}))
+            .collect::<Vec<_>>()
+    });
+    assert_rejected::<DirectedViewportProjection>(split_too_many);
 }
 
 #[test]
