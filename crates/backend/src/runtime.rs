@@ -26,6 +26,7 @@ use azalea::{
     swarm::{DefaultSwarmPlugins, Swarm, SwarmBuilder, SwarmEvent},
     Client, DefaultPlugins, Event, SprintDirection, WalkDirection,
 };
+use mineintent_contracts::minecraft::BackendError;
 use serde_json::json;
 use tokio::sync::{mpsc, Notify};
 
@@ -143,6 +144,12 @@ impl EventWriter {
     }
 }
 
+struct ObservationSubscriber {
+    id: u64,
+    epoch: u64,
+    sender: mpsc::UnboundedSender<BackendEventEnvelope>,
+}
+
 struct SharedRuntime {
     writer: parking_lot::Mutex<EventWriter>,
     swarm: parking_lot::Mutex<Option<Swarm>>,
@@ -150,6 +157,8 @@ struct SharedRuntime {
     config: RunConfig,
     commands: parking_lot::Mutex<VecDeque<BackendCommandEnvelope>>,
     subscribers: parking_lot::Mutex<Vec<mpsc::UnboundedSender<BackendEventEnvelope>>>,
+    observation_subscribers: parking_lot::Mutex<Vec<ObservationSubscriber>>,
+    next_observation_subscription_id: AtomicU64,
     world: parking_lot::Mutex<Option<Arc<parking_lot::RwLock<azalea::world::World>>>>,
     reported_dimension: parking_lot::Mutex<Option<String>>,
     snapshot: parking_lot::Mutex<Option<MinecraftSnapshotV1>>,
@@ -181,6 +190,8 @@ impl SharedRuntime {
             config,
             commands: parking_lot::Mutex::new(VecDeque::new()),
             subscribers: parking_lot::Mutex::new(Vec::new()),
+            observation_subscribers: parking_lot::Mutex::new(Vec::new()),
+            next_observation_subscription_id: AtomicU64::new(0),
             world: parking_lot::Mutex::new(None),
             reported_dimension: parking_lot::Mutex::new(None),
             snapshot: parking_lot::Mutex::new(None),
@@ -210,8 +221,27 @@ impl SharedRuntime {
         }
         let mut writer = self.writer.lock();
         let event = writer.emit(kind, source, payload);
+        self.broadcast_event(event);
+    }
+
+    fn broadcast_event(&self, event: BackendEventEnvelope) {
         let mut subscribers = self.subscribers.lock();
         subscribers.retain(|subscriber| subscriber.send(event.clone()).is_ok());
+
+        let observation_kind = matches!(
+            event.kind,
+            BackendEventKind::Entity | BackendEventKind::Block | BackendEventKind::Sound
+        );
+        let mut observation_subscribers = self.observation_subscribers.lock();
+        observation_subscribers.retain(|subscriber| {
+            if subscriber.sender.is_closed() {
+                return false;
+            }
+            if !observation_kind || subscriber.epoch != event.connection_epoch {
+                return true;
+            }
+            subscriber.sender.send(event.clone()).is_ok()
+        });
     }
 
     /// 在发起网络连接前分配身份，并保证该身份下的第一条生命周期事件就是
@@ -237,8 +267,7 @@ impl SharedRuntime {
                 "port":self.config.port
             }),
         );
-        let mut subscribers = self.subscribers.lock();
-        subscribers.retain(|subscriber| subscriber.send(event.clone()).is_ok());
+        self.broadcast_event(event);
     }
 
     /// `Event::Init` 消费连接发起前预留的身份，而不是再创建一个 epoch。
@@ -282,6 +311,27 @@ impl SharedRuntime {
 
     fn connection_epoch(&self) -> u64 {
         self.writer.lock().connection_epoch
+    }
+
+    fn add_observation_subscription(
+        &self,
+        epoch: u64,
+    ) -> (u64, mpsc::UnboundedReceiver<BackendEventEnvelope>) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let id = self
+            .next_observation_subscription_id
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
+        self.observation_subscribers
+            .lock()
+            .push(ObservationSubscriber { id, epoch, sender });
+        (id, receiver)
+    }
+
+    fn remove_observation_subscription(&self, id: u64) {
+        self.observation_subscribers
+            .lock()
+            .retain(|subscriber| subscriber.id != id);
     }
 
     fn set_swarm(&self, swarm: Swarm) {
@@ -450,6 +500,7 @@ impl RuntimeHandle {
     pub fn observation_source(&self) -> RuntimeObservationSource {
         RuntimeObservationSource {
             shared: self.shared.clone(),
+            bound_epoch: self.shared.connection_epoch(),
         }
     }
 
@@ -565,19 +616,84 @@ fn validate_command(command: &BackendCommand) -> Result<(), String> {
     Ok(())
 }
 
-/// 对齐 MineIntent `ProtocolObservationSource` 的只读最小观察面。
+/// 一个 observation source 的 owned receiver。
+///
+/// 不启动后台转发任务：事件由 `SharedRuntime::broadcast_event` 同步筛选并
+/// 直接写入 channel。显式 unsubscribe 与 Drop 都从 registry 移除 sender，
+/// 因而 receiver 生命周期不会把订阅永久留在共享 runtime 中。
+pub struct RuntimeObservationSubscription {
+    shared: Arc<SharedRuntime>,
+    id: u64,
+    receiver: mpsc::UnboundedReceiver<BackendEventEnvelope>,
+    closed: bool,
+}
+
+impl RuntimeObservationSubscription {
+    pub async fn recv(&mut self) -> Option<BackendEventEnvelope> {
+        if self.closed {
+            return None;
+        }
+        self.receiver.recv().await
+    }
+
+    pub fn try_recv(&mut self) -> Result<BackendEventEnvelope, mpsc::error::TryRecvError> {
+        if self.closed {
+            return Err(mpsc::error::TryRecvError::Disconnected);
+        }
+        self.receiver.try_recv()
+    }
+
+    pub fn unsubscribe(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        self.shared.remove_observation_subscription(self.id);
+        self.receiver.close();
+        while self.receiver.try_recv().is_ok() {}
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed || self.receiver.is_closed()
+    }
+}
+
+impl Drop for RuntimeObservationSubscription {
+    fn drop(&mut self) {
+        self.unsubscribe();
+    }
+}
+
+/// 对齐 MineIntent `ProtocolObservationSource` 的只读 concrete observation seam。
+///
+/// `bound_epoch` 是创建 source 时捕获的值；本类型暂不实现 contracts 中包含
+/// VIEW-02 原子 `read_viewport` 的完整 trait，避免用旧 viewport 结果伪装原子读。
 #[derive(Clone)]
 pub struct RuntimeObservationSource {
     shared: Arc<SharedRuntime>,
+    bound_epoch: u64,
 }
 
 impl RuntimeObservationSource {
     pub fn epoch(&self) -> u64 {
-        self.shared.context().1
+        self.bound_epoch
     }
 
-    pub fn self_pose(&self) -> Option<PoseSnapshot> {
-        self.shared
+    fn ensure_current_epoch(&self) -> Result<(), BackendError> {
+        let current_epoch = self.shared.connection_epoch();
+        if current_epoch != self.bound_epoch {
+            return Err(BackendError::StaleEpoch {
+                bound_epoch: self.bound_epoch,
+                current_epoch,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn self_pose(&self) -> Result<Option<PoseSnapshot>, BackendError> {
+        self.ensure_current_epoch()?;
+        let pose = self
+            .shared
             .snapshot
             .lock()
             .as_ref()
@@ -587,24 +703,36 @@ impl RuntimeObservationSource {
                 yaw: snapshot.self_snapshot.yaw,
                 pitch: snapshot.self_snapshot.pitch,
                 on_ground: snapshot.self_snapshot.on_ground,
-            })
+            });
+        self.ensure_current_epoch()?;
+        Ok(pose)
     }
 
-    pub fn snapshot_source(&self) -> Option<FactSource> {
-        *self.shared.snapshot_source.lock()
+    pub fn snapshot_source(&self) -> Result<Option<FactSource>, BackendError> {
+        self.ensure_current_epoch()?;
+        let source = *self.shared.snapshot_source.lock();
+        self.ensure_current_epoch()?;
+        Ok(source)
     }
 
-    pub fn list_tracked_players(&self) -> Vec<TrackedPlayerSnapshot> {
-        self.shared
+    pub fn list_tracked_players(&self) -> Result<Vec<TrackedPlayerSnapshot>, BackendError> {
+        self.ensure_current_epoch()?;
+        let players = self
+            .shared
             .snapshot
             .lock()
             .as_ref()
             .map(|snapshot| snapshot.tracked_players.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        self.ensure_current_epoch()?;
+        Ok(players)
     }
 
-    pub fn list_tracked_entities(&self) -> Vec<ProtocolEntitySnapshot> {
-        self.shared.tracked_entities.lock().clone()
+    pub fn list_tracked_entities(&self) -> Result<Vec<ProtocolEntitySnapshot>, BackendError> {
+        self.ensure_current_epoch()?;
+        let entities = self.shared.tracked_entities.lock().clone();
+        self.ensure_current_epoch()?;
+        Ok(entities)
     }
 
     /// 对齐 MineIntent viewport 的只读投影；所有坐标仍是 Minecraft 世界绝对坐标。
@@ -614,12 +742,14 @@ impl RuntimeObservationSource {
     pub fn viewport(
         &self,
         options: &ViewportOptions,
-    ) -> Result<Option<ViewportProjection>, String> {
-        let Some(pose) = self.self_pose() else {
+    ) -> Result<Option<ViewportProjection>, BackendError> {
+        self.ensure_current_epoch()?;
+        let Some(pose) = self.self_pose()? else {
             return Ok(None);
         };
-        let entities = self.list_tracked_entities();
+        let entities = self.list_tracked_entities()?;
         let Some(world) = self.shared.world.lock().clone() else {
+            self.ensure_current_epoch()?;
             return Ok(None);
         };
         // 一次投影只读一个世界视图，避免候选扫描的每次体素访问都重新获取
@@ -632,24 +762,55 @@ impl RuntimeObservationSource {
             options,
         )
         .map(Some)
+        .map_err(|message| BackendError::InvalidCommand {
+            field: "viewport".to_owned(),
+            message,
+        })
+        .and_then(|projection| {
+            self.ensure_current_epoch()?;
+            Ok(projection)
+        })
     }
 
     /// 读取已加载世界中的绝对方块状态；结果不等于视线可见性。
     ///
     /// 上层 viewport 应基于 `transparentHint`、碰撞/轮廓几何和观察者姿态
     /// 做射线或暴露面判断，避免把“客户端缓存里有数据”误报成“玩家看到了”。
-    pub fn read_block(&self, position: BlockPosition) -> BlockReadResult {
-        let Some(world) = self.shared.world.lock().clone() else {
-            return BlockReadResult::Unloaded;
-        };
-        let world = world.read();
-        read_block_from_world(&world, position)
+    pub fn read_block(&self, position: BlockPosition) -> Result<BlockReadResult, BackendError> {
+        self.read_block_with_post_read_hook(position, || {})
     }
 
-    pub fn subscribe(&self) -> mpsc::UnboundedReceiver<BackendEventEnvelope> {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        self.shared.subscribers.lock().push(sender);
-        receiver
+    fn read_block_with_post_read_hook(
+        &self,
+        position: BlockPosition,
+        after_read: impl FnOnce(),
+    ) -> Result<BlockReadResult, BackendError> {
+        self.ensure_current_epoch()?;
+        let Some(world) = self.shared.world.lock().clone() else {
+            after_read();
+            self.ensure_current_epoch()?;
+            return Ok(BlockReadResult::Unloaded);
+        };
+        let world = world.read();
+        let result = read_block_from_world(&world, position);
+        after_read();
+        self.ensure_current_epoch()?;
+        Ok(result)
+    }
+
+    pub fn subscribe(&self) -> Result<RuntimeObservationSubscription, BackendError> {
+        self.ensure_current_epoch()?;
+        let (id, receiver) = self.shared.add_observation_subscription(self.bound_epoch);
+        if let Err(error) = self.ensure_current_epoch() {
+            self.shared.remove_observation_subscription(id);
+            return Err(error);
+        }
+        Ok(RuntimeObservationSubscription {
+            shared: self.shared.clone(),
+            id,
+            receiver,
+            closed: false,
+        })
     }
 }
 
@@ -1345,6 +1506,7 @@ fn validate_run_config(config: &RunConfig) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot::{ExperienceSnapshot, InventorySnapshot, SelfSnapshot, WorldSnapshot};
 
     #[test]
     fn command_validation_matches_motor_boundary() {
@@ -1496,5 +1658,278 @@ mod tests {
         assert_eq!(changed.payload["from"], "minecraft:overworld");
         assert_eq!(changed.payload["to"], "minecraft:the_nether");
         assert_eq!(changed.dimension.as_deref(), Some("minecraft:the_nether"));
+    }
+
+    fn observation_snapshot(epoch: u64) -> MinecraftSnapshotV1 {
+        MinecraftSnapshotV1 {
+            protocol: "mineintent.minecraft.snapshot.v1".to_owned(),
+            snapshot_revision: 1,
+            lifecycle_revision: 1,
+            captured_at: now_utc(),
+            process_session_id: "test-session".to_owned(),
+            connection_epoch: epoch,
+            connection_attempt_id: format!("attempt-{epoch}"),
+            world: WorldSnapshot {
+                world_id: "test-world".to_owned(),
+                dimension: "minecraft:overworld".to_owned(),
+                minecraft_version: "26.1.2".to_owned(),
+                protocol_version: 775,
+                game_mode: "survival".to_owned(),
+                min_y: -64,
+                height: 384,
+            },
+            self_snapshot: SelfSnapshot {
+                entity_key: "self".to_owned(),
+                username: "MineIntentBot".to_owned(),
+                position: Vec3Value {
+                    x: 1.0,
+                    y: 64.0,
+                    z: 2.0,
+                },
+                velocity: Vec3Value {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                yaw: 0.25,
+                pitch: -0.1,
+                on_ground: true,
+                alive: true,
+                health: 20.0,
+                food: 20,
+                food_saturation: 5.0,
+                experience: ExperienceSnapshot {
+                    level: 0,
+                    progress: 0.0,
+                    total: 0,
+                },
+            },
+            inventory: InventorySnapshot {
+                selected_hotbar_slot: 0,
+                slots: Vec::new(),
+            },
+            tracked_players: Vec::new(),
+        }
+    }
+
+    fn observation_entity(entity_key: &str) -> ProtocolEntitySnapshot {
+        ProtocolEntitySnapshot {
+            entity_key: entity_key.to_owned(),
+            protocol_entity_id: 7,
+            entity_type: "zombie".to_owned(),
+            name: Some("zombie".to_owned()),
+            username: None,
+            uuid: None,
+            position: Vec3Value {
+                x: 3.0,
+                y: 64.0,
+                z: 4.0,
+            },
+            velocity: Vec3Value {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            yaw: 0.0,
+            pitch: 0.0,
+            head_yaw: None,
+            width: 0.6,
+            height: 1.95,
+            on_ground: true,
+            pose: None,
+            held_item_name: None,
+            equipment: Vec::new(),
+            valid: true,
+        }
+    }
+
+    fn emit_test_fact(handle: &RuntimeHandle, kind: BackendEventKind) {
+        handle.shared.emit(
+            kind,
+            FactSource::ServerObserved,
+            json!({"type":"test_fact"}),
+        );
+    }
+
+    #[test]
+    fn observation_source_binds_epoch_and_returns_structured_stale_errors() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        handle.shared.begin_connection_attempt();
+        let source = handle.observation_source();
+        assert_eq!(source.epoch(), 1);
+
+        *handle.shared.snapshot.lock() = Some(observation_snapshot(1));
+        handle
+            .shared
+            .tracked_entities
+            .lock()
+            .push(observation_entity("entity-7"));
+
+        let pose = source
+            .self_pose()
+            .expect("current source pose should not be stale")
+            .expect("fixture pose should be present");
+        assert_eq!(pose.position.x, 1.0);
+        assert_eq!(source.list_tracked_entities().unwrap().len(), 1);
+        assert!(source
+            .read_block(BlockPosition { x: 0, y: 64, z: 0 })
+            .expect("current source block read should not be stale")
+            .eq(&BlockReadResult::Unloaded));
+
+        handle.shared.begin_connection_attempt();
+        assert_eq!(source.epoch(), 1, "old source must keep its bound epoch");
+        let stale = BackendError::StaleEpoch {
+            bound_epoch: 1,
+            current_epoch: 2,
+        };
+        let stale_wire = serde_json::to_value(&stale).expect("stale error should be structured");
+        assert_eq!(stale_wire["code"], "stale_epoch");
+        assert_eq!(stale_wire["boundEpoch"], 1);
+        assert_eq!(stale_wire["currentEpoch"], 2);
+        assert_eq!(source.self_pose(), Err(stale.clone()));
+        assert_eq!(source.list_tracked_players(), Err(stale.clone()));
+        assert_eq!(source.list_tracked_entities(), Err(stale.clone()));
+        assert_eq!(
+            source.read_block(BlockPosition { x: 0, y: 64, z: 0 }),
+            Err(stale.clone())
+        );
+        assert_eq!(source.snapshot_source(), Err(stale));
+        assert!(matches!(
+            source.subscribe(),
+            Err(BackendError::StaleEpoch {
+                bound_epoch: 1,
+                current_epoch: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn read_block_unloaded_early_return_rechecks_epoch() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        handle.shared.begin_connection_attempt();
+        let source = handle.observation_source();
+
+        let result = source
+            .read_block_with_post_read_hook(BlockPosition { x: 0, y: 64, z: 0 }, || {
+                handle.shared.begin_connection_attempt()
+            });
+        assert_eq!(
+            result,
+            Err(BackendError::StaleEpoch {
+                bound_epoch: 1,
+                current_epoch: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn observation_subscription_filters_kind_and_epoch_without_background_tasks() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        handle.shared.begin_connection_attempt();
+        let source = handle.observation_source();
+        let mut old_subscription = source.subscribe().expect("current source subscribes");
+        assert_eq!(handle.shared.observation_subscribers.lock().len(), 1);
+
+        for kind in [
+            BackendEventKind::Entity,
+            BackendEventKind::Block,
+            BackendEventKind::Sound,
+        ] {
+            emit_test_fact(&handle, kind);
+        }
+        for kind in [
+            BackendEventKind::Lifecycle,
+            BackendEventKind::KeepAlive,
+            BackendEventKind::Chat,
+            BackendEventKind::SelfState,
+            BackendEventKind::World,
+            BackendEventKind::PlayerList,
+            BackendEventKind::SnapshotChanged,
+            BackendEventKind::Motor,
+            BackendEventKind::Error,
+        ] {
+            emit_test_fact(&handle, kind);
+        }
+
+        for expected_kind in [
+            BackendEventKind::Entity,
+            BackendEventKind::Block,
+            BackendEventKind::Sound,
+        ] {
+            assert_eq!(
+                old_subscription
+                    .try_recv()
+                    .expect("observation fact should be delivered")
+                    .kind,
+                expected_kind
+            );
+        }
+        assert!(matches!(
+            old_subscription.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        handle.shared.begin_connection_attempt();
+        emit_test_fact(&handle, BackendEventKind::Entity);
+        assert!(matches!(
+            old_subscription.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let new_source = handle.observation_source();
+        let mut new_subscription = new_source.subscribe().expect("new source subscribes");
+        emit_test_fact(&handle, BackendEventKind::Block);
+        assert!(matches!(
+            old_subscription.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            new_subscription
+                .try_recv()
+                .expect("new epoch fact should be delivered")
+                .connection_epoch,
+            2
+        );
+    }
+
+    #[test]
+    fn observation_subscription_unsubscribe_and_drop_release_owned_sender() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        handle.shared.begin_connection_attempt();
+        let source = handle.observation_source();
+
+        let mut unsubscribed = source.subscribe().expect("current source subscribes");
+        assert_eq!(handle.shared.observation_subscribers.lock().len(), 1);
+        unsubscribed.unsubscribe();
+        assert!(unsubscribed.is_closed());
+        assert_eq!(handle.shared.observation_subscribers.lock().len(), 0);
+        emit_test_fact(&handle, BackendEventKind::Entity);
+        assert!(matches!(
+            unsubscribed.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+
+        let dropped = source.subscribe().expect("second subscription");
+        assert_eq!(handle.shared.observation_subscribers.lock().len(), 1);
+        drop(dropped);
+        assert_eq!(handle.shared.observation_subscribers.lock().len(), 0);
+        emit_test_fact(&handle, BackendEventKind::Sound);
+    }
+
+    #[tokio::test]
+    async fn observation_subscription_unsubscribe_discards_queued_events() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        handle.shared.begin_connection_attempt();
+        let source = handle.observation_source();
+        let mut subscription = source.subscribe().expect("current source subscribes");
+
+        emit_test_fact(&handle, BackendEventKind::Entity);
+        subscription.unsubscribe();
+
+        assert!(matches!(
+            subscription.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        assert!(subscription.recv().await.is_none());
     }
 }
