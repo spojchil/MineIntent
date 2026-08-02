@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::AgentError;
+use super::{AgentError, AgentErrorCode};
 
 pub trait CancellationSignal: Send + Sync {
     /// Returns the cancellation state without waiting.
@@ -28,8 +28,10 @@ impl Deadline {
         Self { expires_at }
     }
 
-    pub fn after(now: Instant, duration: Duration) -> Self {
-        Self::at(now + duration)
+    pub fn after(now: Instant, duration: Duration) -> Result<Self, AgentError> {
+        now.checked_add(duration)
+            .map(Self::at)
+            .ok_or_else(|| AgentError::new(AgentErrorCode::InvalidRequest, "deadline_out_of_range"))
     }
 
     pub fn expires_at(self) -> Instant {

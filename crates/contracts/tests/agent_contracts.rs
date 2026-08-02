@@ -10,7 +10,7 @@ use mineintent_contracts::agent::{
     fixtures, AgentContextProtocol, AgentError, AgentErrorCode, AgentRunRequest, AgentRunner,
     CancellationSignal, ContractFuture, Deadline, ExecutionControl, JsonAgentDecisionContext,
     ModelProvider, ModelRunResult, ModelUsage, RequiredNullable, ToolCallKey, ToolDefinitionName,
-    ToolExecution, ToolInvocation, ToolName, WireToolDefinition,
+    ToolExecution, ToolInvocation, ToolName, WireToolDefinition, MAX_AGENT_RUN_TOOLS,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -269,6 +269,34 @@ fn run_request_uses_external_prompt_reference_and_excludes_transport_configurati
 }
 
 #[test]
+fn run_request_tool_limit_is_shared_by_validation_and_both_serde_directions() {
+    let mut request = fixtures::agent_run_request();
+    request.tools = vec![fixtures::tool_definition(); MAX_AGENT_RUN_TOOLS];
+    assert!(request.validate().is_ok());
+
+    let encoded = serde_json::to_value(&request).expect("32-tool request serializes");
+    let decoded: AgentRunRequest<JsonAgentDecisionContext> =
+        serde_json::from_value(encoded.clone()).expect("32-tool request deserializes");
+    assert_eq!(
+        serde_json::to_value(decoded).expect("32-tool request round trips"),
+        encoded
+    );
+
+    let mut too_many = request;
+    too_many.tools.push(fixtures::tool_definition());
+    let error = too_many
+        .validate()
+        .expect_err("33 tools exceed the run limit");
+    assert_eq!(error.code, AgentErrorCode::LimitExceeded);
+    assert_eq!(error.summary, "agent_run_tool_limit_exceeded");
+    assert!(serde_json::to_value(&too_many).is_err());
+
+    let mut too_many_wire = encoded;
+    too_many_wire["tools"] = Value::Array(vec![fixture_value(TOOL_DEFINITION); 33]);
+    assert_rejected::<AgentRunRequest<JsonAgentDecisionContext>>(too_many_wire);
+}
+
+#[test]
 fn python_test_config_requires_an_independent_service_token_maps_to_strict_contract_rejection() {
     for legacy in ["serviceToken", "modelApiKey"] {
         assert_legacy_agent_run_field_rejected(legacy);
@@ -341,7 +369,8 @@ fn model_result_usage_and_structured_errors_are_versioned_and_strict() {
 #[test]
 fn cancellation_precedes_deadline_and_deadline_is_deterministic() {
     let now = Instant::now();
-    let deadline = Deadline::after(now, Duration::from_millis(10));
+    let deadline =
+        Deadline::after(now, Duration::from_millis(10)).expect("short deadline is representable");
     let active = FixedCancellation(None);
     let active_control = ExecutionControl::new(&active, deadline);
     assert_eq!(
@@ -379,7 +408,10 @@ fn cancellation_precedes_deadline_and_deadline_is_deterministic() {
 fn public_agent_traits_are_object_safe_with_bound_associated_types() {
     let now = Instant::now();
     let active = FixedCancellation(None);
-    let control = ExecutionControl::new(&active, Deadline::after(now, Duration::from_secs(1)));
+    let control = ExecutionControl::new(
+        &active,
+        Deadline::after(now, Duration::from_secs(1)).expect("one-second deadline is representable"),
+    );
 
     let runner_impl = StubAgentRunner;
     let runner: &dyn AgentRunner<Context = JsonAgentDecisionContext> = &runner_impl;
@@ -399,6 +431,14 @@ fn model_usage_defaults_to_absent_counters_without_accepting_null() {
     let usage: ModelUsage = serde_json::from_value(json!({})).expect("empty usage is valid");
     assert_eq!(usage, ModelUsage::default());
     assert_rejected::<ModelUsage>(json!({"cacheReadTokens": null}));
+}
+
+#[test]
+fn deadline_rejects_an_unrepresentable_duration_as_a_structured_request_error() {
+    let error = Deadline::after(Instant::now(), Duration::MAX)
+        .expect_err("Duration::MAX must not panic or create an invalid deadline");
+    assert_eq!(error.code, AgentErrorCode::InvalidRequest);
+    assert_eq!(error.summary, "deadline_out_of_range");
 }
 
 struct FixedCancellation(Option<AgentError>);

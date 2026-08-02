@@ -225,7 +225,11 @@ fn capability_context_checks_cancellation_deadline_then_scope() {
     let context = CapabilityExecutionContext::new(
         "world-1",
         "chat-1",
-        ExecutionControl::new(&active, Deadline::after(now, Duration::from_secs(1))),
+        ExecutionControl::new(
+            &active,
+            Deadline::after(now, Duration::from_secs(1))
+                .expect("one-second deadline is representable"),
+        ),
         &invalid_scope,
     );
     assert_eq!(
@@ -237,7 +241,11 @@ fn capability_context_checks_cancellation_deadline_then_scope() {
     let context = CapabilityExecutionContext::new(
         "world-1",
         "chat-1",
-        ExecutionControl::new(&active, Deadline::after(now, Duration::from_secs(1))),
+        ExecutionControl::new(
+            &active,
+            Deadline::after(now, Duration::from_secs(1))
+                .expect("one-second deadline is representable"),
+        ),
         &current_scope,
     );
     assert!(context.check_at(now).is_ok());
@@ -251,7 +259,10 @@ fn in_process_capability_and_dispatch_traits_need_no_transport_fields() {
     let now = Instant::now();
     let active = FixedCancellation(None);
     let current_scope = FixedScope(true);
-    let control = ExecutionControl::new(&active, Deadline::after(now, Duration::from_secs(1)));
+    let control = ExecutionControl::new(
+        &active,
+        Deadline::after(now, Duration::from_secs(1)).expect("one-second deadline is representable"),
+    );
     let context = CapabilityExecutionContext::new("world", "chat", control, &current_scope);
 
     let capability = stub_capability("echo", None);
