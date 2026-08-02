@@ -183,6 +183,9 @@ async fn driver_reuses_one_deadline_and_dispatches_every_call_sequentially() {
 
     let requests = driver.model().requests.lock().expect("requests lock");
     assert_eq!(requests.len(), 2);
+    assert!(requests
+        .iter()
+        .all(|request| request.run_id.as_str() == "driver-run"));
     assert_eq!(requests[0].tools, [fixtures::tool_definition()]);
     let replay = &requests[1].messages;
     assert_eq!(replay[replay.len() - 2]["tool_call_id"], "one");

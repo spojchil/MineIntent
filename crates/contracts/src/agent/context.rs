@@ -1,7 +1,91 @@
-use serde::{ser::Error as _, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{de::Error as _, ser::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use super::tool::AgentContextProtocol;
+
+/// The v3 discriminator is part of the context type, rather than an independent
+/// value that can be paired with an arbitrary stable shape.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AgentContextProtocolV3;
+
+impl AgentContextProtocolV3 {
+    pub const WIRE: &'static str = "mineintent.agent-context.v3";
+}
+
+impl Serialize for AgentContextProtocolV3 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(Self::WIRE)
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentContextProtocolV3 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        (value == Self::WIRE)
+            .then_some(Self)
+            .ok_or_else(|| D::Error::custom("expected mineintent.agent-context.v3"))
+    }
+}
+
+impl PartialEq<AgentContextProtocol> for AgentContextProtocolV3 {
+    fn eq(&self, other: &AgentContextProtocol) -> bool {
+        matches!(other, AgentContextProtocol::V3)
+    }
+}
+
+impl PartialEq<AgentContextProtocolV3> for AgentContextProtocol {
+    fn eq(&self, other: &AgentContextProtocolV3) -> bool {
+        other == self
+    }
+}
+
+/// The v4 discriminator is bound to [`StableContextV4`] by
+/// [`AgentDecisionContextV4`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AgentContextProtocolV4;
+
+impl AgentContextProtocolV4 {
+    pub const WIRE: &'static str = "mineintent.agent-context.v4";
+}
+
+impl Serialize for AgentContextProtocolV4 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(Self::WIRE)
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentContextProtocolV4 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        (value == Self::WIRE)
+            .then_some(Self)
+            .ok_or_else(|| D::Error::custom("expected mineintent.agent-context.v4"))
+    }
+}
+
+impl PartialEq<AgentContextProtocol> for AgentContextProtocolV4 {
+    fn eq(&self, other: &AgentContextProtocol) -> bool {
+        matches!(other, AgentContextProtocol::V4)
+    }
+}
+
+impl PartialEq<AgentContextProtocolV4> for AgentContextProtocol {
+    fn eq(&self, other: &AgentContextProtocolV4) -> bool {
+        other == self
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -98,8 +182,17 @@ pub type JsonAgentFrame = AgentFrame<Value, Value, Value, Value>;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct StableContext<Memories = Value> {
+pub struct StableContextV3<Memories = Value> {
     pub memories: Memories,
+}
+
+/// The v4 stable section is one complete memory document.  Keeping this as a
+/// separate type prevents a generic v3 envelope from being re-used with the
+/// v4 `memory` field (and vice versa).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct StableContextV4 {
+    pub memory: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -111,19 +204,53 @@ pub struct StableContext<Memories = Value> {
     deny_unknown_fields,
     rename_all = "camelCase"
 )]
-pub struct AgentDecisionContext<
+pub struct AgentDecisionContextV3<
     Memories = Value,
     Status = Value,
     Inventory = Value,
     Sound = Value,
     Omission = Value,
 > {
-    pub protocol: AgentContextProtocol,
-    pub stable: StableContext<Memories>,
+    pub protocol: AgentContextProtocolV3,
+    pub stable: StableContextV3<Memories>,
     pub frame: AgentFrame<Status, Inventory, Sound, Omission>,
 }
 
-pub type JsonAgentDecisionContext = AgentDecisionContext<Value, Value, Value, Value, Value>;
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(
+    bound(
+        deserialize = "Status: Deserialize<'de>, Inventory: Deserialize<'de>, Sound: Deserialize<'de>, Omission: Deserialize<'de>",
+        serialize = "Status: Serialize, Inventory: Serialize, Sound: Serialize, Omission: Serialize"
+    ),
+    deny_unknown_fields,
+    rename_all = "camelCase"
+)]
+pub struct AgentDecisionContextV4<
+    Status = Value,
+    Inventory = Value,
+    Sound = Value,
+    Omission = Value,
+> {
+    pub protocol: AgentContextProtocolV4,
+    pub stable: StableContextV4,
+    pub frame: AgentFrame<Status, Inventory, Sound, Omission>,
+}
+
+/// Backward-compatible public v3 name. This alias resolves only to the v3
+/// envelope; v4 remains [`AgentDecisionContextV4`] with its own stable type.
+pub type AgentDecisionContext<
+    Memories = Value,
+    Status = Value,
+    Inventory = Value,
+    Sound = Value,
+    Omission = Value,
+> = AgentDecisionContextV3<Memories, Status, Inventory, Sound, Omission>;
+
+/// Backward-compatible public v3 stable-section name.
+pub type StableContext<Memories = Value> = StableContextV3<Memories>;
+
+pub type JsonAgentDecisionContext = AgentDecisionContextV3<Value, Value, Value, Value, Value>;
+pub type JsonAgentDecisionContextV4 = AgentDecisionContextV4<Value, Value, Value, Value>;
 
 pub(super) fn deserialize_optional_non_null<'de, D, T>(
     deserializer: D,

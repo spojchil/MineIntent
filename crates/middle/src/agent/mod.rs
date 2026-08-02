@@ -4,10 +4,14 @@
 //! 调用上限、tool-call 一次性 claim 与严格的结果配对。
 
 mod driver;
+mod prompt;
 mod run;
+mod runner;
 
 pub use driver::{AgentLoopDriver, AgentLoopOutcome, AgentModelRequest};
+pub use prompt::{initial_messages, system_prompt, template_text, PromptError};
 pub use run::{
     AgentRun, AgentRunStep, AgentToolResult, ModelCompletion, PlannedToolCall,
     MAX_MODEL_REQUESTS_PER_RUN, MAX_TOOL_CALLS_PER_RESPONSE, MAX_TOOL_CALLS_PER_RUN,
 };
+pub use runner::{AgentRunnerImpl, ConcreteAgentRunner};

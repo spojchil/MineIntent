@@ -1,0 +1,23 @@
+{
+  "protocol": "mineintent.agent-context.v4",
+  "stable": {
+    "memory": "玩家怕高"
+  },
+  "frame": {
+    "at": "2026-07-25T00:00:00Z",
+    "player": {
+      "username": "Alex",
+      "text": "看看羊"
+    },
+    "world": {
+      "dimension": "overworld"
+    },
+    "self": {
+      "position": [0.0, 64.0, 0.0],
+      "yawDegrees": 0.0,
+      "pitchDegrees": 0.0
+    },
+    "events": [],
+    "omissions": []
+  }
+}
