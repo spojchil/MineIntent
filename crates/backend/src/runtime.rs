@@ -52,7 +52,7 @@ use mineintent_contracts::minecraft::{
     VisibleEntitiesView as ContractVisibleEntitiesView,
     VisibleEntityView as ContractVisibleEntityView,
 };
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{oneshot, Notify};
 
 use crate::{
     protocol::{
@@ -183,16 +183,168 @@ impl EventWriter {
     }
 }
 
-#[derive(Default)]
 struct EventDispatchState {
-    queue: VecDeque<BackendEventEnvelope>,
+    ordinary: VecDeque<RuntimeDispatchEntry>,
+    control: VecDeque<RuntimeDispatchEntry>,
+    overflow: VecDeque<RuntimeDispatchOverflow>,
+    terminal: Option<RuntimeDispatchEntry>,
+    next_sequence: u64,
+    next_admission: u64,
+    open_loss_segment: Option<u64>,
     drainer_active: bool,
 }
 
+impl Default for EventDispatchState {
+    fn default() -> Self {
+        Self {
+            ordinary: VecDeque::new(),
+            control: VecDeque::new(),
+            overflow: VecDeque::new(),
+            terminal: None,
+            next_sequence: 1,
+            next_admission: 1,
+            open_loss_segment: None,
+            drainer_active: false,
+        }
+    }
+}
+
+struct RuntimeDispatchEntry {
+    sequence: u64,
+    event: BackendEventEnvelope,
+}
+
+struct RuntimeDispatchOverflow {
+    sequence: u64,
+    template: BackendEventEnvelope,
+    dropped_count: u64,
+    dropped_kinds: Vec<BackendEventKind>,
+}
+
+struct RuntimeDispatchPending {
+    sequence: u64,
+    event: BackendEventEnvelope,
+}
+
+enum RuntimeDispatchAdmission {
+    Accepted(bool),
+    Wait,
+    Cancelled,
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeDispatchLane {
+    Ordinary,
+    Control,
+    Overflow,
+    Terminal,
+}
+
+pub(crate) const RUNTIME_DISPATCH_ORDINARY_CAPACITY: usize = 256;
+pub(crate) const RUNTIME_DISPATCH_CONTROL_CAPACITY: usize = 512;
+pub(crate) const RUNTIME_DISPATCH_OVERFLOW_CAPACITY: usize = 64;
+
 impl EventDispatchState {
-    /// Enqueue while the dispatch mutex is held and elect exactly one drainer.
-    fn enqueue(&mut self, event: BackendEventEnvelope) -> bool {
-        self.queue.push_back(event);
+    /// Admit into the finite runtime-owner queue and elect exactly one
+    /// drainer.  This is the admission immediately before the runtime broker;
+    /// it must not become an unbounded spill queue while the broker is
+    /// backpressured.  Ordinary reconstructable facts use the same contiguous
+    /// loss-segment rule as the broker.  Control facts wait only while stop has
+    /// not cancelled the producer, and stopped has a reserved terminal slot.
+    fn enqueue(
+        &mut self,
+        event: &mut Option<BackendEventEnvelope>,
+        pending: &mut Option<RuntimeDispatchPending>,
+        cancel: &AtomicBool,
+    ) -> RuntimeDispatchAdmission {
+        if pending.is_none() {
+            let event = event.take().expect("dispatch event must be supplied once");
+            let sequence = self.next_sequence;
+            self.next_sequence = self.next_sequence.wrapping_add(1);
+            *pending = Some(RuntimeDispatchPending { sequence, event });
+        }
+        let pending_sequence = pending
+            .as_ref()
+            .expect("dispatch pending event must exist")
+            .sequence;
+        if self.next_admission != pending_sequence {
+            if cancel.load(Ordering::Acquire) {
+                pending.take();
+                self.advance_admission();
+                return RuntimeDispatchAdmission::Cancelled;
+            }
+            return RuntimeDispatchAdmission::Wait;
+        }
+        let pending_event = &pending
+            .as_ref()
+            .expect("dispatch pending event must exist")
+            .event;
+        if is_runtime_terminal_event(pending_event) {
+            let pending = pending.take().expect("terminal pending event");
+            if self.terminal.is_none() {
+                self.terminal = Some(RuntimeDispatchEntry {
+                    sequence: pending.sequence,
+                    event: pending.event,
+                });
+            }
+            self.close_loss_segment();
+            self.advance_admission();
+            return RuntimeDispatchAdmission::Accepted(self.activate_drainer());
+        }
+        if is_runtime_droppable_event(pending_event) {
+            if self.ordinary.len() < RUNTIME_DISPATCH_ORDINARY_CAPACITY {
+                let pending = pending.take().expect("ordinary pending event");
+                self.ordinary.push_back(RuntimeDispatchEntry {
+                    sequence: pending.sequence,
+                    event: pending.event,
+                });
+                self.close_loss_segment();
+                self.advance_admission();
+                return RuntimeDispatchAdmission::Accepted(self.activate_drainer());
+            }
+            if self.open_loss_segment.is_some_and(|sequence| {
+                self.overflow
+                    .back()
+                    .is_some_and(|overflow| overflow.sequence == sequence)
+            }) {
+                self.record_overflow_loss(pending_event.kind);
+                pending.take();
+                self.advance_admission();
+                return RuntimeDispatchAdmission::Accepted(false);
+            }
+            if self.overflow.len() < RUNTIME_DISPATCH_OVERFLOW_CAPACITY {
+                let pending = pending.take().expect("overflow pending event");
+                let kind = pending.event.kind;
+                self.overflow.push_back(RuntimeDispatchOverflow {
+                    sequence: pending.sequence,
+                    template: pending.event,
+                    dropped_count: 1,
+                    dropped_kinds: vec![kind],
+                });
+                self.open_loss_segment = Some(pending_sequence);
+                self.advance_admission();
+                return RuntimeDispatchAdmission::Accepted(self.activate_drainer());
+            }
+        } else if self.control.len() < RUNTIME_DISPATCH_CONTROL_CAPACITY {
+            let pending = pending.take().expect("control pending event");
+            self.control.push_back(RuntimeDispatchEntry {
+                sequence: pending.sequence,
+                event: pending.event,
+            });
+            self.close_loss_segment();
+            self.advance_admission();
+            return RuntimeDispatchAdmission::Accepted(self.activate_drainer());
+        }
+        if cancel.load(Ordering::Acquire) {
+            pending.take();
+            self.advance_admission();
+            RuntimeDispatchAdmission::Cancelled
+        } else {
+            RuntimeDispatchAdmission::Wait
+        }
+    }
+
+    fn activate_drainer(&mut self) -> bool {
         if self.drainer_active {
             false
         } else {
@@ -200,6 +352,398 @@ impl EventDispatchState {
             true
         }
     }
+
+    fn advance_admission(&mut self) {
+        self.next_admission = self.next_admission.wrapping_add(1);
+    }
+
+    fn close_loss_segment(&mut self) {
+        self.open_loss_segment = None;
+    }
+
+    fn record_overflow_loss(&mut self, kind: BackendEventKind) {
+        if let Some(overflow) = self.overflow.back_mut() {
+            overflow.dropped_count = overflow.dropped_count.saturating_add(1);
+            if !overflow.dropped_kinds.contains(&kind) {
+                overflow.dropped_kinds.push(kind);
+            }
+        }
+    }
+
+    fn pop_next(&mut self) -> Option<BackendEventEnvelope> {
+        let mut candidate: Option<(u64, RuntimeDispatchLane)> = None;
+        if let Some(entry) = self.ordinary.front() {
+            candidate = Some((entry.sequence, RuntimeDispatchLane::Ordinary));
+        }
+        if let Some(entry) = self.control.front() {
+            if candidate.is_none_or(|(sequence, _)| entry.sequence < sequence) {
+                candidate = Some((entry.sequence, RuntimeDispatchLane::Control));
+            }
+        }
+        if let Some(overflow) = self.overflow.front() {
+            if candidate.is_none_or(|(sequence, _)| overflow.sequence < sequence) {
+                candidate = Some((overflow.sequence, RuntimeDispatchLane::Overflow));
+            }
+        }
+        if let Some(entry) = self.terminal.as_ref() {
+            if candidate.is_none_or(|(sequence, _)| entry.sequence < sequence) {
+                candidate = Some((entry.sequence, RuntimeDispatchLane::Terminal));
+            }
+        }
+        let (_, lane) = candidate?;
+        match lane {
+            RuntimeDispatchLane::Ordinary => self.ordinary.pop_front().map(|entry| entry.event),
+            RuntimeDispatchLane::Control => self.control.pop_front().map(|entry| entry.event),
+            RuntimeDispatchLane::Terminal => self.terminal.take().map(|entry| entry.event),
+            RuntimeDispatchLane::Overflow => {
+                let overflow = self.overflow.pop_front()?;
+                if self.open_loss_segment == Some(overflow.sequence) {
+                    self.open_loss_segment = None;
+                }
+                Some(BackendEventEnvelope::from_payload(
+                    mineintent_contracts::minecraft::BackendEventMetadata {
+                        id: format!("runtime-dispatch-overflow-{}", overflow.sequence),
+                        occurred_at: overflow.template.occurred_at,
+                        process_session_id: overflow.template.process_session_id,
+                        connection_epoch: overflow.template.connection_epoch,
+                        connection_attempt_id: overflow.template.connection_attempt_id,
+                        world_id: overflow.template.world_id,
+                        dimension: overflow.template.dimension,
+                    },
+                    overflow.template.source,
+                    BackendEventPayload::Overflow(
+                        mineintent_contracts::minecraft::BackendOverflowPayload {
+                            event_type: mineintent_contracts::minecraft::OverflowType::Overflow,
+                            dropped_count: overflow.dropped_count,
+                            dropped_kinds: overflow.dropped_kinds,
+                        },
+                    ),
+                ))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn queued_counts(&self) -> (usize, usize, usize, usize) {
+        (
+            self.ordinary.len(),
+            self.control.len(),
+            self.overflow.len(),
+            usize::from(self.terminal.is_some()),
+        )
+    }
+}
+
+const RUNTIME_BROKER_ORDINARY_CAPACITY: usize = 256;
+pub(crate) const RUNTIME_BROKER_CONTROL_CAPACITY: usize = 512;
+const RUNTIME_BROKER_OVERFLOW_CAPACITY: usize = 64;
+
+/// A finite subscriber queue between the runtime execution owner and the
+/// facade's runtime-event broker.  The old unbounded Tokio channel allowed a
+/// paused public callback to accumulate an unbounded upstream backlog.  This
+/// queue keeps the same loss-position discipline as the public bridge: only
+/// entity/block/sound facts may be dropped, control facts use bounded,
+/// cancellation-aware backpressure, and a terminal event has its own slot.
+struct RuntimeEventQueue {
+    state: parking_lot::Mutex<RuntimeEventQueueState>,
+    wake: parking_lot::Condvar,
+    notify: Notify,
+    #[cfg(test)]
+    backpressure_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+struct RuntimeEventQueueState {
+    ordinary: VecDeque<RuntimeEventEntry>,
+    control: VecDeque<RuntimeEventEntry>,
+    overflow: VecDeque<RuntimeOverflowEntry>,
+    terminal: Option<RuntimeEventEntry>,
+    next_sequence: u64,
+    next_admission: u64,
+    open_loss_segment: Option<u64>,
+}
+
+struct RuntimeEventEntry {
+    sequence: u64,
+    event: BackendEventEnvelope,
+}
+
+struct RuntimeOverflowEntry {
+    sequence: u64,
+    template: BackendEventEnvelope,
+    dropped_count: u64,
+    dropped_kinds: Vec<BackendEventKind>,
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeQueueLane {
+    Ordinary,
+    Control,
+    Overflow,
+    Terminal,
+}
+
+/// Receiver returned by `RuntimeHandle::subscribe`.  It intentionally exposes
+/// only bounded queue operations while retaining the small `recv`/`try_recv`
+/// surface used by the runtime worker and deterministic tests.
+pub struct RuntimeEventReceiver {
+    queue: Arc<RuntimeEventQueue>,
+}
+
+impl RuntimeEventQueue {
+    fn new(#[cfg(test)] backpressure_hook: Option<Arc<dyn Fn() + Send + Sync>>) -> Arc<Self> {
+        Arc::new(Self {
+            state: parking_lot::Mutex::new(RuntimeEventQueueState {
+                ordinary: VecDeque::new(),
+                control: VecDeque::new(),
+                overflow: VecDeque::new(),
+                terminal: None,
+                next_sequence: 1,
+                next_admission: 1,
+                open_loss_segment: None,
+            }),
+            wake: parking_lot::Condvar::new(),
+            notify: Notify::new(),
+            #[cfg(test)]
+            backpressure_hook: parking_lot::Mutex::new(backpressure_hook),
+        })
+    }
+
+    fn publish(&self, event: BackendEventEnvelope, cancel: &AtomicBool) -> bool {
+        let mut state = self.state.lock();
+        let sequence = state.next_sequence;
+        state.next_sequence = state.next_sequence.wrapping_add(1);
+        let mut event = Some(event);
+        loop {
+            if state.next_admission != sequence {
+                if cancel.load(Ordering::Acquire) {
+                    state.next_admission = state.next_admission.wrapping_add(1);
+                    self.wake.notify_all();
+                    return false;
+                }
+                #[cfg(test)]
+                {
+                    let hook = self.backpressure_hook.lock().take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                self.wake.wait(&mut state);
+                continue;
+            }
+            let pending_event = event
+                .as_ref()
+                .expect("runtime broker event must be supplied until admission");
+            if is_runtime_terminal_event(pending_event) {
+                let event = event.take().expect("terminal broker event");
+                if state.terminal.is_none() {
+                    state.terminal = Some(RuntimeEventEntry { sequence, event });
+                }
+                state.open_loss_segment = None;
+                state.next_admission = state.next_admission.wrapping_add(1);
+                self.wake.notify_all();
+                self.notify.notify_one();
+                return true;
+            }
+            if is_runtime_droppable_event(pending_event) {
+                if state.ordinary.len() < RUNTIME_BROKER_ORDINARY_CAPACITY {
+                    let event = event.take().expect("ordinary broker event");
+                    state
+                        .ordinary
+                        .push_back(RuntimeEventEntry { sequence, event });
+                    state.open_loss_segment = None;
+                    state.next_admission = state.next_admission.wrapping_add(1);
+                    self.wake.notify_all();
+                    self.notify.notify_one();
+                    return true;
+                }
+                if state.open_loss_segment.is_some_and(|segment| {
+                    state
+                        .overflow
+                        .back()
+                        .is_some_and(|overflow| overflow.sequence == segment)
+                }) {
+                    state.record_runtime_overflow(pending_event.kind);
+                    event.take();
+                    state.next_admission = state.next_admission.wrapping_add(1);
+                    self.wake.notify_all();
+                    return true;
+                }
+                if state.overflow.len() < RUNTIME_BROKER_OVERFLOW_CAPACITY {
+                    let event = event.take().expect("overflow broker event");
+                    let kind = event.kind;
+                    state.overflow.push_back(RuntimeOverflowEntry {
+                        sequence,
+                        template: event,
+                        dropped_count: 1,
+                        dropped_kinds: vec![kind],
+                    });
+                    state.open_loss_segment = Some(sequence);
+                    state.next_admission = state.next_admission.wrapping_add(1);
+                    self.wake.notify_all();
+                    self.notify.notify_one();
+                    return true;
+                }
+            } else if state.control.len() < RUNTIME_BROKER_CONTROL_CAPACITY {
+                let event = event.take().expect("control broker event");
+                state
+                    .control
+                    .push_back(RuntimeEventEntry { sequence, event });
+                state.open_loss_segment = None;
+                state.next_admission = state.next_admission.wrapping_add(1);
+                self.wake.notify_all();
+                self.notify.notify_one();
+                return true;
+            }
+            if cancel.load(Ordering::Acquire) {
+                event.take();
+                state.next_admission = state.next_admission.wrapping_add(1);
+                self.wake.notify_all();
+                return false;
+            }
+            #[cfg(test)]
+            {
+                let hook = self.backpressure_hook.lock().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            // This is finite broker backpressure, not an unbounded receive
+            // queue.  Stop wakes this wait through wake_runtime_subscribers.
+            self.wake.wait(&mut state);
+        }
+    }
+
+    fn pop(&self) -> Option<BackendEventEnvelope> {
+        let mut state = self.state.lock();
+        let event = state.pop_next();
+        if event.is_some() {
+            self.wake.notify_all();
+        }
+        event
+    }
+
+    async fn recv(&self) -> Option<BackendEventEnvelope> {
+        loop {
+            if let Some(event) = self.pop() {
+                return Some(event);
+            }
+            let notified = self.notify.notified();
+            if let Some(event) = self.pop() {
+                return Some(event);
+            }
+            notified.await;
+        }
+    }
+
+    fn wake_all(&self) {
+        self.wake.notify_all();
+        self.notify.notify_waiters();
+    }
+
+    #[cfg(test)]
+    fn queued_count(&self) -> usize {
+        let state = self.state.lock();
+        state.ordinary.len()
+            + state.control.len()
+            + state.overflow.len()
+            + usize::from(state.terminal.is_some())
+    }
+}
+
+impl RuntimeEventReceiver {
+    pub async fn recv(&mut self) -> Option<BackendEventEnvelope> {
+        self.queue.recv().await
+    }
+
+    pub fn try_recv(
+        &mut self,
+    ) -> Result<BackendEventEnvelope, tokio::sync::mpsc::error::TryRecvError> {
+        self.queue
+            .pop()
+            .ok_or(tokio::sync::mpsc::error::TryRecvError::Empty)
+    }
+
+    #[cfg(test)]
+    fn queued_count(&self) -> usize {
+        self.queue.queued_count()
+    }
+}
+
+impl RuntimeEventQueueState {
+    fn record_runtime_overflow(&mut self, kind: BackendEventKind) {
+        if let Some(overflow) = self.overflow.back_mut() {
+            overflow.dropped_count = overflow.dropped_count.saturating_add(1);
+            if !overflow.dropped_kinds.contains(&kind) {
+                overflow.dropped_kinds.push(kind);
+            }
+        }
+    }
+
+    fn pop_next(&mut self) -> Option<BackendEventEnvelope> {
+        let mut candidate: Option<(u64, RuntimeQueueLane)> = None;
+        if let Some(entry) = self.ordinary.front() {
+            candidate = Some((entry.sequence, RuntimeQueueLane::Ordinary));
+        }
+        if let Some(entry) = self.control.front() {
+            if candidate.is_none_or(|(sequence, _)| entry.sequence < sequence) {
+                candidate = Some((entry.sequence, RuntimeQueueLane::Control));
+            }
+        }
+        if let Some(overflow) = self.overflow.front() {
+            if candidate.is_none_or(|(sequence, _)| overflow.sequence < sequence) {
+                candidate = Some((overflow.sequence, RuntimeQueueLane::Overflow));
+            }
+        }
+        if let Some(entry) = self.terminal.as_ref() {
+            if candidate.is_none_or(|(sequence, _)| entry.sequence < sequence) {
+                candidate = Some((entry.sequence, RuntimeQueueLane::Terminal));
+            }
+        }
+        match candidate?.1 {
+            RuntimeQueueLane::Ordinary => self.ordinary.pop_front().map(|entry| entry.event),
+            RuntimeQueueLane::Control => self.control.pop_front().map(|entry| entry.event),
+            RuntimeQueueLane::Terminal => self.terminal.take().map(|entry| entry.event),
+            RuntimeQueueLane::Overflow => {
+                let overflow = self.overflow.pop_front()?;
+                if self.open_loss_segment == Some(overflow.sequence) {
+                    self.open_loss_segment = None;
+                }
+                Some(BackendEventEnvelope::from_payload(
+                    mineintent_contracts::minecraft::BackendEventMetadata {
+                        id: format!("runtime-overflow-{}", overflow.sequence),
+                        occurred_at: overflow.template.occurred_at,
+                        process_session_id: overflow.template.process_session_id,
+                        connection_epoch: overflow.template.connection_epoch,
+                        connection_attempt_id: overflow.template.connection_attempt_id,
+                        world_id: overflow.template.world_id,
+                        dimension: overflow.template.dimension,
+                    },
+                    overflow.template.source,
+                    BackendEventPayload::Overflow(
+                        mineintent_contracts::minecraft::BackendOverflowPayload {
+                            event_type: mineintent_contracts::minecraft::OverflowType::Overflow,
+                            dropped_count: overflow.dropped_count,
+                            dropped_kinds: overflow.dropped_kinds,
+                        },
+                    ),
+                ))
+            }
+        }
+    }
+}
+
+fn is_runtime_droppable_event(event: &BackendEventEnvelope) -> bool {
+    matches!(
+        event.kind,
+        BackendEventKind::Entity | BackendEventKind::Block | BackendEventKind::Sound
+    )
+}
+
+fn is_runtime_terminal_event(event: &BackendEventEnvelope) -> bool {
+    matches!(
+        event.payload,
+        BackendEventPayload::Lifecycle(BackendLifecyclePayload::Stopped { .. })
+    )
 }
 
 struct ObservationSubscriber {
@@ -369,13 +913,16 @@ enum ActiveMovementRegistration {
 struct SharedRuntime {
     writer: parking_lot::Mutex<EventWriter>,
     event_dispatch: parking_lot::Mutex<EventDispatchState>,
+    event_dispatch_wake: parking_lot::Condvar,
     swarm: parking_lot::Mutex<Option<Swarm>>,
     shutdown: Arc<Notify>,
     reconnect_cancel: Arc<Notify>,
     shutdown_requested: AtomicBool,
+    stop_requested: AtomicBool,
+    dispatch_cancelled: AtomicBool,
     config: RunConfig,
     commands: parking_lot::Mutex<VecDeque<QueuedCommand>>,
-    subscribers: parking_lot::Mutex<Vec<mpsc::UnboundedSender<BackendEventEnvelope>>>,
+    subscribers: parking_lot::Mutex<Vec<Arc<RuntimeEventQueue>>>,
     observation_subscribers: parking_lot::Mutex<Vec<ObservationSubscriber>>,
     next_observation_subscription_id: AtomicU64,
     observation: parking_lot::RwLock<ObservationState>,
@@ -425,6 +972,12 @@ struct SharedRuntime {
     #[cfg(test)]
     event_broadcast_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
+    event_dispatch_backpressure_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    stop_signal_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    runtime_broker_backpressure_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
     disconnect_cleanup_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
@@ -433,10 +986,13 @@ impl SharedRuntime {
         Self {
             writer: parking_lot::Mutex::new(EventWriter::new(&config.world_id)),
             event_dispatch: parking_lot::Mutex::new(EventDispatchState::default()),
+            event_dispatch_wake: parking_lot::Condvar::new(),
             swarm: parking_lot::Mutex::new(None),
             shutdown: Arc::new(Notify::new()),
             reconnect_cancel: Arc::new(Notify::new()),
             shutdown_requested: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
+            dispatch_cancelled: AtomicBool::new(false),
             config,
             commands: parking_lot::Mutex::new(VecDeque::new()),
             subscribers: parking_lot::Mutex::new(Vec::new()),
@@ -481,6 +1037,12 @@ impl SharedRuntime {
             #[cfg(test)]
             event_broadcast_hook: parking_lot::Mutex::new(None),
             #[cfg(test)]
+            event_dispatch_backpressure_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            stop_signal_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            runtime_broker_backpressure_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
             disconnect_cleanup_hook: parking_lot::Mutex::new(None),
         }
     }
@@ -523,7 +1085,38 @@ impl SharedRuntime {
             let mut writer = self.writer.lock();
             writer.emit_at(source, payload, occurred_at)
         };
-        dispatch.enqueue(event)
+        self.enqueue_dispatch_locked(&mut dispatch, event)
+    }
+
+    fn enqueue_dispatch_locked(
+        &self,
+        dispatch: &mut parking_lot::MutexGuard<'_, EventDispatchState>,
+        event: BackendEventEnvelope,
+    ) -> bool {
+        let mut event = Some(event);
+        let mut pending = None;
+        loop {
+            match dispatch.enqueue(&mut event, &mut pending, &self.dispatch_cancelled) {
+                RuntimeDispatchAdmission::Accepted(should_drain) => {
+                    self.event_dispatch_wake.notify_all();
+                    return should_drain;
+                }
+                RuntimeDispatchAdmission::Cancelled => {
+                    self.event_dispatch_wake.notify_all();
+                    return false;
+                }
+                RuntimeDispatchAdmission::Wait => {
+                    #[cfg(test)]
+                    {
+                        let hook = self.event_dispatch_backpressure_hook.lock().take();
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
+                    self.event_dispatch_wake.wait(dispatch);
+                }
+            }
+        }
     }
 
     #[cfg(test)]
@@ -574,10 +1167,12 @@ impl SharedRuntime {
         loop {
             let event = {
                 let mut dispatch = self.event_dispatch.lock();
-                let Some(event) = dispatch.queue.pop_front() else {
+                let Some(event) = dispatch.pop_next() else {
                     dispatch.drainer_active = false;
+                    self.event_dispatch_wake.notify_all();
                     return;
                 };
+                self.event_dispatch_wake.notify_all();
                 event
             };
             self.broadcast_event(event);
@@ -594,9 +1189,13 @@ impl SharedRuntime {
                 Err(error) => eprintln!("事件编码失败：{error}"),
             }
         }
-        {
+        let subscribers = {
             let mut subscribers = self.subscribers.lock();
-            subscribers.retain(|subscriber| subscriber.send(event.clone()).is_ok());
+            subscribers.retain(|subscriber| Arc::strong_count(subscriber) > 1);
+            subscribers.clone()
+        };
+        for subscriber in subscribers {
+            let _ = subscriber.publish(event.clone(), &self.dispatch_cancelled);
         }
         #[cfg(test)]
         self.invoke_event_broadcast_hook();
@@ -667,7 +1266,7 @@ impl SharedRuntime {
     }
 
     fn begin_connection_attempt_locked(&self, reconnect_token: Option<u64>) -> Option<bool> {
-        if self.stopping.load(Ordering::Acquire) {
+        if self.stopping.load(Ordering::Acquire) || self.stop_requested.load(Ordering::Acquire) {
             return None;
         }
         if let Some(token) = reconnect_token {
@@ -681,6 +1280,9 @@ impl SharedRuntime {
         self.stopped_reported.store(false, Ordering::Release);
         self.faulted_reported.store(false, Ordering::Release);
         self.shutdown_requested.store(false, Ordering::Release);
+        if !self.stop_requested.load(Ordering::Acquire) {
+            self.dispatch_cancelled.store(false, Ordering::Release);
+        }
         *self.stop_reason.lock() = None;
         *self.last_close.lock() = None;
         *self.last_failure.lock() = None;
@@ -711,7 +1313,7 @@ impl SharedRuntime {
             attempt_id,
             attempt,
         });
-        Some(dispatch.enqueue(event))
+        Some(self.enqueue_dispatch_locked(&mut dispatch, event))
     }
 
     /// `Event::Init` 消费连接发起前预留的身份，而不是再创建一个 epoch。
@@ -1398,6 +2000,20 @@ impl SharedRuntime {
         // select 之前，也不会因为时序而永久等待。
         self.shutdown_requested.store(true, Ordering::Release);
         self.shutdown.notify_one();
+        self.cancel_event_admission();
+    }
+
+    fn cancel_event_admission(&self) {
+        self.dispatch_cancelled.store(true, Ordering::Release);
+        self.event_dispatch_wake.notify_all();
+        self.wake_runtime_subscribers();
+    }
+
+    fn wake_runtime_subscribers(&self) {
+        let subscribers = self.subscribers.lock().clone();
+        for subscriber in subscribers {
+            subscriber.wake_all();
+        }
     }
 
     #[cfg(test)]
@@ -1452,6 +2068,34 @@ impl SharedRuntime {
         if let Some(hook) = hook {
             hook();
         }
+    }
+
+    #[cfg(test)]
+    fn set_event_dispatch_backpressure_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.event_dispatch_backpressure_hook.lock() = hook;
+    }
+
+    #[cfg(test)]
+    fn set_stop_signal_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.stop_signal_hook.lock() = hook;
+    }
+
+    #[cfg(test)]
+    fn invoke_stop_signal_hook(&self) {
+        let hook = self.stop_signal_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_runtime_broker_backpressure_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.runtime_broker_backpressure_hook.lock() = hook;
+    }
+
+    #[cfg(test)]
+    fn event_dispatch_counts(&self) -> (usize, usize, usize, usize) {
+        self.event_dispatch.lock().queued_counts()
     }
 
     #[cfg(test)]
@@ -1884,6 +2528,13 @@ impl SharedRuntime {
     }
 
     fn initiate_stop(&self, reason: &str) {
+        // Signal cancellation before taking command admission. A producer may
+        // already hold that lock while waiting for this finite dispatch queue;
+        // stop must be able to wake that producer instead of waiting for it.
+        self.stop_requested.store(true, Ordering::Release);
+        self.cancel_event_admission();
+        #[cfg(test)]
+        self.invoke_stop_signal_hook();
         {
             // Make stop admission atomic with the start of a Move
             // registration.  Once either side owns this short lock, the
@@ -1955,10 +2606,14 @@ impl RuntimeHandle {
         self.shared.observation.read().source
     }
 
-    pub fn subscribe(&self) -> mpsc::UnboundedReceiver<BackendEventEnvelope> {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        self.shared.subscribers.lock().push(sender);
-        receiver
+    pub fn subscribe(&self) -> RuntimeEventReceiver {
+        #[cfg(test)]
+        let queue =
+            RuntimeEventQueue::new(self.shared.runtime_broker_backpressure_hook.lock().clone());
+        #[cfg(not(test))]
+        let queue = RuntimeEventQueue::new();
+        self.shared.subscribers.lock().push(queue.clone());
+        RuntimeEventReceiver { queue }
     }
 
     pub fn observation_source(&self) -> RuntimeObservationSource {
@@ -2061,6 +2716,11 @@ impl RuntimeHandle {
     }
 
     #[cfg(test)]
+    pub(crate) async fn test_wait_for_shutdown(&self) {
+        self.shared.shutdown.notified().await;
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_drive_event(&self, source: FactSource, payload: BackendEventPayload) {
         match payload.clone() {
             BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected) => {
@@ -2085,6 +2745,32 @@ impl RuntimeHandle {
             }
             _ => self.shared.emit(source, payload),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_event_dispatch_backpressure_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        self.shared.set_event_dispatch_backpressure_hook(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_stop_signal_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.shared.set_stop_signal_hook(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_runtime_broker_backpressure_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        self.shared.set_runtime_broker_backpressure_hook(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_event_dispatch_counts(&self) -> (usize, usize, usize, usize) {
+        self.shared.event_dispatch_counts()
     }
 
     #[cfg(test)]
@@ -7456,5 +8142,614 @@ mod tests {
 
         emit_test_fact(&handle, BackendEventKind::Block);
         assert_eq!(b_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn runtime_subscriber_queue_stays_bounded_under_unconsumed_high_frequency() {
+        let mut config = RunConfig::default();
+        config.emit_stdout = false;
+        let handle = RuntimeHandle::new(config);
+        let mut events = handle.subscribe();
+        for _ in 0..10_000 {
+            handle.test_drive_event(
+                FactSource::ServerObserved,
+                valid_observation_payload(BackendEventKind::Entity),
+            );
+            assert!(
+                events.queued_count()
+                    <= RUNTIME_BROKER_ORDINARY_CAPACITY
+                        + RUNTIME_BROKER_CONTROL_CAPACITY
+                        + RUNTIME_BROKER_OVERFLOW_CAPACITY
+                        + 1
+            );
+        }
+        handle.test_drive_event(
+            FactSource::ServerObserved,
+            BackendEventPayload::Chat(ContractProtocolChatEvent {
+                sender_username: Some("Alex".to_owned()),
+                plain_text: "upstream chat".to_owned(),
+                position: Some(ChatPosition::Chat),
+                verified: None,
+            }),
+        );
+        let mut saw_chat = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(
+                event.payload,
+                BackendEventPayload::Chat(ContractProtocolChatEvent { ref plain_text, .. })
+                    if plain_text == "upstream chat"
+            ) {
+                saw_chat = true;
+            }
+        }
+        assert!(saw_chat, "bounded upstream must retain admitted chat");
+    }
+
+    #[test]
+    fn runtime_broker_old_marker_pop_does_not_close_new_loss_segment() {
+        let queue = RuntimeEventQueue::new(None);
+        let cancel = AtomicBool::new(false);
+        let mut writer = EventWriter::new("world");
+
+        for _ in 0..RUNTIME_BROKER_ORDINARY_CAPACITY {
+            assert!(queue.publish(
+                writer.emit(
+                    FactSource::ServerObserved,
+                    valid_observation_payload(BackendEventKind::Entity)
+                ),
+                &cancel,
+            ));
+        }
+        assert!(queue.publish(
+            writer.emit(
+                FactSource::ServerObserved,
+                valid_observation_payload(BackendEventKind::Entity)
+            ),
+            &cancel,
+        ));
+        assert!(queue.publish(
+            writer.emit(
+                FactSource::ServerObserved,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected),
+            ),
+            &cancel,
+        ));
+        for _ in 0..RUNTIME_BROKER_ORDINARY_CAPACITY {
+            queue.pop().expect("ordinary broker entry");
+        }
+        for _ in 0..RUNTIME_BROKER_ORDINARY_CAPACITY {
+            assert!(queue.publish(
+                writer.emit(
+                    FactSource::ServerObserved,
+                    valid_observation_payload(BackendEventKind::Entity)
+                ),
+                &cancel,
+            ));
+        }
+        assert!(queue.publish(
+            writer.emit(
+                FactSource::ServerObserved,
+                valid_observation_payload(BackendEventKind::Entity)
+            ),
+            &cancel,
+        ));
+        let first = queue.pop().expect("first broker marker");
+        assert!(matches!(
+            first.payload,
+            BackendEventPayload::Overflow(payload) if payload.dropped_count == 1
+        ));
+
+        assert!(queue.publish(
+            writer.emit(
+                FactSource::ServerObserved,
+                valid_observation_payload(BackendEventKind::Entity)
+            ),
+            &cancel,
+        ));
+        let control = queue.pop().expect("broker control after first marker");
+        assert!(matches!(
+            control.payload,
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected)
+        ));
+        for _ in 0..RUNTIME_BROKER_ORDINARY_CAPACITY {
+            queue.pop().expect("refilled ordinary broker entry");
+        }
+        let second = queue.pop().expect("second broker marker");
+        assert!(matches!(
+            second.payload,
+            BackendEventPayload::Overflow(payload) if payload.dropped_count == 2
+        ));
+    }
+
+    #[test]
+    fn runtime_dispatch_old_marker_pop_does_not_close_new_loss_segment() {
+        let mut state = EventDispatchState::default();
+        let cancel = AtomicBool::new(false);
+        let mut writer = EventWriter::new("world");
+
+        for _ in 0..RUNTIME_DISPATCH_ORDINARY_CAPACITY {
+            let mut event = Some(writer.emit(
+                FactSource::ServerObserved,
+                valid_observation_payload(BackendEventKind::Entity),
+            ));
+            let mut pending = None;
+            assert!(matches!(
+                state.enqueue(&mut event, &mut pending, &cancel),
+                RuntimeDispatchAdmission::Accepted(_)
+            ));
+        }
+        for payload in [
+            valid_observation_payload(BackendEventKind::Entity),
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected),
+        ] {
+            let mut event = Some(writer.emit(FactSource::ServerObserved, payload));
+            let mut pending = None;
+            assert!(matches!(
+                state.enqueue(&mut event, &mut pending, &cancel),
+                RuntimeDispatchAdmission::Accepted(_)
+            ));
+        }
+
+        for _ in 0..RUNTIME_DISPATCH_ORDINARY_CAPACITY {
+            state.pop_next().expect("ordinary dispatch entry");
+        }
+        for _ in 0..RUNTIME_DISPATCH_ORDINARY_CAPACITY {
+            let mut event = Some(writer.emit(
+                FactSource::ServerObserved,
+                valid_observation_payload(BackendEventKind::Entity),
+            ));
+            let mut pending = None;
+            assert!(matches!(
+                state.enqueue(&mut event, &mut pending, &cancel),
+                RuntimeDispatchAdmission::Accepted(_)
+            ));
+        }
+        let mut event = Some(writer.emit(
+            FactSource::ServerObserved,
+            valid_observation_payload(BackendEventKind::Entity),
+        ));
+        let mut pending = None;
+        assert!(matches!(
+            state.enqueue(&mut event, &mut pending, &cancel),
+            RuntimeDispatchAdmission::Accepted(_)
+        ));
+        let first = state.pop_next().expect("first dispatch marker");
+        assert!(matches!(
+            first.payload,
+            BackendEventPayload::Overflow(payload) if payload.dropped_count == 1
+        ));
+
+        let mut event = Some(writer.emit(
+            FactSource::ServerObserved,
+            valid_observation_payload(BackendEventKind::Entity),
+        ));
+        let mut pending = None;
+        assert!(matches!(
+            state.enqueue(&mut event, &mut pending, &cancel),
+            RuntimeDispatchAdmission::Accepted(_)
+        ));
+        let control = state
+            .pop_next()
+            .expect("dispatch control after first marker");
+        assert!(matches!(
+            control.payload,
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected)
+        ));
+        for _ in 0..RUNTIME_DISPATCH_ORDINARY_CAPACITY {
+            state.pop_next().expect("refilled ordinary dispatch entry");
+        }
+        let second = state.pop_next().expect("second dispatch marker");
+        assert!(matches!(
+            second.payload,
+            BackendEventPayload::Overflow(payload) if payload.dropped_count == 2
+        ));
+    }
+
+    #[test]
+    fn runtime_dispatch_waiting_ticket_cannot_be_overtaken_by_later_ordinary() {
+        let state = Arc::new(parking_lot::Mutex::new(EventDispatchState::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut writer = EventWriter::new("world");
+        {
+            let mut guard = state.lock();
+            for _ in 0..RUNTIME_DISPATCH_CONTROL_CAPACITY {
+                let mut event = Some(writer.emit(
+                    FactSource::ServerObserved,
+                    BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected),
+                ));
+                let mut pending = None;
+                assert!(matches!(
+                    guard.enqueue(&mut event, &mut pending, &cancel),
+                    RuntimeDispatchAdmission::Accepted(_)
+                ));
+            }
+        }
+
+        let first_event = writer.emit(
+            FactSource::ServerObserved,
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::LoggedIn {
+                version: "test".to_owned(),
+                dimension: "minecraft:overworld".to_owned(),
+            }),
+        );
+        let later_event = writer.emit(
+            FactSource::ServerObserved,
+            valid_observation_payload(BackendEventKind::Entity),
+        );
+        let (first_waited, first_waited_received) = std_mpsc::channel();
+        let (later_waited, later_waited_received) = std_mpsc::channel();
+        let waiting_barrier = Arc::new(Barrier::new(3));
+        let (first_release, first_release_received) = std_mpsc::channel();
+        let (later_release, later_release_received) = std_mpsc::channel();
+        let (admitted, admitted_received) = std_mpsc::channel();
+
+        let first_state = state.clone();
+        let first_cancel = cancel.clone();
+        let first_waiting_barrier = waiting_barrier.clone();
+        let first_admitted = admitted.clone();
+        let first = thread::spawn(move || {
+            let mut event = Some(first_event);
+            let mut pending = None;
+            let mut guard = first_state.lock();
+            assert!(matches!(
+                guard.enqueue(&mut event, &mut pending, &first_cancel),
+                RuntimeDispatchAdmission::Wait
+            ));
+            first_waited.send(()).expect("first wait gate");
+            drop(guard);
+            first_waiting_barrier.wait();
+            first_release_received
+                .recv_timeout(StdDuration::from_secs(1))
+                .expect("first admission release");
+            let mut guard = first_state.lock();
+            assert!(matches!(
+                guard.enqueue(&mut event, &mut pending, &first_cancel),
+                RuntimeDispatchAdmission::Accepted(_)
+            ));
+            first_admitted
+                .send("control")
+                .expect("first admission result");
+        });
+
+        first_waited_received
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("first control must wait at full control capacity");
+
+        let later_state = state.clone();
+        let later_cancel = cancel.clone();
+        let later_waiting_barrier = waiting_barrier.clone();
+        let later_admitted = admitted.clone();
+        let later = thread::spawn(move || {
+            let mut event = Some(later_event);
+            let mut pending = None;
+            let mut guard = later_state.lock();
+            assert!(matches!(
+                guard.enqueue(&mut event, &mut pending, &later_cancel),
+                RuntimeDispatchAdmission::Wait
+            ));
+            later_waited.send(()).expect("later wait gate");
+            drop(guard);
+            later_waiting_barrier.wait();
+            later_release_received
+                .recv_timeout(StdDuration::from_secs(1))
+                .expect("later admission release");
+            let mut guard = later_state.lock();
+            assert!(matches!(
+                guard.enqueue(&mut event, &mut pending, &later_cancel),
+                RuntimeDispatchAdmission::Accepted(_)
+            ));
+            later_admitted
+                .send("ordinary")
+                .expect("later admission result");
+        });
+
+        later_waited_received
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("later ordinary must wait behind the earlier control ticket");
+        assert!(admitted_received.try_recv().is_err());
+
+        {
+            let mut guard = state.lock();
+            guard.control.pop_front();
+        }
+        waiting_barrier.wait();
+        first_release
+            .send(())
+            .expect("first admission release sender");
+        assert_eq!(
+            admitted_received
+                .recv_timeout(StdDuration::from_secs(1))
+                .expect("first admission after one control slot is released"),
+            "control"
+        );
+        later_release
+            .send(())
+            .expect("later admission release sender");
+        assert_eq!(
+            admitted_received
+                .recv_timeout(StdDuration::from_secs(1))
+                .expect("later admission after the first ticket advances"),
+            "ordinary"
+        );
+        first.join().expect("first waiter");
+        later.join().expect("later waiter");
+    }
+
+    #[test]
+    fn runtime_dispatch_stop_cancels_waiting_ticket_and_advances_turn() {
+        let state = Arc::new(parking_lot::Mutex::new(EventDispatchState::default()));
+        let wake = Arc::new(parking_lot::Condvar::new());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut writer = EventWriter::new("world");
+        {
+            let mut guard = state.lock();
+            for _ in 0..RUNTIME_DISPATCH_CONTROL_CAPACITY {
+                let mut event = Some(writer.emit(
+                    FactSource::ServerObserved,
+                    BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected),
+                ));
+                let mut pending = None;
+                assert!(matches!(
+                    guard.enqueue(&mut event, &mut pending, &cancel),
+                    RuntimeDispatchAdmission::Accepted(_)
+                ));
+            }
+        }
+        let first_event = writer.emit(
+            FactSource::ServerObserved,
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::LoggedIn {
+                version: "test".to_owned(),
+                dimension: "minecraft:overworld".to_owned(),
+            }),
+        );
+        let later_event = writer.emit(
+            FactSource::ServerObserved,
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::Ready {
+                snapshot_revision: 1,
+            }),
+        );
+        let (first_waited, first_waited_received) = std_mpsc::channel();
+        let (later_waited, later_waited_received) = std_mpsc::channel();
+        let (cancelled, cancelled_received) = std_mpsc::channel();
+        let cancellation_barrier = Arc::new(Barrier::new(3));
+        let first_state = state.clone();
+        let first_cancel = cancel.clone();
+        let first_cancelled = cancelled.clone();
+        let first_cancellation_barrier = cancellation_barrier.clone();
+        let first = thread::spawn(move || {
+            let mut event = Some(first_event);
+            let mut pending = None;
+            loop {
+                let mut guard = first_state.lock();
+                match guard.enqueue(&mut event, &mut pending, &first_cancel) {
+                    RuntimeDispatchAdmission::Wait => {
+                        let _ = first_waited.send(());
+                        drop(guard);
+                        first_cancellation_barrier.wait();
+                        continue;
+                    }
+                    RuntimeDispatchAdmission::Cancelled => {
+                        first_cancelled.send("first").expect("first cancellation");
+                        return;
+                    }
+                    RuntimeDispatchAdmission::Accepted(_) => {
+                        panic!("stop-cancelled first waiter must not admit");
+                    }
+                }
+            }
+        });
+        first_waited_received
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("first stop-cancelled waiter");
+
+        let later_state = state.clone();
+        let later_cancel = cancel.clone();
+        let later_cancelled = cancelled.clone();
+        let later_cancellation_barrier = cancellation_barrier.clone();
+        let later = thread::spawn(move || {
+            let mut event = Some(later_event);
+            let mut pending = None;
+            loop {
+                let mut guard = later_state.lock();
+                match guard.enqueue(&mut event, &mut pending, &later_cancel) {
+                    RuntimeDispatchAdmission::Wait => {
+                        let _ = later_waited.send(());
+                        drop(guard);
+                        later_cancellation_barrier.wait();
+                        continue;
+                    }
+                    RuntimeDispatchAdmission::Cancelled => {
+                        later_cancelled.send("later").expect("later cancellation");
+                        return;
+                    }
+                    RuntimeDispatchAdmission::Accepted(_) => {
+                        panic!("stop-cancelled later waiter must not admit");
+                    }
+                }
+            }
+        });
+        later_waited_received
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("later stop-cancelled waiter");
+
+        cancel.store(true, Ordering::Release);
+        cancellation_barrier.wait();
+        wake.notify_all();
+        let mut cancelled_names = vec![
+            cancelled_received
+                .recv_timeout(StdDuration::from_secs(1))
+                .expect("first waiter cancellation"),
+            cancelled_received
+                .recv_timeout(StdDuration::from_secs(1))
+                .expect("later waiter cancellation"),
+        ];
+        cancelled_names.sort_unstable();
+        assert_eq!(cancelled_names, vec!["first", "later"]);
+        first.join().expect("first cancelled waiter");
+        later.join().expect("later cancelled waiter");
+        let state = state.lock();
+        assert_eq!(state.next_admission, state.next_sequence);
+    }
+
+    #[test]
+    fn runtime_stop_cancellation_is_not_reset_while_connection_admission_waits() {
+        let mut config = RunConfig::default();
+        config.emit_stdout = false;
+        let handle = RuntimeHandle::new(config);
+
+        let (broker_waiting, broker_waiting_received) = std_mpsc::channel();
+        handle.test_set_runtime_broker_backpressure_hook(Some(Arc::new(move || {
+            broker_waiting
+                .send(())
+                .expect("runtime broker wait gate should remain live");
+        })));
+        let mut events = handle.subscribe();
+        let cancel = AtomicBool::new(false);
+        let mut broker_writer = EventWriter::new("world");
+        for _ in 0..RUNTIME_BROKER_CONTROL_CAPACITY {
+            assert!(events.queue.publish(
+                broker_writer.emit(
+                    FactSource::ServerObserved,
+                    BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected,),
+                ),
+                &cancel,
+            ));
+        }
+
+        for index in 0..RUNTIME_DISPATCH_CONTROL_CAPACITY {
+            let should_drain = handle.shared.enqueue_event(
+                FactSource::ServerObserved,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionRequested {
+                    attempt: 7,
+                }),
+            );
+            assert_eq!(should_drain, index == 0);
+        }
+        assert_eq!(
+            handle.test_event_dispatch_counts(),
+            (0, RUNTIME_DISPATCH_CONTROL_CAPACITY, 0, 0)
+        );
+
+        let shared = handle.shared.clone();
+        let drainer = thread::spawn(move || {
+            shared.drain_events();
+        });
+        broker_waiting_received
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("runtime worker drainer must block at the full broker");
+        assert!(!handle.shared.enqueue_event(
+            FactSource::ServerObserved,
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionRequested {
+                attempt: 8
+            },),
+        ));
+        assert_eq!(
+            handle.test_event_dispatch_counts(),
+            (0, RUNTIME_DISPATCH_CONTROL_CAPACITY, 0, 0)
+        );
+
+        let (dispatch_waiting, dispatch_waiting_received) = std_mpsc::channel();
+        handle.test_set_event_dispatch_backpressure_hook(Some(Arc::new(move || {
+            dispatch_waiting
+                .send(())
+                .expect("connection admission wait gate should remain live");
+        })));
+        let connection_shared = handle.shared.clone();
+        let (connection_result, connection_result_received) = std_mpsc::channel();
+        let (release_command, release_command_received) = std_mpsc::channel();
+        let connection = thread::spawn(move || {
+            let admission = connection_shared.command_admission.lock();
+            let result = connection_shared.begin_connection_attempt_locked(None);
+            connection_result
+                .send(result)
+                .expect("connection admission result should be observable");
+            release_command_received
+                .recv_timeout(StdDuration::from_secs(1))
+                .expect("test must release the command admission");
+            drop(admission);
+        });
+        dispatch_waiting_received
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("connection attempt must wait in internal dispatch admission");
+
+        let (stop_signaled, stop_signaled_received) = std_mpsc::channel();
+        handle.test_set_stop_signal_hook(Some(Arc::new(move || {
+            stop_signaled
+                .send(())
+                .expect("stop signal gate should remain live");
+        })));
+        let stop_handle = handle.clone();
+        let (stop_finished, stop_finished_received) = std_mpsc::channel();
+        let stopper = thread::spawn(move || {
+            stop_handle.stop("connection-admission-stop");
+            stop_finished
+                .send(())
+                .expect("stop completion should be observable");
+        });
+        stop_signaled_received
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("stop must publish its monotonic cancellation before command lock");
+        assert!(handle.shared.stop_requested.load(Ordering::Acquire));
+        assert!(handle.shared.dispatch_cancelled.load(Ordering::Acquire));
+        assert!(!handle.shared.shutdown_requested.load(Ordering::Acquire));
+
+        assert_eq!(
+            connection_result_received
+                .recv_timeout(StdDuration::from_secs(1))
+                .expect("connection admission must cancel while stop waits for its lock"),
+            Some(false)
+        );
+        release_command
+            .send(())
+            .expect("connection command admission release");
+        connection.join().expect("connection waiter");
+        stop_finished_received
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("stop must finish after the cancelled admission releases");
+        stopper.join().expect("stopper");
+        drainer.join().expect("runtime drainer");
+
+        let mut stopped_count = 0;
+        while let Ok(event) = events.try_recv() {
+            if matches!(
+                event.payload,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::Stopped { .. })
+            ) {
+                stopped_count += 1;
+            }
+        }
+        assert_eq!(
+            stopped_count, 1,
+            "stop must settle exactly one terminal event"
+        );
+        assert!(matches!(handle.state(), BackendState::Stopped { .. }));
+    }
+
+    #[test]
+    fn runtime_dropped_receiver_is_pruned_before_control_backpressure() {
+        let mut config = RunConfig::default();
+        config.emit_stdout = false;
+        let handle = RuntimeHandle::new(config);
+        let dropped = handle.subscribe();
+        drop(dropped);
+
+        let producer_handle = handle.clone();
+        let (finished, finished_received) = std_mpsc::channel();
+        let producer = thread::spawn(move || {
+            for attempt in 0..(RUNTIME_BROKER_CONTROL_CAPACITY * 2) {
+                producer_handle.test_drive_event(
+                    FactSource::ServerObserved,
+                    BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionRequested {
+                        attempt: attempt as u32,
+                    }),
+                );
+            }
+            finished.send(()).expect("dropped receiver producer result");
+        });
+        finished_received
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("dropped receiver must not create control backpressure");
+        producer.join().expect("dropped receiver producer");
+        assert_eq!(handle.shared.subscribers.lock().len(), 0);
     }
 }

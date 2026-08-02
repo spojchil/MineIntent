@@ -6,10 +6,10 @@
 //! independent unbounded queue or a callback thread of their own.
 
 use std::{
+    collections::VecDeque,
     future::pending,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, Receiver, SyncSender},
         Arc, Weak,
     },
     thread::{self, JoinHandle, ThreadId},
@@ -17,20 +17,16 @@ use std::{
 };
 
 use mineintent_contracts::minecraft::{
-    BackendError, BackendEventEnvelope, BackendEventListener, BackendEventPayload, BackendFailure,
-    BackendFailureCode, BackendLifecyclePayload, BackendReady, BackendState, BlockPosition,
+    BackendError, BackendEventEnvelope, BackendEventKind, BackendEventListener,
+    BackendEventMetadata, BackendEventPayload, BackendFailure, BackendFailureCode,
+    BackendLifecyclePayload, BackendOverflowPayload, BackendReady, BackendState, BlockPosition,
     BlockReadResult, BoxFuture, DirectedViewportError, DirectedViewportProjection, GameMode,
     LookRelativeRequest, MinecraftBackendApi, MinecraftBackendConfig, MinecraftMotorDriverApi,
     MinecraftSnapshotV1, MoveInputRequest, ObservationEventListener, OperationControl,
-    ProtocolEntitySnapshot, ProtocolObservationSource, SelfPose, Subscription, ViewportRead,
+    OverflowType, ProtocolEntitySnapshot, ProtocolObservationSource, SelfPose, Subscription,
+    ViewportRead,
 };
 use tokio::{runtime::Builder, sync::Notify, task::LocalSet};
-
-#[cfg(test)]
-use tokio::sync::mpsc as tokio_mpsc;
-
-#[cfg(test)]
-use mineintent_contracts::minecraft::FactSource;
 
 use crate::{
     protocol::{BackendEventEnvelope as RuntimeEventEnvelope, MotorDirection},
@@ -40,8 +36,284 @@ use crate::{
     snapshot as runtime_snapshot,
 };
 
+#[cfg(test)]
+use crate::runtime::{
+    RuntimeEventReceiver, RUNTIME_BROKER_CONTROL_CAPACITY, RUNTIME_DISPATCH_CONTROL_CAPACITY,
+    RUNTIME_DISPATCH_ORDINARY_CAPACITY, RUNTIME_DISPATCH_OVERFLOW_CAPACITY,
+};
+#[cfg(test)]
+use mineintent_contracts::minecraft::FactSource;
+
 const DISPATCH_CAPACITY: usize = 256;
+const CONTROL_CAPACITY: usize = 512;
+const OVERFLOW_CAPACITY: usize = 64;
 const UNSUBSCRIBE_WAIT: Duration = Duration::from_secs(2);
+
+/// The public callback is deliberately single-threaded and may block while it
+/// calls back into the facade.  The bridge therefore has finite, explicit
+/// lanes: 256 reconstructable ordinary facts, 512 lifecycle/chat control facts,
+/// 64 overflow segments, and one terminal slot.  Ordinary entity/block/sound
+/// facts beyond their lane are dropped; a contiguous loss segment gets one
+/// marker at its first loss position.  A successful admission closes that
+/// segment, so a later loss can never be folded into an earlier marker.  The
+/// control and marker lanes apply cancellation-aware backpressure rather than
+/// growing storage.  The dispatcher merges all lanes by admission sequence,
+/// while stop completion is owned by runtime state and worker join rather than
+/// by callback consumption of `Stopped`.
+struct EventBridge {
+    state: parking_lot::Mutex<EventBridgeState>,
+    wake: parking_lot::Condvar,
+}
+
+struct EventBridgeState {
+    ordinary: VecDeque<DispatchEntry>,
+    control: VecDeque<DispatchEntry>,
+    overflow: VecDeque<OverflowEntry>,
+    terminal: Option<DispatchEntry>,
+    next_sequence: u64,
+    next_admission: u64,
+    open_loss_segment: Option<u64>,
+    closed: bool,
+}
+
+struct DispatchEntry {
+    sequence: u64,
+    session_id: u64,
+    event: BackendEventEnvelope,
+}
+
+struct OverflowEntry {
+    sequence: u64,
+    session_id: u64,
+    template: BackendEventEnvelope,
+    dropped_count: u64,
+    dropped_kinds: Vec<BackendEventKind>,
+}
+
+struct DispatchItem {
+    session_id: u64,
+    event: BackendEventEnvelope,
+}
+
+#[derive(Clone, Copy)]
+enum DispatchLane {
+    Ordinary,
+    Control,
+    Overflow,
+    Terminal,
+}
+
+impl EventBridge {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: parking_lot::Mutex::new(EventBridgeState {
+                ordinary: VecDeque::new(),
+                control: VecDeque::new(),
+                overflow: VecDeque::new(),
+                terminal: None,
+                next_sequence: 1,
+                next_admission: 1,
+                open_loss_segment: None,
+                closed: false,
+            }),
+            wake: parking_lot::Condvar::new(),
+        })
+    }
+
+    fn enqueue(
+        &self,
+        session_id: u64,
+        event: BackendEventEnvelope,
+        cancel: Option<&AtomicBool>,
+    ) -> bool {
+        let mut state = self.state.lock();
+        let sequence = state.next_sequence;
+        state.next_sequence = state.next_sequence.wrapping_add(1);
+        while !state.closed && state.next_admission != sequence {
+            self.wake.wait(&mut state);
+        }
+        loop {
+            if state.closed {
+                return false;
+            }
+            if is_stopped_event(&event) {
+                if state.terminal.is_none() {
+                    state.terminal = Some(DispatchEntry {
+                        sequence,
+                        session_id,
+                        event,
+                    });
+                }
+                state.open_loss_segment = None;
+                state.next_admission = state.next_admission.wrapping_add(1);
+                self.wake.notify_all();
+                return true;
+            }
+            if is_droppable_event(&event) {
+                if state.ordinary.len() < DISPATCH_CAPACITY {
+                    state.ordinary.push_back(DispatchEntry {
+                        sequence,
+                        session_id,
+                        event,
+                    });
+                    state.open_loss_segment = None;
+                    state.next_admission = state.next_admission.wrapping_add(1);
+                    self.wake.notify_all();
+                    return true;
+                }
+                if state.open_loss_segment.is_some_and(|segment| {
+                    state
+                        .overflow
+                        .back()
+                        .is_some_and(|overflow| overflow.sequence == segment)
+                }) {
+                    state.record_overflow_loss(event.kind);
+                    state.next_admission = state.next_admission.wrapping_add(1);
+                    self.wake.notify_all();
+                    return true;
+                }
+                if state.overflow.len() < OVERFLOW_CAPACITY {
+                    let kind = event.kind;
+                    state.overflow.push_back(OverflowEntry {
+                        sequence,
+                        session_id,
+                        template: event,
+                        dropped_count: 1,
+                        dropped_kinds: vec![kind],
+                    });
+                    state.open_loss_segment = Some(sequence);
+                    state.next_admission = state.next_admission.wrapping_add(1);
+                    self.wake.notify_all();
+                    return true;
+                }
+            } else if state.control.len() < CONTROL_CAPACITY {
+                state.control.push_back(DispatchEntry {
+                    sequence,
+                    session_id,
+                    event,
+                });
+                state.open_loss_segment = None;
+                state.next_admission = state.next_admission.wrapping_add(1);
+                self.wake.notify_all();
+                return true;
+            }
+            if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
+                state.next_admission = state.next_admission.wrapping_add(1);
+                self.wake.notify_all();
+                return false;
+            }
+            self.wake.wait(&mut state);
+        }
+    }
+
+    fn next(&self) -> Option<DispatchItem> {
+        let mut state = self.state.lock();
+        loop {
+            if let Some(item) = state.pop_next() {
+                self.wake.notify_all();
+                return Some(item);
+            }
+            if state.closed {
+                return None;
+            }
+            self.wake.wait(&mut state);
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock();
+        state.closed = true;
+        self.wake.notify_all();
+    }
+
+    fn wake_all(&self) {
+        self.wake.notify_all();
+    }
+
+    #[cfg(test)]
+    fn queued_counts(&self) -> (usize, usize, usize, usize) {
+        let state = self.state.lock();
+        (
+            state.ordinary.len(),
+            state.control.len(),
+            state.overflow.len(),
+            usize::from(state.terminal.is_some()),
+        )
+    }
+}
+
+impl EventBridgeState {
+    fn record_overflow_loss(&mut self, kind: BackendEventKind) {
+        if let Some(overflow) = self.overflow.back_mut() {
+            overflow.dropped_count = overflow.dropped_count.saturating_add(1);
+            if !overflow.dropped_kinds.contains(&kind) {
+                overflow.dropped_kinds.push(kind);
+            }
+        }
+    }
+
+    fn pop_next(&mut self) -> Option<DispatchItem> {
+        let mut candidate: Option<(u64, DispatchLane)> = None;
+        if let Some(entry) = self.ordinary.front() {
+            candidate = Some((entry.sequence, DispatchLane::Ordinary));
+        }
+        if let Some(entry) = self.control.front() {
+            if candidate.is_none_or(|(sequence, _)| entry.sequence < sequence) {
+                candidate = Some((entry.sequence, DispatchLane::Control));
+            }
+        }
+        if let Some(overflow) = self.overflow.front() {
+            if candidate.is_none_or(|(sequence, _)| overflow.sequence < sequence) {
+                candidate = Some((overflow.sequence, DispatchLane::Overflow));
+            }
+        }
+        if let Some(entry) = self.terminal.as_ref() {
+            if candidate.is_none_or(|(sequence, _)| entry.sequence < sequence) {
+                candidate = Some((entry.sequence, DispatchLane::Terminal));
+            }
+        }
+        let (_, lane) = candidate?;
+        match lane {
+            DispatchLane::Ordinary => self.ordinary.pop_front().map(|entry| DispatchItem {
+                session_id: entry.session_id,
+                event: entry.event,
+            }),
+            DispatchLane::Control => self.control.pop_front().map(|entry| DispatchItem {
+                session_id: entry.session_id,
+                event: entry.event,
+            }),
+            DispatchLane::Overflow => self.overflow.pop_front().map(|overflow| {
+                if self.open_loss_segment == Some(overflow.sequence) {
+                    self.open_loss_segment = None;
+                }
+                DispatchItem {
+                    session_id: overflow.session_id,
+                    event: BackendEventEnvelope::from_payload(
+                        BackendEventMetadata {
+                            id: format!("overflow-{}", overflow.sequence),
+                            occurred_at: overflow.template.occurred_at,
+                            process_session_id: overflow.template.process_session_id,
+                            connection_epoch: overflow.template.connection_epoch,
+                            connection_attempt_id: overflow.template.connection_attempt_id,
+                            world_id: overflow.template.world_id,
+                            dimension: overflow.template.dimension,
+                        },
+                        overflow.template.source,
+                        BackendEventPayload::Overflow(BackendOverflowPayload {
+                            event_type: OverflowType::Overflow,
+                            dropped_count: overflow.dropped_count,
+                            dropped_kinds: overflow.dropped_kinds,
+                        }),
+                    ),
+                }
+            }),
+            DispatchLane::Terminal => self.terminal.take().map(|entry| DispatchItem {
+                session_id: entry.session_id,
+                event: entry.event,
+            }),
+        }
+    }
+}
 
 /// The public production facade.  Construction validates and normalizes the
 /// frozen config; `start` owns the actual runtime attempt.
@@ -156,13 +428,13 @@ struct FacadeInner {
     next_session_id: AtomicU64,
     registry: parking_lot::Mutex<Vec<ListenerEntry>>,
     next_subscription_id: AtomicU64,
-    dispatch_tx: SyncSender<DispatchMessage>,
-    dispatch_normal_queued: parking_lot::Mutex<usize>,
-    dispatch_capacity_cv: parking_lot::Condvar,
+    dispatch: Arc<EventBridge>,
     dispatcher_join: parking_lot::Mutex<Option<JoinHandle<()>>>,
     closed: AtomicBool,
     #[cfg(test)]
     scripted: bool,
+    #[cfg(test)]
+    next_synthetic_worker: parking_lot::Mutex<Option<Arc<ProductionWorkerControl>>>,
 }
 
 struct ListenerEntry {
@@ -171,42 +443,31 @@ struct ListenerEntry {
     state: Arc<ListenerState>,
 }
 
-enum DispatchMessage {
-    Event {
-        session_id: u64,
-        event: BackendEventEnvelope,
-    },
-    Shutdown,
-}
-
 impl FacadeInner {
     fn new(
         config: MinecraftBackendConfig,
         #[cfg(test)] scripted: bool,
         #[cfg(not(test))] _scripted: bool,
     ) -> Result<Arc<Self>, BackendError> {
-        // Keep one bounded emergency slot for the single owned session's
-        // terminal Stopped envelope. Ordinary events are still limited to
-        // DISPATCH_CAPACITY by dispatch_normal_queued below.
-        let (dispatch_tx, dispatch_rx) = mpsc::sync_channel(DISPATCH_CAPACITY + 1);
+        let dispatch = EventBridge::new();
         let inner = Arc::new(Self {
             config,
             session: parking_lot::Mutex::new(None),
             next_session_id: AtomicU64::new(0),
             registry: parking_lot::Mutex::new(Vec::new()),
             next_subscription_id: AtomicU64::new(0),
-            dispatch_tx,
-            dispatch_normal_queued: parking_lot::Mutex::new(0),
-            dispatch_capacity_cv: parking_lot::Condvar::new(),
+            dispatch: dispatch.clone(),
             dispatcher_join: parking_lot::Mutex::new(None),
             closed: AtomicBool::new(false),
             #[cfg(test)]
             scripted,
+            #[cfg(test)]
+            next_synthetic_worker: parking_lot::Mutex::new(None),
         });
         let weak = Arc::downgrade(&inner);
         let join = thread::Builder::new()
             .name("mineintent-backend-dispatcher".to_owned())
-            .spawn(move || dispatcher_loop(weak, dispatch_rx))
+            .spawn(move || dispatcher_loop(weak, dispatch))
             .map_err(|error| thread_failure("dispatcher", error))?;
         *inner.dispatcher_join.lock() = Some(join);
         Ok(inner)
@@ -251,6 +512,10 @@ impl FacadeInner {
             }
             let id = self.next_session_id.fetch_add(1, Ordering::AcqRel) + 1;
             let session = RuntimeSession::new(id, run_config(&self.config), self.is_scripted());
+            #[cfg(test)]
+            if let Some(control) = self.next_synthetic_worker.lock().take() {
+                session.set_synthetic_worker(control);
+            }
             *current = Some(session.clone());
             session
         };
@@ -303,39 +568,14 @@ impl FacadeInner {
     }
 
     fn route_event(&self, session_id: u64, event: BackendEventEnvelope) {
-        let stopped = is_stopped_event(&event);
-        if !stopped && !self.reserve_normal_dispatch_slot() {
+        if self.closed.load(Ordering::Acquire) {
             return;
         }
-        let send_result = self
-            .dispatch_tx
-            .send(DispatchMessage::Event { session_id, event });
-        if send_result.is_err() {
-            if !stopped {
-                self.release_normal_dispatch_slot();
-            }
-            if let Some(session) = self.current_session().filter(|s| s.id == session_id) {
-                session.record_terminal(thread_failure_message("dispatcher is closed"));
-            }
-        }
-    }
-
-    fn reserve_normal_dispatch_slot(&self) -> bool {
-        let mut queued = self.dispatch_normal_queued.lock();
-        while *queued >= DISPATCH_CAPACITY && !self.closed.load(Ordering::Acquire) {
-            self.dispatch_capacity_cv.wait(&mut queued);
-        }
-        if self.closed.load(Ordering::Acquire) {
-            return false;
-        }
-        *queued += 1;
-        true
-    }
-
-    fn release_normal_dispatch_slot(&self) {
-        let mut queued = self.dispatch_normal_queued.lock();
-        *queued = queued.saturating_sub(1);
-        self.dispatch_capacity_cv.notify_one();
+        let cancel = self
+            .current_session()
+            .filter(|session| session.id == session_id)
+            .map(|session| session.stop_cancel.clone());
+        self.dispatch.enqueue(session_id, event, cancel.as_deref());
     }
 
     fn handle_event(&self, session_id: u64, event: BackendEventEnvelope) {
@@ -409,17 +649,21 @@ impl FacadeInner {
             inner: self.clone(),
         }
     }
+
+    #[cfg(test)]
+    fn install_next_synthetic_worker(&self, control: Arc<ProductionWorkerControl>) {
+        *self.next_synthetic_worker.lock() = Some(control);
+    }
 }
 
 impl Drop for FacadeInner {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Release);
-        self.dispatch_capacity_cv.notify_all();
+        self.dispatch.close();
         if let Some(session) = self.session.get_mut().take() {
             session.request_stop_without_inner("facade_dropped");
             session.join_worker_blocking();
         }
-        let _ = self.dispatch_tx.send(DispatchMessage::Shutdown);
         if let Some(join) = self.dispatcher_join.get_mut().take() {
             if join.thread().id() != thread::current().id() {
                 let _ = join.join();
@@ -439,11 +683,13 @@ struct RuntimeSession {
     joined: AtomicBool,
     joined_notify: Notify,
     worker_thread: parking_lot::Mutex<Option<ThreadId>>,
+    stop_cancel: Arc<AtomicBool>,
     #[cfg(test)]
-    scripted_receiver:
-        parking_lot::Mutex<Option<tokio_mpsc::UnboundedReceiver<RuntimeEventEnvelope>>>,
+    scripted_receiver: parking_lot::Mutex<Option<RuntimeEventReceiver>>,
     #[cfg(test)]
     scripted_snapshot: parking_lot::Mutex<Option<MinecraftSnapshotV1>>,
+    #[cfg(test)]
+    synthetic_worker: parking_lot::Mutex<Option<Arc<ProductionWorkerControl>>>,
 }
 
 #[derive(Default)]
@@ -468,10 +714,13 @@ impl RuntimeSession {
             joined: AtomicBool::new(scripted),
             joined_notify: Notify::new(),
             worker_thread: parking_lot::Mutex::new(None),
+            stop_cancel: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             scripted_receiver: parking_lot::Mutex::new(scripted_receiver),
             #[cfg(test)]
             scripted_snapshot: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            synthetic_worker: parking_lot::Mutex::new(None),
         })
     }
 
@@ -520,7 +769,9 @@ impl RuntimeSession {
     }
 
     fn request_stop(&self, inner: &FacadeInner, reason: &str) {
+        self.stop_cancel.store(true, Ordering::Release);
         self.request_stop_without_inner(reason);
+        inner.dispatch.wake_all();
         #[cfg(test)]
         if inner.is_scripted() {
             self.drain_scripted_events(inner);
@@ -530,6 +781,7 @@ impl RuntimeSession {
     }
 
     fn request_stop_without_inner(&self, reason: &str) {
+        self.stop_cancel.store(true, Ordering::Release);
         self.handle.stop(reason);
     }
 
@@ -721,6 +973,11 @@ impl RuntimeSession {
     }
 
     #[cfg(test)]
+    fn set_synthetic_worker(&self, control: Arc<ProductionWorkerControl>) {
+        *self.synthetic_worker.lock() = Some(control);
+    }
+
+    #[cfg(test)]
     fn drain_scripted_events(&self, inner: &FacadeInner) {
         let mut events = Vec::new();
         if let Some(receiver) = self.scripted_receiver.lock().as_mut() {
@@ -742,17 +999,114 @@ impl RuntimeSession {
     }
 }
 
+#[cfg(test)]
+struct ProductionWorkerControl {
+    burst_len: usize,
+    first_event: std::sync::mpsc::Sender<()>,
+    start_burst: Arc<Notify>,
+    burst_submitted: std::sync::mpsc::Sender<()>,
+    #[cfg(test)]
+    control_burst: usize,
+    #[cfg(test)]
+    broker_full: Option<std::sync::mpsc::Sender<()>>,
+    #[cfg(test)]
+    broker_backpressure_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[cfg(test)]
+async fn synthetic_production_worker(
+    session: Arc<RuntimeSession>,
+    control: Arc<ProductionWorkerControl>,
+) {
+    let entity = BackendEventPayload::Entity(
+        mineintent_contracts::minecraft::ProtocolEntityEvent::Animation {
+            entity_key: "synthetic-entity".to_owned(),
+            animation: "tick".to_owned(),
+        },
+    );
+    session
+        .handle
+        .test_drive_event(FactSource::ServerObserved, entity.clone());
+    let _ = control.first_event.send(());
+    control.start_burst.notified().await;
+    #[cfg(test)]
+    if control.control_burst > 0 {
+        for index in 0..control.control_burst {
+            if index == RUNTIME_BROKER_CONTROL_CAPACITY {
+                if let Some(broker_full) = control.broker_full.as_ref() {
+                    broker_full.send(()).expect("broker-full gate receiver");
+                }
+            }
+            session.handle.test_drive_event(
+                FactSource::ServerObserved,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionRequested {
+                    attempt: index as u32 + 1,
+                }),
+            );
+        }
+    } else {
+        for _ in 0..control.burst_len {
+            session
+                .handle
+                .test_drive_event(FactSource::ServerObserved, entity.clone());
+        }
+    }
+    session.handle.test_drive_event(
+        FactSource::ServerObserved,
+        BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionRequested {
+            attempt: 900,
+        }),
+    );
+    session.handle.test_drive_event(
+        FactSource::ServerObserved,
+        BackendEventPayload::Chat(mineintent_contracts::minecraft::ProtocolChatEvent {
+            sender_username: Some("synthetic".to_owned()),
+            plain_text: "lossless chat".to_owned(),
+            position: Some(mineintent_contracts::minecraft::ChatPosition::Chat),
+            verified: Some(true),
+        }),
+    );
+    let _ = control.burst_submitted.send(());
+    session.handle.test_wait_for_shutdown().await;
+}
+
 async fn runtime_worker(session: Arc<RuntimeSession>, inner: Weak<FacadeInner>, config: RunConfig) {
+    #[cfg(test)]
+    let synthetic_control = { session.synthetic_worker.lock().take() };
+    #[cfg(test)]
+    if let Some(control) = synthetic_control.as_ref() {
+        session
+            .handle
+            .test_set_runtime_broker_backpressure_hook(control.broker_backpressure_hook.clone());
+    }
     let mut events = session.handle.subscribe();
+    #[cfg(test)]
+    let mut run = if let Some(control) = synthetic_control {
+        let producer_session = session.clone();
+        let synthetic_session = session.clone();
+        tokio::task::spawn_local(async move {
+            tokio::task::spawn_local(synthetic_production_worker(synthetic_session, control));
+            producer_session.handle.test_wait_for_shutdown().await;
+            Ok(())
+        })
+    } else {
+        tokio::task::spawn_local(run_with_handle(session.handle.clone(), config))
+    };
+    #[cfg(not(test))]
     let mut run = tokio::task::spawn_local(run_with_handle(session.handle.clone(), config));
     let mut run_finished = false;
     let mut run_failed = false;
+    let mut stopped_seen = false;
     loop {
         if run_finished {
+            if stopped_seen {
+                break;
+            }
             let Some(event) = events.recv().await else {
                 break;
             };
             let stopped = is_stopped_event(&event);
+            stopped_seen |= stopped;
             session.observe_event(&event);
             if let Some(inner) = inner.upgrade() {
                 inner.route_event(session.id, event);
@@ -801,32 +1155,29 @@ async fn runtime_worker(session: Arc<RuntimeSession>, inner: Weak<FacadeInner>, 
                 if run_failed {
                     break;
                 }
+                if stopped_seen {
+                    break;
+                }
             }
             event = events.recv() => {
                 let Some(event) = event else { break; };
+                let stopped = is_stopped_event(&event);
                 session.observe_event(&event);
                 if let Some(inner) = inner.upgrade() {
                     inner.route_event(session.id, event);
                 }
+                stopped_seen |= stopped;
             }
         }
     }
 }
 
-fn dispatcher_loop(weak: Weak<FacadeInner>, receiver: Receiver<DispatchMessage>) {
-    while let Ok(message) = receiver.recv() {
-        match message {
-            DispatchMessage::Event { session_id, event } => {
-                let Some(inner) = weak.upgrade() else {
-                    continue;
-                };
-                if !is_stopped_event(&event) {
-                    inner.release_normal_dispatch_slot();
-                }
-                inner.handle_event(session_id, event);
-            }
-            DispatchMessage::Shutdown => break,
-        }
+fn dispatcher_loop(weak: Weak<FacadeInner>, dispatch: Arc<EventBridge>) {
+    while let Some(item) = dispatch.next() {
+        let Some(inner) = weak.upgrade() else {
+            break;
+        };
+        inner.handle_event(item.session_id, item.event);
     }
 }
 
@@ -1331,6 +1682,13 @@ fn is_stopped_event(event: &RuntimeEventEnvelope) -> bool {
     matches!(
         event.payload,
         BackendEventPayload::Lifecycle(BackendLifecyclePayload::Stopped { .. })
+    )
+}
+
+fn is_droppable_event(event: &BackendEventEnvelope) -> bool {
+    matches!(
+        event.kind,
+        BackendEventKind::Entity | BackendEventKind::Block | BackendEventKind::Sound
     )
 }
 
@@ -2240,6 +2598,88 @@ mod tests {
         called: AtomicBool,
     }
 
+    struct ProductionWorkerStopListener {
+        facade: MinecraftBackendFacade,
+        start_burst: Arc<Notify>,
+        burst_submitted: parking_lot::Mutex<Option<std_mpsc::Receiver<()>>>,
+        completed: std_mpsc::Sender<Result<Result<(), BackendError>, tokio::time::error::Elapsed>>,
+        stopped: std_mpsc::Sender<()>,
+        seen: Arc<parking_lot::Mutex<Vec<BackendEventEnvelope>>>,
+        called: AtomicBool,
+    }
+
+    struct InternalAdmissionSaturationListener {
+        facade: MinecraftBackendFacade,
+        start_burst: Arc<Notify>,
+        callback_started: std_mpsc::Sender<()>,
+        callback_release: Arc<Notify>,
+        completed: std_mpsc::Sender<Result<Result<(), BackendError>, tokio::time::error::Elapsed>>,
+        stopped: std_mpsc::Sender<()>,
+        seen: Arc<parking_lot::Mutex<Vec<BackendEventEnvelope>>>,
+        called: AtomicBool,
+    }
+
+    impl BackendEventListener for ProductionWorkerStopListener {
+        fn on_event(&self, event: BackendEventEnvelope) {
+            self.seen.lock().push(event.clone());
+            if matches!(
+                event.payload,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::Stopped { .. })
+            ) {
+                let _ = self.stopped.send(());
+            }
+            if self.called.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            self.start_burst.notify_one();
+            let _ = self
+                .burst_submitted
+                .lock()
+                .take()
+                .expect("burst receiver")
+                .recv_timeout(Duration::from_secs(1));
+            let facade = self.facade.clone();
+            let result = futures_block_on(async move {
+                tokio::time::timeout(
+                    Duration::from_millis(800),
+                    facade.stop("production-callback-stop".to_owned(), never_control()),
+                )
+                .await
+            });
+            let _ = self.completed.send(result);
+        }
+    }
+
+    impl BackendEventListener for InternalAdmissionSaturationListener {
+        fn on_event(&self, event: BackendEventEnvelope) {
+            self.seen.lock().push(event.clone());
+            if matches!(
+                event.payload,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::Stopped { .. })
+            ) {
+                let _ = self.stopped.send(());
+            }
+            if self.called.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            self.callback_started
+                .send(())
+                .expect("public dispatcher gate receiver");
+            self.start_burst.notify_one();
+            let callback_release = self.callback_release.clone();
+            let facade = self.facade.clone();
+            let result = futures_block_on(async move {
+                callback_release.notified().await;
+                tokio::time::timeout(
+                    Duration::from_millis(800),
+                    facade.stop("internal-admission-saturation".to_owned(), never_control()),
+                )
+                .await
+            });
+            let _ = self.completed.send(result);
+        }
+    }
+
     impl BackendEventListener for SaturatedStopListener {
         fn on_event(&self, event: BackendEventEnvelope) {
             let first = !self.called.swap(true, Ordering::AcqRel);
@@ -2279,6 +2719,422 @@ mod tests {
             .build()
             .expect("callback helper runtime");
         runtime.block_on(future)
+    }
+
+    fn bridge_event(id: &str, payload: BackendEventPayload) -> BackendEventEnvelope {
+        BackendEventEnvelope::from_payload(
+            BackendEventMetadata {
+                id: id.to_owned(),
+                occurred_at: "2026-08-03T00:00:00Z".to_owned(),
+                process_session_id: "bridge-test".to_owned(),
+                connection_epoch: 1,
+                connection_attempt_id: "attempt-1".to_owned(),
+                world_id: "world".to_owned(),
+                dimension: Some("minecraft:overworld".to_owned()),
+            },
+            FactSource::ServerObserved,
+            payload,
+        )
+    }
+
+    fn bridge_entity(id: &str) -> BackendEventEnvelope {
+        bridge_event(
+            id,
+            BackendEventPayload::Entity(
+                mineintent_contracts::minecraft::ProtocolEntityEvent::Animation {
+                    entity_key: "bridge-entity".to_owned(),
+                    animation: "tick".to_owned(),
+                },
+            ),
+        )
+    }
+
+    #[test]
+    fn event_bridge_closes_each_loss_segment_at_loss_position() {
+        let bridge = EventBridge::new();
+        for index in 0..DISPATCH_CAPACITY {
+            assert!(bridge.enqueue(1, bridge_entity(&format!("ordinary-{index}")), None));
+        }
+        assert!(bridge.enqueue(1, bridge_entity("drop-a"), None));
+        assert!(bridge.enqueue(
+            1,
+            bridge_event(
+                "lifecycle",
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionRequested {
+                    attempt: 7,
+                }),
+            ),
+            None,
+        ));
+        assert!(bridge.enqueue(1, bridge_entity("drop-b"), None));
+        assert_eq!(bridge.queued_counts(), (DISPATCH_CAPACITY, 1, 2, 0));
+
+        for _ in 0..DISPATCH_CAPACITY {
+            assert_eq!(
+                bridge.next().expect("ordinary entry").event.kind,
+                BackendEventKind::Entity
+            );
+        }
+        let first_marker = bridge.next().expect("first overflow marker").event;
+        let first_count = match first_marker.payload {
+            BackendEventPayload::Overflow(payload) => payload.dropped_count,
+            payload => panic!("expected first overflow, got {payload:?}"),
+        };
+        assert_eq!(first_count, 1);
+        assert!(matches!(
+            bridge
+                .next()
+                .expect("lifecycle after first loss")
+                .event
+                .payload,
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionRequested {
+                attempt: 7
+            })
+        ));
+        let second_marker = bridge.next().expect("second overflow marker").event;
+        let second_count = match second_marker.payload {
+            BackendEventPayload::Overflow(payload) => payload.dropped_count,
+            payload => panic!("expected second overflow, got {payload:?}"),
+        };
+        assert_eq!(second_count, 1);
+    }
+
+    #[test]
+    fn event_bridge_old_marker_pop_does_not_close_new_loss_segment() {
+        let bridge = EventBridge::new();
+        for index in 0..DISPATCH_CAPACITY {
+            assert!(bridge.enqueue(1, bridge_entity(&format!("ordinary-{index}")), None));
+        }
+        assert!(bridge.enqueue(1, bridge_entity("drop-a"), None));
+        assert!(bridge.enqueue(
+            1,
+            bridge_event(
+                "control",
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected),
+            ),
+            None,
+        ));
+        for _ in 0..DISPATCH_CAPACITY {
+            bridge.next().expect("ordinary entry");
+        }
+        for index in 0..DISPATCH_CAPACITY {
+            assert!(bridge.enqueue(1, bridge_entity(&format!("refill-{index}")), None));
+        }
+        assert!(bridge.enqueue(1, bridge_entity("drop-b"), None));
+        let first = bridge.next().expect("first marker").event;
+        assert!(matches!(
+            first.payload,
+            BackendEventPayload::Overflow(payload) if payload.dropped_count == 1
+        ));
+
+        // Marker A is gone, while marker B is the still-open segment.  A new
+        // loss must aggregate into B even though A was the marker just popped.
+        assert!(bridge.enqueue(1, bridge_entity("drop-c"), None));
+        let control = bridge.next().expect("control after first marker").event;
+        assert!(matches!(
+            control.payload,
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected)
+        ));
+        for _ in 0..DISPATCH_CAPACITY {
+            bridge.next().expect("refilled ordinary entry");
+        }
+        let second = bridge.next().expect("second marker").event;
+        assert!(matches!(
+            second.payload,
+            BackendEventPayload::Overflow(payload) if payload.dropped_count == 2
+        ));
+    }
+
+    #[test]
+    fn event_bridge_sustained_high_frequency_is_finite_and_control_is_retained() {
+        let bridge = EventBridge::new();
+        for index in 0..10_000 {
+            assert!(bridge.enqueue(1, bridge_entity(&format!("entity-{index}")), None));
+            let (ordinary, control, overflow, terminal) = bridge.queued_counts();
+            assert!(ordinary <= DISPATCH_CAPACITY);
+            assert!(control <= CONTROL_CAPACITY);
+            assert!(overflow <= OVERFLOW_CAPACITY);
+            assert!(terminal <= 1);
+        }
+        assert_eq!(bridge.queued_counts(), (DISPATCH_CAPACITY, 0, 1, 0));
+        assert!(bridge.enqueue(
+            1,
+            bridge_event(
+                "chat",
+                BackendEventPayload::Chat(mineintent_contracts::minecraft::ProtocolChatEvent {
+                    sender_username: Some("Alex".to_owned()),
+                    plain_text: "must arrive".to_owned(),
+                    position: Some(mineintent_contracts::minecraft::ChatPosition::Chat),
+                    verified: None,
+                },),
+            ),
+            None,
+        ));
+        assert_eq!(bridge.queued_counts(), (DISPATCH_CAPACITY, 1, 1, 0));
+        for index in 0..10_000 {
+            assert!(bridge.enqueue(1, bridge_entity(&format!("entity-after-{index}")), None));
+            let (ordinary, control, overflow, terminal) = bridge.queued_counts();
+            assert!(ordinary <= DISPATCH_CAPACITY);
+            assert!(control <= CONTROL_CAPACITY);
+            assert!(overflow <= OVERFLOW_CAPACITY);
+            assert!(terminal <= 1);
+        }
+
+        let mut saw_chat = false;
+        while {
+            let (ordinary, control, overflow, terminal) = bridge.queued_counts();
+            ordinary + control + overflow + terminal > 0
+        } {
+            if matches!(
+                bridge.next().expect("queued bridge event").event.payload,
+                BackendEventPayload::Chat(_)
+            ) {
+                saw_chat = true;
+            }
+        }
+        assert!(
+            saw_chat,
+            "lossless chat must survive bounded high-frequency load"
+        );
+    }
+
+    #[test]
+    fn facade_real_runtime_worker_capacity_plus_one_stop_is_bounded() {
+        let facade = MinecraftBackendFacade::new(test_config()).expect("production facade");
+        let (first_sent, first_received) = std_mpsc::channel();
+        let start_burst = Arc::new(Notify::new());
+        let (burst_submitted, burst_received) = std_mpsc::channel();
+        let (completed, completed_received) = std_mpsc::channel();
+        let (stopped, stopped_received) = std_mpsc::channel();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _subscription = facade
+            .subscribe(Arc::new(ProductionWorkerStopListener {
+                facade: facade.clone(),
+                start_burst: start_burst.clone(),
+                burst_submitted: parking_lot::Mutex::new(Some(burst_received)),
+                completed,
+                stopped,
+                seen: seen.clone(),
+                called: AtomicBool::new(false),
+            }))
+            .expect("production subscription");
+        facade
+            .inner
+            .install_next_synthetic_worker(Arc::new(ProductionWorkerControl {
+                burst_len: DISPATCH_CAPACITY + 1,
+                first_event: first_sent,
+                start_burst,
+                burst_submitted,
+                control_burst: 0,
+                broker_full: None,
+                broker_backpressure_hook: None,
+            }));
+        let session = facade
+            .inner
+            .admit_start()
+            .expect("runtime worker admission");
+        first_received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("real runtime worker must submit its first event");
+        let stop_result = completed_received
+            .recv_timeout(Duration::from_secs(2))
+            .expect("callback stop must finish at bounded saturation");
+        assert!(
+            matches!(stop_result, Ok(Ok(()))),
+            "stop result: {stop_result:?}"
+        );
+        stopped_received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stopped must be dispatched");
+        assert!(session.worker_done.load(Ordering::Acquire));
+        assert!(session.joined.load(Ordering::Acquire));
+        let seen = seen.lock();
+        let overflow_count = seen
+            .iter()
+            .filter(|event| event.kind == BackendEventKind::Overflow)
+            .count();
+        let stopped_count = seen
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.payload,
+                    BackendEventPayload::Lifecycle(BackendLifecyclePayload::Stopped { .. })
+                )
+            })
+            .count();
+        assert_eq!(overflow_count, 1, "one continuous loss segment expected");
+        assert_eq!(stopped_count, 1, "terminal event must be unique");
+        assert!(seen.iter().any(|event| {
+            matches!(
+                event.payload,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionRequested {
+                    attempt: 900
+                })
+            )
+        }));
+        assert!(seen.iter().any(|event| {
+            matches!(
+                event.payload,
+                BackendEventPayload::Chat(ref chat) if chat.plain_text == "lossless chat"
+            )
+        }));
+    }
+
+    #[test]
+    fn facade_real_worker_finite_internal_admission_stops_under_broker_backpressure() {
+        let facade = MinecraftBackendFacade::new(test_config()).expect("production facade");
+        let (first_sent, first_received) = std_mpsc::channel();
+        let start_burst = Arc::new(Notify::new());
+        let (broker_full, broker_full_received) = std_mpsc::channel();
+        let (broker_blocked, broker_blocked_received) = std_mpsc::channel();
+        let broker_backpressure_hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            broker_blocked
+                .send(())
+                .expect("broker backpressure receiver");
+        });
+        let (callback_started, callback_started_received) = std_mpsc::channel();
+        let callback_release = Arc::new(Notify::new());
+        let (completed, completed_received) = std_mpsc::channel();
+        let (stopped, stopped_received) = std_mpsc::channel();
+        let (control_ready, control_ready_received) = std_mpsc::channel();
+        let (dispatch_blocked, dispatch_blocked_received) = std_mpsc::channel();
+        let (ordinary_done, ordinary_done_received) = std_mpsc::channel();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _subscription = facade
+            .subscribe(Arc::new(InternalAdmissionSaturationListener {
+                facade: facade.clone(),
+                start_burst: start_burst.clone(),
+                callback_started,
+                callback_release: callback_release.clone(),
+                completed,
+                stopped,
+                seen: seen.clone(),
+                called: AtomicBool::new(false),
+            }))
+            .expect("production saturation subscription");
+        let (burst_submitted, _burst_submitted_received) = std_mpsc::channel();
+        facade
+            .inner
+            .install_next_synthetic_worker(Arc::new(ProductionWorkerControl {
+                burst_len: 0,
+                first_event: first_sent,
+                start_burst,
+                burst_submitted,
+                control_burst: RUNTIME_BROKER_CONTROL_CAPACITY + 1,
+                broker_full: Some(broker_full),
+                broker_backpressure_hook: Some(broker_backpressure_hook),
+            }));
+        let session = facade
+            .inner
+            .admit_start()
+            .expect("runtime worker admission");
+
+        first_received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker must submit first event");
+        callback_started_received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("public dispatcher must be gated inside callback");
+        broker_full_received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runtime broker control lane must fill deterministically");
+        broker_blocked_received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runtime drainer must block at broker capacity plus one");
+        let dispatch_blocked_hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            dispatch_blocked
+                .send(())
+                .expect("internal dispatch backpressure receiver");
+        });
+        session
+            .handle
+            .test_set_event_dispatch_backpressure_hook(Some(dispatch_blocked_hook));
+
+        let control_handle = session.handle.clone();
+        let control_producer = thread::spawn(move || {
+            for attempt in 0..RUNTIME_DISPATCH_CONTROL_CAPACITY {
+                control_handle.test_drive_event(
+                    FactSource::ServerObserved,
+                    BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionRequested {
+                        attempt: attempt as u32 + 10_000,
+                    }),
+                );
+            }
+            control_ready
+                .send(())
+                .expect("internal control capacity receiver");
+            control_handle.test_drive_event(
+                FactSource::ServerObserved,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected),
+            );
+        });
+
+        control_ready_received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("internal control lane must admit exactly its finite capacity");
+        dispatch_blocked_received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the next internal control admission must backpressure");
+        let ordinary_handle = session.handle.clone();
+        let ordinary_producer = thread::spawn(move || {
+            for _ in 0..10_000 {
+                ordinary_handle.test_drive_event(
+                    FactSource::ServerObserved,
+                    BackendEventPayload::Entity(
+                        mineintent_contracts::minecraft::ProtocolEntityEvent::Animation {
+                            entity_key: "internal-saturation-entity".to_owned(),
+                            animation: "tick".to_owned(),
+                        },
+                    ),
+                );
+            }
+            ordinary_done
+                .send(())
+                .expect("ordinary producer completion receiver");
+        });
+        assert!(
+            ordinary_done_received.try_recv().is_err(),
+            "a later ordinary producer must not overtake the waiting control ticket"
+        );
+        let (ordinary, control, overflow, terminal) = session.handle.test_event_dispatch_counts();
+        assert!(ordinary <= RUNTIME_DISPATCH_ORDINARY_CAPACITY);
+        assert!(control <= RUNTIME_DISPATCH_CONTROL_CAPACITY);
+        assert!(overflow <= RUNTIME_DISPATCH_OVERFLOW_CAPACITY);
+        assert!(terminal <= 1);
+
+        callback_release.notify_one();
+        let stop_result = completed_received
+            .recv_timeout(Duration::from_secs(2))
+            .expect("callback stop must finish after finite admission cancellation");
+        assert!(
+            matches!(stop_result, Ok(Ok(()))),
+            "stop result: {stop_result:?}"
+        );
+        control_producer
+            .join()
+            .expect("blocked control producer must be woken by stop");
+        ordinary_producer
+            .join()
+            .expect("ordinary producer must finish");
+        ordinary_done_received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("ordinary producer must finish after stop cancellation");
+        stopped_received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stopped must be delivered once the public callback gate opens");
+        assert!(session.worker_done.load(Ordering::Acquire));
+        assert!(session.joined.load(Ordering::Acquire));
+        let stopped_count = seen
+            .lock()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.payload,
+                    BackendEventPayload::Lifecycle(BackendLifecyclePayload::Stopped { .. })
+                )
+            })
+            .count();
+        assert_eq!(stopped_count, 1, "terminal admission must be unique");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2419,7 +3275,7 @@ mod tests {
 
         let fill_driver = driver.clone();
         let filler = thread::spawn(move || {
-            for attempt in 0..DISPATCH_CAPACITY {
+            for attempt in 0..CONTROL_CAPACITY {
                 fill_driver.emit(
                     FactSource::Commanded,
                     BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionRequested {
@@ -2446,7 +3302,7 @@ mod tests {
         assert_eq!(stop_result, Ok(Ok(())));
         first_emitter.join().expect("first event emitter");
 
-        let expected_count = DISPATCH_CAPACITY + 2;
+        let expected_count = CONTROL_CAPACITY + 2;
         let deadline = Instant::now() + Duration::from_secs(1);
         let mut delivered = Vec::with_capacity(expected_count);
         while delivered.len() < expected_count {
