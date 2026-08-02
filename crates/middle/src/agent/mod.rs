@@ -3,6 +3,7 @@
 //! 初始模型消息由上层 context composer 提供；本模块只负责可步进的循环状态、
 //! 调用上限、tool-call 一次性 claim 与严格的结果配对。
 
+mod context;
 mod driver;
 mod prompt;
 mod run;
@@ -10,6 +11,10 @@ mod runner;
 mod transcript;
 mod viewport;
 
+pub use context::{
+    AgentChatInputV5, AgentChatTriggerV5, AgentContextV5Assembler, AgentContextV5AssemblyError,
+    AgentContextV5EventInput, AgentContextV5Input,
+};
 pub use driver::{AgentLoopDriver, AgentLoopOutcome, AgentModelRequest};
 pub use prompt::{initial_messages, system_prompt, template_text, PromptError};
 pub use run::{

@@ -617,3 +617,166 @@ pub struct ViewportRead {
     pub source: super::FactSource,
     pub revision: u64,
 }
+
+/// 模型可见视口的独立 schema 锚点。
+///
+/// `ViewportProjection` 仍然是 backend observation source 的旧 kernel DTO；它不能
+/// 直接穿过 middle 的模型边界。模型只接收下面的 v2 presenter 结果。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ViewportProtocolV2 {
+    #[default]
+    #[serde(rename = "mineintent.viewport.v2")]
+    V2,
+}
+
+impl ViewportProtocolV2 {
+    pub const WIRE: &'static str = "mineintent.viewport.v2";
+}
+
+/// `view(mode="full")` 与轮末 viewport frame 共用的模型可见 payload。
+///
+/// 这是有意与 backend 的 `ViewportProjection` 分开的 DTO：`standingOnBlock` 已从
+/// 模型通道删除，但 backend 内部仍可以保留它作为 kernel/旧回放数据。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ViewportFullV2 {
+    pub protocol: ViewportProtocolV2,
+    pub frame: ViewportFrame,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub looked_at_block: Option<ViewportBlock>,
+    pub visible_entities: VisibleEntitiesView,
+    pub visible_blocks: VisibleBlocksView,
+}
+
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+/// `view(mode="directed")` 共用同一个模型可见 schema 锚点。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ViewportDirectedV2 {
+    pub protocol: ViewportProtocolV2,
+    pub seen: Vec<DirectedSeenBlock>,
+    pub unseen: Vec<DirectedUnseenBlock>,
+}
+
+impl ViewportDirectedV2 {
+    pub fn validate(&self) -> Result<(), String> {
+        DirectedViewportProjection {
+            seen: self.seen.clone(),
+            unseen: self.unseen.clone(),
+        }
+        .validate()
+    }
+}
+
+impl Serialize for ViewportDirectedV2 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("protocol", &self.protocol)?;
+        map.serialize_entry("seen", &self.seen)?;
+        map.serialize_entry("unseen", &self.unseen)?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ViewportDirectedV2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            protocol: ViewportProtocolV2,
+            seen: Vec<DirectedSeenBlock>,
+            unseen: Vec<DirectedUnseenBlock>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let value = Self {
+            protocol: raw.protocol,
+            seen: raw.seen,
+            unseen: raw.unseen,
+        };
+        value.validate().map_err(de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+pub type ViewportProjectionV2 = ViewportFullV2;
+pub type DirectedViewportProjectionV2 = ViewportDirectedV2;
+
+/// The two model-visible forms share the same nested protocol anchor without adding a
+/// model-visible `mode` field to either frozen payload.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ViewportV2 {
+    Full(ViewportFullV2),
+    Directed(ViewportDirectedV2),
+}
+
+impl Serialize for ViewportV2 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Full(value) => value.serialize(serializer),
+            Self::Directed(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ViewportV2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value
+            .as_object()
+            .is_some_and(|object| object.contains_key("seen") || object.contains_key("unseen"))
+        {
+            serde_json::from_value(value)
+                .map(Self::Directed)
+                .map_err(de::Error::custom)
+        } else {
+            serde_json::from_value(value)
+                .map(Self::Full)
+                .map_err(de::Error::custom)
+        }
+    }
+}
+
+/// 唯一的 kernel → model presenter。所有模型可见 full viewport 消费方都必须经过它。
+pub fn present_viewport_v2(projection: &ViewportProjection) -> ViewportFullV2 {
+    ViewportFullV2 {
+        protocol: ViewportProtocolV2::V2,
+        frame: projection.frame.clone(),
+        looked_at_block: projection.looked_at_block.clone(),
+        visible_entities: projection.visible_entities.clone(),
+        visible_blocks: projection.visible_blocks.clone(),
+    }
+}
+
+/// 唯一的 kernel directed DTO → model presenter；几何和 directed 五值纪律仍由 kernel
+/// 的 `DirectedViewportProjection` 负责。
+pub fn present_directed_viewport_v2(
+    projection: &DirectedViewportProjection,
+) -> Result<ViewportDirectedV2, String> {
+    let value = ViewportDirectedV2 {
+        protocol: ViewportProtocolV2::V2,
+        seen: projection.seen.clone(),
+        unseen: projection.unseen.clone(),
+    };
+    value.validate()?;
+    Ok(value)
+}

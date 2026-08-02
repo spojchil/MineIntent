@@ -212,7 +212,7 @@ struct RecordingSampler {
 impl RecordingSampler {
     fn success(value: Value) -> Self {
         Self {
-            behavior: SampleBehavior::Success(value),
+            behavior: SampleBehavior::Success(canonical_viewport(&marker(&value))),
             at: "2026-08-02T12:34:56Z".to_owned(),
             calls: AtomicUsize::new(0),
             deadlines: Mutex::new(Vec::new()),
@@ -227,6 +227,39 @@ impl RecordingSampler {
             deadlines: Mutex::new(Vec::new()),
         }
     }
+}
+
+fn marker(value: &Value) -> String {
+    value
+        .as_object()
+        .and_then(|object| object.values().next())
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn canonical_viewport(marker: &str) -> Value {
+    json!({
+        "protocol": "mineintent.viewport.v2",
+        "frame": {
+            "coordinates": "minecraft_world_absolute",
+            "self": {
+                "position": [0.5, 64.0, 0.5],
+                "yawDegrees": 0.0,
+                "pitchDegrees": 0.0
+            },
+            "legend": {
+                "visibleEntities": "items: {type, player?, position}; nearest first",
+                "visibleBlocks": "[BlockInfo, x, y, z]; nearest first"
+            }
+        },
+        "lookedAtBlock": null,
+        "visibleEntities": {
+            "items": [{"type": "marker", "player": marker, "position": [0.0, 64.0, 0.0]}],
+            "truncated": false
+        },
+        "visibleBlocks": {"blocks": [], "truncated": false}
+    })
 }
 
 impl RoundViewportSampler for RecordingSampler {
@@ -474,9 +507,12 @@ async fn multiple_body_calls_sample_once_after_all_tool_messages() {
     assert_eq!(replay[4]["role"], "user");
     assert_eq!(
         frame_content(&replay[4])["protocol"],
-        "mineintent.viewport-frame.v1"
+        "mineintent.viewport-frame.v2"
     );
-    assert_eq!(frame_content(&replay[4])["viewport"]["projection"], "round");
+    assert_eq!(
+        frame_content(&replay[4])["viewport"]["visibleEntities"]["items"][0]["player"],
+        "round"
+    );
     assert!(replay[4].get("tool_call_id").is_none());
     assert_eq!(driver.viewport_sampler().calls.load(Ordering::SeqCst), 1);
 }
@@ -527,7 +563,10 @@ async fn body_failure_busy_and_panic_still_sample_once() {
     assert_eq!(second["result"]["summary"], "body_held_by_other");
     assert_eq!(third["result"]["summary"], "tool_dispatch_panicked");
     assert_eq!(replay[5]["role"], "user");
-    assert_eq!(frame_content(&replay[5])["viewport"]["after"], "failures");
+    assert_eq!(
+        frame_content(&replay[5])["viewport"]["visibleEntities"]["items"][0]["player"],
+        "failures"
+    );
     assert_eq!(driver.viewport_sampler().calls.load(Ordering::SeqCst), 1);
 }
 
@@ -563,7 +602,10 @@ async fn mixed_view_and_body_preserves_view_result_and_adds_one_round_frame() {
     assert_eq!(replay[2]["tool_call_id"], "view");
     assert_eq!(replay[3]["tool_call_id"], "body");
     assert_eq!(replay[4]["role"], "user");
-    assert_eq!(frame_content(&replay[4])["viewport"]["frame"], "after-body");
+    assert_eq!(
+        frame_content(&replay[4])["viewport"]["visibleEntities"]["items"][0]["player"],
+        "after-body"
+    );
     assert_eq!(driver.viewport_sampler().calls.load(Ordering::SeqCst), 1);
 }
 
@@ -606,7 +648,7 @@ async fn pure_view_and_say_batches_do_not_add_a_frame() {
             .and_then(Value::as_str)
             .and_then(|content| serde_json::from_str::<Value>(content).ok())
             .map_or(true, |value| {
-                value["protocol"] != "mineintent.viewport-frame.v1"
+                value["protocol"] != "mineintent.viewport-frame.v2"
             })
     }));
     assert_eq!(driver.viewport_sampler().calls.load(Ordering::SeqCst), 0);
@@ -660,7 +702,7 @@ async fn missing_sampler_uses_real_utc_for_explicit_unavailable_frame() {
 
     let requests = driver.model().requests.lock().expect("request lock");
     let frame = frame_content(&requests[1].messages[3]);
-    assert_eq!(frame["protocol"], "mineintent.viewport-frame.v1");
+    assert_eq!(frame["protocol"], "mineintent.viewport-frame.v2");
     assert_eq!(frame["viewport"], Value::Null);
     assert_eq!(frame["unavailable"], "viewport_sampler_not_configured");
     let at = frame["at"].as_str().expect("UTC at string");
@@ -772,7 +814,7 @@ async fn sampler_timestamp_panic_is_isolated_with_a_real_utc_frame_at() {
 
     let requests = driver.model().requests.lock().expect("request lock");
     let frame = frame_content(&requests[1].messages[3]);
-    assert_eq!(frame["protocol"], "mineintent.viewport-frame.v1");
+    assert_eq!(frame["protocol"], "mineintent.viewport-frame.v2");
     assert_eq!(frame["viewport"], Value::Null);
     assert_eq!(frame["unavailable"], "viewport_sampler_panicked");
     let at = frame["at"].as_str().expect("fallback UTC at string");
@@ -890,7 +932,7 @@ async fn sampler_cancellation_has_priority_and_does_not_emit_a_failure_frame() {
                 .get("content")
                 .and_then(Value::as_str)
                 .map_or(true, |content| {
-                    !content.contains("mineintent.viewport-frame.v1")
+                    !content.contains("mineintent.viewport-frame.v2")
                 })
         }));
 }
@@ -959,8 +1001,9 @@ async fn frame_is_in_the_next_model_request_and_transcript() {
 
     let requests = runner.driver().model().requests.lock().expect("requests");
     assert_eq!(
-        frame_content(&requests[1].messages.last().unwrap())["viewport"]["round"],
-        1
+        frame_content(&requests[1].messages.last().unwrap())["viewport"]["visibleEntities"]
+            ["items"][0]["player"],
+        "{\"round\":1}"
     );
     let lines = sink.lines.lock().expect("sink lines");
     assert_eq!(lines.len(), 1);
@@ -971,7 +1014,7 @@ async fn frame_is_in_the_next_model_request_and_transcript() {
             .get("content")
             .and_then(Value::as_str)
             .map_or(false, |content| {
-                content.contains("mineintent.viewport-frame.v1")
+                content.contains("mineintent.viewport-frame.v2")
             })
     }));
 }

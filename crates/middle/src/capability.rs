@@ -35,11 +35,11 @@ use mineintent_contracts::{
         ToolDispatcher as ContractToolDispatcher, ToolResultProtocol, ViewArguments, ViewMode,
     },
     minecraft::{
-        BackendError, BoxFuture, CancellationSignal as BackendCancellationSignal,
-        Deadline as BackendDeadline, DirectedViewportError, DirectedViewportProjection,
-        LookRelativeRequest, MinecraftBackendApi, MinecraftMotorDriverApi, MotorMoveDirection,
-        MoveInputRequest, OperationControl, ProtocolObservationSource, SelfPose,
-        ViewportProjection,
+        present_directed_viewport_v2, present_viewport_v2, BackendError, BoxFuture,
+        CancellationSignal as BackendCancellationSignal, Deadline as BackendDeadline,
+        DirectedViewportError, DirectedViewportProjection, LookRelativeRequest,
+        MinecraftBackendApi, MinecraftMotorDriverApi, MotorMoveDirection, MoveInputRequest,
+        OperationControl, ProtocolObservationSource, SelfPose, ViewportDirectedV2, ViewportFullV2,
     },
 };
 use serde::Deserialize;
@@ -56,8 +56,8 @@ const CONTROL_SETTLE_TIMEOUT: Duration = Duration::from_millis(250);
 /// 原子契约内，不穿过 capability 或轮末 frame。
 #[derive(Clone, Debug, PartialEq)]
 pub enum ViewportValue {
-    Full(ViewportProjection),
-    Directed(DirectedViewportProjection),
+    Full(ViewportFullV2),
+    Directed(ViewportDirectedV2),
 }
 
 /// 复用 backend 原子 viewport 读的 middle adapter。
@@ -99,7 +99,7 @@ impl ViewportReader {
     pub fn read_full<'a>(
         &'a self,
         control: ExecutionControl<'a>,
-    ) -> ContractFuture<'a, Result<ViewportProjection, AgentError>> {
+    ) -> ContractFuture<'a, Result<ViewportFullV2, AgentError>> {
         Box::pin(async move {
             control.check_at(Instant::now())?;
             let source = self.bind_source(control)?;
@@ -113,7 +113,7 @@ impl ViewportReader {
             let future = source.read_viewport(bridge.control.clone());
             let read = await_backend(future, control, bridge).await?;
             control.check_at(Instant::now())?;
-            Ok(read.projection)
+            Ok(present_viewport_v2(&read.projection))
         })
     }
 
@@ -121,7 +121,7 @@ impl ViewportReader {
         &'a self,
         positions: Vec<(i32, i32, i32)>,
         control: ExecutionControl<'a>,
-    ) -> ContractFuture<'a, Result<DirectedViewportProjection, AgentError>> {
+    ) -> ContractFuture<'a, Result<ViewportDirectedV2, AgentError>> {
         Box::pin(async move {
             control.check_at(Instant::now())?;
             let source = self.bind_source(control)?;
@@ -139,7 +139,8 @@ impl ViewportReader {
             let future = source.read_directed_viewport(positions, bridge.control.clone());
             let read = await_backend_directed(future, control, bridge).await?;
             control.check_at(Instant::now())?;
-            Ok(read)
+            present_directed_viewport_v2(&read)
+                .map_err(|error| AgentError::new(AgentErrorCode::ToolFailed, error))
         })
     }
 

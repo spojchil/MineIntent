@@ -1,0 +1,22 @@
+{
+  "protocol": "mineintent.viewport-frame.v2",
+  "at": "2026-08-03T00:00:00Z",
+  "viewport": {
+    "protocol": "mineintent.viewport.v2",
+    "frame": {
+      "coordinates": "minecraft_world_absolute",
+      "self": {
+        "position": [0.5, 64.0, 0.5],
+        "yawDegrees": 0.0,
+        "pitchDegrees": 0.0
+      },
+      "legend": {
+        "visibleEntities": "entities",
+        "visibleBlocks": "blocks"
+      }
+    },
+    "lookedAtBlock": null,
+    "visibleEntities": { "items": [], "truncated": false },
+    "visibleBlocks": { "blocks": [], "truncated": false }
+  }
+}

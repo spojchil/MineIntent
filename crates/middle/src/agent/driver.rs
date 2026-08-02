@@ -9,7 +9,7 @@ use std::{
 use mineintent_contracts::{
     agent::{
         AgentError, AgentErrorCode, ExecutionControl, JsonObject, ModelProvider, ModelUsage, RunId,
-        ToolCallId, ViewportFrameMessage, WireToolDefinition,
+        ToolCallId, ViewportFrameMessageV2, WireToolDefinition,
     },
     capability::{ExecutionResource, ToolDispatcher},
 };
@@ -217,7 +217,7 @@ where
             }
         };
         control.check_at(Instant::now())?;
-        if ViewportFrameMessage::validate_at(&at).is_err() {
+        if ViewportFrameMessageV2::validate_at(&at).is_err() {
             return unavailable_frame_message(
                 utc_timestamp_now(),
                 "viewport_frame_timestamp_invalid",
@@ -247,7 +247,7 @@ where
                 let serialized = catch_unwind(AssertUnwindSafe(|| serde_json::to_value(viewport)));
                 match serialized {
                     Ok(Ok(value)) if !value.is_null() => {
-                        let frame = match ViewportFrameMessage::success(at.clone(), value) {
+                        let frame = match ViewportFrameMessageV2::success(at.clone(), value) {
                             Ok(frame) => frame,
                             Err(_) => {
                                 return unavailable_frame_message(
@@ -283,7 +283,7 @@ where
     }
 }
 
-fn encode_user_frame(frame: ViewportFrameMessage) -> Result<JsonObject, AgentError> {
+fn encode_user_frame(frame: ViewportFrameMessageV2) -> Result<JsonObject, AgentError> {
     let content = serde_json::to_string(&frame).map_err(|_| {
         AgentError::new(
             AgentErrorCode::ToolFailed,
@@ -300,7 +300,7 @@ fn unavailable_frame_message(
     at: String,
     reason: impl Into<String>,
 ) -> Result<JsonObject, AgentError> {
-    let frame = ViewportFrameMessage::unavailable(at, reason.into()).map_err(|_| {
+    let frame = ViewportFrameMessageV2::unavailable(at, reason.into()).map_err(|_| {
         AgentError::new(
             AgentErrorCode::ToolFailed,
             "viewport_frame_serialization_failed",

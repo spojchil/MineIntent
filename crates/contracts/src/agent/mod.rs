@@ -12,10 +12,14 @@ mod tool;
 mod viewport;
 
 pub use context::{
-    AgentContextProtocolV3, AgentContextProtocolV4, AgentDecisionContext, AgentDecisionContextV3,
-    AgentDecisionContextV4, AgentEvent, AgentFrame, AgentSelf, AgentWorld,
-    JsonAgentDecisionContext, JsonAgentDecisionContextV4, JsonAgentFrame, PlayerMessage,
-    StableContext, StableContextV3, StableContextV4,
+    AgentChatItemV5, AgentChatMessageV5, AgentChatMovedMarkerV5, AgentChatMovedV5, AgentChatV5,
+    AgentContextProtocolV3, AgentContextProtocolV4, AgentContextProtocolV5, AgentDecisionContext,
+    AgentDecisionContextV3, AgentDecisionContextV4, AgentDecisionContextV5, AgentEvent,
+    AgentEventV5, AgentFrame, AgentFrameV5, AgentHotbarV5, AgentItemStackV5, AgentPoseV5,
+    AgentSelf, AgentStatusV5, AgentWorld, AgentWorldV5, JsonAgentDecisionContext,
+    JsonAgentDecisionContextV4, JsonAgentDecisionContextV5, JsonAgentFrame, JsonAgentFrameV5,
+    PlayerMessage, StableContext, StableContextV3, StableContextV4, StableContextV5,
+    MAX_CHAT_ITEMS_V5, MAX_HOTBAR_SLOT,
 };
 pub use control::{CancellationSignal, Deadline, ExecutionControl};
 pub use error::{AgentError, AgentErrorCode};
@@ -32,4 +36,7 @@ pub use tool::{
     ModelUsage, RequiredNullable, ToolCallKey, ToolDefinitionType, ToolExecution, ToolInvocation,
     ToolResponseProtocol, WireToolDefinition,
 };
-pub use viewport::{ViewportFrameMessage, ViewportFrameProtocol, ViewportFrameWireError};
+pub use viewport::{
+    ViewportFrameMessage, ViewportFrameMessageV2, ViewportFrameProtocol, ViewportFrameProtocolV2,
+    ViewportFrameV2WireError, ViewportFrameWireError,
+};

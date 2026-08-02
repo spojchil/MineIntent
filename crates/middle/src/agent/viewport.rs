@@ -90,7 +90,7 @@ impl BackendRoundViewportSampler {
 }
 
 impl RoundViewportSampler for BackendRoundViewportSampler {
-    type Viewport = mineintent_contracts::minecraft::ViewportProjection;
+    type Viewport = mineintent_contracts::minecraft::ViewportFullV2;
 
     fn timestamp(&self) -> String {
         self.timestamp_source.now()

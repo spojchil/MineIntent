@@ -15,6 +15,8 @@ pub enum AgentContextProtocol {
     V3,
     #[serde(rename = "mineintent.agent-context.v4")]
     V4,
+    #[serde(rename = "mineintent.agent-context.v5")]
+    V5,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

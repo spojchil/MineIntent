@@ -110,6 +110,11 @@ async fn full_and_directed_bind_one_source_and_call_one_atomic_read() {
         .expect("full view completes");
     assert_eq!(full["protocol"], json!("mineintent.tool-result.v1"));
     assert_eq!(full["status"], json!("completed"));
+    assert_eq!(
+        full["viewport"]["protocol"],
+        json!("mineintent.viewport.v2")
+    );
+    assert!(full["viewport"].get("standingOnBlock").is_none());
     assert!(full["viewport"].get("source").is_none());
     assert!(full["viewport"].get("revision").is_none());
     assert_eq!(source.full_reads(), 1);
@@ -128,6 +133,11 @@ async fn full_and_directed_bind_one_source_and_call_one_atomic_read() {
         .expect("directed view completes");
     assert_eq!(directed["protocol"], json!("mineintent.tool-result.v1"));
     assert_eq!(directed["status"], json!("completed"));
+    assert_eq!(
+        directed["viewport"]["protocol"],
+        json!("mineintent.viewport.v2")
+    );
+    assert!(directed["viewport"].get("standingOnBlock").is_none());
     assert_eq!(directed["viewport"]["seen"][0]["at"], json!([124, 65, -37]));
     assert!(directed["viewport"].get("source").is_none());
     assert!(directed["viewport"].get("revision").is_none());
@@ -423,17 +433,24 @@ async fn scope_is_checked_after_read_and_sampler_uses_only_projection_and_inject
     let serialized = serde_json::to_value(&sampler_result).unwrap();
     assert!(serialized.get("source").is_none());
     assert!(serialized.get("revision").is_none());
-    let frame =
-        mineintent_contracts::agent::ViewportFrameMessage::success(sampler.timestamp(), serialized)
-            .expect("projection can be placed in the frozen frame envelope");
+    let frame = mineintent_contracts::agent::ViewportFrameMessageV2::success(
+        sampler.timestamp(),
+        serialized,
+    )
+    .expect("presented viewport can be placed in the v2 frame envelope");
     let frame_wire = serde_json::to_value(frame).unwrap();
     assert_eq!(
         frame_wire["protocol"],
-        json!("mineintent.viewport-frame.v1")
+        json!("mineintent.viewport-frame.v2")
     );
     assert_eq!(frame_wire["at"], json!("2026-08-03T00:00:00Z"));
-    assert!(frame_wire.get("source").is_none());
-    assert!(frame_wire.get("revision").is_none());
+    assert_eq!(
+        frame_wire["viewport"]["protocol"],
+        json!("mineintent.viewport.v2")
+    );
+    assert!(frame_wire["viewport"].get("standingOnBlock").is_none());
+    assert!(frame_wire["viewport"].get("source").is_none());
+    assert!(frame_wire["viewport"].get("revision").is_none());
     assert_eq!(source.full_reads(), 2);
     assert_eq!(backend.source_calls(), 2);
 }

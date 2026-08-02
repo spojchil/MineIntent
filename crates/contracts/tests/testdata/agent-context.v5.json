@@ -1,0 +1,49 @@
+{
+  "protocol": "mineintent.agent-context.v5",
+  "stable": { "memory": "玩家怕高" },
+  "frame": {
+    "at": "2026-07-25T00:00:00Z",
+    "world": { "dimension": "minecraft:overworld" },
+    "pose": {
+      "position": [0.5, 64.0, -7.5],
+      "yawDegrees": 0.0,
+      "pitchDegrees": 0.0
+    },
+    "status": { "health": 20.0, "food": 20.0, "armor": 15 },
+    "hotbar": {
+      "selected": 2,
+      "slots": {
+        "0": ["oak_log", 12],
+        "2": ["iron_sword", 1]
+      },
+      "offHand": ["shield", 1]
+    },
+    "chat": {
+      "items": [
+        { "username": "bob", "text": "早", "at": "2026-07-25T00:00:00Z" },
+        { "username": "alice", "at": "2026-07-25T00:00:00Z", "moved": "events" }
+      ],
+      "omitted": 0
+    },
+    "sound": {
+      "recentSounds": [{
+        "soundName": "block.note_block.harp",
+        "category": "record",
+        "distance": 4.5,
+        "direction": "ahead",
+        "volume": 1.0,
+        "pitch": 0.8,
+        "observedAt": "2026-08-01T00:00:20Z"
+      }]
+    },
+    "light": 12,
+    "events": [
+      {
+        "type": "player_chat",
+        "username": "alice",
+        "text": "帮我看看农田",
+        "at": "2026-07-25T00:00:00Z"
+      }
+    ]
+  }
+}
