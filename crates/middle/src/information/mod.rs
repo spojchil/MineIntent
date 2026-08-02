@@ -19,6 +19,7 @@ mod support;
 
 pub use context_composer::{compose_passive_observations, InformationContextComposer};
 pub use runtime::{InformationRuntime, InformationRuntimeInitError, InformationRuntimeOptions};
+pub(crate) use support::format_utc_millis;
 pub use support::{InformationClock, SystemInformationClock};
 pub use tool_session::{
     InformationCatalogTool, InformationRuntimePort, InformationTool, InformationToolCallKind,

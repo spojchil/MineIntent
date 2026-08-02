@@ -8,5 +8,6 @@ pub mod events;
 pub mod execution;
 pub mod information;
 pub mod memory;
+pub mod participant;
 pub mod speech;
 pub mod telemetry;
