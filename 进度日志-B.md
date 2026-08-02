@@ -534,3 +534,30 @@
 - 当前工作树为 Windows，Unix `0600` 测试按平台条件编译，未在本机执行；Unix 实现使用 `OpenOptionsExt::mode(0o600)`，需 Unix 门禁再实跑一次权限断言。
 - 默认兼容构造器刻意不自动读取 `MINEINTENT_DATA_DIR` 或写 `.mineintent`；实际应用装配仍需显式选择 `FileTranscriptStore::from_environment()`/`with_transcript_store` 或自定义 sink。这是防止无意真实目录写入的既定边界，不是公共 contract 变更。
 - 未修改 `crates/backend`、`crates/contracts`、`supplies/`、`vendor/`、`移植计划/` 或其他进度日志；未 commit、未 push、未开 PR、未启动子代理。
+
+## 2026-08-02｜P2-B：Update 05 view 输入契约
+
+### 唯一可推出的范围与实现
+
+- 按 `中期更新-05.md` §1.1、§2 及 Issue #94 的模式语义，替换旧 `ViewArguments {}`：wire 输入是平铺 `{mode, positions?}`，`mode` 仅接受 `full`/`directed`，schema 只要求 `mode`，不使用 `oneOf`；Rust 反序列化后再做跨字段校验。
+- `full` 只允许正面证据且允许截断，未列出不表示不可见/不存在；`directed` 要求非空 `positions`，逐坐标表达可见事实或不可见原因，不可见目标的身份/状态不进入输入契约描述。未知模式、未知字段、显式 null、错误 tuple/数字均失败关闭。
+- `ViewPosition = (i32, i32, i32)` 是 Minecraft 方块体素的世界绝对坐标 tuple：选择它是因为 `crates/contracts/src/minecraft/snapshot.rs:24-28` 与 `crates/backend/src/snapshot.rs:185-189` 的权威方块坐标分量均为 `i32`，同时不把 `BlockPosition`/world 对象形状或内部句柄暴露给模型。现有 full 可见块也在 `crates/contracts/src/minecraft/viewport.rs:5-6,65-69` 使用整数坐标 tuple。
+- `MAX_DIRECTED_VIEW_POSITIONS = 16` 是本批选择的保守、可调初值，唯一集中在 `crates/contracts/src/capability/schemas.rs:81`，同时驱动运行时校验、schema `maxItems` 和测试边界。依据是 Issue #94 明确说批量与输出预算仍需实测；现有 full 投影默认 `block_limit=256`（`crates/backend/src/viewport.rs:65`），现有 information wrapper 有 `max_result_bytes=65_536`（`crates/middle/src/information/providers/viewport.rs:243`）。16 个逐坐标结果为线性输出预留保守余量，但这些既有数字不是 directed 的永久裁定；未来生产 DTO、不可见原因闭集与实际输出预算仍需单独冻结/测量。
+
+### 旧测试豁免映射与新覆盖
+
+- 按 Update 05 的豁免，旧 `view_arguments_and_execution_enums_are_closed` 不再要求 `{}` 成功；改为 `view_arguments_have_full_and_directed_positive_examples`、`view_schema_freezes_flat_modes_optional_positions_and_semantics` 与 `view_arguments_reject_missing_null_unknown_cross_field_and_bad_positions`。
+- 新测试逐条锁定：旧 `{}` 拒绝；full/directed 正例及 16 项边界；缺失 mode、mode/positions 显式 null、未知 mode/字段、full+positions、directed 缺失/空/超上限 positions、非整数/非有限坐标、错误 tuple 形状；schema 的 required/enum/optional positions/additionalProperties、无 `oneOf` 及 full/directed 描述语义。
+- 本批只改 contracts capability 输入面；没有修改 `crates/middle/src/agent/run.rs`、driver、prompt 或生产 ToolDispatcher。轮末 frame 的 role/envelope、viewport-only/full AgentFrame、采样失败 wire、旧 `observationAfter` 非 viewport 事实保留仍按 Update 05 §1.2 属于新的第三档待决问题。
+
+### 定向验证与 mutation
+
+- `cargo test -p mineintent-contracts --test capability_contracts --locked --offline`：10/10 通过。
+- mutation：临时把 `ViewMode::Full + Some(positions)` 分支改为无操作；`view_arguments_reject_missing_null_unknown_cross_field_and_bad_positions` 按预期失败（0 passed / 1 failed，full+positions 被接受）。恢复原校验后同一测试 1/1 通过，`git diff --check` 无 mutation 残留。
+
+### 全量门禁与轮末审计
+
+- `cargo test -p mineintent-contracts --all-targets --locked --offline`：72/72 具名测试通过（Agent 19、capability 10、Minecraft 26、Information 17）。
+- `cargo test --workspace --all-targets --locked --offline`：298/298 通过，0 failed；`cargo check --workspace --all-targets --locked --offline` 通过。
+- `cargo fmt --all -- --check`、`cargo +stable fmt --all -- --check`、`git diff --check`：全部通过。
+- 轮末 wire 审计证据：`crates/middle/src/agent/driver.rs:22-32` 的 `AgentModelRequest`/`AgentLoopOutcome` 只有 run/messages/tools 与 closing/usage；`run.rs:48-62,315-348` 只构造 `result`/`observationAfter` 并追加 `role=tool`；`prompt.rs:83-99` 只组装 system + opening-frame user 消息。当前没有 viewport 字段、轮末追加 envelope、viewport-only/full AgentFrame、采样失败 wire 或非 viewport `observationAfter` 保留规则，因此按 Update 05 要求不猜测、不修改 middle/driver/prompt。

@@ -16,6 +16,7 @@ use mineintent_contracts::{
         fixtures, move_input_parameters_schema, view_parameters_schema, CapabilityExecutionContext,
         CapabilityInvocation, ExecutionResource, MoveDirection, MoveInputArguments, ScopeGuard,
         ToolCapability, ToolCapabilityRegistry, ToolDispatcher, ToolResultProtocol, ViewArguments,
+        ViewMode, MAX_DIRECTED_VIEW_POSITIONS,
     },
 };
 use serde::de::DeserializeOwned;
@@ -151,20 +152,110 @@ fn move_input_arguments_reject_unknown_fields_versions_and_constraint_mutations(
 }
 
 #[test]
-fn view_arguments_and_execution_enums_are_closed() {
-    let view: ViewArguments = serde_json::from_value(json!({})).expect("view takes no arguments");
-    assert_eq!(view, ViewArguments::default());
-    assert_rejected::<ViewArguments>(json!({"direction": "north"}));
-
+fn view_arguments_have_full_and_directed_positive_examples() {
+    let full: ViewArguments = parse(r#"{"mode":"full"}"#);
+    assert_eq!(full.mode, ViewMode::Full);
+    assert_eq!(full.positions, None);
     assert_eq!(
-        Value::Object(view_parameters_schema()),
+        serde_json::to_value(&full).unwrap(),
+        json!({"mode": "full"})
+    );
+
+    let directed: ViewArguments =
+        parse(r#"{"mode":"directed","positions":[[0,64,0],[-12,65,37]]}"#);
+    assert_eq!(directed.mode, ViewMode::Directed);
+    assert_eq!(directed.positions, Some(vec![(0, 64, 0), (-12, 65, 37)]));
+    assert_eq!(
+        serde_json::to_value(&directed).unwrap(),
         json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
+            "mode": "directed",
+            "positions": [[0, 64, 0], [-12, 65, 37]]
         })
     );
+
+    let at_limit = json!({
+        "mode": "directed",
+        "positions": vec![[0, 64, 0]; MAX_DIRECTED_VIEW_POSITIONS]
+    });
+    let _: ViewArguments = serde_json::from_value(at_limit).expect("initial batch limit is valid");
+}
+
+#[test]
+fn view_schema_freezes_flat_modes_optional_positions_and_semantics() {
+    let schema = Value::Object(view_parameters_schema());
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["required"], json!(["mode"]));
+    assert_eq!(schema["additionalProperties"], false);
+    assert!(schema.get("oneOf").is_none());
+    assert_eq!(schema["properties"]["mode"]["type"], "string");
+    assert_eq!(
+        schema["properties"]["mode"]["enum"],
+        json!(["full", "directed"])
+    );
+    assert_eq!(
+        schema["properties"]["mode"]["description"],
+        "full 只给出本次读取确认的正面可见证据，结果可能因预算而截断；未列出不表示不可见或不存在。想核对未列出的坐标时使用 directed。directed 对 positions 逐坐标给出可见事实或不可见原因；不可见时绝不返回目标方块的身份或状态。"
+    );
+    assert_eq!(
+        schema["properties"]["positions"]["description"],
+        "仅 directed 使用；每项是 Minecraft 方块体素世界绝对坐标的整数三元组 [x, y, z]，不是内部句柄。directed 必须至少给一个坐标；full 不得提供 positions。"
+    );
+    assert_eq!(schema["properties"]["positions"]["type"], "array");
+    assert_eq!(schema["properties"]["positions"]["minItems"], 1);
+    assert_eq!(
+        schema["properties"]["positions"]["maxItems"],
+        MAX_DIRECTED_VIEW_POSITIONS
+    );
+    let coordinate = &schema["properties"]["positions"]["items"];
+    assert_eq!(coordinate["type"], "array");
+    assert_eq!(coordinate["minItems"], 3);
+    assert_eq!(coordinate["maxItems"], 3);
+    assert_eq!(coordinate["items"]["type"], "integer");
+    assert_eq!(coordinate["items"]["minimum"], i32::MIN);
+    assert_eq!(coordinate["items"]["maximum"], i32::MAX);
+}
+
+#[test]
+fn view_arguments_reject_missing_null_unknown_cross_field_and_bad_positions() {
+    for invalid in [
+        json!({}),
+        json!({"mode": null}),
+        json!({"mode": "future"}),
+        json!({"mode": "full", "positions": []}),
+        json!({"mode": "full", "positions": [[0, 64, 0]]}),
+        json!({"mode": "directed"}),
+        json!({"mode": "directed", "positions": null}),
+        json!({"mode": "directed", "positions": []}),
+        json!({
+            "mode": "directed",
+            "positions": vec![[0, 64, 0]; MAX_DIRECTED_VIEW_POSITIONS + 1]
+        }),
+        json!({"mode": "directed", "positions": [[0, 64]]}),
+        json!({"mode": "directed", "positions": [[0, 64, 0, 1]]}),
+        json!({"mode": "directed", "positions": [[0, 64, 0.5]]}),
+        json!({"mode": "directed", "positions": [[0, 64, "0"]]}),
+        json!({"mode": "directed", "positions": [[0, 64, null]]}),
+        json!({"mode": "directed", "positions": [null]}),
+        json!({
+            "mode": "directed",
+            "positions": [[2147483648u64, 64u64, 0u64]]
+        }),
+        json!({"mode": "full", "unexpected": true}),
+    ] {
+        assert_rejected::<ViewArguments>(invalid);
+    }
+
+    for invalid_json in [
+        r#"{"mode":"directed","positions":[[NaN,64,0]]}"#,
+        r#"{"mode":"directed","positions":[[Infinity,64,0]]}"#,
+        r#"{"mode":"directed","positions":[[-Infinity,64,0]]}"#,
+        r#"{"mode":"directed","positions":[[1e400,64,0]]}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<ViewArguments>(invalid_json).is_err(),
+            "non-finite coordinate was accepted: {invalid_json}"
+        );
+    }
 
     for (resource, encoded) in [
         (ExecutionResource::Body, "body"),
