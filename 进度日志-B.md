@@ -405,3 +405,66 @@
 - 5 条 driver 回归覆盖同一 deadline、串行且全执行、错误/panic N 进 N 出、deadline 主动 drop 阻塞 provider、取消唤醒/drop，以及取消与过期同时成立时取消优先。
 - mutation：移除 async poll panic 围栏后 panic 回归按预期失败；把内部 timer 延后 5 秒后 deadline 回归由外层 1 秒 watchdog 杀死；均已恢复。
 - 仍延后：实现 `AgentRunner` trait 的 context/prompt 组装、context v4/MemoryStore、closing leak guard 与 transcript v1。
+
+## 2026-08-02｜Agent Context v4、版本化 Prompt 与具体 AgentRunner
+
+### 实现边界
+
+- contracts 增加独立的 `AgentDecisionContextV3`/`AgentDecisionContextV4`、`StableContextV3`/`StableContextV4` 与 v3/v4 discriminator 类型；v4 固定为 `mineintent.agent-context.v4`，stable 只接受必填字符串 `memory`，空串合法，显式 null、未知字段及跨版本 shape 均拒绝。既有 v3 fixture/解码路径保留，旧公共名称通过明确指向 v3 的 alias 兼容，没有把 v4 字段塞回同名 envelope。
+- 增加 `agent-context.v4.json`、v4 fixture、v4 run request round-trip 及 required/empty/null/unknown/cross-version serde tests；`AgentContextProtocol` 的 v4 枚举值也与 wire discriminator 对齐。
+- 将 oracle commit `6fb3ed0c007601b4e1eb1cb0a9d10525ac2a2467` 的 `system_prompt()` 416 字符正文机械放入 `crates/middle/src/agent/prompts/participant-system/v1.txt`，用 `include_str!` 编译期嵌入。prompt catalog 只精确接受显式 `participant-system`/`v1`；未知 key/version 返回内部 `PromptError::UnknownTemplate`，runner 映射到既有 `invalid_request` 并保留稳定 summary，无隐式回退。
+- v4 非空 memory 以完整全文接在既有 `## 你记得的事` 稳定区标题之后；空 memory 不生成标题或伪造内容。初始 system + opening frame 只在 runner 初始化时构造一次，frame 作为追加的 user JSON 消息，不重新渲染进 system。
+- 增加 `ConcreteAgentRunner`（别名 `AgentRunnerImpl`），实现 contracts `AgentRunner<Context = JsonAgentDecisionContextV4>`；只组合已有 `AgentRun` 与 `AgentLoopDriver`，不复制循环。`AgentModelRequest` 补充贯穿 provider 的 `run_id`；request tools、dispatcher invocation 的 run id 与 provider/dispatcher 的同一 `ExecutionControl`/绝对 deadline 均有回归断言。16/8/32、claim、顺序 N-in/N-out、panic/cancel/deadline 继续由既有状态机/driver负责。
+- runner 的 model name 由装配层显式传入并精确映射到 `ModelRunResult`；usage 沿 driver checked-sum 原样映射。closing 只消费为 transcript 候选，绝不进入玩家台词、tool result 或 `ModelRunResult`。transcript v1 持久化仍 deferred，MemoryStore 仍由调用方先读全文并构造 v4 context，runner 不做 I/O。
+
+### Prompt oracle 映射（2 条）
+
+| Python oracle | Rust 本批处理 |
+|---|---|
+| `agent-service/test_prompt.py:7` `test_stable_context_ignores_profile_and_only_renders_memories` | `agent_prompt::memory_uses_the_existing_stable_heading_without_fabricating_empty_content`；v4 改按 #127 单文本全文接入，严格 stable shape 不含 profile。 |
+| `agent-service/test_prompt.py:17` `test_prompt_carries_behavior_and_the_shared_observation_semantics` | `agent_prompt::participant_system_v1_is_the_exact_oracle_text`、`initial_messages_keep_stable_system_before_one_appended_frame`；逐字保留 say/沉默、observationAfter/null/非因果、frame 与诚实性规则，closing 不进入模型结果。 |
+
+### 本批相关 loop/contract oracle 映射
+
+| Python oracle | Rust 映射 |
+|---|---|
+| `test_server.py:48` DeepSeek replay/deadline/usage/tool identity | `agent_run_loop::replay_preserves_reasoning_tool_ids_order_and_summed_usage` + `agent_runner::concrete_runner_composes_v4_once_and_maps_run_id_tools_usage_and_model`。 |
+| `test_server.py:88` stable prefix/opening frame/role order | `agent_prompt::initial_messages_keep_stable_system_before_one_appended_frame` + `agent_driver::driver_reuses_one_deadline_and_dispatches_every_call_sequentially`。 |
+| `test_server.py:136` strict v2 executor envelope | contracts `tool_execution_v2_requires_nullable_observation_and_rejects_transport_legacy`。 |
+| `test_server.py:151` atomic unique tool-call claim | `agent_run_loop::tool_call_ids_are_preflighted_atomically_and_unique_for_the_run`。 |
+| `test_server.py:180` invalid tool stays local and paired | `agent_run_loop::invalid_model_tool_data_stays_local_and_keeps_the_pair`。 |
+| `test_server.py:206` usage normalization/sum | existing `agent_run_loop::replay_preserves_reasoning_tool_ids_order_and_summed_usage` + concrete runner usage mapping。 |
+| `test_server.py:241` ordered same-round tool execution | `agent_driver::driver_reuses_one_deadline_and_dispatches_every_call_sequentially`。 |
+| `test_server.py:268,284` finish reason allowlist/failure | `agent_run_loop::finish_reason_is_allowlisted_and_missing_or_null_is_accepted`。 |
+| `test_server.py:291` 8/32/16 limits | `agent_run_loop::tool_calls_are_capped_per_response_and_per_run_before_dispatch`、`model_requests_stop_at_sixteen`、`loop_limits_match_the_python_oracle`。 |
+| `test_server.py:330,349` untouched arguments/finite float | `agent_run_loop::unsafe_integer_arguments_stay_local`、`invocation_preserves_open_tool_name_and_arguments_but_validates_keys`。 |
+| `test_server.py:396` closing leak guard | `agent_runner::closing_is_not_player_text_tool_output_or_model_result_content`。 |
+| `test_server.py:412` strict context/request shape | contracts `context_v4_binds_the_discriminator_to_the_single_text_stable_shape`、`v4_run_request_round_trips_without_reopening_the_v3_context_shape`、`run_request_uses_external_prompt_reference_and_excludes_transport_configuration`。 |
+| `test_server.py:460,509,519,565` replacement/cancel/absolute deadline/upstream cancellation | existing driver `cancellation_wakes_and_drops_a_blocked_provider_future`、`cancellation_precedes_an_already_expired_deadline`、`driver_deadline_drops_a_blocked_provider_future`；HTTP transport/old-run service boundary remains out of scope after inline composition。 |
+| `test_server.py:356,382` transcript success/failure/rotation | transcript v1 deferred to next batch; no transcript persistence was added here。 |
+
+### Mutation 验证
+
+- v4 形状绑定：临时移除 `StableContextV4` 的 `deny_unknown_fields`，运行 `cargo test -p mineintent-contracts --test agent_contracts context_v4_binds_the_discriminator_to_the_single_text_stable_shape --locked --offline`，测试按预期失败（未知 `memories` 被接受）；恢复后同命令通过。
+- 未知模板失败关闭：临时把 `template_text` 的未知分支改为回退 v1，运行 `cargo test -p mineintent-middle --test agent_prompt prompt_lookup_is_explicit_and_fail_closed_for_unknown_key_or_version --locked --offline`，测试按预期失败（unknown key 得到正文）；恢复后同命令通过。
+- closing 不泄漏：临时把 runner 的 `ModelRunResult.model` 改为 closing，运行 `cargo test -p mineintent-middle --test agent_runner closing_is_not_player_text_tool_output_or_model_result_content --locked --offline`，测试按预期失败（结果序列化出现 `__tool__`）；恢复后同命令通过。
+
+### 延后项
+
+- transcript v1 文件格式、轮转、成功/失败落盘与 data-dir 接线仍 deferred；MemoryStore 的路径解析和 memory I/O 不进入 runner。本批未修改 Information、backend、participant/app、transcript/journal、supplies/vendor/移植计划，也未修改 manifest/lock。
+
+## 2026-08-02｜独立审查返修
+
+- prompt catalog 的终止符解析现在只去掉一个 LF 或 CRLF；不处理孤立 CR，也不 trim 正文。新增 include_str! 结果无终止 CR/LF 与 helper 的 CRLF/正文保留测试，记录 `core.autocrlf=true` 下 fresh Windows checkout 的 CRLF 风险已封闭。
+- 恢复 `AgentDecisionContext`/`StableContext` 旧公共名称为明确指向 v3 的类型别名并重导出；v4 仍是独立类型，新增最小编译/类型等价测试，未重新开放 v3/v4 wire 误组合。
+- 删除未有裁定依据的公开 `AgentErrorCode::UnknownPromptTemplate`；未知模板仍由内部 `PromptError::UnknownTemplate` 表达，具体 runner 使用既有 `invalid_request` 与稳定 summary。
+
+### 最终门禁
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test --workspace --all-targets --locked --offline` | 通过；backend、contracts、middle 全部 target/test 通过，含本批 v4/prompt/runner 回归。 |
+| `cargo check --workspace --all-targets --locked --offline` | 通过。 |
+| `cargo fmt --all -- --check` | 通过；nightly/default 工具链。 |
+| `cargo +stable fmt --all -- --check` | 通过。 |
+| `git diff --check` | 通过。 |

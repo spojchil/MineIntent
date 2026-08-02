@@ -11,8 +11,10 @@ mod runner;
 mod tool;
 
 pub use context::{
-    AgentDecisionContext, AgentEvent, AgentFrame, AgentSelf, AgentWorld, JsonAgentDecisionContext,
-    JsonAgentFrame, PlayerMessage, StableContext,
+    AgentContextProtocolV3, AgentContextProtocolV4, AgentDecisionContext, AgentDecisionContextV3,
+    AgentDecisionContextV4, AgentEvent, AgentFrame, AgentSelf, AgentWorld,
+    JsonAgentDecisionContext, JsonAgentDecisionContextV4, JsonAgentFrame, PlayerMessage,
+    StableContext, StableContextV3, StableContextV4,
 };
 pub use control::{CancellationSignal, Deadline, ExecutionControl};
 pub use error::{AgentError, AgentErrorCode};

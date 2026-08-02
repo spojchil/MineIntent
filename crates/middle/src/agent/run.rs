@@ -164,6 +164,10 @@ impl AgentRun {
         }
     }
 
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
     pub fn next_step(&mut self) -> Result<AgentRunStep, AgentError> {
         let state = std::mem::replace(&mut self.state, RunState::Failed);
         match state {

@@ -8,7 +8,7 @@ use std::{
 
 use mineintent_contracts::{
     agent::{
-        AgentError, AgentErrorCode, ExecutionControl, JsonObject, ModelProvider, ModelUsage,
+        AgentError, AgentErrorCode, ExecutionControl, JsonObject, ModelProvider, ModelUsage, RunId,
         ToolCallId, WireToolDefinition,
     },
     capability::ToolDispatcher,
@@ -20,6 +20,7 @@ use super::{AgentRun, AgentRunStep, AgentToolResult, ModelCompletion, PlannedToo
 /// 一轮 OpenAI-compatible completion 所需的 provider 无关输入。
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentModelRequest {
+    pub run_id: RunId,
     pub messages: Vec<JsonObject>,
     pub tools: Vec<WireToolDefinition>,
 }
@@ -71,6 +72,7 @@ where
             match run.next_step()? {
                 AgentRunStep::CallModel { messages } => {
                     let request = AgentModelRequest {
+                        run_id: run.run_id().clone(),
                         messages,
                         tools: definitions.to_vec(),
                     };

@@ -7,15 +7,18 @@ use std::{
 };
 
 use mineintent_contracts::agent::{
-    fixtures, AgentContextProtocol, AgentError, AgentErrorCode, AgentRunRequest, AgentRunner,
-    CancellationSignal, ContractFuture, Deadline, ExecutionControl, JsonAgentDecisionContext,
-    ModelProvider, ModelRunResult, ModelUsage, RequiredNullable, ToolCallKey, ToolDefinitionName,
-    ToolExecution, ToolInvocation, ToolName, WireToolDefinition, MAX_AGENT_RUN_TOOLS,
+    fixtures, AgentContextProtocol, AgentDecisionContext, AgentDecisionContextV3, AgentError,
+    AgentErrorCode, AgentRunRequest, AgentRunner, CancellationSignal, ContractFuture, Deadline,
+    ExecutionControl, JsonAgentDecisionContext, JsonAgentDecisionContextV4, ModelProvider,
+    ModelRunResult, ModelUsage, RequiredNullable, StableContext, StableContextV3, ToolCallKey,
+    ToolDefinitionName, ToolExecution, ToolInvocation, ToolName, WireToolDefinition,
+    MAX_AGENT_RUN_TOOLS,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
 const AGENT_CONTEXT: &str = include_str!("testdata/agent-context.v3.json");
+const AGENT_CONTEXT_V4: &str = include_str!("testdata/agent-context.v4.json");
 const TOOL_DEFINITION: &str = include_str!("testdata/tool-definition.function.json");
 const TOOL_INVOCATION: &str = include_str!("testdata/tool-invocation.valid.json");
 const TOOL_EXECUTION: &str = include_str!("testdata/tool-execution.v2.json");
@@ -28,11 +31,28 @@ fn deterministic_fixtures_match_the_frozen_wire_examples() {
     let invocation: ToolInvocation = parse(TOOL_INVOCATION);
 
     assert_eq!(context, fixtures::agent_context());
+    let context_v4: JsonAgentDecisionContextV4 = parse(AGENT_CONTEXT_V4);
+    assert_eq!(context_v4, fixtures::agent_context_v4());
     assert_eq!(definition, fixtures::tool_definition());
     assert_eq!(invocation, fixtures::tool_invocation());
     assert_eq!(fixtures::agent_frame(), fixtures::agent_frame());
     assert_eq!(fixtures::agent_run_request().run_id.as_str(), "run-1");
     assert_eq!(fixtures::model_run_result(), fixtures::model_run_result());
+}
+
+#[test]
+fn legacy_public_context_names_remain_explicit_v3_aliases() {
+    let legacy: AgentDecisionContext = fixtures::agent_context();
+    let explicit: AgentDecisionContextV3 = legacy.clone();
+    let legacy_stable: StableContext = legacy.stable.clone();
+    let explicit_stable: StableContextV3 = legacy_stable;
+
+    assert_eq!(explicit, fixtures::agent_context());
+    assert_eq!(explicit_stable, fixtures::agent_context().stable);
+    assert_eq!(
+        serde_json::to_value(legacy).unwrap()["protocol"],
+        "mineintent.agent-context.v3"
+    );
 }
 
 #[test]
@@ -65,6 +85,74 @@ fn context_v3_round_trips_with_strict_outer_shapes() {
         "amount": 1
     }]);
     assert_rejected::<JsonAgentDecisionContext>(unknown_event);
+}
+
+#[test]
+fn context_v4_binds_the_discriminator_to_the_single_text_stable_shape() {
+    let context: JsonAgentDecisionContextV4 = parse(AGENT_CONTEXT_V4);
+    let encoded = serde_json::to_value(&context).expect("v4 context serializes");
+    assert_eq!(encoded, fixture_value(AGENT_CONTEXT_V4));
+    assert_eq!(context.protocol, AgentContextProtocol::V4);
+    assert_eq!(context.stable.memory, "玩家怕高");
+
+    let mut empty = fixture_value(AGENT_CONTEXT_V4);
+    empty["stable"]["memory"] = json!("");
+    let decoded: JsonAgentDecisionContextV4 =
+        serde_json::from_value(empty).expect("v4 memory may be empty");
+    assert_eq!(decoded.stable.memory, "");
+
+    let mut missing = fixture_value(AGENT_CONTEXT_V4);
+    missing["stable"].as_object_mut().unwrap().remove("memory");
+    assert_rejected::<JsonAgentDecisionContextV4>(missing);
+
+    let mut null_memory = fixture_value(AGENT_CONTEXT_V4);
+    null_memory["stable"]["memory"] = Value::Null;
+    assert_rejected::<JsonAgentDecisionContextV4>(null_memory);
+
+    let mut unknown_stable = fixture_value(AGENT_CONTEXT_V4);
+    insert_unknown(&mut unknown_stable["stable"], "memories");
+    assert_rejected::<JsonAgentDecisionContextV4>(unknown_stable);
+
+    let mut wrong_shape = fixture_value(AGENT_CONTEXT_V4);
+    wrong_shape["stable"] = json!({"memories": []});
+    assert_rejected::<JsonAgentDecisionContextV4>(wrong_shape);
+
+    let mut v3_discriminator = fixture_value(AGENT_CONTEXT);
+    v3_discriminator["protocol"] = json!("mineintent.agent-context.v4");
+    v3_discriminator["stable"] = json!({"memory": "玩家怕高"});
+    assert_rejected::<JsonAgentDecisionContext>(v3_discriminator);
+
+    let mut v4_discriminator = fixture_value(AGENT_CONTEXT_V4);
+    v4_discriminator["protocol"] = json!("mineintent.agent-context.v3");
+    v4_discriminator["stable"] = json!({"memories": []});
+    assert_rejected::<JsonAgentDecisionContextV4>(v4_discriminator);
+
+    let mut unknown_top_level = fixture_value(AGENT_CONTEXT_V4);
+    insert_unknown(&mut unknown_top_level, "profile");
+    assert_rejected::<JsonAgentDecisionContextV4>(unknown_top_level);
+
+    let mut unknown_frame = fixture_value(AGENT_CONTEXT_V4);
+    insert_unknown(&mut unknown_frame["frame"], "viewport");
+    assert_rejected::<JsonAgentDecisionContextV4>(unknown_frame);
+}
+
+#[test]
+fn v4_run_request_round_trips_without_reopening_the_v3_context_shape() {
+    let request = fixtures::agent_run_request_v4();
+    let encoded = serde_json::to_value(&request).expect("v4 request serializes");
+    assert_eq!(
+        encoded["context"]["protocol"],
+        "mineintent.agent-context.v4"
+    );
+    assert_eq!(encoded["context"]["stable"], json!({"memory": "玩家怕高"}));
+    let decoded: AgentRunRequest<JsonAgentDecisionContextV4> =
+        serde_json::from_value(encoded.clone()).expect("v4 request decodes");
+    assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+
+    let mut wrong_context = encoded;
+    wrong_context["context"]["protocol"] = json!("mineintent.agent-context.v3");
+    wrong_context["context"]["stable"] = json!({"memories": []});
+    assert_rejected::<AgentRunRequest<JsonAgentDecisionContextV4>>(wrong_context);
 }
 
 #[test]

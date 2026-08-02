@@ -1,12 +1,13 @@
 use serde_json::{json, Map, Value};
 
 use super::{
-    AgentContextProtocol, AgentDecisionContext, AgentEvent, AgentFrame, AgentRunRequest, AgentSelf,
-    AgentWorld, FunctionToolDefinition, JsonAgentDecisionContext, JsonAgentFrame, ModelName,
+    AgentContextProtocolV3, AgentContextProtocolV4, AgentDecisionContextV3, AgentDecisionContextV4,
+    AgentEvent, AgentFrame, AgentRunRequest, AgentSelf, AgentWorld, FunctionToolDefinition,
+    JsonAgentDecisionContext, JsonAgentDecisionContextV4, JsonAgentFrame, ModelName,
     ModelRunResult, ModelUsage, PlayerMessage, PromptTemplateKey, PromptTemplateRef,
-    PromptTemplateVersion, RequiredNullable, RunId, StableContext, ToolCallId, ToolDefinitionName,
-    ToolDefinitionType, ToolExecution, ToolInvocation, ToolName, ToolResponseProtocol,
-    WireToolDefinition,
+    PromptTemplateVersion, RequiredNullable, RunId, StableContextV3, StableContextV4, ToolCallId,
+    ToolDefinitionName, ToolDefinitionType, ToolExecution, ToolInvocation, ToolName,
+    ToolResponseProtocol, WireToolDefinition,
 };
 
 pub const FIXTURE_AT: &str = "2026-07-25T00:00:00Z";
@@ -37,14 +38,24 @@ pub fn agent_frame() -> JsonAgentFrame {
 }
 
 pub fn agent_context() -> JsonAgentDecisionContext {
-    AgentDecisionContext {
-        protocol: AgentContextProtocol::V3,
-        stable: StableContext {
+    AgentDecisionContextV3 {
+        protocol: AgentContextProtocolV3,
+        stable: StableContextV3 {
             memories: json!([{
                 "kind": "note",
                 "summary": "玩家怕高",
                 "createdAt": "2026-07-01T00:00:00Z"
             }]),
+        },
+        frame: agent_frame(),
+    }
+}
+
+pub fn agent_context_v4() -> JsonAgentDecisionContextV4 {
+    AgentDecisionContextV4 {
+        protocol: AgentContextProtocolV4,
+        stable: StableContextV4 {
+            memory: "玩家怕高".to_owned(),
         },
         frame: agent_frame(),
     }
@@ -96,6 +107,15 @@ pub fn agent_run_request() -> AgentRunRequest<JsonAgentDecisionContext> {
     AgentRunRequest {
         run_id: RunId::new("run-1").expect("fixture run id is valid"),
         context: agent_context(),
+        tools: vec![tool_definition()],
+        prompt_template: prompt_template(),
+    }
+}
+
+pub fn agent_run_request_v4() -> AgentRunRequest<JsonAgentDecisionContextV4> {
+    AgentRunRequest {
+        run_id: RunId::new("run-1").expect("fixture run id is valid"),
+        context: agent_context_v4(),
         tools: vec![tool_definition()],
         prompt_template: prompt_template(),
     }
