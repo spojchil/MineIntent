@@ -1,8 +1,9 @@
 use std::{
     collections::VecDeque,
     future::{pending, Future},
+    io,
     pin::Pin,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -15,7 +16,7 @@ use mineintent_contracts::{
     capability::ToolDispatcher,
 };
 use mineintent_middle::agent::{
-    AgentModelRequest, AgentRunnerImpl, ConcreteAgentRunner, ModelCompletion,
+    AgentModelRequest, AgentRunnerImpl, ConcreteAgentRunner, ModelCompletion, TranscriptSink,
 };
 use serde_json::{json, Value};
 
@@ -116,6 +117,37 @@ fn runner(
         mineintent_contracts::agent::ModelName::new("model-v4")
             .expect("fixture model name is valid"),
     )
+}
+
+#[derive(Default)]
+struct CapturingTranscriptSink {
+    lines: Mutex<Vec<String>>,
+}
+
+impl TranscriptSink for CapturingTranscriptSink {
+    fn append_line(&self, line: &str) -> io::Result<()> {
+        self.lines.lock().unwrap().push(line.to_owned());
+        Ok(())
+    }
+}
+
+struct FailingTranscriptSink;
+
+impl TranscriptSink for FailingTranscriptSink {
+    fn append_line(&self, _line: &str) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "diagnostic sink unavailable",
+        ))
+    }
+}
+
+struct PanickingTranscriptSink;
+
+impl TranscriptSink for PanickingTranscriptSink {
+    fn append_line(&self, _line: &str) -> io::Result<()> {
+        panic!("diagnostic sink panic fixture")
+    }
 }
 
 #[tokio::test]
@@ -269,4 +301,162 @@ async fn unknown_prompt_key_or_version_fails_closed_before_provider() {
         "unknown_prompt_template:participant-system@v9"
     );
     assert!(runner.driver().model().requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn concrete_runner_records_successful_replay_and_wire_usage() {
+    let sink = Arc::new(CapturingTranscriptSink::default());
+    let runner = ConcreteAgentRunner::with_shared_transcript_sink(
+        RecordingProvider::new(vec![
+            completion(
+                json!({
+                    "role": "assistant",
+                    "reasoning_content": "先观察",
+                    "tool_calls": [tool_call()],
+                }),
+                ModelUsage {
+                    input_tokens: Some(5),
+                    output_tokens: Some(0),
+                    cache_read_tokens: Some(0),
+                    cache_write_tokens: None,
+                },
+            ),
+            completion(
+                json!({"role": "assistant", "content": "  完成  "}),
+                ModelUsage {
+                    input_tokens: Some(7),
+                    output_tokens: Some(0),
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                },
+            ),
+        ]),
+        RecordingDispatcher::default(),
+        mineintent_contracts::agent::ModelName::new("explicit-model").unwrap(),
+        sink.clone(),
+    );
+    let request = fixtures::agent_run_request_v4();
+    let signal = NeverCancelled;
+    let deadline = Deadline::after(Instant::now(), Duration::from_secs(5)).unwrap();
+
+    runner
+        .run(request.clone(), ExecutionControl::new(&signal, deadline))
+        .await
+        .expect("successful runner result");
+
+    let lines = sink.lines.lock().unwrap();
+    assert_eq!(lines.len(), 1);
+    let record: Value = serde_json::from_str(&lines[0]).unwrap();
+    assert_eq!(record["runId"], request.run_id.as_str());
+    assert_eq!(record["model"], "explicit-model");
+    assert_eq!(record["tools"], json!(["look_relative"]));
+    assert_eq!(
+        record["toolSchemas"],
+        serde_json::to_value(&request.tools).unwrap()
+    );
+    assert_eq!(record["closing"], "完成");
+    assert_eq!(
+        record["usage"],
+        json!({"prompt_tokens": 12, "completion_tokens": 0, "cache_read_tokens": 0})
+    );
+    assert!(record["error"].is_null());
+    let messages = record["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[2]["role"], "assistant");
+    assert_eq!(messages[2]["reasoning_content"], "先观察");
+    assert_eq!(messages[2]["tool_calls"][0]["id"], "call-1");
+    assert_eq!(messages[3]["role"], "tool");
+    assert_eq!(messages[3]["tool_call_id"], "call-1");
+    assert!(messages.iter().all(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_str)
+            .map_or(true, |content| content.trim() != "完成")
+    }));
+    let ended_at = record["endedAt"].as_str().unwrap();
+    assert_eq!(ended_at.len(), 20);
+    assert!(ended_at.ends_with('Z'));
+    assert!(record.get("truncated").is_none());
+}
+
+#[tokio::test]
+async fn provider_failure_is_recorded_without_replacing_the_original_error() {
+    let sink = Arc::new(CapturingTranscriptSink::default());
+    let runner = ConcreteAgentRunner::with_shared_transcript_sink(
+        RecordingProvider::new(Vec::new()),
+        RecordingDispatcher::default(),
+        mineintent_contracts::agent::ModelName::new("explicit-model").unwrap(),
+        sink.clone(),
+    );
+    let signal = NeverCancelled;
+    let deadline = Deadline::after(Instant::now(), Duration::from_secs(5)).unwrap();
+    let error = runner
+        .run(
+            fixtures::agent_run_request_v4(),
+            ExecutionControl::new(&signal, deadline),
+        )
+        .await
+        .expect_err("provider failure must remain an error");
+
+    assert_eq!(error.code, AgentErrorCode::ProviderFailed);
+    assert_eq!(error.summary, "exhausted");
+    let lines = sink.lines.lock().unwrap();
+    assert_eq!(lines.len(), 1);
+    let record: Value = serde_json::from_str(&lines[0]).unwrap();
+    let error_summary = record["error"].as_str().unwrap();
+    assert!(error_summary.contains("provider_failed"));
+    assert!(error_summary.contains("exhausted"));
+    assert!(record["closing"].is_null());
+    assert!(error_summary.chars().count() <= 300);
+}
+
+#[tokio::test]
+async fn transcript_sink_errors_and_panics_are_fail_open() {
+    for sink in [
+        Arc::new(FailingTranscriptSink) as Arc<dyn TranscriptSink>,
+        Arc::new(PanickingTranscriptSink) as Arc<dyn TranscriptSink>,
+    ] {
+        let runner = ConcreteAgentRunner::with_shared_transcript_sink(
+            RecordingProvider::new(vec![completion(
+                json!({"role": "assistant", "content": "ok"}),
+                ModelUsage::default(),
+            )]),
+            RecordingDispatcher::default(),
+            mineintent_contracts::agent::ModelName::new("explicit-model").unwrap(),
+            sink,
+        );
+        let signal = NeverCancelled;
+        let deadline = Deadline::after(Instant::now(), Duration::from_secs(5)).unwrap();
+        let result = runner
+            .run(
+                fixtures::agent_run_request_v4(),
+                ExecutionControl::new(&signal, deadline),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "diagnostic sink must not alter business result"
+        );
+    }
+}
+
+#[tokio::test]
+async fn validation_failure_does_not_create_a_transcript_record() {
+    let sink = Arc::new(CapturingTranscriptSink::default());
+    let runner = ConcreteAgentRunner::with_shared_transcript_sink(
+        RecordingProvider::new(Vec::new()),
+        RecordingDispatcher::default(),
+        mineintent_contracts::agent::ModelName::new("explicit-model").unwrap(),
+        sink.clone(),
+    );
+    let mut request = fixtures::agent_run_request_v4();
+    request.tools = vec![fixtures::tool_definition(); 33];
+    let signal = NeverCancelled;
+    let deadline = Deadline::after(Instant::now(), Duration::from_secs(5)).unwrap();
+    let error = runner
+        .run(request, ExecutionControl::new(&signal, deadline))
+        .await
+        .expect_err("request validation must fail before the loop");
+    assert_eq!(error.code, AgentErrorCode::LimitExceeded);
+    assert!(sink.lines.lock().unwrap().is_empty());
 }

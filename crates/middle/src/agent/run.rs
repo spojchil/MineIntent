@@ -168,6 +168,27 @@ impl AgentRun {
         &self.run_id
     }
 
+    /// The complete model-visible replay accumulated so far.
+    pub fn messages(&self) -> &[JsonObject] {
+        &self.messages
+    }
+
+    /// Usage accumulated from provider responses so far, including a
+    /// partially completed run.
+    pub fn usage(&self) -> Option<&ModelUsage> {
+        self.usage.as_ref()
+    }
+
+    /// A closing is available only after an assistant final message has been
+    /// accepted. It remains readable if a later control check fails before
+    /// the driver emits `Done`.
+    pub fn closing(&self) -> Option<&str> {
+        match &self.state {
+            RunState::Done(closing) => Some(closing),
+            _ => None,
+        }
+    }
+
     pub fn next_step(&mut self) -> Result<AgentRunStep, AgentError> {
         let state = std::mem::replace(&mut self.state, RunState::Failed);
         match state {
