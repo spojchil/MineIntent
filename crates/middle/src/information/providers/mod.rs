@@ -4,12 +4,14 @@ mod current_status;
 mod inventory;
 mod schema;
 mod sound;
+mod viewport;
 
 use std::sync::Mutex;
 
 pub use current_status::CurrentStatusProvider;
 pub use inventory::InventoryProvider;
 pub use sound::SoundInformationProvider;
+pub use viewport::ViewportInformationProvider;
 
 struct RevisionTracker<Snapshot> {
     state: Mutex<RevisionState<Snapshot>>,
