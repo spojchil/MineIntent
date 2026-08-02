@@ -468,3 +468,32 @@
 | `cargo fmt --all -- --check` | 通过；nightly/default 工具链。 |
 | `cargo +stable fmt --all -- --check` | 通过。 |
 | `git diff --check` | 通过。 |
+
+## 2026-08-02｜阶段 5 B：telemetry debug state 与 loopback read-only server
+
+### 范围与实现
+
+- 本批只迁移 telemetry 的 `contracts.ts`、`debug-state.ts`、`debug-server.ts` 及其 `debug-state.test.ts` 两条行为 oracle；没有实现旧 Python transcript wire，也没有猜测 transcript 结构。
+- `mineintent.debug-state.v1` DTO 使用现有 Rust Minecraft/Information contracts 的 `BackendState`、`Vec3Value` 与 `PassiveObservations`，字段用 camelCase serde；默认 connection 为 idle、failures 为空、decision 为 idle 且两个数组为空。revision 从 0 开始，update/failure 各加一，snapshot 每次生成 UTC 毫秒时间戳。
+- `DebugStateStore` 以 `Arc<RwLock<...>>` 保存 owned input；update 是顶层 patch，四个 optional 字段用 outer `None` 表示缺席/不改、`Some(Some(value))` 表示设值、`Some(None)` 表示清空，`DebugStateInput` 的 `None` 也转换为清空。调用方输入与 store 不共享可变嵌套值。snapshot 在锁外复制、递归脱敏后以 `Arc<ParticipantDebugState>` 返回，调用方修改自有 clone 不能反向改变 store；failure 保留最近 10 条并保持顺序。
+- 脱敏覆盖敏感 key 后缀与 private raw key，并按 ECMAScript `/iu` 的 ASCII simple-case-fold 处理 LONG S（`ſ`）/KELVIN SIGN（`K`）；任意数组/嵌套对象中的 Bearer 与 `sk-` 字符串模式也覆盖。Value 级函数不修改原输入。
+- `LocalDebugServer` 只用 Tokio `TcpListener` 绑定字面 `127.0.0.1`，支持默认 3211 与端口 0；手写最小 HTTP parser/response，不引入 web framework。所有响应统一 JSON content type/cache control；GET 只提供 `/health` 和 `/v1/state`，非 GET 统一 405 + `Allow: GET`，其他 GET 为 404。stop 会发送 shutdown、abort/join connection tasks，并可重复 start/stop；未监听 address 返回结构化 `not_listening`。
+- middle manifest 仅补充 Tokio 的 `net`/`io-util` feature；Cargo.lock 未变化。
+
+### 测试与 mutation
+
+- `crates/middle/tests/telemetry.rs` 共 10 条：2 条 TS oracle 一一对应 + 8 条补充，覆盖 DTO/default/revision、输入/快照隔离、optional patch 的 set/clear、完整 input 的 None 清空、serde absent/null、递归数组/嵌套/Unicode `/iu` key/字符串值脱敏、headers/health/404/全部非 GET、幂等生命周期/非法端口、并发 snapshot 与 HTTP 读取。
+- failure cap mutation：临时把 `MAX_RECENT_FAILURES` 改为 11，具名 `debug_state_is_immutable_bounded_and_redacts_sensitive_values` 失败（实际 length 11、期望 10，exit 101）；恢复为 10 后具名测试 1/1 通过。
+- read-only mutation：临时允许 POST 路由，具名 `local_debug_server_only_permits_read_only_get_routes` 失败（实际 200、期望 405，exit 101）；恢复后 telemetry 全部 10/10 通过。
+
+### 门禁结果与边界
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test -p mineintent-middle --test telemetry --locked --offline` | 通过；10/10。 |
+| `cargo test -p mineintent-middle --all-targets --locked --offline` | 通过；161/161，telemetry 10/10。 |
+| `cargo check --workspace --all-targets --locked --offline` | 通过；因本批修改 manifest 追加复验。 |
+| `cargo fmt --all -- --check` | 通过。 |
+| `git diff --check` | 通过。 |
+
+- 未修改 `crates/backend`、`crates/contracts`、agent/information/backend/contracts/participant/app、`supplies/`、`vendor/`、`移植计划/` 或其他日志；未 commit、未联网、未 push/开 PR、未启动子代理。旧 transcript 仍明确留在范围外。
