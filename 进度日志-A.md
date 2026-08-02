@@ -406,3 +406,28 @@ TS 本批 **2/2 tests**：
 - mutation：临时将 `current_status.rs` 的缺省 oxygen 从 `20.0` 改为 `19.0`，运行 `cargo test -p mineintent-middle --test information_current_status_provider ts_current_status_defaults_missing_oxygen_to_full_and_reads_experience_level --locked --offline`；指定测试按预期失败，差异 `Some(19.0) != Some(20.0)`。维护侧另独立反转 `RevisionTracker` 的快照变化条件，`ts_current_status_bumps_revision_only_when_vitals_change` 按预期以 revision `0 != 1` 失败。两处均已恢复；current-status 5/5、inventory 4/4、registry 6/6 定向测试通过。
 - `cargo test --workspace --all-targets --locked --offline`：174 passed；`cargo check --workspace --all-targets --locked --offline`、`cargo +stable fmt --all -- --check`、`git diff --check`：通过。
 - 冻结 SPI 没有发现必须修改却被本轮范围挡住的实现障碍。明确 deferred：source-port 的 backend adapter；sound/viewport providers；Information runtime/tool-session/context-composer；B 所有的 participant/runtime、app、models、speech、execution、events。ProviderReadRequest 的 selector/page 形状未扩张，runtime 层的 field/budget/access/cancellation 组合校验也未提前实现。
+
+## 2026-08-02｜P1-A 阶段 3 sound information provider 叶子迁移
+
+### 基线、oracle 与范围
+
+- 开始基线：`03ce6eb`，A worktree clean；只读对照 `supplies/mineintent-main/src/information/providers/sound-provider.ts`、`sound-provider.test.ts`、`testing/provider-contract.ts`，以及现有 Rust `SoundHistoryPort`/`SoundObservation`、current-status/inventory provider 与 registry SPI。未联网；supplies/vendor/移植计划、Cargo manifest/lock、contracts、backend、B/A2 均零修改。
+- 新增 `information/providers/sound.rs` 并从 `providers/mod.rs` 公开 `SoundInformationProvider`。不改变冻结 SoundPort：read 按 TS 顺序在请求 `recentSounds` 时调用 `recent(20.0)`，随后只调用一次 `revision()`；空历史返回 `recentSounds: []` 且 `unavailable` 为空。
+- definition 精确对齐：`sound_information`、中文描述、`sound-information:1`、participant、`recentSounds`、quantized、sound_projection、连接+世界 scope、1/16384/2000 limits、notes 与 `sound-provider.v1` source metadata。`z.object` 未知键 strip、可选 soundName/category 非 null、distance/volume 非负、direction 四枚闭合值、pitch finite、observedAt 为 Z-only ISO datetime 均有运行期 schema。
+- SourcePort 的 `revision: f64` 在 provider wire 边界转换为非负 JavaScript safe integer `u64`；read 遇负数、fraction、超过 `Number.MAX_SAFE_INTEGER`、NaN、Infinity 返回结构化 `InformationProviderError::Failed`，不 panic/unwrap/expect。availability 因冻结 SPI 无 Result，只在无效 source revision 时降为 0；有效路径与 TS 完全一致。
+
+### TS 2/2 一对一映射与 Rust-only
+
+1. `sound-provider.test.ts:21` `sound provider satisfies the provider contract` → `ts_sound_provider_satisfies_the_provider_contract`。
+2. `sound-provider.test.ts:30` `returns an empty list, not unavailable, when nothing was heard` → `ts_sound_provider_returns_an_empty_list_not_unavailable_when_nothing_was_heard`。
+
+两条测试均复用既有 Rust `information_provider_contract_support::assert_information_provider_contract`，保留 definition 完整性、revision JSON 整数、请求字段/available-unavailable 互斥与运行期 schema 断言。
+
+另有 **3 条 Rust-only contract tests**，不冒充 TS 映射：definition/schema 全字段正负例；object-safe registry 注入、`recent(20)` 上限、source/observedAt/evidence metadata；无效 source revision 的结构化错误回归。
+
+### mutation、验证与 deferred
+
+- mutation：临时将 `RECENT_SOUND_LIMIT` 从 `20.0` 改为 `19.0`，运行 `cargo test -p mineintent-middle --test information_sound_provider rust_contract_sound_is_object_safe_limited_and_preserves_wire_metadata --locked --offline`；测试按预期失败（实际 `Some(19)`、期望 `Some(20)`），已恢复并复跑 sound 5/5。
+- 维护侧复审修正 revision 上界：原草稿以 `u64::MAX as f64` 判断会让浮点 `2^64` 穿过并在 cast 时饱和；现与 JavaScript wire 语义一致地限制为 `Number.MAX_SAFE_INTEGER`，负数、fraction、`2^53`、`u64::MAX as f64`、NaN、Infinity 均由测试覆盖。非 fallible availability 对这些非法 source 值固定降为 revision 0，read 返回结构化错误。
+- `cargo test --workspace --all-targets --locked --offline`：191 passed；`cargo check --workspace --all-targets --locked --offline`、`cargo +stable fmt --all -- --check`、`git diff --check`：通过。
+- 明确 deferred：backend sound producer/adapter、viewport provider、Information runtime/tool-session/context-composer，以及 B/A2 所有路径。本轮未扩张 selector/page、取消、budget/access 或 backend 生产行为。
