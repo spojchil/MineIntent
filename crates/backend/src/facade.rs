@@ -157,6 +157,8 @@ struct FacadeInner {
     registry: parking_lot::Mutex<Vec<ListenerEntry>>,
     next_subscription_id: AtomicU64,
     dispatch_tx: SyncSender<DispatchMessage>,
+    dispatch_normal_queued: parking_lot::Mutex<usize>,
+    dispatch_capacity_cv: parking_lot::Condvar,
     dispatcher_join: parking_lot::Mutex<Option<JoinHandle<()>>>,
     closed: AtomicBool,
     #[cfg(test)]
@@ -183,7 +185,10 @@ impl FacadeInner {
         #[cfg(test)] scripted: bool,
         #[cfg(not(test))] _scripted: bool,
     ) -> Result<Arc<Self>, BackendError> {
-        let (dispatch_tx, dispatch_rx) = mpsc::sync_channel(DISPATCH_CAPACITY);
+        // Keep one bounded emergency slot for the single owned session's
+        // terminal Stopped envelope. Ordinary events are still limited to
+        // DISPATCH_CAPACITY by dispatch_normal_queued below.
+        let (dispatch_tx, dispatch_rx) = mpsc::sync_channel(DISPATCH_CAPACITY + 1);
         let inner = Arc::new(Self {
             config,
             session: parking_lot::Mutex::new(None),
@@ -191,6 +196,8 @@ impl FacadeInner {
             registry: parking_lot::Mutex::new(Vec::new()),
             next_subscription_id: AtomicU64::new(0),
             dispatch_tx,
+            dispatch_normal_queued: parking_lot::Mutex::new(0),
+            dispatch_capacity_cv: parking_lot::Condvar::new(),
             dispatcher_join: parking_lot::Mutex::new(None),
             closed: AtomicBool::new(false),
             #[cfg(test)]
@@ -296,22 +303,45 @@ impl FacadeInner {
     }
 
     fn route_event(&self, session_id: u64, event: BackendEventEnvelope) {
-        if self
+        let stopped = is_stopped_event(&event);
+        if !stopped && !self.reserve_normal_dispatch_slot() {
+            return;
+        }
+        let send_result = self
             .dispatch_tx
-            .send(DispatchMessage::Event { session_id, event })
-            .is_err()
-        {
+            .send(DispatchMessage::Event { session_id, event });
+        if send_result.is_err() {
+            if !stopped {
+                self.release_normal_dispatch_slot();
+            }
             if let Some(session) = self.current_session().filter(|s| s.id == session_id) {
                 session.record_terminal(thread_failure_message("dispatcher is closed"));
             }
         }
     }
 
+    fn reserve_normal_dispatch_slot(&self) -> bool {
+        let mut queued = self.dispatch_normal_queued.lock();
+        while *queued >= DISPATCH_CAPACITY && !self.closed.load(Ordering::Acquire) {
+            self.dispatch_capacity_cv.wait(&mut queued);
+        }
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        *queued += 1;
+        true
+    }
+
+    fn release_normal_dispatch_slot(&self) {
+        let mut queued = self.dispatch_normal_queued.lock();
+        *queued = queued.saturating_sub(1);
+        self.dispatch_capacity_cv.notify_one();
+    }
+
     fn handle_event(&self, session_id: u64, event: BackendEventEnvelope) {
-        let Some(session) = self.current_session().filter(|s| s.id == session_id) else {
+        let Some(_session) = self.current_session().filter(|s| s.id == session_id) else {
             return;
         };
-        session.observe_event(&event);
         let deliveries = {
             let registry = self.registry.lock();
             registry
@@ -384,6 +414,7 @@ impl FacadeInner {
 impl Drop for FacadeInner {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Release);
+        self.dispatch_capacity_cv.notify_all();
         if let Some(session) = self.session.get_mut().take() {
             session.request_stop_without_inner("facade_dropped");
             session.join_worker_blocking();
@@ -419,7 +450,6 @@ struct RuntimeSession {
 struct SessionOutcome {
     ready: Option<Result<BackendReady, BackendError>>,
     terminal: Option<BackendError>,
-    stopped: bool,
 }
 
 impl RuntimeSession {
@@ -512,6 +542,7 @@ impl RuntimeSession {
         self.worker_done.store(true, Ordering::Release);
         self.joined.store(true, Ordering::Release);
         while let Ok(event) = events.try_recv() {
+            self.observe_event(&event);
             inner.route_event(self.id, event);
         }
         self.notify.notify_waiters();
@@ -611,7 +642,6 @@ impl RuntimeSession {
             }
             BackendEventPayload::Lifecycle(BackendLifecyclePayload::Stopped { .. }) => {
                 let mut outcome = self.outcome.lock();
-                outcome.stopped = true;
                 if outcome.ready.is_none() && outcome.terminal.is_none() {
                     outcome.terminal = Some(BackendError::NotReady {
                         state: "stopped".to_owned(),
@@ -674,13 +704,6 @@ impl RuntimeSession {
             .ready
             .clone()
             .or_else(|| outcome.terminal.clone().map(Err))
-            .or_else(|| {
-                outcome.stopped.then(|| {
-                    Err(BackendError::NotReady {
-                        state: "stopped".to_owned(),
-                    })
-                })
-            })
     }
 
     /// Stop completion is owned by the runtime admission state and worker
@@ -713,6 +736,7 @@ impl RuntimeSession {
                     snapshot.connection_attempt_id = event.connection_attempt_id.clone();
                 }
             }
+            self.observe_event(&event);
             inner.route_event(self.id, event);
         }
     }
@@ -729,6 +753,7 @@ async fn runtime_worker(session: Arc<RuntimeSession>, inner: Weak<FacadeInner>, 
                 break;
             };
             let stopped = is_stopped_event(&event);
+            session.observe_event(&event);
             if let Some(inner) = inner.upgrade() {
                 inner.route_event(session.id, event);
             }
@@ -779,6 +804,7 @@ async fn runtime_worker(session: Arc<RuntimeSession>, inner: Weak<FacadeInner>, 
             }
             event = events.recv() => {
                 let Some(event) = event else { break; };
+                session.observe_event(&event);
                 if let Some(inner) = inner.upgrade() {
                     inner.route_event(session.id, event);
                 }
@@ -794,6 +820,9 @@ fn dispatcher_loop(weak: Weak<FacadeInner>, receiver: Receiver<DispatchMessage>)
                 let Some(inner) = weak.upgrade() else {
                     continue;
                 };
+                if !is_stopped_event(&event) {
+                    inner.release_normal_dispatch_slot();
+                }
                 inner.handle_event(session_id, event);
             }
             DispatchMessage::Shutdown => break,
@@ -1993,6 +2022,71 @@ mod tests {
         ));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn facade_internal_lifecycle_observation_bypasses_blocked_public_callback() {
+        let (facade, driver) = MinecraftBackendFacade::scripted(test_config());
+        let start = facade.start(never_control());
+        let (started, started_rx) = std_mpsc::channel();
+        let release = Arc::new(Notify::new());
+        let (events, events_rx) = std_mpsc::channel();
+        let _subscription = facade
+            .subscribe(Arc::new(GatedListener {
+                started,
+                release: release.clone(),
+                events,
+                first: AtomicBool::new(false),
+            }))
+            .expect("gated subscription");
+
+        let first_driver = driver.clone();
+        let first_emitter = thread::spawn(move || {
+            first_driver.emit(
+                FactSource::Commanded,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionRequested {
+                    attempt: 0,
+                }),
+            );
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first public callback must reach its gate");
+        assert_eq!(
+            events_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first event id"),
+            "event-1"
+        );
+
+        driver.snapshot(test_snapshot());
+        driver.emit(
+            FactSource::ServerObserved,
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::Ready {
+                snapshot_revision: 7,
+            }),
+        );
+        assert!(events_rx.try_recv().is_err());
+
+        let ready = tokio::time::timeout(Duration::from_secs(1), start)
+            .await
+            .expect("internal ready observation must be bounded")
+            .expect("ready must be returned before public callback gate opens");
+        assert_eq!(ready.snapshot.snapshot_revision, 7);
+
+        release.notify_one();
+        assert_eq!(
+            events_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("ready public event after gate"),
+            "event-2"
+        );
+        first_emitter.join().expect("first event emitter");
+
+        facade
+            .stop("lifecycle-owner-test".to_owned(), never_control())
+            .await
+            .expect("cleanup stop");
+    }
+
     struct RecordingListener {
         ids: Arc<parking_lot::Mutex<Vec<String>>>,
         sent: Option<std_mpsc::Sender<String>>,
@@ -2003,6 +2097,24 @@ mod tests {
             self.ids.lock().push(event.id.clone());
             if let Some(sender) = &self.sent {
                 let _ = sender.send(event.id);
+            }
+        }
+    }
+
+    struct GatedListener {
+        started: std_mpsc::Sender<()>,
+        release: Arc<Notify>,
+        events: std_mpsc::Sender<String>,
+        first: AtomicBool,
+    }
+
+    impl BackendEventListener for GatedListener {
+        fn on_event(&self, event: BackendEventEnvelope) {
+            let first = !self.first.swap(true, Ordering::AcqRel);
+            let _ = self.events.send(event.id);
+            if first {
+                let _ = self.started.send(());
+                futures_block_on(self.release.notified());
             }
         }
     }
@@ -2112,6 +2224,39 @@ mod tests {
                 tokio::time::timeout(
                     Duration::from_millis(800),
                     facade.stop("callback-stop".to_owned(), never_control()),
+                )
+                .await
+            });
+            let _ = self.completed.send(result);
+        }
+    }
+
+    struct SaturatedStopListener {
+        facade: MinecraftBackendFacade,
+        started: std_mpsc::Sender<()>,
+        capacity_ready: parking_lot::Mutex<std_mpsc::Receiver<()>>,
+        completed: std_mpsc::Sender<Result<Result<(), BackendError>, tokio::time::error::Elapsed>>,
+        events: std_mpsc::Sender<String>,
+        called: AtomicBool,
+    }
+
+    impl BackendEventListener for SaturatedStopListener {
+        fn on_event(&self, event: BackendEventEnvelope) {
+            let first = !self.called.swap(true, Ordering::AcqRel);
+            let _ = self.events.send(event.id);
+            if !first {
+                return;
+            }
+            let _ = self.started.send(());
+            self.capacity_ready
+                .lock()
+                .recv()
+                .expect("filler must reach the bounded capacity");
+            let facade = self.facade.clone();
+            let result = futures_block_on(async move {
+                tokio::time::timeout(
+                    Duration::from_millis(800),
+                    facade.stop("saturated-callback-stop".to_owned(), never_control()),
                 )
                 .await
             });
@@ -2236,6 +2381,91 @@ mod tests {
             .expect("dispatcher must subsequently deliver strict stopped FIFO event");
         assert_eq!(first, "event-1");
         assert_eq!(stopped, "event-2");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn facade_scripted_callback_sync_stop_completes_with_quiescent_bounded_dispatch_saturation(
+    ) {
+        let (facade, driver) = MinecraftBackendFacade::scripted(test_config());
+        let _start = facade.start(never_control());
+        let (started, started_rx) = std_mpsc::channel();
+        let (capacity_ready, capacity_ready_rx) = std_mpsc::channel();
+        let (filler_done, filler_done_rx) = std_mpsc::channel();
+        let (completed, completed_rx) = std_mpsc::channel();
+        let (events, events_rx) = std_mpsc::channel();
+        let _subscription = facade
+            .subscribe(Arc::new(SaturatedStopListener {
+                facade: facade.clone(),
+                started,
+                capacity_ready: parking_lot::Mutex::new(capacity_ready_rx),
+                completed,
+                events,
+                called: AtomicBool::new(false),
+            }))
+            .expect("saturated stop subscription");
+
+        let first_driver = driver.clone();
+        let first_emitter = thread::spawn(move || {
+            first_driver.emit(
+                FactSource::Commanded,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionRequested {
+                    attempt: 0,
+                }),
+            );
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("saturated callback must start");
+
+        let fill_driver = driver.clone();
+        let filler = thread::spawn(move || {
+            for attempt in 0..DISPATCH_CAPACITY {
+                fill_driver.emit(
+                    FactSource::Commanded,
+                    BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionRequested {
+                        attempt: attempt as u32 + 1,
+                    }),
+                );
+            }
+            filler_done.send(()).expect("filler completion receiver");
+        });
+        if filler_done_rx.recv_timeout(Duration::from_secs(1)).is_err() {
+            let _ = capacity_ready.send(());
+            first_emitter.join().expect("first event emitter cleanup");
+            filler.join().expect("bounded filler cleanup");
+            panic!("bounded filler did not complete within one second");
+        }
+        filler.join().expect("bounded filler");
+        capacity_ready
+            .send(())
+            .expect("saturated callback must remain alive");
+
+        let stop_result = completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("callback stop must complete at bounded saturation");
+        assert_eq!(stop_result, Ok(Ok(())));
+        first_emitter.join().expect("first event emitter");
+
+        let expected_count = DISPATCH_CAPACITY + 2;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut delivered = Vec::with_capacity(expected_count);
+        while delivered.len() < expected_count {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "FIFO delivery exceeded its bound");
+            delivered.push(
+                events_rx
+                    .recv_timeout(remaining)
+                    .expect("bounded dispatcher must not lose an event"),
+            );
+        }
+        let expected = (1..=expected_count)
+            .map(|id| format!("event-{id}"))
+            .collect::<Vec<_>>();
+        assert_eq!(delivered, expected);
+        assert!(matches!(facade.state(), BackendState::Stopped { .. }));
+        let session = facade.inner.current_session().expect("owned session");
+        assert!(session.worker_done.load(Ordering::Acquire));
+        assert!(session.joined.load(Ordering::Acquire));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
