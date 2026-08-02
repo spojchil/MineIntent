@@ -12,5 +12,5 @@ pub use contracts::{
 };
 pub use schemas::{
     move_input_parameters_schema, view_parameters_schema, MoveDirection, MoveInputArguments,
-    ViewArguments,
+    ViewArguments, ViewMode, ViewPosition, MAX_DIRECTED_VIEW_POSITIONS,
 };
