@@ -3,11 +3,13 @@
 mod current_status;
 mod inventory;
 mod schema;
+mod sound;
 
 use std::sync::Mutex;
 
 pub use current_status::CurrentStatusProvider;
 pub use inventory::InventoryProvider;
+pub use sound::SoundInformationProvider;
 
 struct RevisionTracker<Snapshot> {
     state: Mutex<RevisionState<Snapshot>>,
