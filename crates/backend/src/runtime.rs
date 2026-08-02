@@ -79,6 +79,7 @@ struct EventWriter {
     connection_epoch: u64,
     connection_attempt_id: String,
     world_id: String,
+    dimension: Option<String>,
 }
 
 impl EventWriter {
@@ -93,12 +94,18 @@ impl EventWriter {
             connection_epoch: 0,
             connection_attempt_id: "attempt-0".to_owned(),
             world_id: world_id.to_owned(),
+            dimension: None,
         }
     }
 
     fn new_attempt(&mut self) {
         self.connection_epoch += 1;
         self.connection_attempt_id = format!("attempt-{}", self.connection_epoch);
+        self.dimension = None;
+    }
+
+    fn set_dimension(&mut self, dimension: impl Into<String>) {
+        self.dimension = Some(dimension.into());
     }
 
     fn context(&self) -> (String, u64, String) {
@@ -116,13 +123,14 @@ impl EventWriter {
         payload: serde_json::Value,
     ) -> BackendEventEnvelope {
         self.next_id += 1;
-        let event = BackendEventEnvelope::new(
+        let event = BackendEventEnvelope::new_with_dimension(
             format!("event-{}", self.next_id),
             kind,
             self.process_session_id.clone(),
             self.connection_epoch,
             self.connection_attempt_id.clone(),
             self.world_id.clone(),
+            self.dimension.clone(),
             source,
             payload,
         );
@@ -247,6 +255,29 @@ impl SharedRuntime {
 
     fn context(&self) -> (String, u64, String) {
         self.writer.lock().context()
+    }
+
+    fn set_dimension(&self, dimension: impl Into<String>) -> Option<String> {
+        let dimension = dimension.into();
+        self.writer.lock().set_dimension(dimension.clone());
+        self.reported_dimension.lock().replace(dimension)
+    }
+
+    fn observe_dimension(&self, dimension: impl Into<String>) {
+        let dimension = dimension.into();
+        if let Some(previous) = self.set_dimension(dimension.clone()) {
+            if previous != dimension {
+                self.emit(
+                    BackendEventKind::Lifecycle,
+                    FactSource::ServerObserved,
+                    json!({
+                        "type":"dimension_changed",
+                        "from":previous,
+                        "to":dimension
+                    }),
+                );
+            }
+        }
     }
 
     fn connection_epoch(&self) -> u64 {
@@ -702,25 +733,7 @@ fn reset_spawn_marker_on_world_loaded(
     state: Res<SwarmState>,
 ) {
     for event in world_loaded.read() {
-        let dimension = event.name.to_string();
-        let previous = state
-            .shared
-            .reported_dimension
-            .lock()
-            .replace(dimension.clone());
-        if let Some(previous) = previous {
-            if previous != dimension {
-                state.shared.emit(
-                    BackendEventKind::Lifecycle,
-                    FactSource::ServerObserved,
-                    json!({
-                        "type":"dimension_changed",
-                        "from":previous,
-                        "to":dimension
-                    }),
-                );
-            }
-        }
+        state.shared.observe_dimension(event.name.to_string());
         commands.entity(event.entity).remove::<(
             azalea::events::SentSpawnEvent,
             azalea::entity::InLoadedChunk,
@@ -1054,6 +1067,9 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             shared.death_reported.store(false, Ordering::Release);
             shared.set_world(bot.world());
             let snapshot = shared.refresh_snapshot(&bot, true, FactSource::ServerObserved);
+            if let Some(snapshot) = snapshot.as_ref() {
+                shared.set_dimension(snapshot.world.dimension.clone());
+            }
             shared.emit(
                 BackendEventKind::Lifecycle,
                 FactSource::ServerObserved,
@@ -1063,10 +1079,6 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                 }),
             );
             if let Some(snapshot) = snapshot {
-                shared
-                    .reported_dimension
-                    .lock()
-                    .replace(snapshot.world.dimension.clone());
                 if was_dead {
                     shared.emit(
                         BackendEventKind::Lifecycle,
@@ -1408,6 +1420,7 @@ mod tests {
         assert_eq!(first_request.connection_attempt_id, "attempt-1");
         assert_eq!(first_request.payload["type"], "connection_requested");
         assert_eq!(first_request.payload["attempt"], 1);
+        assert!(first_request.dimension.is_none());
 
         handle.shared.consume_attempt_for_transport_init();
         handle.shared.emit(
@@ -1433,9 +1446,55 @@ mod tests {
         assert_eq!(second_request.connection_attempt_id, "attempt-2");
         assert_eq!(second_request.payload["type"], "connection_requested");
         assert_eq!(second_request.payload["attempt"], 2);
+        assert!(second_request.dimension.is_none());
 
         handle.shared.consume_attempt_for_transport_init();
         assert_eq!(handle.shared.context().1, 2);
         assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn event_dimension_is_captured_at_emit_time_and_cleared_for_a_new_attempt() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+
+        handle.shared.begin_connection_attempt();
+        let first_request = events.try_recv().expect("首次连接请求事件");
+        assert!(first_request.dimension.is_none());
+
+        assert_eq!(handle.shared.set_dimension("minecraft:overworld"), None);
+        handle.shared.emit(
+            BackendEventKind::World,
+            FactSource::ServerObserved,
+            json!({"type":"world_observed"}),
+        );
+        let world_event = events.try_recv().expect("世界事件");
+        assert_eq!(
+            world_event.dimension.as_deref(),
+            Some("minecraft:overworld")
+        );
+
+        handle.shared.begin_connection_attempt();
+        let second_request = events.try_recv().expect("重连请求事件");
+        assert_eq!(second_request.connection_epoch, 2);
+        assert!(second_request.dimension.is_none());
+    }
+
+    #[test]
+    fn dimension_changed_event_carries_the_new_dimension() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle.shared.begin_connection_attempt();
+        let _request = events.try_recv().expect("连接请求事件");
+
+        handle.shared.observe_dimension("minecraft:overworld");
+        assert!(events.try_recv().is_err());
+        handle.shared.observe_dimension("minecraft:the_nether");
+
+        let changed = events.try_recv().expect("维度变化事件");
+        assert_eq!(changed.payload["type"], "dimension_changed");
+        assert_eq!(changed.payload["from"], "minecraft:overworld");
+        assert_eq!(changed.payload["to"], "minecraft:the_nether");
+        assert_eq!(changed.dimension.as_deref(), Some("minecraft:the_nether"));
     }
 }

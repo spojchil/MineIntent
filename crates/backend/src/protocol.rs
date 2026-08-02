@@ -70,6 +70,30 @@ impl BackendEventEnvelope {
         source: FactSource,
         payload: Value,
     ) -> Self {
+        Self::new_with_dimension(
+            id,
+            kind,
+            process_session_id,
+            connection_epoch,
+            connection_attempt_id,
+            world_id,
+            None,
+            source,
+            payload,
+        )
+    }
+
+    pub fn new_with_dimension(
+        id: impl Into<String>,
+        kind: BackendEventKind,
+        process_session_id: impl Into<String>,
+        connection_epoch: u64,
+        connection_attempt_id: impl Into<String>,
+        world_id: impl Into<String>,
+        dimension: Option<String>,
+        source: FactSource,
+        payload: Value,
+    ) -> Self {
         Self {
             protocol: BACKEND_EVENT_PROTOCOL.to_owned(),
             id: id.into(),
@@ -79,7 +103,7 @@ impl BackendEventEnvelope {
             connection_epoch,
             connection_attempt_id: connection_attempt_id.into(),
             world_id: world_id.into(),
-            dimension: None,
+            dimension,
             source,
             payload,
         }
@@ -254,6 +278,26 @@ mod tests {
         let decoded: BackendEventEnvelope = serde_json::from_str(&encoded).expect("事件应能解码");
         assert_eq!(decoded.source, FactSource::ServerObserved);
         assert_eq!(decoded.payload["id"], 42);
+        assert_eq!(decoded.protocol, BACKEND_EVENT_PROTOCOL);
+    }
+
+    #[test]
+    fn event_dimension_is_captured_without_changing_the_v1_discriminator() {
+        let event = BackendEventEnvelope::new_with_dimension(
+            "event-2",
+            BackendEventKind::Lifecycle,
+            "session-1",
+            1,
+            "attempt-1",
+            "world-1",
+            Some("minecraft:overworld".to_owned()),
+            FactSource::ServerObserved,
+            serde_json::json!({"type":"transport_connected"}),
+        );
+        let encoded = serde_json::to_value(&event).expect("event should encode");
+        assert_eq!(encoded["protocol"], BACKEND_EVENT_PROTOCOL);
+        assert_eq!(encoded["dimension"], "minecraft:overworld");
+        assert_eq!(event.protocol, BACKEND_EVENT_PROTOCOL);
     }
 
     #[test]
