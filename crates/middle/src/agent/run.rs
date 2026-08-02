@@ -548,7 +548,11 @@ fn invalid_model_tool_call() -> AgentError {
 }
 
 fn truncate_summary(summary: &str) -> String {
-    summary.chars().take(300).collect()
+    summary
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(300)
+        .collect()
 }
 
 fn stable_fragment(value: &str, max_chars: usize) -> String {

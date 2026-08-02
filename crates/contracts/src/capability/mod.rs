@@ -11,7 +11,8 @@ pub use contracts::{
     ToolCapability, ToolCapabilityRegistry, ToolDispatcher, ToolResultProtocol,
 };
 pub use schemas::{
-    directed_view_result_schema, move_input_parameters_schema, validate_directed_positions,
-    view_parameters_schema, MoveDirection, MoveInputArguments, ViewArguments, ViewMode,
-    ViewPosition, MAX_DIRECTED_VIEW_POSITIONS,
+    directed_view_result_schema, look_relative_parameters_schema, move_input_parameters_schema,
+    remember_parameters_schema, validate_directed_positions, view_parameters_schema,
+    LookRelativeArguments, MoveDirection, MoveInputArguments, RememberArguments, RememberOperation,
+    ViewArguments, ViewMode, ViewPosition, MAX_DIRECTED_VIEW_POSITIONS,
 };

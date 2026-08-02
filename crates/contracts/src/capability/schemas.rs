@@ -13,6 +13,116 @@ pub enum MoveDirection {
     Right,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LookRelativeArguments {
+    pub yaw_degrees: f64,
+    pub pitch_degrees: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLookRelativeArguments {
+    yaw_degrees: f64,
+    pitch_degrees: f64,
+}
+
+impl<'de> Deserialize<'de> for LookRelativeArguments {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawLookRelativeArguments::deserialize(deserializer)?;
+        for (field, value) in [
+            ("yaw_degrees", raw.yaw_degrees),
+            ("pitch_degrees", raw.pitch_degrees),
+        ] {
+            if !value.is_finite() || value.abs() > 90.0 {
+                return Err(serde::de::Error::custom(format!(
+                    "{field} must be finite and within -90..=90 degrees"
+                )));
+            }
+        }
+        Ok(Self {
+            yaw_degrees: raw.yaw_degrees,
+            pitch_degrees: raw.pitch_degrees,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RememberOperation {
+    Append,
+    Replace,
+    Rewrite,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RememberArguments {
+    pub operation: RememberOperation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(rename = "oldText", skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    #[serde(rename = "newText", skip_serializing_if = "Option::is_none")]
+    pub new_text: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RawRememberArguments {
+    operation: RememberOperation,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    text: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    old_text: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    new_text: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for RememberArguments {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawRememberArguments::deserialize(deserializer)?;
+        match raw.operation {
+            RememberOperation::Append
+                if raw.text.is_some() && raw.old_text.is_none() && raw.new_text.is_none() => {}
+            RememberOperation::Rewrite
+                if raw.text.is_some() && raw.old_text.is_none() && raw.new_text.is_none() => {}
+            RememberOperation::Replace
+                if raw.text.is_none()
+                    && raw
+                        .old_text
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty())
+                    && raw.new_text.is_some() => {}
+            RememberOperation::Append => {
+                return Err(serde::de::Error::custom(
+                    "append requires text and forbids oldText/newText",
+                ));
+            }
+            RememberOperation::Replace => {
+                return Err(serde::de::Error::custom(
+                    "replace requires non-empty oldText and newText, and forbids text",
+                ));
+            }
+            RememberOperation::Rewrite => {
+                return Err(serde::de::Error::custom(
+                    "rewrite requires text and forbids oldText/newText",
+                ));
+            }
+        }
+        Ok(Self {
+            operation: raw.operation,
+            text: raw.text,
+            old_text: raw.old_text,
+            new_text: raw.new_text,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct MoveInputArguments {
     pub directions: Vec<MoveDirection>,
@@ -182,6 +292,75 @@ pub fn move_input_parameters_schema() -> Map<String, Value> {
         },
         "required": ["directions", "duration_ms"],
         "additionalProperties": false
+    }))
+}
+
+pub fn look_relative_parameters_schema() -> Map<String, Value> {
+    object(json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "yaw_degrees": {
+                "description": "相对当前视线的水平转角，度。正值向右，负值向左。",
+                "type": "number",
+                "minimum": -90,
+                "maximum": 90
+            },
+            "pitch_degrees": {
+                "description": "相对当前视线的垂直转角，度。正值向下，负值向上。",
+                "type": "number",
+                "minimum": -90,
+                "maximum": 90
+            }
+        },
+        "required": ["yaw_degrees", "pitch_degrees"],
+        "additionalProperties": false
+    }))
+}
+
+pub fn remember_parameters_schema() -> Map<String, Value> {
+    object(json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "明确选择一种单文本记忆编辑：append 追加，replace 用唯一锚点替换（newText 可为空以删除），rewrite 重写全文。不同操作的字段不能混用。",
+        "type": "object",
+        "properties": {
+            "operation": {
+                "description": "记忆编辑操作。",
+                "type": "string",
+                "enum": ["append", "replace", "rewrite"]
+            },
+            "text": {
+                "description": "append 要追加的文本，或 rewrite 的完整文本；可为空。",
+                "type": "string"
+            },
+            "oldText": {
+                "description": "replace 的非空唯一原文锚点；必须在当前记忆中恰好出现一次。",
+                "type": "string",
+                "minLength": 1
+            },
+            "newText": {
+                "description": "replace 的替换文本；允许空字符串，表示删除 oldText。",
+                "type": "string"
+            }
+        },
+        "additionalProperties": false,
+        "oneOf": [
+            {
+                "required": ["operation", "text"],
+                "properties": {"operation": {"const": "append"}},
+                "not": {"anyOf": [{"required": ["oldText"]}, {"required": ["newText"]}]}
+            },
+            {
+                "required": ["operation", "oldText", "newText"],
+                "properties": {"operation": {"const": "replace"}},
+                "not": {"required": ["text"]}
+            },
+            {
+                "required": ["operation", "text"],
+                "properties": {"operation": {"const": "rewrite"}},
+                "not": {"anyOf": [{"required": ["oldText"]}, {"required": ["newText"]}]}
+            }
+        ]
     }))
 }
 

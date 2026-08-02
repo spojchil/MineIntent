@@ -13,11 +13,12 @@ use mineintent_contracts::{
         ToolExecution, ToolInvocation, ToolResponseProtocol, WireToolDefinition,
     },
     capability::{
-        directed_view_result_schema, fixtures, move_input_parameters_schema,
-        validate_directed_positions, view_parameters_schema, CapabilityExecutionContext,
-        CapabilityInvocation, ExecutionResource, MoveDirection, MoveInputArguments, ScopeGuard,
-        ToolCapability, ToolCapabilityRegistry, ToolDispatcher, ToolResultProtocol, ViewArguments,
-        ViewMode, MAX_DIRECTED_VIEW_POSITIONS,
+        directed_view_result_schema, fixtures, look_relative_parameters_schema,
+        move_input_parameters_schema, remember_parameters_schema, validate_directed_positions,
+        view_parameters_schema, CapabilityExecutionContext, CapabilityInvocation,
+        ExecutionResource, LookRelativeArguments, MoveDirection, MoveInputArguments,
+        RememberArguments, ScopeGuard, ToolCapability, ToolCapabilityRegistry, ToolDispatcher,
+        ToolResultProtocol, ViewArguments, ViewMode, MAX_DIRECTED_VIEW_POSITIONS,
     },
     minecraft::{
         BlockInfo, DirectedOccluder, DirectedSeenBlock, DirectedUnseenBlock,
@@ -95,6 +96,46 @@ fn registry_rejects_duplicate_advertised_names_with_structured_error() {
 
     assert_eq!(error.code, AgentErrorCode::DuplicateToolCapability);
     assert_eq!(error.summary, "duplicate_tool_capability:same");
+}
+
+#[test]
+fn look_and_remember_schemas_match_strict_deserializers() {
+    let look = Value::Object(look_relative_parameters_schema());
+    assert_eq!(look["required"], json!(["yaw_degrees", "pitch_degrees"]));
+    assert_eq!(look["additionalProperties"], false);
+    let _: LookRelativeArguments = parse(r#"{"yaw_degrees":10,"pitch_degrees":-5}"#);
+    for invalid in [
+        json!({"yaw_degrees": 10}),
+        json!({"yaw_degrees": 91, "pitch_degrees": 0}),
+        json!({"yaw_degrees": 0, "pitch_degrees": 0, "unknown": true}),
+    ] {
+        assert_rejected::<LookRelativeArguments>(invalid);
+    }
+
+    let schema = Value::Object(remember_parameters_schema());
+    assert_eq!(schema["oneOf"].as_array().unwrap().len(), 3);
+    let branches = schema["oneOf"].as_array().unwrap();
+    assert_eq!(branches[0]["properties"]["operation"]["const"], "append");
+    assert_eq!(branches[1]["properties"]["operation"]["const"], "replace");
+    assert_eq!(branches[2]["properties"]["operation"]["const"], "rewrite");
+    assert!(branches.iter().all(|branch| branch.get("not").is_some()));
+    for valid in [
+        json!({"operation":"append", "text":"remember this"}),
+        json!({"operation":"replace", "oldText":"old", "newText":""}),
+        json!({"operation":"rewrite", "text":""}),
+    ] {
+        let _: RememberArguments = serde_json::from_value(valid).expect("valid memory edit");
+    }
+    for invalid in [
+        json!({"operation":"append", "text":"x", "oldText":"old"}),
+        json!({"operation":"append", "text":"x", "newText":"new"}),
+        json!({"operation":"replace", "oldText":"old", "newText":"new", "text":"x"}),
+        json!({"operation":"rewrite", "text":"x", "oldText":"old"}),
+        json!({"operation":"rewrite", "text":"x", "newText":"new"}),
+        json!({"operation":"replace", "oldText":"", "newText":"new"}),
+    ] {
+        assert_rejected::<RememberArguments>(invalid);
+    }
 }
 
 #[test]

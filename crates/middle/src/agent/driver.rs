@@ -330,7 +330,9 @@ fn tool_panic_result(tool_call_id: ToolCallId) -> AgentToolResult {
 fn is_run_control_error(code: AgentErrorCode) -> bool {
     matches!(
         code,
-        AgentErrorCode::RunCancelled | AgentErrorCode::DeadlineExceeded
+        AgentErrorCode::RunCancelled
+            | AgentErrorCode::DeadlineExceeded
+            | AgentErrorCode::ScopeInvalid
     )
 }
 
