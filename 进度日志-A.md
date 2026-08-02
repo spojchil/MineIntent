@@ -482,3 +482,29 @@ TS 本批 **2/2 tests**：
 ### deferred 与交付边界
 
 - 本批没有需要上报的范围内阻塞；实现与验证均在 A 允许目录内完成。明确 deferred：`information/context-composer`、viewport provider/backend adapter、participant runtime、contracts/backend crate、B 所有路径，以及其余未被本批 oracle 直接要求的模块。
+
+## 2026-08-02｜P1-A 阶段 4 Information context composer
+
+### 基线、oracle 与范围
+
+- 开始时 `git status --short --branch` 与 `git diff --stat` 均无工作树改动，分支为 `port/a-context-composer`，HEAD 为 `7ade1341d7330dadeb1033c82e4bbe3961191548`。只读核对 `supplies/mineintent-main/src/information/context-composer.ts`、`context-composer.test.ts`、任务书/中期更新/模块清单/测试归类；未改 supplies、vendor、移植计划、contracts、backend 或其他代理日志。
+- 基线：`cargo test -p mineintent-middle --test information_runtime --locked --offline` 为 16 passed；`cargo test -p mineintent-contracts --test i02_information_contract --locked --offline` 为 17 passed。
+
+### 生产实现与语义决策
+
+- 新增 `crates/middle/src/information/context_composer.rs`，并在 information barrel 公开 `InformationContextComposer` 与 `compose_passive_observations`。实现只依赖既有 `InformationRuntimePort`/`InformationRuntime::query`，固定按 `current_status`、`inventory_information`、`sound_information`、`viewport_information` 各 query 一次，复用同一个 `OperationControl` 的 clone，不新建 child deadline/cancellation。
+- 固定请求计划严格为 `current-status:1` 的六字段、`inventory-information:1` 的两字段、`sound-information:1` 的 `recentSounds`，以及 `viewport-information:10` 的唯一 `frame` 字段；不实现 viewport provider/backend adapter，也不实现 `InformationFacade::read_viewport`。
+- 每次 read 先严格检查 interface/schema/字段覆盖、unavailable 与 value 互斥、无 cursor，再用 `serde` 的 `deny_unknown_fields` DTO 边界转换为冻结 `mineintent_contracts::information::PassiveObservations`。可用值与 `InformationReadResult.unavailable` 共存时保留 typed partial values，并逐字段转为 facade omission；完全无值时仅保留 `Unavailable` omission。`AudienceDenied`、`UnknownInterface`（映射 `Unavailable`）、`DeadlineExceeded`、`ScopeChanged`、`ProviderFailed` 等 query error 映射到冻结 omission 类型；非法/异构 JSON 转换为可观察 `ProviderFailed`，不会 panic 或捏造事实。
+
+### TS 6/6 对应与 Rust-only 回归
+
+1. `context-composer.test.ts:50` 全允许四份 plain values → `ts_compose_passive_observations_flattens_four_plain_values`。
+2. `context-composer.test.ts:66` 只允许 current status、恰 3 个 audience denial omission → `ts_compose_passive_observations_keeps_current_status_when_three_reads_are_denied`。
+
+另有 4 条 Rust-only 回归：固定顺序/schema/fields/共享 control；partial + field-level unavailable 且继续后续读取；deadline/scope/provider/missing-interface omission 映射；malformed provider JSON 的严格 DTO 失败可观察。composer 定向测试最终为 6 passed。
+
+### mutation、验证与 deferred
+
+- mutation：临时交换 `READ_PLAN` 前两项，运行具名 `composer_uses_fixed_order_exact_schema_fields_and_shared_control`；按预期失败，实际首个请求为 `inventory_information`，期望为 `current_status`。已恢复，具名测试复跑通过。
+- 恢复后：`cargo test -p mineintent-middle --test information_context_composer --locked --offline` 为 6 passed；`cargo test -p mineintent-middle --test information_runtime --locked --offline` 为 16 passed；`cargo test -p mineintent-middle --all-targets --locked --offline` 为 144 passed；`cargo +stable fmt --all -- --check` 与 `git diff --check` 通过。
+- deferred：实际 viewport provider/backend adapter、后续 `InformationFacade` 组装及原子 `read_viewport`；本批不扩张冻结 contracts，不修改 manifest/lock。

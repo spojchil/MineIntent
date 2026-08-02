@@ -1,6 +1,7 @@
 //! Information 协议、叶子 provider、runtime/tool-session control plane 与其基础设施。
 
 pub mod access_policy;
+pub mod context_composer;
 pub mod contracts;
 mod control;
 pub mod cursor_store;
@@ -16,6 +17,7 @@ pub mod trace;
 
 mod support;
 
+pub use context_composer::{compose_passive_observations, InformationContextComposer};
 pub use runtime::{InformationRuntime, InformationRuntimeInitError, InformationRuntimeOptions};
 pub use support::{InformationClock, SystemInformationClock};
 pub use tool_session::{
