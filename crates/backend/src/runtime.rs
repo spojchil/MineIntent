@@ -157,12 +157,26 @@ impl EventWriter {
             source,
             payload,
         );
-        // stdout 是跨进程事件流边界；每行一个完整 JSON 信封。
-        match serde_json::to_string(&event) {
-            Ok(line) => println!("{line}"),
-            Err(error) => eprintln!("事件编码失败：{error}"),
-        }
         event
+    }
+}
+
+#[derive(Default)]
+struct EventDispatchState {
+    queue: VecDeque<BackendEventEnvelope>,
+    drainer_active: bool,
+}
+
+impl EventDispatchState {
+    /// Enqueue while the dispatch mutex is held and elect exactly one drainer.
+    fn enqueue(&mut self, event: BackendEventEnvelope) -> bool {
+        self.queue.push_back(event);
+        if self.drainer_active {
+            false
+        } else {
+            self.drainer_active = true;
+            true
+        }
     }
 }
 
@@ -327,7 +341,7 @@ impl ObservationState {
 
 struct SharedRuntime {
     writer: parking_lot::Mutex<EventWriter>,
-    event_dispatch: parking_lot::Mutex<()>,
+    event_dispatch: parking_lot::Mutex<EventDispatchState>,
     swarm: parking_lot::Mutex<Option<Swarm>>,
     shutdown: Arc<Notify>,
     config: RunConfig,
@@ -359,7 +373,7 @@ impl SharedRuntime {
     fn new(config: RunConfig) -> Self {
         Self {
             writer: parking_lot::Mutex::new(EventWriter::new(&config.world_id)),
-            event_dispatch: parking_lot::Mutex::new(()),
+            event_dispatch: parking_lot::Mutex::new(EventDispatchState::default()),
             swarm: parking_lot::Mutex::new(None),
             shutdown: Arc::new(Notify::new()),
             config,
@@ -392,15 +406,41 @@ impl SharedRuntime {
         if matches!(kind, BackendEventKind::Lifecycle) {
             self.lifecycle_revision.fetch_add(1, Ordering::AcqRel);
         }
-        let _dispatch = self.event_dispatch.lock();
-        let event = {
-            let mut writer = self.writer.lock();
-            writer.emit(kind, source, payload)
+        let should_drain = {
+            let mut dispatch = self.event_dispatch.lock();
+            let event = {
+                let mut writer = self.writer.lock();
+                writer.emit(kind, source, payload)
+            };
+            dispatch.enqueue(event)
         };
-        self.broadcast_event(event);
+        if should_drain {
+            self.drain_events();
+        }
+    }
+
+    /// 排水期间不持有 dispatch 或 observation registry 锁。callback 内重新
+    /// emit 只会把事件追加到队尾，由当前 drainer 在本事件后继续处理。
+    fn drain_events(&self) {
+        loop {
+            let event = {
+                let mut dispatch = self.event_dispatch.lock();
+                let Some(event) = dispatch.queue.pop_front() else {
+                    dispatch.drainer_active = false;
+                    return;
+                };
+                event
+            };
+            self.broadcast_event(event);
+        }
     }
 
     fn broadcast_event(&self, event: BackendEventEnvelope) {
+        // stdout 是跨进程事件流边界；唯一 drainer 保证打印顺序与入队顺序一致。
+        match serde_json::to_string(&event) {
+            Ok(line) => println!("{line}"),
+            Err(error) => eprintln!("事件编码失败：{error}"),
+        }
         {
             let mut subscribers = self.subscribers.lock();
             subscribers.retain(|subscriber| subscriber.send(event.clone()).is_ok());
@@ -463,24 +503,29 @@ impl SharedRuntime {
         self.clear_observations();
         self.lifecycle_revision.fetch_add(1, Ordering::AcqRel);
 
-        let _dispatch = self.event_dispatch.lock();
-        let event = {
-            let mut writer = self.writer.lock();
-            writer.new_attempt();
-            let attempt = writer.connection_epoch;
-            writer.emit(
-                BackendEventKind::Lifecycle,
-                FactSource::Commanded,
-                json!({
-                    "type":"connection_requested",
-                    "attempt":attempt,
-                    "username":self.config.username,
-                    "host":self.config.host,
-                    "port":self.config.port
-                }),
-            )
+        let should_drain = {
+            let mut dispatch = self.event_dispatch.lock();
+            let event = {
+                let mut writer = self.writer.lock();
+                writer.new_attempt();
+                let attempt = writer.connection_epoch;
+                writer.emit(
+                    BackendEventKind::Lifecycle,
+                    FactSource::Commanded,
+                    json!({
+                        "type":"connection_requested",
+                        "attempt":attempt,
+                        "username":self.config.username,
+                        "host":self.config.host,
+                        "port":self.config.port
+                    }),
+                )
+            };
+            dispatch.enqueue(event)
         };
-        self.broadcast_event(event);
+        if should_drain {
+            self.drain_events();
+        }
     }
 
     /// `Event::Init` 消费连接发起前预留的身份，而不是再创建一个 epoch。
@@ -866,8 +911,8 @@ fn validate_command(command: &BackendCommand) -> Result<(), String> {
 
 /// 一个 observation source 的 owned typed subscription。
 ///
-/// 回调由 `SharedRuntime::broadcast_event` 同步调用；没有队列、后台转发任务
-/// 或每订阅线程。关闭会先从 registry 线性化移除，再等待在途回调结束。
+/// 回调由共享的 FIFO drainer 同步调用；每个订阅本身没有独立队列、后台转发
+/// 任务或每订阅线程。关闭会先从 registry 线性化移除，再等待在途回调结束。
 pub struct RuntimeObservationSubscription {
     shared: Arc<SharedRuntime>,
     id: u64,
@@ -2627,6 +2672,224 @@ mod tests {
         assert_eq!(changed.dimension.as_deref(), Some("minecraft:the_nether"));
     }
 
+    #[test]
+    fn observation_callback_can_stop_without_deadlock_and_preserves_fifo() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle.shared.begin_connection_attempt();
+        let request = events.try_recv().expect("connection request event");
+        assert_eq!(request.id, "event-1");
+
+        let source = handle.observation_source();
+        let stop_event_ids = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (stop_returned_tx, stop_returned_rx) = std_mpsc::channel();
+        let stop_listener = Arc::new(StopOnFirstListener {
+            handle: handle.clone(),
+            event_ids: stop_event_ids.clone(),
+            stop_returned: stop_returned_tx,
+            invoked: AtomicBool::new(false),
+        });
+        let (other_listener, other_events) = recording_listener();
+        let _stop_subscription = ProtocolObservationSource::subscribe(&source, stop_listener)
+            .expect("stop listener subscription should succeed");
+        let _other_subscription = ProtocolObservationSource::subscribe(&source, other_listener)
+            .expect("other listener subscription should succeed");
+
+        let emitting_handle = handle.clone();
+        let (emit_finished_tx, emit_finished_rx) = std_mpsc::channel();
+        let emit_thread = thread::spawn(move || {
+            emit_test_fact(&emitting_handle, BackendEventKind::Entity);
+            emit_finished_tx
+                .send(())
+                .expect("emit completion should be observable");
+        });
+        emit_finished_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("callback stop and its drain must finish within the bound");
+        stop_returned_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("stop must return from inside the callback");
+        emit_thread.join().expect("event thread should not panic");
+
+        let mut delivered = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            delivered.push(event);
+        }
+        assert_eq!(
+            delivered
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["event-2", "event-3", "event-4"]
+        );
+        assert_eq!(delivered[0].payload["type"], "animation");
+        assert_eq!(delivered[1].payload["type"], "stopping");
+        assert_eq!(delivered[1].payload["reason"], "callback-stop");
+        assert_eq!(delivered[2].payload["type"], "shutdown_requested");
+        assert_eq!(delivered[2].payload["swarmAvailable"], false);
+        assert_eq!(&*stop_event_ids.lock(), &["event-2".to_owned()]);
+        assert_eq!(
+            other_events
+                .lock()
+                .iter()
+                .map(observation_event_id)
+                .collect::<Vec<_>>(),
+            vec!["event-2"]
+        );
+    }
+
+    #[test]
+    fn nested_observation_emit_is_fifo_and_drained_before_top_level_returns() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle.shared.begin_connection_attempt();
+        let _request = events.try_recv().expect("connection request event");
+
+        let source = handle.observation_source();
+        let nested_event_ids = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let nested_listener = Arc::new(NestedEmitListener {
+            handle: handle.clone(),
+            event_ids: nested_event_ids.clone(),
+            emitted: AtomicBool::new(false),
+        });
+        let (other_listener, other_events) = recording_listener();
+        let _nested_subscription = ProtocolObservationSource::subscribe(&source, nested_listener)
+            .expect("nested listener subscription should succeed");
+        let _other_subscription = ProtocolObservationSource::subscribe(&source, other_listener)
+            .expect("other listener subscription should succeed");
+
+        let emitting_handle = handle.clone();
+        let (emit_finished_tx, emit_finished_rx) = std_mpsc::channel();
+        let emit_thread = thread::spawn(move || {
+            emit_test_fact(&emitting_handle, BackendEventKind::Entity);
+            emit_finished_tx
+                .send(())
+                .expect("nested emit completion should be observable");
+        });
+        emit_finished_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("nested emit and its drain must finish within the bound");
+        emit_thread
+            .join()
+            .expect("nested emit thread should not panic");
+
+        assert_eq!(
+            &*nested_event_ids.lock(),
+            &[
+                "event-2".to_owned(),
+                "event-3".to_owned(),
+                "event-4".to_owned()
+            ]
+        );
+        assert_eq!(
+            other_events
+                .lock()
+                .iter()
+                .map(observation_event_id)
+                .collect::<Vec<_>>(),
+            vec!["event-2", "event-3", "event-4"]
+        );
+        let mut delivered = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            delivered.push(event);
+        }
+        assert_eq!(
+            delivered
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["event-2", "event-3", "event-4"]
+        );
+        assert_eq!(delivered[0].kind, BackendEventKind::Entity);
+        assert_eq!(delivered[1].kind, BackendEventKind::Entity);
+        assert_eq!(delivered[2].kind, BackendEventKind::Block);
+    }
+
+    #[test]
+    fn concurrent_producers_keep_connection_request_first_for_each_epoch() {
+        const PRODUCER_COUNT: usize = 8;
+        const EVENTS_PER_PRODUCER: usize = 32;
+        const ATTEMPT_COUNT: usize = 40;
+
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        let start = Arc::new(Barrier::new(PRODUCER_COUNT + 2));
+        let (worker_finished_tx, worker_finished_rx) = std_mpsc::channel();
+        let mut workers = Vec::new();
+        for producer in 0..PRODUCER_COUNT {
+            let shared = handle.shared.clone();
+            let start = start.clone();
+            let worker_finished = worker_finished_tx.clone();
+            workers.push(thread::spawn(move || {
+                start.wait();
+                for sequence in 0..EVENTS_PER_PRODUCER {
+                    shared.emit(
+                        BackendEventKind::World,
+                        FactSource::ServerObserved,
+                        json!({"producer":producer,"sequence":sequence}),
+                    );
+                }
+                worker_finished
+                    .send(())
+                    .expect("producer completion should be observable");
+            }));
+        }
+        let attempt_shared = handle.shared.clone();
+        let attempt_start = start.clone();
+        let attempt_finished = worker_finished_tx.clone();
+        workers.push(thread::spawn(move || {
+            attempt_start.wait();
+            for _ in 0..ATTEMPT_COUNT {
+                attempt_shared.begin_connection_attempt();
+            }
+            attempt_finished
+                .send(())
+                .expect("attempt completion should be observable");
+        }));
+        let worker_count = workers.len();
+        drop(worker_finished_tx);
+        start.wait();
+        for _ in 0..worker_count {
+            worker_finished_rx
+                .recv_timeout(StdDuration::from_secs(1))
+                .expect("all concurrent producers must finish within the bound");
+        }
+        for worker in workers {
+            worker.join().expect("producer should not panic");
+        }
+
+        let mut delivered = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            delivered.push(event);
+        }
+        assert_eq!(
+            delivered.len(),
+            PRODUCER_COUNT * EVENTS_PER_PRODUCER + ATTEMPT_COUNT
+        );
+        for (index, event) in delivered.iter().enumerate() {
+            assert_eq!(event.id, format!("event-{}", index + 1));
+        }
+
+        let mut first_event_by_epoch = std::collections::BTreeMap::new();
+        for event in &delivered {
+            if event.connection_epoch > 0 {
+                first_event_by_epoch
+                    .entry(event.connection_epoch)
+                    .or_insert(event);
+            }
+        }
+        assert_eq!(first_event_by_epoch.len(), ATTEMPT_COUNT);
+        for epoch in 1..=ATTEMPT_COUNT as u64 {
+            let event = first_event_by_epoch
+                .get(&epoch)
+                .expect("every attempt epoch must have an event");
+            assert_eq!(event.kind, BackendEventKind::Lifecycle);
+            assert_eq!(event.connection_attempt_id, format!("attempt-{epoch}"));
+            assert_eq!(event.payload["type"], "connection_requested");
+            assert_eq!(event.payload["attempt"], epoch);
+        }
+    }
+
     fn observation_snapshot(epoch: u64) -> MinecraftSnapshotV1 {
         MinecraftSnapshotV1 {
             protocol: "mineintent.minecraft.snapshot.v1".to_owned(),
@@ -2962,6 +3225,62 @@ mod tests {
 
     impl ObservationEventListener for NoopListener {
         fn on_event(&self, _event: ObservationEvent) {}
+    }
+
+    fn observation_event_id(event: &ObservationEvent) -> &str {
+        match event {
+            ObservationEvent::Entity(event) => &event.id,
+            ObservationEvent::Block(event) => &event.id,
+            ObservationEvent::Sound(event) => &event.id,
+        }
+    }
+
+    struct StopOnFirstListener {
+        handle: RuntimeHandle,
+        event_ids: Arc<parking_lot::Mutex<Vec<String>>>,
+        stop_returned: std_mpsc::Sender<()>,
+        invoked: AtomicBool,
+    }
+
+    impl ObservationEventListener for StopOnFirstListener {
+        fn on_event(&self, event: ObservationEvent) {
+            self.event_ids
+                .lock()
+                .push(observation_event_id(&event).to_owned());
+            if !self.invoked.swap(true, Ordering::SeqCst) {
+                self.handle.stop("callback-stop");
+                self.stop_returned
+                    .send(())
+                    .expect("stop completion should be observable");
+            }
+        }
+    }
+
+    struct NestedEmitListener {
+        handle: RuntimeHandle,
+        event_ids: Arc<parking_lot::Mutex<Vec<String>>>,
+        emitted: AtomicBool,
+    }
+
+    impl ObservationEventListener for NestedEmitListener {
+        fn on_event(&self, event: ObservationEvent) {
+            self.event_ids
+                .lock()
+                .push(observation_event_id(&event).to_owned());
+            if self.emitted.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            self.handle.shared.emit(
+                BackendEventKind::Entity,
+                FactSource::ServerObserved,
+                valid_observation_payload(BackendEventKind::Entity),
+            );
+            self.handle.shared.emit(
+                BackendEventKind::Block,
+                FactSource::ServerObserved,
+                valid_observation_payload(BackendEventKind::Block),
+            );
+        }
     }
 
     struct PanicListener;

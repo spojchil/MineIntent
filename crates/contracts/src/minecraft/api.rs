@@ -105,6 +105,12 @@ pub enum ObservationEvent {
     Sound(BackendEventEnvelope<ProtocolSoundPayload>),
 }
 
+/// Typed observation callbacks are synchronous, but may call public runtime
+/// operations, including emitting or stopping the runtime. Any nested event is
+/// queued after the current event and delivered in FIFO order by the active
+/// drainer before the enclosing top-level operation returns. Implementations
+/// should not rely on a nested emit having completed its callback before that
+/// nested call returns; cross-thread emit return timing is otherwise unspecified.
 pub trait ObservationEventListener: Send + Sync {
     fn on_event(&self, event: ObservationEvent);
 }
