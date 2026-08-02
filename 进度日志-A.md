@@ -431,3 +431,54 @@ TS 本批 **2/2 tests**：
 - 维护侧复审修正 revision 上界：原草稿以 `u64::MAX as f64` 判断会让浮点 `2^64` 穿过并在 cast 时饱和；现与 JavaScript wire 语义一致地限制为 `Number.MAX_SAFE_INTEGER`，负数、fraction、`2^53`、`u64::MAX as f64`、NaN、Infinity 均由测试覆盖。非 fallible availability 对这些非法 source 值固定降为 revision 0，read 返回结构化错误。
 - `cargo test --workspace --all-targets --locked --offline`：191 passed；`cargo check --workspace --all-targets --locked --offline`、`cargo +stable fmt --all -- --check`、`git diff --check`：通过。
 - 明确 deferred：backend sound producer/adapter、viewport provider、Information runtime/tool-session/context-composer，以及 B/A2 所有路径。本轮未扩张 selector/page、取消、budget/access 或 backend 生产行为。
+
+## 2026-08-02｜P1-A 阶段 4 Information runtime + tool-session 完整迁移
+
+### 基线、裁定与范围
+
+- 开始时以当前 worktree 的 `git status --short` 与 `git diff --stat` 为准，均无输出；HEAD 为 `37d5a79`，未 commit、未 push、未改远端。
+- 完整复读任务书、中期更新 01/02/03、A 线日志、阶段 4 模块清单与测试归类，并逐行核对 `runtime.ts`、`tool-session.ts`、`runtime.test.ts`、`runtime-references.test.ts` 及直接 contracts/policy/registry/ref-store/cursor-store/scope/trace/provider SPI。按用户在本批开始前的纠正，范围明确为 **information/runtime + information/tool-session**；runtime.test 原 11 条中的 tool-session 三条纳入本批，不登记为待决；context-composer、viewport/backend adapter、participant runtime、contracts/backend 与 B 路径未进入。
+- 只修改 `crates/middle/src/information/**`、`crates/middle/tests/information_runtime.rs` 与本日志；未改 Cargo manifest/lock、contracts/backend/agent、supplies/vendor/移植计划及其他代理日志，未生成 TS/JS。
+
+### 生产实现
+
+- 新增 `information/runtime.rs`：严格 v1 catalog/query JSON 解析；sealed registry 检查；grant principal/purpose/audience/interface/field/scope 授权；按可见 fields 计算 `baseCatalogRevision:sha256(...).slice(0,12)` effective revision；catalog/help/read 的结构化错误、schema/field/selector/page 校验与 negotiated version。
+- read 路径复用既有 registry/access policy/ref store/cursor store/scope/trace/provider SPI。provider 调用前复制 owned context，provider/availability 调用均在 store/registry 锁外；结果验证覆盖 requested fields、遗漏与 unavailable 互斥、runtime value schema 重建、declared source kind、source revision/adapter/acquisition、observedAt/validUntil、evidence UTF-16 长度、JSON clone、page revision 与 result byte cap。trace 只写 fields/source/evidence/correlation/observedAt，不写 values。
+- read 的 parent cancellation/deadline preflight 对齐 TS `#read`/`withTimeout` 边界：schema、fields、authorization、selector 与一次性 cursor/page 解析先完成，再在 provider 调用前检查；因此已取消请求仍返回更早的 stale/field/authorization/selector/page 结构化错误，并按 TS 语义消费已解析 cursor。成功路径的可注入 trace sink panic 由固定的 `provider_failed` 摘要围栏，不改变正常成功 wire。
+- 新增 `information/control.rs`：以 contracts `CancellationSignal`/`Deadline` 为边界的 child operation control；runtime provider timeout、上游 cancellation/deadline 与 tool-session deadline 均触发 child，并在有界 drain 内给 provider 观察取消机会。同步 provider panic、异步 future poll panic、scope/provider/store 错误均转换为结构化结果，不让生产路径 panic。
+- 新增 `information/tool_session.rs`：catalog/help/read reserve、maxCalls/maxReadCalls/maxReturnedBytes/deadline、JS JSON UTF-8 byte 计数、caller 映射、`information_catalog` 与 `information` tool adapter；上游 control 的 cancellation/deadline 转发到 child。`support.rs` 的 JS JSON bytes helper 与 ref/cursor 已有 formatter 共用，避免 byte cap 使用不同数字语义。
+- `information/mod.rs` 导出 runtime/tool-session 入口；未触及 context-composer。原有 runtime 依赖设施均直接复用，没有复制 registry/policy/ref/cursor/scope/trace 实现。
+
+### TS 13/13 一对一映射
+
+1. `runtime.test.ts:147` catalog → help → read、participant audience、health=18/sourceRevision=12、trace omission → `ts_runtime_catalog_help_read_and_trace_omits_values`。
+2. `runtime.test.ts:179` grant field visibility、effective catalog revision、purpose binding → `ts_runtime_effective_catalog_revision_binds_visible_fields_and_purpose`。
+3. `runtime.test.ts:219` stale schema、unknown field、forged worldId strict request → `ts_runtime_rejects_stale_schema_unknown_field_and_forged_scope_input`。
+4. `runtime.test.ts:245` partial health + food unavailable/not_currently_displayed → `ts_runtime_preserves_partial_reads_without_filling_unavailable_fields`。
+5. `runtime.test.ts:279` unrequested provider leak + post-read scope race → `ts_runtime_discards_provider_leaks_and_reads_racing_scope_change`。
+6. `runtime.test.ts:316` nested schema strips hidden key + undeclared source → `ts_runtime_rebuilds_nested_values_and_enforces_declared_sources`。
+7. `runtime.test.ts:386` provider timeout abort/deadline_exceeded → `ts_runtime_aborts_provider_when_its_deadline_elapses`。
+8. `runtime.test.ts:412` legal provider contract fixture → `ts_provider_contract_fixture_is_legal`。
+9. `runtime.test.ts:425` tool-session maxReadCalls and returned-byte budgets → `ts_tool_session_enforces_call_read_and_byte_budgets`。
+10. `runtime.test.ts:484` tool-session deadline aborts in-progress query → `ts_tool_session_deadline_aborts_an_in_progress_query`。
+11. `runtime.test.ts:526` upstream cancellation forwarded to in-progress query → `ts_tool_session_forwards_upstream_cancellation_to_query`；Rust frozen `OperationControl` 没有 JS `reason` 字段，因此对应验证 child cancellation forwarding 与 deadline_exceeded 语义，不伪造不存在的 reason identity。
+12. `runtime-references.test.ts:55` provider ref target kind/principal/grant/scope/source revision + wrong target → `ts_runtime_references_bind_target_kind_and_source_revision`。
+13. `runtime-references.test.ts:186` cursor first `[0,1]` + same-scope continuation `[2,3]` + one-time consume/no next cursor → `ts_runtime_references_cursor_paging_is_bound_and_one_time`。
+
+上述 13 条是唯一 TS oracle 映射；另有 3 条 **Rust-only** `rust_only_provider_panic_is_structured`、`rust_only_cancelled_read_keeps_stale_schema_preflight_order`、`rust_only_trace_panic_is_structured_without_leaking_panic_summary`，分别锁定 provider panic、取消+stale schema 的 oracle 顺序与 trace sink panic 围栏，不冒充 TS 映射。定向文件结果为 16 passed（13 mapped + 3 Rust-only）。
+
+### mutation 与验证
+
+- mutation 1：临时把 runtime catalog 的 field authorization filter 改为恒真；运行 `cargo test -p mineintent-middle --test information_runtime ts_runtime_effective_catalog_revision_binds_visible_fields_and_purpose --locked --offline`，按预期失败，restricted/full revision 均变为 `catalog:1.21.1:d07a4ede6e804e10:ba9e5f934798`。已恢复并复跑通过。
+- mutation 2：临时把 runtime cursor resolve 的 `fields` 绑定改为空；运行 `cargo test -p mineintent-middle --test information_runtime ts_runtime_references_cursor_paging_is_bound_and_one_time --locked --offline`，按预期失败，第二页无法解析 cursor。已恢复并复跑通过。
+- mutation 3（本次返修）：临时把 parent preflight 放回 `read` 函数开头；运行 `rust_only_cancelled_read_keeps_stale_schema_preflight_order`，按预期失败，实际 `DeadlineExceeded` 而回归期望 `StaleSchema`。已恢复并复跑通过。
+- mutation 4（本次返修）：临时去掉 trace `append` 的 `catch_unwind`；运行 `rust_only_trace_panic_is_structured_without_leaking_panic_summary`，按预期以 exit 101 直接暴露 `fixture trace sink panic`。已恢复并复跑通过。
+- `cargo test -p mineintent-middle --test information_runtime --locked --offline`：16 passed（13 TS mapped + 3 Rust-only）。
+- `cargo test --workspace --all-targets --locked --offline`：通过。
+- `cargo check --workspace --all-targets --locked --offline`：通过。
+- `cargo +stable fmt --all -- --check`：通过；`cargo +nightly fmt --all -- --check`：通过。
+- `git diff --check`：通过。
+
+### deferred 与交付边界
+
+- 本批没有需要上报的范围内阻塞；实现与验证均在 A 允许目录内完成。明确 deferred：`information/context-composer`、viewport provider/backend adapter、participant runtime、contracts/backend crate、B 所有路径，以及其余未被本批 oracle 直接要求的模块。
