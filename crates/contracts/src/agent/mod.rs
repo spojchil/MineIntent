@@ -20,7 +20,10 @@ pub use ids::{
     ModelName, PromptTemplateKey, PromptTemplateVersion, RunId, ToolCallId, ToolDefinitionName,
     ToolName,
 };
-pub use runner::{AgentRunRequest, AgentRunner, ContractFuture, ModelProvider, PromptTemplateRef};
+pub use runner::{
+    AgentRunRequest, AgentRunner, ContractFuture, ModelProvider, PromptTemplateRef,
+    MAX_AGENT_RUN_TOOLS,
+};
 pub use tool::{
     AgentContextProtocol, AgentRunProtocol, FunctionToolDefinition, JsonObject, ModelRunResult,
     ModelUsage, RequiredNullable, ToolCallKey, ToolDefinitionType, ToolExecution, ToolInvocation,

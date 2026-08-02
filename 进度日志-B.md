@@ -364,3 +364,19 @@
 - `cargo test --workspace --all-targets --locked --offline`：通过，共 185 条测试。
 - `cargo check --workspace --all-targets --locked --offline`、`cargo fmt --all -- --check`、`git diff --check`：通过。
 - AgentRunner 与 `agent-context v4` 仍按 Issue #127 段登记延后，本次没有修改 contracts/manifest/lock。
+
+## 2026-08-02｜Agent 前置合约守卫
+
+### 实现
+
+- `Deadline::after` 改为返回 `Result`，使用 `Instant::checked_add`；不可表示的 deadline 返回 `invalid_request/deadline_out_of_range`，不再由 `Instant + Duration` panic。
+- `AgentRunRequest` 的模型工具发布上限由单一公开常量 `MAX_AGENT_RUN_TOOLS = 32` 定义。公开 `validate()`、手写 `Serialize` 与 `Deserialize` 共用同一校验，Rust 直接构造的 33-tool request 也不能被写成非法 wire。
+- `agent/mod.rs` 仅增加上述公共常量的重导出；没有修改 AgentRunner/ModelProvider trait、context v3/v4、memory 或 middle 循环。
+
+### 独立验证
+
+- 32-tool request 的 validate/serialize/deserialize/round-trip 均成功；33-tool request 的三条入口均返回或产生 `limit_exceeded/agent_run_tool_limit_exceeded`。
+- `Duration::MAX` 回归确认返回结构化错误且不 panic；正常 deadline 调用点显式处理 `Result`。
+- 维护侧 mutation 1：临时绕过手写 `Serialize` 的 validate，33-tool serialization 断言按预期失败；已恢复。
+- 维护侧 mutation 2：临时让 checked-add 溢出回退到 `now`，`Duration::MAX` 回归按预期失败；已恢复。
+- `cargo test -p mineintent-contracts --all-targets --locked --offline`：通过（agent 16、capability 8、Minecraft 26、Information 17）。
