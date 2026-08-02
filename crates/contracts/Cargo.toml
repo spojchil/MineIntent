@@ -2,7 +2,7 @@
 name = "mineintent-contracts"
 version = "0.0.1"
 edition = "2021"
-description = "MineIntent 进程内公共契约骨架"
+description = "MineIntent Agent、capability、Information 与 Minecraft backend 进程内契约"
 publish = false
 
 [dependencies]

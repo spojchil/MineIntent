@@ -1,17 +1,21 @@
 # MineIntent（Rust workspace / MC 26.1）
 
-本仓库是 MineIntent 全 Rust 单进程移植的 Cargo workspace。当前 P0 骨架包含：
+本仓库是 MineIntent 全 Rust 单进程移植的 Cargo workspace。目前包含：
 
-- `crates/backend`：既有离线 Minecraft Java 客户端后端；
-- `crates/contracts`：公共契约的薄骨架，具体契约留待 I01/I02/I03 冻结；
-- `crates/middle`：中间层与 Agent 循环的薄骨架，尚无业务实现。
+- `crates/backend`：Minecraft Java 客户端运行时、命令/生命周期事件、typed observation source，以及 full/directed viewport 原子投影；
+- `crates/contracts`：Agent、capability、Information 与 Minecraft backend 的严格进程内契约和 wire DTO；
+- `crates/middle`：Agent loop、transcript、prompt、Information provider、生产 `view` capability 与轮末 viewport sampler 适配层。
+
+当前仍缺生产 `ToolDispatcher`、Participant Runtime、app composition root 和 concrete
+`MinecraftBackendApi` facade，因此尚未形成 Paper→生产 Agent 的端到端发布。
 
 既有后端固定目标为 Paper 26.1.2、协议号 775，协议执行层使用已发布的 `azalea 0.16.0+mc26.1`。
 
 ## 构建与运行
 
 ```powershell
-cargo build --workspace --offline
+cargo build --workspace --locked --offline
+cargo test --workspace --all-targets --locked --offline
 cargo run -p mineintent-backend --offline -- --host 127.0.0.1 --port 25565 --username MineIntentBot --duration-secs 30
 ```
 
@@ -35,6 +39,6 @@ cargo run -p mineintent-backend --offline -- --host 127.0.0.1 --port 25565 --use
 
 快照协议为 `mineintent.minecraft.snapshot.v1`，运行时句柄提供 `snapshot`、`snapshot_source`、`subscribe`、`observation_source`、`send_chat`、`look_relative`、`move_input`、`release_all` 和显式 `respawn`；读取快照时必须同时检查来源。死亡不会自动调用 `respawn`，自动重连与资源包接受也保持关闭，均需由上层明确决定。块读取返回加载状态、绝对坐标、状态 ID、属性和碰撞几何；`RuntimeObservationSource::viewport(&ViewportOptions::default())` 再按主仓库语义执行矩形视锥、暴露面、0.25 格遮挡射线和实体命中盒采样，输出绝对坐标且不穿不透明墙。临时运行日志统一放在已被 git 排除的 `server-run/`，不会作为提交物。
 
-viewport 的 `visibleBlocks` 是 `[block_name, x, y, z]` 整数体素并按距离排序，`visibleEntities` 是最近优先且带 `truncated` 的有限列表；未加载方块会让相关可见性射线保守失败，不会被当作空气。Azalea 的角度输入是度，投影内部转换为与主仓库几何函数相同的弧度约定，输出 frame 仍使用 `yawDegrees/pitchDegrees`。
+viewport 的 `visibleBlocks` 是 `[BlockInfo, x, y, z]` 整数体素并按距离排序；`BlockInfo` 无视觉属性时为方块名称字符串，有属性时为名称与白名单属性对象。`visibleEntities` 最近优先且是带 `truncated` 的有限列表；未加载方块会让相关可见性射线保守失败，不会被当作空气。`directed` 查询最多接收 16 个唯一世界坐标，并逐坐标返回 seen 或闭合的 unseen reason。Azalea 的角度输入是度，投影内部转换为与主仓库几何函数相同的弧度约定，输出 frame 仍使用 `yawDegrees/pitchDegrees`。
 
-workspace 移植进度见 [`进度日志-B.md`](进度日志-B.md)；既有后端里程碑证据和待裁决项见 [`进度日志.md`](进度日志.md)，版本/选型证据见 [`M0-版本与选型.md`](M0-版本与选型.md)。
+workspace 总进度与边界见 [`进度日志.md`](进度日志.md)；各并行切片的详细证据见根目录 `进度日志-*.md`，版本/选型证据见 [`M0-版本与选型.md`](M0-版本与选型.md)，增量决策台账见 [`需要决策的新问题.md`](需要决策的新问题.md)。
