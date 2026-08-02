@@ -4,13 +4,12 @@
 //! `BlockReadResult` 只提供绝对坐标上的观察原语，投影层再做视锥、暴露面和
 //! 遮挡射线判断。算法参数与主仓库 `source-ports/perception.ts` 对齐。
 
-use std::{cell::RefCell, cmp::Ordering, collections::HashMap, f64::consts::PI};
+use std::{cmp::Ordering, collections::HashMap, f64::consts::PI};
 
 use mineintent_contracts::capability::validate_directed_positions;
 use mineintent_contracts::minecraft::{
-    BackendError, BlockInfo, BlockInfoPresenterRegistry, BlockPosition as ContractBlockPosition,
-    DirectedOccluder, DirectedSeenBlock, DirectedUnseenBlock, DirectedViewportError,
-    DirectedViewportProjection, DirectedWhy,
+    BackendError, BlockInfo, BlockInfoPresenterRegistry, DirectedOccluder, DirectedSeenBlock,
+    DirectedUnseenBlock, DirectedViewportError, DirectedViewportProjection, DirectedWhy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +26,28 @@ const DEFAULT_VERTICAL_HALF_ANGLE: f64 = 35.0 * PI / 180.0;
 const DEFAULT_ASPECT_RATIO: f64 = 16.0 / 9.0;
 const DEFAULT_LOOKED_AT_DISTANCE: f64 = 4.5;
 const DIRECTED_MAX_DISTANCE: f64 = 32.0;
+
+/// The dimension height metadata captured alongside the world read guard.
+///
+/// Directed geometry may use this value before touching a target. Keeping the
+/// upper-bound calculation in `i64` makes arbitrary `i32` query coordinates
+/// safe even when a test seam supplies extreme values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorldHeightBounds {
+    pub min_y: i32,
+    pub height: u32,
+}
+
+impl WorldHeightBounds {
+    pub const fn new(min_y: i32, height: u32) -> Self {
+        Self { min_y, height }
+    }
+
+    fn contains_y(self, y: i32) -> bool {
+        let y = i64::from(y);
+        y >= i64::from(self.min_y) && y < i64::from(self.min_y) + i64::from(self.height)
+    }
+}
 
 /// 可见方块候选的几何谓词。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -398,13 +419,15 @@ where
 
 /// Directed projection in the same backend viewport kernel as full projection.
 ///
-/// `OutOfWorld` is deliberately not representable as `chunk_not_loaded`; callers receive the
-/// independent internal error and must not turn it into a model-visible directed row.
+/// The captured height bounds classify out-of-world targets without reads. A target read that
+/// independently returns `OutOfWorld` becomes the model-visible reason; neighbor reads follow
+/// the full kernel's conservative out-of-world boundary handling.
 pub fn project_directed<F, C>(
     pose: &PoseSnapshot,
     positions: &[[i32; 3]],
     read_block: F,
     options: &ViewportOptions,
+    world_bounds: WorldHeightBounds,
     checkpoint: C,
 ) -> Result<DirectedViewportProjection, DirectedViewportError>
 where
@@ -417,6 +440,7 @@ where
         positions,
         read_block,
         options,
+        world_bounds,
         &presenters,
         checkpoint,
     )
@@ -427,6 +451,7 @@ pub fn project_directed_with_presenters<F, C>(
     positions: &[[i32; 3]],
     mut read_block: F,
     options: &ViewportOptions,
+    world_bounds: WorldHeightBounds,
     presenters: &BlockInfoPresenterRegistry,
     mut checkpoint: C,
 ) -> Result<DirectedViewportProjection, DirectedViewportError>
@@ -459,23 +484,12 @@ where
     };
     let axes = view_axes(pose.yaw, pose.pitch);
     let mut block_cache = HashMap::<(i32, i32, i32), BlockReadResult>::new();
-    let out_of_world = RefCell::new(None);
     let mut read_cached = |position: BlockPosition| {
         let key = (position.x, position.y, position.z);
         if let Some(result) = block_cache.get(&key).cloned() {
-            if matches!(&result, BlockReadResult::OutOfWorld) {
-                out_of_world.replace(Some(position));
-            }
             return result;
         }
         let result = read_block(position);
-        if matches!(&result, BlockReadResult::OutOfWorld) {
-            out_of_world.replace(Some(BlockPosition {
-                x: key.0,
-                y: key.1,
-                z: key.2,
-            }));
-        }
         block_cache.insert(key, result.clone());
         result
     };
@@ -495,17 +509,21 @@ where
         let distance = length(delta);
         let outside_fov = !inside_frustum(axes, delta, options);
         let too_far = distance > directed_max_distance;
+        let out_of_world = !world_bounds.contains_y(y);
 
         // Geometry is a hard privacy and work boundary. A target outside the view cone or
         // beyond the directed distance limit is classified without consulting the world or
         // tracing a ray, so arbitrary i32 coordinates remain O(1) work.
-        if outside_fov || too_far {
+        if outside_fov || too_far || out_of_world {
             let mut why = Vec::new();
             if outside_fov {
                 why.push(DirectedWhy::OutsideFov);
             }
             if too_far {
                 why.push(DirectedWhy::TooFar);
+            }
+            if out_of_world {
+                why.push(DirectedWhy::OutOfWorld);
             }
             unseen.push(DirectedUnseenBlock {
                 at: [x, y, z],
@@ -528,24 +546,16 @@ where
             }
             BlockReadResult::Unloaded => None,
             BlockReadResult::OutOfWorld => {
-                return Err(DirectedViewportError::OutOfWorld {
-                    position: ContractBlockPosition {
-                        x: target.x,
-                        y: target.y,
-                        z: target.z,
-                    },
+                unseen.push(DirectedUnseenBlock {
+                    at: [x, y, z],
+                    why: vec![DirectedWhy::OutOfWorld],
+                    distance: None,
+                    max: None,
+                    by: None,
                 });
+                continue;
             }
         };
-        if let Some(position) = out_of_world.take() {
-            return Err(DirectedViewportError::OutOfWorld {
-                position: ContractBlockPosition {
-                    x: position.x,
-                    y: position.y,
-                    z: position.z,
-                },
-            });
-        }
 
         let target_visible = match &target_result {
             BlockReadResult::Loaded { .. } => is_visible_candidate(
@@ -561,15 +571,6 @@ where
             BlockReadResult::Unloaded => false,
             BlockReadResult::OutOfWorld => unreachable!("out-of-world target returned above"),
         };
-        if let Some(position) = out_of_world.take() {
-            return Err(DirectedViewportError::OutOfWorld {
-                position: ContractBlockPosition {
-                    x: position.x,
-                    y: position.y,
-                    z: position.z,
-                },
-            });
-        }
 
         if target_visible {
             seen.push(DirectedSeenBlock {
@@ -690,15 +691,9 @@ where
             }
             BlockReadResult::Loaded { .. } => {}
             BlockReadResult::Unloaded => return Ok(DirectedRayOutcome::Unloaded),
-            BlockReadResult::OutOfWorld => {
-                return Err(DirectedViewportError::OutOfWorld {
-                    position: ContractBlockPosition {
-                        x: voxel.x,
-                        y: voxel.y,
-                        z: voxel.z,
-                    },
-                });
-            }
+            // Match the full kernel's conservative ray boundary: an out-of-world
+            // neighbor is not evidence about the queried target and is skipped.
+            BlockReadResult::OutOfWorld => {}
         }
     }
     Ok(DirectedRayOutcome::Clear)
@@ -1591,6 +1586,18 @@ mod tests {
         }
     }
 
+    fn world_bounds() -> WorldHeightBounds {
+        WorldHeightBounds::new(-64, 384)
+    }
+
+    #[test]
+    fn world_height_bounds_uses_u32_without_upper_bound_overflow() {
+        let bounds = WorldHeightBounds::new(i32::MIN, u32::MAX);
+        assert!(bounds.contains_y(i32::MIN));
+        assert!(bounds.contains_y(i32::MAX - 1));
+        assert!(!bounds.contains_y(i32::MAX));
+    }
+
     #[test]
     fn projection_uses_absolute_coordinates_and_first_hit() {
         let projection = project(&pose(0.0), &[], fixture_read, &options())
@@ -1678,6 +1685,7 @@ mod tests {
                 }
             },
             &options(),
+            world_bounds(),
             || Ok(()),
         )
         .expect("directed fixture should be classifiable");
@@ -1732,6 +1740,7 @@ mod tests {
             &positions,
             |_position| panic!("geometrically rejected directed target was read"),
             &options(),
+            world_bounds(),
             || Ok(()),
         )
         .expect("extreme directed coordinates should be classified without world access");
@@ -1739,7 +1748,12 @@ mod tests {
         assert!(result.seen.is_empty());
         assert_eq!(result.unseen.len(), positions.len());
         assert!(result.unseen.iter().all(|item| {
-            item.why == [DirectedWhy::OutsideFov, DirectedWhy::TooFar]
+            item.why
+                == [
+                    DirectedWhy::OutsideFov,
+                    DirectedWhy::TooFar,
+                    DirectedWhy::OutOfWorld,
+                ]
                 && item.distance.is_some()
                 && item.max == Some(options().max_distance)
                 && item.by.is_none()
@@ -1762,6 +1776,7 @@ mod tests {
                 }
             },
             &options(),
+            world_bounds(),
             || Ok(()),
         )
         .expect("clear unloaded target should be classified");
@@ -1829,6 +1844,7 @@ mod tests {
             &[[target.x, target.y, target.z]],
             read,
             &options(),
+            world_bounds(),
             || Ok(()),
         )
         .expect("directed projection should reuse the full visibility predicate");
@@ -1846,6 +1862,7 @@ mod tests {
                 block: block("air", true),
             },
             &options(),
+            world_bounds(),
             || Ok(()),
         )
         .expect("far fixture should be classifiable");
@@ -1866,12 +1883,13 @@ mod tests {
     }
 
     #[test]
-    fn directed_kernel_rejects_duplicate_input_and_keeps_out_of_world_internal() {
+    fn directed_kernel_rejects_duplicate_input_and_serializes_target_out_of_world_per_row() {
         let duplicate = project_directed(
             &pose(0.0),
             &[[1, 2, -1], [1, 2, -1]],
             fixture_read,
             &options(),
+            world_bounds(),
             || Ok(()),
         );
         assert!(matches!(
@@ -1887,12 +1905,147 @@ mod tests {
             &[[0, 2, -1]],
             |_position| BlockReadResult::OutOfWorld,
             &options(),
+            world_bounds(),
             || Ok(()),
+        )
+        .expect("a target read returning OutOfWorld must become a row");
+        assert!(out_of_world.seen.is_empty());
+        assert_eq!(out_of_world.unseen.len(), 1);
+        assert_eq!(out_of_world.unseen[0].why, [DirectedWhy::OutOfWorld]);
+        assert!(out_of_world.unseen[0].by.is_none());
+        let wire = serde_json::to_value(&out_of_world.unseen[0]).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "at": [0, 2, -1],
+                "why": ["out_of_world"]
+            })
         );
-        assert!(matches!(
-            out_of_world,
-            Err(DirectedViewportError::OutOfWorld { position })
-                if position.y == 2
-        ));
+    }
+
+    #[test]
+    fn directed_world_height_bounds_lock_lower_and_upper_edges() {
+        let mut lower_pose = pose(0.0);
+        lower_pose.position.y = -64.0;
+        lower_pose.pitch = -35.0;
+        let lower = project_directed(
+            &lower_pose,
+            &[[0, -65, -3], [0, -64, -3]],
+            |_position| BlockReadResult::Loaded {
+                block: block("air", true),
+            },
+            &options(),
+            world_bounds(),
+            || Ok(()),
+        )
+        .expect("lower world-height edge should remain a row-wise result");
+        assert_eq!(lower.unseen.len(), 1);
+        assert_eq!(lower.unseen[0].at, [0, -65, -3]);
+        assert_eq!(lower.unseen[0].why, [DirectedWhy::OutOfWorld]);
+        assert!(lower.seen.iter().any(|item| item.at == [0, -64, -3]));
+
+        let mut upper_pose = pose(0.0);
+        upper_pose.position.y = 319.0;
+        let upper = project_directed(
+            &upper_pose,
+            &[[0, 319, -3], [0, 320, -3]],
+            |_position| BlockReadResult::Loaded {
+                block: block("air", true),
+            },
+            &options(),
+            world_bounds(),
+            || Ok(()),
+        )
+        .expect("upper world-height edge should remain a row-wise result");
+        assert_eq!(upper.unseen.len(), 1);
+        assert_eq!(upper.unseen[0].at, [0, 320, -3]);
+        assert_eq!(upper.unseen[0].why, [DirectedWhy::OutOfWorld]);
+        assert!(upper.seen.iter().any(|item| item.at == [0, 319, -3]));
+    }
+
+    #[test]
+    fn directed_out_of_world_geometry_short_circuits_and_mixes_with_other_rows() {
+        let mut observation_pose = pose(0.0);
+        observation_pose.position.y = 0.5;
+        let bounds = WorldHeightBounds::new(-64, 66);
+        let result = project_directed(
+            &observation_pose,
+            &[[0, 1, -2], [0, 2, -4], [5, 1, 0], [40, 2, 0]],
+            |position| {
+                assert_ne!(
+                    [position.x, position.y, position.z],
+                    [0, 2, -4],
+                    "the in-range out-of-world target must not be read"
+                );
+                assert_ne!(
+                    [position.x, position.y, position.z],
+                    [40, 2, 0],
+                    "the geometrically rejected out-of-world target must not be read"
+                );
+                BlockReadResult::Loaded {
+                    block: block("air", true),
+                }
+            },
+            &options(),
+            bounds,
+            || Ok(()),
+        )
+        .expect("mixed directed rows must not fail as a batch");
+
+        assert!(result.seen.iter().any(|item| item.at == [0, 1, -2]));
+        let out_of_world = result
+            .unseen
+            .iter()
+            .find(|item| item.at == [0, 2, -4])
+            .expect("in-range out-of-world target should be present");
+        assert_eq!(out_of_world.why, [DirectedWhy::OutOfWorld]);
+        assert!(out_of_world.by.is_none());
+        assert!(serde_json::to_value(out_of_world)
+            .unwrap()
+            .get("block")
+            .is_none());
+
+        let combined = result
+            .unseen
+            .iter()
+            .find(|item| item.at == [40, 2, 0])
+            .expect("geometrically rejected out-of-world target should be present");
+        assert_eq!(
+            combined.why,
+            [
+                DirectedWhy::OutsideFov,
+                DirectedWhy::TooFar,
+                DirectedWhy::OutOfWorld
+            ]
+        );
+        assert!(combined.distance.is_some());
+        assert_eq!(combined.max, Some(options().max_distance));
+        assert!(combined.by.is_none());
+
+        let outside = result
+            .unseen
+            .iter()
+            .find(|item| item.at == [5, 1, 0])
+            .expect("normal unseen target should remain in a mixed batch");
+        assert_eq!(outside.why, [DirectedWhy::OutsideFov]);
+    }
+
+    #[test]
+    fn directed_target_out_of_world_wins_over_inconsistent_test_bounds() {
+        let target = [0, 2, -1];
+        let result = project_directed(
+            &pose(0.0),
+            &[target],
+            |position| {
+                assert_eq!([position.x, position.y, position.z], target);
+                BlockReadResult::OutOfWorld
+            },
+            &options(),
+            world_bounds(),
+            || Ok(()),
+        )
+        .expect("target OutOfWorld must not become a batch error");
+        assert_eq!(result.unseen[0].why, [DirectedWhy::OutOfWorld]);
+        assert!(result.unseen[0].by.is_none());
     }
 }

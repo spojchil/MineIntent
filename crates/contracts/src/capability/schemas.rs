@@ -278,6 +278,10 @@ pub fn directed_view_result_schema() -> Map<String, Value> {
                             "if": {"properties": {"why": {"contains": {"const": "occluded"}}}},
                             "then": {},
                             "else": {"not": {"required": ["by"]}}
+                        },
+                        {
+                            "if": {"properties": {"why": {"contains": {"const": "out_of_world"}}}},
+                            "then": {"not": {"required": ["by"]}}
                         }
                     ]
                 }
@@ -304,7 +308,13 @@ fn position_schema() -> Value {
 }
 
 fn directed_why_schema() -> Value {
-    let reasons = ["outside_fov", "too_far", "occluded", "chunk_not_loaded"];
+    let reasons = [
+        "outside_fov",
+        "too_far",
+        "occluded",
+        "chunk_not_loaded",
+        "out_of_world",
+    ];
     let canonical_choices = (1u8..(1u8 << reasons.len()))
         .map(|mask| {
             let why = reasons
@@ -317,7 +327,7 @@ fn directed_why_schema() -> Value {
         })
         .collect::<Vec<_>>();
     json!({
-        "description": "why uses the closed reason set in canonical order: outside_fov, too_far, occluded, chunk_not_loaded; any non-empty subset is allowed",
+        "description": "why uses the closed reason set in canonical order: outside_fov, too_far, occluded, chunk_not_loaded, out_of_world; any non-empty subset is allowed",
         "type": "array",
         "minItems": 1,
         "maxItems": reasons.len(),

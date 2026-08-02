@@ -332,6 +332,41 @@ fn directed_wire_is_strict_reasoned_and_does_not_leak_unseen_target_block() {
         "unseen": [{"at":[0,64,0],"why":["outside_fov"],"by":{"at":[0,64,-1],"block":"stone"}}]
     });
     assert_rejected::<DirectedViewportProjection>(invalid_by);
+    let invalid_out_of_world_by = json!({
+        "seen": [],
+        "unseen": [{"at":[0,64,0],"why":["occluded", "out_of_world"],"by":{"at":[0,64,-1],"block":"stone"}}]
+    });
+    assert_rejected::<DirectedViewportProjection>(invalid_out_of_world_by);
+    let five_reason_wire = json!({
+        "seen": [],
+        "unseen": [{
+            "at":[0,64,0],
+            "why":["outside_fov", "too_far", "occluded", "chunk_not_loaded", "out_of_world"],
+            "distance": 47.2,
+            "max": 32.0
+        }]
+    });
+    let five_reason: DirectedViewportProjection =
+        serde_json::from_value(five_reason_wire).expect("five directed reasons should deserialize");
+    assert_eq!(
+        five_reason.unseen[0].why,
+        [
+            DirectedWhy::OutsideFov,
+            DirectedWhy::TooFar,
+            DirectedWhy::Occluded,
+            DirectedWhy::ChunkNotLoaded,
+            DirectedWhy::OutOfWorld
+        ]
+    );
+    let legacy_four_reason: DirectedViewportProjection = serde_json::from_value(json!({
+        "seen": [],
+        "unseen": [{"at":[0,64,0],"why":["outside_fov", "occluded"]}]
+    }))
+    .expect("old four-value reason wire must remain valid");
+    assert_eq!(
+        legacy_four_reason.unseen[0].why,
+        [DirectedWhy::OutsideFov, DirectedWhy::Occluded]
+    );
     let invalid_empty_block = json!({
         "seen": [{"at":[0,64,0],"block":{"name":"stone"}}],
         "unseen": []
@@ -354,14 +389,34 @@ fn directed_input_validation_and_output_schema_share_closed_limits() {
     assert_eq!(schema["required"], json!(["seen", "unseen"]));
     assert_eq!(
         schema["properties"]["unseen"]["items"]["properties"]["why"]["items"]["enum"],
-        json!(["outside_fov", "too_far", "occluded", "chunk_not_loaded"])
+        json!([
+            "outside_fov",
+            "too_far",
+            "occluded",
+            "chunk_not_loaded",
+            "out_of_world"
+        ])
     );
     let why_choices = schema["properties"]["unseen"]["items"]["properties"]["why"]["oneOf"]
         .as_array()
         .expect("directed why schema choices");
+    assert_eq!(why_choices.len(), 31);
     assert!(why_choices
         .iter()
         .any(|choice| choice["const"] == json!(["outside_fov", "occluded"])));
+    assert!(why_choices
+        .iter()
+        .any(|choice| choice["const"] == json!(["outside_fov", "out_of_world"])));
+    assert!(why_choices.iter().any(|choice| {
+        choice["const"]
+            == json!([
+                "outside_fov",
+                "too_far",
+                "occluded",
+                "chunk_not_loaded",
+                "out_of_world"
+            ])
+    }));
     assert!(!why_choices
         .iter()
         .any(|choice| choice["const"] == json!(["occluded", "outside_fov"])));
@@ -377,6 +432,13 @@ fn directed_input_validation_and_output_schema_share_closed_limits() {
         schema["properties"]["unseen"]["maxItems"],
         MAX_DIRECTED_VIEW_POSITIONS
     );
+    let unseen_conditions = schema["properties"]["unseen"]["items"]["allOf"]
+        .as_array()
+        .expect("directed unseen schema conditions");
+    assert!(unseen_conditions.iter().any(|condition| {
+        condition["if"]["properties"]["why"]["contains"]["const"] == "out_of_world"
+            && condition["then"]["not"]["required"] == json!(["by"])
+    }));
     assert_eq!(
         schema["properties"]["seen"]["items"]["properties"]["block"]["oneOf"][1]["minProperties"],
         2

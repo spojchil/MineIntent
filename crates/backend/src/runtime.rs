@@ -63,7 +63,7 @@ use crate::{
     viewport::{
         project as project_viewport, project_directed as project_directed_viewport,
         project_with_checkpoint as project_viewport_with_checkpoint, ViewportBlock,
-        ViewportOptions, ViewportProjection,
+        ViewportOptions, ViewportProjection, WorldHeightBounds,
     },
 };
 
@@ -959,6 +959,7 @@ const MAX_VIEWPORT_CAPTURE_ATTEMPTS: usize = 3;
 struct ViewportCapture {
     generation: u64,
     world: SharedWorld,
+    world_bounds: WorldHeightBounds,
     pose: PoseSnapshot,
     entities: Vec<ProtocolEntitySnapshot>,
     source: FactSource,
@@ -1200,7 +1201,8 @@ impl RuntimeObservationSource {
     }
 
     /// Read directed coordinates against the same atomic capture and viewport kernel as full.
-    /// NEW-08 `OutOfWorld` remains a separate error variant and is never converted to a reason.
+    /// The captured world height is the only metadata used for zero-read out-of-world geometry
+    /// classification; a target read that independently returns `OutOfWorld` becomes a row.
     pub fn read_directed_viewport(
         &self,
         positions: Vec<ContractBlockPosition>,
@@ -1341,6 +1343,10 @@ impl RuntimeObservationSource {
                 ViewportCapture {
                     generation: observation.generation,
                     world: projection_world.clone(),
+                    world_bounds: WorldHeightBounds::new(
+                        world_read.chunks.min_y(),
+                        world_read.chunks.height(),
+                    ),
                     pose: PoseSnapshot {
                         position: snapshot.self_snapshot.position.clone(),
                         velocity: snapshot.self_snapshot.velocity.clone(),
@@ -1374,6 +1380,7 @@ impl RuntimeObservationSource {
                         &positions,
                         |position| read_block_from_world(&world_read, position),
                         &ViewportOptions::default(),
+                        capture.world_bounds,
                         || projection_control.preflight(operation),
                     )?)
                 }
@@ -1819,9 +1826,10 @@ fn read_block_from_world(world: &azalea::world::World, position: BlockPosition) 
         y: position.y,
         z: position.z,
     };
-    if block_position.y < world.chunks.min_y()
-        || block_position.y >= world.chunks.min_y() + world.chunks.height() as i32
-    {
+    let y = i64::from(block_position.y);
+    let min_y = i64::from(world.chunks.min_y());
+    let max_y_exclusive = min_y + i64::from(world.chunks.height());
+    if y < min_y || y >= max_y_exclusive {
         return BlockReadResult::OutOfWorld;
     }
     let Some(state) = world.get_block_state(block_position) else {
@@ -3264,8 +3272,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_directed_viewport_rejects_duplicates_and_out_of_world_without_reason_mapping() {
-        let (_handle, source, _world) = ready_viewport_source();
+    async fn read_directed_viewport_rejects_duplicates_and_serializes_out_of_world_rows() {
+        let (handle, source, _world) = ready_viewport_source();
         let duplicate = source
             .read_directed_viewport(
                 vec![
@@ -3283,7 +3291,6 @@ mod tests {
             })) if field == "positions"
         ));
 
-        let handle = _handle;
         {
             let mut observation = handle.shared.observation.write();
             observation.snapshot = Some(snapshot_at(1, 0.0, 9_999.0, 0.0));
@@ -3300,11 +3307,118 @@ mod tests {
                 no_deadline_control(),
             )
             .await;
-        assert!(matches!(
-            out_of_world,
-            Err(DirectedViewportError::OutOfWorld { position })
-                if position.y == 10_000
-        ));
+        let out_of_world = out_of_world.expect("out-of-world coordinates are row-wise answers");
+        assert!(out_of_world.seen.is_empty());
+        assert_eq!(out_of_world.unseen.len(), 1);
+        assert_eq!(out_of_world.unseen[0].at, [0, 10_000, -1]);
+        assert_eq!(
+            out_of_world.unseen[0].why,
+            [mineintent_contracts::minecraft::DirectedWhy::OutOfWorld]
+        );
+        assert!(out_of_world.unseen[0].by.is_none());
+        assert!(serde_json::to_value(&out_of_world.unseen[0])
+            .unwrap()
+            .get("block")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn read_directed_viewport_uses_current_world_height_bounds_rowwise() {
+        let (handle, source, world) = ready_viewport_source();
+        let (min_y, height) = {
+            let world = world.read();
+            (world.chunks.min_y(), world.chunks.height())
+        };
+        let upper_y = i32::try_from(i64::from(min_y) + i64::from(height))
+            .expect("test world height upper bound fits i32 coordinates");
+
+        let mut lower_snapshot = snapshot_at(1, 0.5, f64::from(min_y), 0.5);
+        lower_snapshot.self_snapshot.pitch = -35.0;
+        {
+            let mut observation = handle.shared.observation.write();
+            observation.snapshot = Some(lower_snapshot);
+            observation.bump_generation();
+        }
+        let lower = source
+            .read_directed_viewport(
+                vec![
+                    ContractBlockPosition {
+                        x: 0,
+                        y: min_y - 1,
+                        z: -3,
+                    },
+                    ContractBlockPosition {
+                        x: 0,
+                        y: min_y,
+                        z: -3,
+                    },
+                ],
+                no_deadline_control(),
+            )
+            .await
+            .expect("lower boundary should be answered per coordinate");
+        assert_eq!(
+            lower
+                .unseen
+                .iter()
+                .find(|item| item.at == [0, min_y - 1, -3])
+                .expect("lower out-of-world row")
+                .why,
+            [mineintent_contracts::minecraft::DirectedWhy::OutOfWorld]
+        );
+        assert!(lower
+            .unseen
+            .iter()
+            .find(|item| item.at == [0, min_y, -3])
+            .is_some_and(|item| {
+                !item
+                    .why
+                    .contains(&mineintent_contracts::minecraft::DirectedWhy::OutOfWorld)
+            }));
+
+        let mut upper_snapshot = snapshot_at(1, 0.5, f64::from(upper_y - 1), 0.5);
+        upper_snapshot.self_snapshot.pitch = 0.0;
+        {
+            let mut observation = handle.shared.observation.write();
+            observation.snapshot = Some(upper_snapshot);
+            observation.bump_generation();
+        }
+        let upper = source
+            .read_directed_viewport(
+                vec![
+                    ContractBlockPosition {
+                        x: 0,
+                        y: upper_y - 1,
+                        z: -3,
+                    },
+                    ContractBlockPosition {
+                        x: 0,
+                        y: upper_y,
+                        z: -3,
+                    },
+                ],
+                no_deadline_control(),
+            )
+            .await
+            .expect("upper boundary should be answered per coordinate");
+        assert_eq!(
+            upper
+                .unseen
+                .iter()
+                .find(|item| item.at == [0, upper_y, -3])
+                .expect("upper out-of-world row")
+                .why,
+            [mineintent_contracts::minecraft::DirectedWhy::OutOfWorld]
+        );
+        assert!(upper
+            .unseen
+            .iter()
+            .find(|item| item.at == [0, upper_y - 1, -3])
+            .is_some_and(|item| {
+                !item
+                    .why
+                    .contains(&mineintent_contracts::minecraft::DirectedWhy::OutOfWorld)
+            }));
     }
 
     #[tokio::test]

@@ -129,8 +129,9 @@ pub trait ProtocolObservationSource: Send + Sync {
         &self,
         control: OperationControl,
     ) -> BoxFuture<'_, Result<ViewportRead, BackendError>>;
-    /// Directed reads share the full viewport capture/kernel. `OutOfWorld` remains a separate
-    /// internal error and must not be translated into the closed model-visible reason enum.
+    /// Directed reads share the full viewport capture/kernel. A queried target that is outside
+    /// the captured world height is returned as the closed `out_of_world` reason; a neighbor
+    /// boundary read must not be mistaken for the queried target.
     fn read_directed_viewport(
         &self,
         positions: Vec<BlockPosition>,

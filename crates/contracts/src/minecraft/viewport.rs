@@ -380,6 +380,7 @@ pub enum DirectedWhy {
     TooFar,
     Occluded,
     ChunkNotLoaded,
+    OutOfWorld,
 }
 
 impl DirectedWhy {
@@ -389,6 +390,7 @@ impl DirectedWhy {
             Self::TooFar => 1,
             Self::Occluded => 2,
             Self::ChunkNotLoaded => 3,
+            Self::OutOfWorld => 4,
         }
     }
 }
@@ -445,6 +447,9 @@ impl DirectedUnseenBlock {
         }
         if !self.why.contains(&DirectedWhy::Occluded) && self.by.is_some() {
             return Err("by is only valid with occluded".to_owned());
+        }
+        if self.why.contains(&DirectedWhy::OutOfWorld) && self.by.is_some() {
+            return Err("out_of_world rows must not contain by".to_owned());
         }
         Ok(())
     }
@@ -575,7 +580,8 @@ impl<'de> Deserialize<'de> for DirectedViewportProjection {
     }
 }
 
-/// NEW-08 的内部边界：世界高度之外不是 `chunk_not_loaded`。
+/// Internal failure boundary for a non-target viewport read; queried targets use the
+/// model-visible `DirectedWhy::OutOfWorld` row instead of this error.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DirectedViewportError {
     Backend(BackendError),
