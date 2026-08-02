@@ -497,3 +497,40 @@
 | `git diff --check` | 通过。 |
 
 - 未修改 `crates/backend`、`crates/contracts`、agent/information/backend/contracts/participant/app、`supplies/`、`vendor/`、`移植计划/` 或其他日志；未 commit、未联网、未 push/开 PR、未启动子代理。旧 transcript 仍明确留在范围外。
+
+## 2026-08-02｜Agent transcript v1 精确迁移与 runner 接线
+
+### 迁移范围
+
+- 按只读 GitHub oracle `spojchil/MineIntent@6fb3ed0c007601b4e1eb1cb0a9d10525ac2a2467` 自行核对 `server.py:477-508`（usage）、`511-621`（tool loop）、`624-673`（path/append）及 `test_server.py:206-239`、`:356-394`；未恢复或修改 `supplies/` 中已移除的 Python 文件。
+- 新增 `crates/middle/src/agent/transcript.rs` 与公开的 `AgentTranscriptRecord`、`TranscriptUsage`、`TranscriptSink`、`FileTranscriptStore`。记录保持 v1 字段顺序，usage 映射为 snake_case，UTC 秒级 `endedAt` 使用标准库，JSON 紧凑 UTF-8 序列化；截断按 Unicode scalar 数计数，轮转按 Python 的“现有 byte size + 行字符数”且严格 `>`。
+- `FileTranscriptStore` 递归建父目录、Unix 新文件使用 `0600`、单次 append 行并带换行；同一 store（含 clone）用 Mutex 串行写入和轮转，失败由 runner fail-open。
+- `AgentRun` 只增加 `messages`/`usage`/`closing` 只读 getter；`ConcreteAgentRunner::new` 保持无 sink、无真实目录写入，新增显式 `with_transcript_store`/`with_transcript_sink`/共享 sink 接入。driver 仍是唯一循环实现；驱动返回成功或错误后统一生成一条记录，校验或 prompt 组装失败不生成。
+
+### 测试映射
+
+| Python oracle | Rust 覆盖 |
+|---|---|
+| `test_cache_counters_are_read_from_each_provider_shape_and_summed`（206-239） | `agent_run_loop::replay_preserves_reasoning_tool_ids_order_and_summed_usage`、`agent_runner::concrete_runner_records_successful_replay_and_wire_usage`；transcript usage 输出 `prompt_tokens`/`completion_tokens`/cache keys 并保留 0。 |
+| `test_transcript_records_tools_rotates_and_honors_the_data_dir`（356-375） | `agent_transcript::success_record_has_exact_wire_fields_usage_and_replay_boundary`、`transcript_path_is_pure_and_trims_data_directory_input`、`rotation_is_strictly_greater_and_replaces_old_backup`。 |
+| `test_transcript_records_the_run_even_when_it_fails`（382-394） | `agent_runner::provider_failure_is_recorded_without_replacing_the_original_error`；原 `AgentError` 返回不变，记录保留 code/summary 且 closing 为 null。 |
+| `run_tool_loop` replay/finally（511-621） | 现有 `agent_run_loop`/`agent_driver` 全量回归，加 `concurrent_appends_from_one_store_are_complete_parseable_records`、多字节截断边界、sink fail-open 和校验前不写测试。 |
+
+### 验证与 mutation
+
+- `cargo test -p mineintent-middle --test agent_transcript --test agent_runner --locked --offline`：管理侧补强后 14/14 通过。
+- `cargo test -p mineintent-middle --all-targets --locked --offline`：通过；既有 agent driver/run/runner 与全部 middle targets 均通过。
+- `cargo check --workspace --all-targets --locked --offline`、`cargo fmt --all -- --check`、`cargo +stable fmt --all -- --check`、`git diff --check`：全部通过；未修改 `Cargo.toml`/`Cargo.lock`。
+- mutation 1：临时令 runner 仅在 `drive_result.is_ok()` 时写入；`provider_failure_is_recorded_without_replacing_the_original_error` 按预期失败（记录数 0 而期望 1），随后恢复并复跑通过。
+- mutation 2：临时把轮转条件从 `>` 改为 `>=`；`rotation_is_strictly_greater_and_replaces_old_backup` 按预期失败（等界错误轮转），随后恢复并复跑通过。当前工作树无 mutation 残留。
+
+### 管理侧独立复核补强
+
+- 成功接线测试改为实际经历 assistant tool-call → tool result → final closing，断言 transcript `messages` 只含 system/user/assistant replay/tool 四项，最终 closing 只在顶层字段，未被重复塞回 messages。
+- 新增空 `ModelUsage` 精确编码为 `usage: null`、超长多字节错误按 300 个 Unicode 字符截断的回归；定向 14/14 与 middle all-targets 独立复跑通过，默认/+stable fmt 及 `git diff --check` 通过。
+
+### Deferred / 风险
+
+- 当前工作树为 Windows，Unix `0600` 测试按平台条件编译，未在本机执行；Unix 实现使用 `OpenOptionsExt::mode(0o600)`，需 Unix 门禁再实跑一次权限断言。
+- 默认兼容构造器刻意不自动读取 `MINEINTENT_DATA_DIR` 或写 `.mineintent`；实际应用装配仍需显式选择 `FileTranscriptStore::from_environment()`/`with_transcript_store` 或自定义 sink。这是防止无意真实目录写入的既定边界，不是公共 contract 变更。
+- 未修改 `crates/backend`、`crates/contracts`、`supplies/`、`vendor/`、`移植计划/` 或其他进度日志；未 commit、未 push、未开 PR、未启动子代理。

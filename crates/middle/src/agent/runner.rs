@@ -1,16 +1,24 @@
-use std::time::Instant;
+use std::{
+    panic::{catch_unwind, AssertUnwindSafe},
+    sync::Arc,
+    time::Instant,
+};
 
 use mineintent_contracts::{
     agent::{
         AgentError, AgentErrorCode, AgentRunProtocol, AgentRunRequest,
         AgentRunner as ContractRunner, ContractFuture, ExecutionControl,
-        JsonAgentDecisionContextV4, ModelName, ModelProvider, ModelRunResult,
+        JsonAgentDecisionContextV4, ModelName, ModelProvider, ModelRunResult, RunId,
+        WireToolDefinition,
     },
     capability::ToolDispatcher,
 };
 use serde::Serialize;
 
-use super::{initial_messages, AgentLoopDriver, AgentModelRequest, AgentRun, ModelCompletion};
+use super::{
+    initial_messages, summarize_error, AgentLoopDriver, AgentModelRequest, AgentRun,
+    AgentTranscriptRecord, FileTranscriptStore, ModelCompletion, TranscriptSink,
+};
 
 /// The concrete in-process runner assembled from one model provider and one
 /// ordered tool dispatcher.
@@ -21,6 +29,7 @@ use super::{initial_messages, AgentLoopDriver, AgentModelRequest, AgentRun, Mode
 pub struct ConcreteAgentRunner<Model, Tools> {
     driver: AgentLoopDriver<Model, Tools>,
     model_name: ModelName,
+    transcript_sink: Option<Arc<dyn TranscriptSink>>,
 }
 
 impl<Model, Tools> ConcreteAgentRunner<Model, Tools> {
@@ -28,6 +37,44 @@ impl<Model, Tools> ConcreteAgentRunner<Model, Tools> {
         Self {
             driver: AgentLoopDriver::new(model, tools),
             model_name,
+            transcript_sink: None,
+        }
+    }
+
+    /// Constructs a runner with an explicitly selected file store. The
+    /// ordinary `new` constructor remains completely side-effect free.
+    pub fn with_transcript_store(
+        model: Model,
+        tools: Tools,
+        model_name: ModelName,
+        store: FileTranscriptStore,
+    ) -> Self {
+        Self::with_shared_transcript_sink(model, tools, model_name, Arc::new(store))
+    }
+
+    /// Constructs a runner with an arbitrary diagnostic sink.
+    pub fn with_transcript_sink<S>(
+        model: Model,
+        tools: Tools,
+        model_name: ModelName,
+        sink: S,
+    ) -> Self
+    where
+        S: TranscriptSink + 'static,
+    {
+        Self::with_shared_transcript_sink(model, tools, model_name, Arc::new(sink))
+    }
+
+    pub fn with_shared_transcript_sink(
+        model: Model,
+        tools: Tools,
+        model_name: ModelName,
+        sink: Arc<dyn TranscriptSink>,
+    ) -> Self {
+        Self {
+            driver: AgentLoopDriver::new(model, tools),
+            model_name,
+            transcript_sink: Some(sink),
         }
     }
 
@@ -65,8 +112,11 @@ where
             // owns the resulting prefix and only appends assistant/tool turns.
             let messages = initial_messages(&request.context, &request.prompt_template)
                 .map_err(prompt_error)?;
+            let run_id = request.run_id.clone();
             let mut run = AgentRun::new(request.run_id, messages);
-            let outcome = self.driver.drive(&mut run, &request.tools, control).await?;
+            let drive_result = self.driver.drive(&mut run, &request.tools, control).await;
+            self.append_transcript(&run, run_id, &request.tools, &drive_result);
+            let outcome = drive_result?;
 
             // `closing` is deliberately not copied: it is transcript-only and
             // never becomes speech, a tool result, or ModelRunResult content.
@@ -77,6 +127,43 @@ where
                 usage: outcome.usage,
             })
         })
+    }
+}
+
+impl<Model, Tools> ConcreteAgentRunner<Model, Tools> {
+    fn append_transcript(
+        &self,
+        run: &AgentRun,
+        run_id: RunId,
+        tools: &[WireToolDefinition],
+        drive_result: &Result<super::AgentLoopOutcome, AgentError>,
+    ) {
+        let Some(sink) = self.transcript_sink.as_ref() else {
+            return;
+        };
+
+        let (closing, error) = match drive_result {
+            Ok(outcome) => (Some(outcome.closing.clone()), None),
+            Err(error) => (
+                run.closing().map(str::to_owned),
+                Some(summarize_error(error)),
+            ),
+        };
+        let record = AgentTranscriptRecord::new(
+            run_id,
+            self.model_name.clone(),
+            tools,
+            run.messages().to_vec(),
+            closing,
+            run.usage().cloned(),
+            error,
+        );
+
+        // Transcript diagnostics are deliberately fail-open. This catches
+        // both an ordinary sink error (ignored below) and a custom sink panic.
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _ = sink.append_record(&record);
+        }));
     }
 }
 
