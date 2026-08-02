@@ -27,8 +27,19 @@ use azalea::{
     Client, DefaultPlugins, Event, SprintDirection, WalkDirection,
 };
 use mineintent_contracts::minecraft::{
-    BackendError, BackendFailure, BackendFailureCode, BoxFuture, FactSource as ContractFactSource,
-    OperationControl, ViewportBlock as ContractViewportBlock,
+    BackendError, BackendEventEnvelope as ContractBackendEventEnvelope,
+    BackendEventKind as ContractBackendEventKind,
+    BackendEventMetadata as ContractBackendEventMetadata, BackendFailure, BackendFailureCode,
+    BlockBoundingBox as ContractBlockBoundingBox, BlockPosition as ContractBlockPosition,
+    BlockPropertyValue as ContractBlockPropertyValue, BlockReadResult as ContractBlockReadResult,
+    BoxFuture, EntityEquipmentSnapshot as ContractEntityEquipmentSnapshot,
+    FactSource as ContractFactSource, ObservationEvent, ObservationEventListener, OperationControl,
+    ProtocolBlockEvent as ContractProtocolBlockEvent,
+    ProtocolBlockSnapshot as ContractProtocolBlockSnapshot,
+    ProtocolEntityEvent as ContractProtocolEntityEvent,
+    ProtocolEntitySnapshot as ContractProtocolEntitySnapshot, ProtocolObservationSource,
+    ProtocolSoundPayload as ContractProtocolSoundPayload, SelfPose as ContractSelfPose,
+    Subscription, Vec3Value as ContractVec3Value, ViewportBlock as ContractViewportBlock,
     ViewportFrame as ContractViewportFrame, ViewportLegend as ContractViewportLegend,
     ViewportProjection as ContractViewportProjection, ViewportRead as ContractViewportRead,
     ViewportSelfPose as ContractViewportSelfPose, VisibleBlocksView as ContractVisibleBlocksView,
@@ -44,9 +55,9 @@ use crate::{
         FactSource, MotorDirection, BACKEND_COMMAND_PROTOCOL,
     },
     snapshot::{
-        block_snapshot, capture, capture_pose, capture_tracked_entities, BlockPosition,
-        BlockReadResult, MinecraftSnapshotV1, PoseSnapshot, ProtocolEntitySnapshot,
-        TrackedPlayerSnapshot, Vec3Value,
+        block_snapshot, capture, capture_pose, capture_tracked_entities, BlockBoundingBox,
+        BlockPosition, BlockReadResult, MinecraftSnapshotV1, PoseSnapshot, ProtocolBlockSnapshot,
+        ProtocolEntitySnapshot, TrackedPlayerSnapshot, Vec3Value,
     },
     viewport::{
         project as project_viewport, project_with_checkpoint as project_viewport_with_checkpoint,
@@ -158,7 +169,128 @@ impl EventWriter {
 struct ObservationSubscriber {
     id: u64,
     epoch: u64,
-    sender: mpsc::UnboundedSender<BackendEventEnvelope>,
+    listener: Arc<dyn ObservationEventListener>,
+    state: Arc<ObservationSubscriptionState>,
+}
+
+struct ObservationSubscriptionState {
+    status: parking_lot::Mutex<ObservationSubscriptionStatus>,
+    quiescent: parking_lot::Condvar,
+}
+
+#[derive(Default)]
+struct ObservationSubscriptionStatus {
+    closed: bool,
+    pending_callbacks: usize,
+    active_callbacks: usize,
+}
+
+impl ObservationSubscriptionState {
+    fn new() -> Self {
+        Self {
+            status: parking_lot::Mutex::new(ObservationSubscriptionStatus::default()),
+            quiescent: parking_lot::Condvar::new(),
+        }
+    }
+
+    /// Reserve a callback while the registry lock is held. The reservation is
+    /// later turned into an active callback outside that lock.
+    fn reserve_callback(&self) -> bool {
+        let mut status = self.status.lock();
+        if status.closed {
+            return false;
+        }
+        status.pending_callbacks += 1;
+        true
+    }
+
+    fn start_callback(&self) -> bool {
+        let mut status = self.status.lock();
+        debug_assert!(status.pending_callbacks > 0);
+        status.pending_callbacks = status.pending_callbacks.saturating_sub(1);
+        if status.closed {
+            self.quiescent.notify_all();
+            return false;
+        }
+        status.active_callbacks += 1;
+        true
+    }
+
+    fn finish_callback(&self) {
+        let mut status = self.status.lock();
+        debug_assert!(status.active_callbacks > 0);
+        status.active_callbacks = status.active_callbacks.saturating_sub(1);
+        if status.active_callbacks == 0 && status.pending_callbacks == 0 {
+            self.quiescent.notify_all();
+        }
+    }
+
+    fn close(&self) {
+        self.status.lock().closed = true;
+    }
+
+    fn is_closed(&self) -> bool {
+        self.status.lock().closed
+    }
+
+    fn wait_for_quiescence(&self) {
+        let own_active_callbacks = current_observation_callback_count(self);
+        let mut status = self.status.lock();
+        // A pending reservation is deliberately not waited on: after `closed`
+        // is set, `start_callback` consumes it and skips the listener. Waiting
+        // for that reservation here would deadlock when listener A unsubscribes
+        // listener B from the same dispatch pass before B starts.
+        while status.active_callbacks > own_active_callbacks {
+            self.quiescent.wait(&mut status);
+        }
+    }
+}
+
+struct ObservationDelivery {
+    listener: Arc<dyn ObservationEventListener>,
+    state: Arc<ObservationSubscriptionState>,
+    id: u64,
+}
+
+thread_local! {
+    static OBSERVATION_CALLBACK_STACK: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn observation_state_key(state: &ObservationSubscriptionState) -> usize {
+    state as *const ObservationSubscriptionState as usize
+}
+
+fn current_observation_callback_count(state: &ObservationSubscriptionState) -> usize {
+    let key = observation_state_key(state);
+    OBSERVATION_CALLBACK_STACK.with(|stack| {
+        stack
+            .borrow()
+            .iter()
+            .filter(|current| **current == key)
+            .count()
+    })
+}
+
+struct ObservationCallbackGuard {
+    key: usize,
+}
+
+impl ObservationCallbackGuard {
+    fn enter(state: &ObservationSubscriptionState) -> Self {
+        let key = observation_state_key(state);
+        OBSERVATION_CALLBACK_STACK.with(|stack| stack.borrow_mut().push(key));
+        Self { key }
+    }
+}
+
+impl Drop for ObservationCallbackGuard {
+    fn drop(&mut self) {
+        OBSERVATION_CALLBACK_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            debug_assert_eq!(stack.pop(), Some(self.key));
+        });
+    }
 }
 
 type SharedWorld = Arc<parking_lot::RwLock<azalea::world::World>>;
@@ -195,6 +327,7 @@ impl ObservationState {
 
 struct SharedRuntime {
     writer: parking_lot::Mutex<EventWriter>,
+    event_dispatch: parking_lot::Mutex<()>,
     swarm: parking_lot::Mutex<Option<Swarm>>,
     shutdown: Arc<Notify>,
     config: RunConfig,
@@ -226,6 +359,7 @@ impl SharedRuntime {
     fn new(config: RunConfig) -> Self {
         Self {
             writer: parking_lot::Mutex::new(EventWriter::new(&config.world_id)),
+            event_dispatch: parking_lot::Mutex::new(()),
             swarm: parking_lot::Mutex::new(None),
             shutdown: Arc::new(Notify::new()),
             config,
@@ -258,33 +392,70 @@ impl SharedRuntime {
         if matches!(kind, BackendEventKind::Lifecycle) {
             self.lifecycle_revision.fetch_add(1, Ordering::AcqRel);
         }
-        let mut writer = self.writer.lock();
-        let event = writer.emit(kind, source, payload);
+        let _dispatch = self.event_dispatch.lock();
+        let event = {
+            let mut writer = self.writer.lock();
+            writer.emit(kind, source, payload)
+        };
         self.broadcast_event(event);
     }
 
     fn broadcast_event(&self, event: BackendEventEnvelope) {
-        let mut subscribers = self.subscribers.lock();
-        subscribers.retain(|subscriber| subscriber.send(event.clone()).is_ok());
+        {
+            let mut subscribers = self.subscribers.lock();
+            subscribers.retain(|subscriber| subscriber.send(event.clone()).is_ok());
+        }
 
         let observation_kind = matches!(
             event.kind,
             BackendEventKind::Entity | BackendEventKind::Block | BackendEventKind::Sound
         );
-        let mut observation_subscribers = self.observation_subscribers.lock();
-        observation_subscribers.retain(|subscriber| {
-            if subscriber.sender.is_closed() {
-                return false;
+        if !observation_kind {
+            return;
+        }
+
+        let Some(observation_event) = observation_event_from_backend(&event) else {
+            return;
+        };
+        let deliveries = {
+            let subscribers = self.observation_subscribers.lock();
+            subscribers
+                .iter()
+                .filter(|subscriber| subscriber.epoch == event_epoch(&observation_event))
+                .filter_map(|subscriber| {
+                    subscriber
+                        .state
+                        .reserve_callback()
+                        .then(|| ObservationDelivery {
+                            listener: subscriber.listener.clone(),
+                            state: subscriber.state.clone(),
+                            id: subscriber.id,
+                        })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for delivery in deliveries {
+            if !delivery.state.start_callback() {
+                continue;
             }
-            if !observation_kind || subscriber.epoch != event.connection_epoch {
-                return true;
+            let callback_guard = ObservationCallbackGuard::enter(&delivery.state);
+            let callback_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                delivery.listener.on_event(observation_event.clone());
+            }));
+            drop(callback_guard);
+            delivery.state.finish_callback();
+            if callback_result.is_err() {
+                eprintln!(
+                    "observation listener panic isolated: subscription_id={}; other listeners continue",
+                    delivery.id
+                );
             }
-            subscriber.sender.send(event.clone()).is_ok()
-        });
+        }
     }
 
     /// 在发起网络连接前分配身份，并保证该身份下的第一条生命周期事件就是
-    /// `connection_requested`。writer 锁覆盖身份分配、事件编号和广播，避免
+    /// `connection_requested`。dispatch 锁覆盖身份分配、事件编号和广播，避免
     /// 其他生产者把事件插入新 attempt 与请求事件之间。
     fn begin_connection_attempt(&self) {
         self.attempt_epoch_reserved.store(true, Ordering::Release);
@@ -292,20 +463,23 @@ impl SharedRuntime {
         self.clear_observations();
         self.lifecycle_revision.fetch_add(1, Ordering::AcqRel);
 
-        let mut writer = self.writer.lock();
-        writer.new_attempt();
-        let attempt = writer.connection_epoch;
-        let event = writer.emit(
-            BackendEventKind::Lifecycle,
-            FactSource::Commanded,
-            json!({
-                "type":"connection_requested",
-                "attempt":attempt,
-                "username":self.config.username,
-                "host":self.config.host,
-                "port":self.config.port
-            }),
-        );
+        let _dispatch = self.event_dispatch.lock();
+        let event = {
+            let mut writer = self.writer.lock();
+            writer.new_attempt();
+            let attempt = writer.connection_epoch;
+            writer.emit(
+                BackendEventKind::Lifecycle,
+                FactSource::Commanded,
+                json!({
+                    "type":"connection_requested",
+                    "attempt":attempt,
+                    "username":self.config.username,
+                    "host":self.config.host,
+                    "port":self.config.port
+                }),
+            )
+        };
         self.broadcast_event(event);
     }
 
@@ -355,22 +529,31 @@ impl SharedRuntime {
     fn add_observation_subscription(
         &self,
         epoch: u64,
-    ) -> (u64, mpsc::UnboundedReceiver<BackendEventEnvelope>) {
-        let (sender, receiver) = mpsc::unbounded_channel();
+        listener: Arc<dyn ObservationEventListener>,
+    ) -> (u64, Arc<ObservationSubscriptionState>) {
         let id = self
             .next_observation_subscription_id
             .fetch_add(1, Ordering::AcqRel)
             + 1;
+        let state = Arc::new(ObservationSubscriptionState::new());
         self.observation_subscribers
             .lock()
-            .push(ObservationSubscriber { id, epoch, sender });
-        (id, receiver)
+            .push(ObservationSubscriber {
+                id,
+                epoch,
+                listener,
+                state: state.clone(),
+            });
+        (id, state)
     }
 
-    fn remove_observation_subscription(&self, id: u64) {
-        self.observation_subscribers
-            .lock()
-            .retain(|subscriber| subscriber.id != id);
+    fn remove_observation_subscription(&self, id: u64, state: &ObservationSubscriptionState) {
+        {
+            let mut subscribers = self.observation_subscribers.lock();
+            subscribers.retain(|subscriber| subscriber.id != id);
+            state.close();
+        }
+        state.wait_for_quiescence();
     }
 
     fn set_swarm(&self, swarm: Swarm) {
@@ -681,51 +864,45 @@ fn validate_command(command: &BackendCommand) -> Result<(), String> {
     Ok(())
 }
 
-/// 一个 observation source 的 owned receiver。
+/// 一个 observation source 的 owned typed subscription。
 ///
-/// 不启动后台转发任务：事件由 `SharedRuntime::broadcast_event` 同步筛选并
-/// 直接写入 channel。显式 unsubscribe 与 Drop 都从 registry 移除 sender，
-/// 因而 receiver 生命周期不会把订阅永久留在共享 runtime 中。
+/// 回调由 `SharedRuntime::broadcast_event` 同步调用；没有队列、后台转发任务
+/// 或每订阅线程。关闭会先从 registry 线性化移除，再等待在途回调结束。
 pub struct RuntimeObservationSubscription {
     shared: Arc<SharedRuntime>,
     id: u64,
-    receiver: mpsc::UnboundedReceiver<BackendEventEnvelope>,
+    state: Arc<ObservationSubscriptionState>,
     closed: bool,
 }
 
 impl RuntimeObservationSubscription {
-    pub async fn recv(&mut self) -> Option<BackendEventEnvelope> {
-        if self.closed {
-            return None;
-        }
-        self.receiver.recv().await
-    }
-
-    pub fn try_recv(&mut self) -> Result<BackendEventEnvelope, mpsc::error::TryRecvError> {
-        if self.closed {
-            return Err(mpsc::error::TryRecvError::Disconnected);
-        }
-        self.receiver.try_recv()
-    }
-
-    pub fn unsubscribe(&mut self) {
+    fn close(&mut self) {
         if self.closed {
             return;
         }
         self.closed = true;
-        self.shared.remove_observation_subscription(self.id);
-        self.receiver.close();
-        while self.receiver.try_recv().is_ok() {}
+        self.shared
+            .remove_observation_subscription(self.id, &self.state);
     }
 
-    pub fn is_closed(&self) -> bool {
-        self.closed || self.receiver.is_closed()
+    fn closed(&self) -> bool {
+        self.closed || self.state.is_closed()
+    }
+}
+
+impl Subscription for RuntimeObservationSubscription {
+    fn unsubscribe(&mut self) {
+        self.close();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed()
     }
 }
 
 impl Drop for RuntimeObservationSubscription {
     fn drop(&mut self) {
-        self.unsubscribe();
+        self.close();
     }
 }
 
@@ -755,9 +932,7 @@ enum ViewportProjectionWorkerResult {
 
 /// 对齐 MineIntent `ProtocolObservationSource` 的只读 concrete observation seam。
 ///
-/// `bound_epoch` 是创建 source 时捕获的值；本类型没有实现 contracts 中完整的
-/// `ProtocolObservationSource` trait。VIEW-02 的 `read_viewport` 是本 backend 的
-/// concrete atomic seam，subscription 仍是本文件已有的 backend concrete seam。
+/// `bound_epoch` 是创建 source 时捕获的值；所有 observation 方法都在读前后检查它。
 #[derive(Clone)]
 pub struct RuntimeObservationSource {
     shared: Arc<SharedRuntime>,
@@ -780,7 +955,7 @@ impl RuntimeObservationSource {
         Ok(())
     }
 
-    pub fn self_pose(&self) -> Result<Option<PoseSnapshot>, BackendError> {
+    fn self_pose_snapshot(&self) -> Result<Option<PoseSnapshot>, BackendError> {
         self.ensure_current_epoch()?;
         let pose = self
             .shared
@@ -797,6 +972,15 @@ impl RuntimeObservationSource {
             });
         self.ensure_current_epoch()?;
         Ok(pose)
+    }
+
+    pub fn self_pose(&self) -> Result<ContractSelfPose, BackendError> {
+        let pose = self.self_pose_snapshot()?;
+        self.ensure_current_epoch()?;
+        let pose = pose.ok_or_else(|| BackendError::NotReady {
+            state: "self_pose_unavailable".to_owned(),
+        })?;
+        Ok(contract_self_pose(pose))
     }
 
     pub fn snapshot_source(&self) -> Result<Option<FactSource>, BackendError> {
@@ -818,11 +1002,23 @@ impl RuntimeObservationSource {
         Ok(players)
     }
 
-    pub fn list_tracked_entities(&self) -> Result<Vec<ProtocolEntitySnapshot>, BackendError> {
+    fn list_tracked_entities_snapshot(&self) -> Result<Vec<ProtocolEntitySnapshot>, BackendError> {
         self.ensure_current_epoch()?;
         let entities = self.shared.observation.read().tracked_entities.clone();
         self.ensure_current_epoch()?;
         Ok(entities)
+    }
+
+    pub fn list_tracked_entities(
+        &self,
+    ) -> Result<Vec<ContractProtocolEntitySnapshot>, BackendError> {
+        let entities = self.list_tracked_entities_snapshot()?;
+        let converted = entities
+            .into_iter()
+            .map(contract_entity_snapshot)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.ensure_current_epoch()?;
+        Ok(converted)
     }
 
     /// 对齐 MineIntent viewport 的只读投影；所有坐标仍是 Minecraft 世界绝对坐标。
@@ -836,10 +1032,10 @@ impl RuntimeObservationSource {
         options: &ViewportOptions,
     ) -> Result<Option<ViewportProjection>, BackendError> {
         self.ensure_current_epoch()?;
-        let Some(pose) = self.self_pose()? else {
+        let Some(pose) = self.self_pose_snapshot()? else {
             return Ok(None);
         };
-        let entities = self.list_tracked_entities()?;
+        let entities = self.list_tracked_entities_snapshot()?;
         let Some(world) = self.shared.observation.read().world.clone() else {
             self.ensure_current_epoch()?;
             return Ok(None);
@@ -868,8 +1064,20 @@ impl RuntimeObservationSource {
     ///
     /// 上层 viewport 应基于 `transparentHint`、碰撞/轮廓几何和观察者姿态
     /// 做射线或暴露面判断，避免把“客户端缓存里有数据”误报成“玩家看到了”。
-    pub fn read_block(&self, position: BlockPosition) -> Result<BlockReadResult, BackendError> {
-        self.read_block_with_post_read_hook(position, || {})
+    pub fn read_block(
+        &self,
+        position: ContractBlockPosition,
+    ) -> Result<ContractBlockReadResult, BackendError> {
+        let result = self.read_block_with_post_read_hook(
+            BlockPosition {
+                x: position.x,
+                y: position.y,
+                z: position.z,
+            },
+            || {},
+        )?;
+        self.ensure_current_epoch()?;
+        Ok(contract_block_read_result(result))
     }
 
     fn read_block_with_post_read_hook(
@@ -1101,19 +1309,266 @@ impl RuntimeObservationSource {
         }))
     }
 
-    pub fn subscribe(&self) -> Result<RuntimeObservationSubscription, BackendError> {
+    fn subscribe_listener(
+        &self,
+        listener: Arc<dyn ObservationEventListener>,
+        post_register_hook: Option<&dyn Fn()>,
+    ) -> Result<RuntimeObservationSubscription, BackendError> {
         self.ensure_current_epoch()?;
-        let (id, receiver) = self.shared.add_observation_subscription(self.bound_epoch);
+        let (id, state) = self
+            .shared
+            .add_observation_subscription(self.bound_epoch, listener);
+        if let Some(hook) = post_register_hook {
+            hook();
+        }
         if let Err(error) = self.ensure_current_epoch() {
-            self.shared.remove_observation_subscription(id);
+            self.shared.remove_observation_subscription(id, &state);
             return Err(error);
         }
         Ok(RuntimeObservationSubscription {
             shared: self.shared.clone(),
             id,
-            receiver,
+            state,
             closed: false,
         })
+    }
+
+    #[cfg(test)]
+    fn subscribe_with_post_register_hook(
+        &self,
+        listener: Arc<dyn ObservationEventListener>,
+        hook: impl Fn(),
+    ) -> Result<RuntimeObservationSubscription, BackendError> {
+        self.subscribe_listener(listener, Some(&hook))
+    }
+}
+
+impl ProtocolObservationSource for RuntimeObservationSource {
+    fn epoch(&self) -> u64 {
+        RuntimeObservationSource::epoch(self)
+    }
+
+    fn self_pose(&self) -> Result<ContractSelfPose, BackendError> {
+        RuntimeObservationSource::self_pose(self)
+    }
+
+    fn list_tracked_entities(&self) -> Result<Vec<ContractProtocolEntitySnapshot>, BackendError> {
+        RuntimeObservationSource::list_tracked_entities(self)
+    }
+
+    fn read_block(
+        &self,
+        position: ContractBlockPosition,
+    ) -> Result<ContractBlockReadResult, BackendError> {
+        RuntimeObservationSource::read_block(self, position)
+    }
+
+    fn subscribe(
+        &self,
+        listener: Arc<dyn ObservationEventListener>,
+    ) -> Result<Box<dyn Subscription>, BackendError> {
+        self.subscribe_listener(listener, None)
+            .map(|subscription| Box::new(subscription) as Box<dyn Subscription>)
+    }
+
+    fn read_viewport(
+        &self,
+        control: OperationControl,
+    ) -> BoxFuture<'_, Result<ContractViewportRead, BackendError>> {
+        // Fully qualify the inherent method so the trait adapter cannot recurse.
+        RuntimeObservationSource::read_viewport(self, control)
+    }
+}
+
+fn contract_vec3(value: Vec3Value) -> ContractVec3Value {
+    ContractVec3Value {
+        x: value.x,
+        y: value.y,
+        z: value.z,
+    }
+}
+
+fn contract_self_pose(pose: PoseSnapshot) -> ContractSelfPose {
+    ContractSelfPose {
+        position: contract_vec3(pose.position),
+        velocity: contract_vec3(pose.velocity),
+        yaw: f64::from(pose.yaw),
+        pitch: f64::from(pose.pitch),
+    }
+}
+
+fn dto_conversion_error(field: &str, message: impl Into<String>) -> BackendError {
+    BackendError::BackendFailure {
+        failure: BackendFailure {
+            code: BackendFailureCode::ProtocolError,
+            message: format!(
+                "cannot convert backend observation DTO {field}: {}",
+                message.into()
+            ),
+            retryable: false,
+        },
+    }
+}
+
+fn contract_entity_snapshot(
+    entity: ProtocolEntitySnapshot,
+) -> Result<ContractProtocolEntitySnapshot, BackendError> {
+    let equipment = entity
+        .equipment
+        .into_iter()
+        .map(|item| {
+            let count = u32::try_from(item.count).map_err(|_| {
+                dto_conversion_error(
+                    "entity.equipment.count",
+                    format!("negative item count {}", item.count),
+                )
+            })?;
+            Ok(ContractEntityEquipmentSnapshot {
+                slot: u32::from(item.slot),
+                item_name: item.item_name,
+                count,
+            })
+        })
+        .collect::<Result<Vec<_>, BackendError>>()?;
+
+    Ok(ContractProtocolEntitySnapshot {
+        entity_key: entity.entity_key,
+        protocol_entity_id: entity.protocol_entity_id,
+        entity_type: entity.entity_type,
+        name: entity.name,
+        username: entity.username,
+        uuid: entity.uuid,
+        position: contract_vec3(entity.position),
+        velocity: contract_vec3(entity.velocity),
+        yaw: f64::from(entity.yaw),
+        pitch: f64::from(entity.pitch),
+        head_yaw: entity.head_yaw.map(f64::from),
+        width: f64::from(entity.width),
+        height: f64::from(entity.height),
+        on_ground: entity.on_ground,
+        pose: entity.pose,
+        held_item_name: entity.held_item_name,
+        equipment,
+        valid: entity.valid,
+    })
+}
+
+fn contract_block_snapshot(block: ProtocolBlockSnapshot) -> ContractProtocolBlockSnapshot {
+    ContractProtocolBlockSnapshot {
+        position: ContractBlockPosition {
+            x: block.position.x,
+            y: block.position.y,
+            z: block.position.z,
+        },
+        name: block.name,
+        state_id: block.state_id,
+        properties: block
+            .properties
+            .into_iter()
+            .map(|(key, value)| (key, ContractBlockPropertyValue::String(value)))
+            .collect(),
+        collision_shapes: block.collision_shapes,
+        transparent_hint: block.transparent_hint,
+        bounding_box: match block.bounding_box {
+            BlockBoundingBox::Block => ContractBlockBoundingBox::Block,
+            BlockBoundingBox::Empty => ContractBlockBoundingBox::Empty,
+        },
+    }
+}
+
+fn contract_block_read_result(result: BlockReadResult) -> ContractBlockReadResult {
+    match result {
+        BlockReadResult::Loaded { block } => ContractBlockReadResult::Loaded {
+            block: contract_block_snapshot(block),
+        },
+        BlockReadResult::Unloaded => ContractBlockReadResult::Unloaded,
+        BlockReadResult::OutOfWorld => ContractBlockReadResult::OutOfWorld,
+    }
+}
+
+fn contract_event_metadata(event: &BackendEventEnvelope) -> ContractBackendEventMetadata {
+    ContractBackendEventMetadata {
+        id: event.id.clone(),
+        occurred_at: event.occurred_at.to_rfc3339(),
+        process_session_id: event.process_session_id.clone(),
+        connection_epoch: event.connection_epoch,
+        connection_attempt_id: event.connection_attempt_id.clone(),
+        world_id: event.world_id.clone(),
+        dimension: event.dimension.clone(),
+    }
+}
+
+fn contract_event_kind(kind: BackendEventKind) -> ContractBackendEventKind {
+    match kind {
+        BackendEventKind::Entity => ContractBackendEventKind::Entity,
+        BackendEventKind::Block => ContractBackendEventKind::Block,
+        BackendEventKind::Sound => ContractBackendEventKind::Sound,
+        _ => unreachable!("non-observation event cannot enter typed observation adapter"),
+    }
+}
+
+fn observation_event_from_backend(event: &BackendEventEnvelope) -> Option<ObservationEvent> {
+    let metadata = contract_event_metadata(event);
+    let source = contract_fact_source(event.source);
+    let parse_error = |error: serde_json::Error| {
+        eprintln!(
+            "typed observation payload deferred: producer remains deferred; event_id={}; kind={:?}; error={}",
+            event.id, event.kind, error
+        );
+    };
+
+    match event.kind {
+        BackendEventKind::Entity => {
+            match serde_json::from_value::<ContractProtocolEntityEvent>(event.payload.clone()) {
+                Ok(payload) => Some(ObservationEvent::Entity(ContractBackendEventEnvelope::new(
+                    metadata,
+                    contract_event_kind(event.kind),
+                    source,
+                    payload,
+                ))),
+                Err(error) => {
+                    parse_error(error);
+                    None
+                }
+            }
+        }
+        BackendEventKind::Block => {
+            match serde_json::from_value::<ContractProtocolBlockEvent>(event.payload.clone()) {
+                Ok(payload) => Some(ObservationEvent::Block(ContractBackendEventEnvelope::new(
+                    metadata,
+                    contract_event_kind(event.kind),
+                    source,
+                    payload,
+                ))),
+                Err(error) => {
+                    parse_error(error);
+                    None
+                }
+            }
+        }
+        BackendEventKind::Sound => {
+            match serde_json::from_value::<ContractProtocolSoundPayload>(event.payload.clone()) {
+                Ok(payload) => Some(ObservationEvent::Sound(ContractBackendEventEnvelope::new(
+                    metadata,
+                    contract_event_kind(event.kind),
+                    source,
+                    payload,
+                ))),
+                Err(error) => {
+                    parse_error(error);
+                    None
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+fn event_epoch(event: &ObservationEvent) -> u64 {
+    match event {
+        ObservationEvent::Entity(event) => event.connection_epoch,
+        ObservationEvent::Block(event) => event.connection_epoch,
+        ObservationEvent::Sound(event) => event.connection_epoch,
     }
 }
 
@@ -1873,11 +2328,20 @@ fn validate_run_config(config: &RunConfig) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{future::pending, sync::atomic::AtomicUsize};
+    use std::{
+        future::pending,
+        sync::{atomic::AtomicUsize, mpsc as std_mpsc, Barrier, Mutex as StdMutex},
+        thread,
+        time::Duration as StdDuration,
+    };
 
     use super::*;
     use crate::snapshot::{ExperienceSnapshot, InventorySnapshot, SelfSnapshot, WorldSnapshot};
-    use mineintent_contracts::minecraft::{CancellationSignal, Deadline};
+    use mineintent_contracts::minecraft::{
+        BackendEventProtocol as ContractBackendEventProtocol, CancellationSignal, Deadline,
+        HeardSoundType as ContractHeardSoundType,
+        ProtocolSoundSource as ContractProtocolSoundSource,
+    };
 
     struct TestCancellation {
         checks: AtomicUsize,
@@ -2190,9 +2654,9 @@ mod tests {
                     z: 2.0,
                 },
                 velocity: Vec3Value {
-                    x: 0.0,
-                    y: 0.0,
-                    z: 0.0,
+                    x: -1.5,
+                    y: 0.25,
+                    z: 2.75,
                 },
                 yaw: 0.25,
                 pitch: -0.1,
@@ -2229,19 +2693,23 @@ mod tests {
                 z: 4.0,
             },
             velocity: Vec3Value {
-                x: 0.0,
-                y: 0.0,
-                z: 0.0,
+                x: -0.25,
+                y: 0.5,
+                z: 0.75,
             },
-            yaw: 0.0,
-            pitch: 0.0,
-            head_yaw: None,
-            width: 0.6,
-            height: 1.95,
-            on_ground: true,
-            pose: None,
-            held_item_name: None,
-            equipment: Vec::new(),
+            yaw: 0.125,
+            pitch: -0.25,
+            head_yaw: Some(0.5),
+            width: 0.625,
+            height: 1.875,
+            on_ground: false,
+            pose: Some("standing".to_owned()),
+            held_item_name: Some("iron_sword".to_owned()),
+            equipment: vec![crate::snapshot::EntityEquipmentSnapshot {
+                slot: 2,
+                item_name: "iron_sword".to_owned(),
+                count: 3,
+            }],
             valid: true,
         }
     }
@@ -2467,12 +2935,255 @@ mod tests {
         );
     }
 
+    struct RecordingListener {
+        events: Arc<parking_lot::Mutex<Vec<ObservationEvent>>>,
+    }
+
+    impl ObservationEventListener for RecordingListener {
+        fn on_event(&self, event: ObservationEvent) {
+            self.events.lock().push(event);
+        }
+    }
+
+    fn recording_listener() -> (
+        Arc<RecordingListener>,
+        Arc<parking_lot::Mutex<Vec<ObservationEvent>>>,
+    ) {
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        (
+            Arc::new(RecordingListener {
+                events: events.clone(),
+            }),
+            events,
+        )
+    }
+
+    struct NoopListener;
+
+    impl ObservationEventListener for NoopListener {
+        fn on_event(&self, _event: ObservationEvent) {}
+    }
+
+    struct PanicListener;
+
+    impl ObservationEventListener for PanicListener {
+        fn on_event(&self, _event: ObservationEvent) {
+            panic!("observation listener test panic");
+        }
+    }
+
+    struct ReentrantListener {
+        source: RuntimeObservationSource,
+        invoked: AtomicBool,
+        pose: Arc<parking_lot::Mutex<Option<Result<ContractSelfPose, BackendError>>>>,
+        block: Arc<parking_lot::Mutex<Option<Result<ContractBlockReadResult, BackendError>>>>,
+        nested_subscription_succeeded: AtomicBool,
+    }
+
+    impl ObservationEventListener for ReentrantListener {
+        fn on_event(&self, _event: ObservationEvent) {
+            if self.invoked.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            *self.pose.lock() = Some(self.source.self_pose());
+            *self.block.lock() =
+                Some(
+                    self.source
+                        .read_block(ContractBlockPosition { x: 0, y: 64, z: 0 }),
+                );
+            let nested = ProtocolObservationSource::subscribe(&self.source, Arc::new(NoopListener));
+            self.nested_subscription_succeeded
+                .store(nested.is_ok(), Ordering::SeqCst);
+        }
+    }
+
+    struct BlockingListener {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ObservationEventListener for BlockingListener {
+        fn on_event(&self, _event: ObservationEvent) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.wait();
+            self.release.wait();
+        }
+    }
+
+    struct AUnsubscribesBListener {
+        b_subscription: Arc<StdMutex<Option<Box<dyn Subscription>>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ObservationEventListener for AUnsubscribesBListener {
+        fn on_event(&self, _event: ObservationEvent) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut subscription = self
+                .b_subscription
+                .lock()
+                .expect("B subscription mutex should not be poisoned")
+                .take()
+                .expect("B subscription should be present during A callback");
+            subscription.unsubscribe();
+        }
+    }
+
+    fn valid_observation_payload(kind: BackendEventKind) -> serde_json::Value {
+        match kind {
+            BackendEventKind::Entity => {
+                json!({"type":"animation", "entityKey":"entity-7", "animation":"swing"})
+            }
+            BackendEventKind::Block => {
+                json!({"type":"chunk_loaded", "chunkX":3, "chunkZ":-4})
+            }
+            BackendEventKind::Sound => json!({
+                "type":"heard",
+                "soundKey":"minecraft:block.note_block.harp",
+                "soundName":"note_block.harp",
+                "soundId":12,
+                "category":"blocks",
+                "sourcePosition":{"x":1.5,"y":64.25,"z":-2.0},
+                "volume":0.75,
+                "pitch":1.25,
+                "protocolSource":"named_sound_effect"
+            }),
+            _ => json!({"type":"ignored"}),
+        }
+    }
+
     fn emit_test_fact(handle: &RuntimeHandle, kind: BackendEventKind) {
         handle.shared.emit(
             kind,
             FactSource::ServerObserved,
-            json!({"type":"test_fact"}),
+            valid_observation_payload(kind),
         );
+    }
+
+    fn emit_and_capture(
+        handle: &RuntimeHandle,
+        kind: BackendEventKind,
+        payload: serde_json::Value,
+    ) -> BackendEventEnvelope {
+        let mut events = handle.subscribe();
+        handle
+            .shared
+            .emit(kind, FactSource::ServerObserved, payload);
+        events
+            .try_recv()
+            .expect("global v1 event should be emitted for adapter fixture")
+    }
+
+    fn contract_event_kind(event: &ObservationEvent) -> ContractBackendEventKind {
+        match event {
+            ObservationEvent::Entity(_) => ContractBackendEventKind::Entity,
+            ObservationEvent::Block(_) => ContractBackendEventKind::Block,
+            ObservationEvent::Sound(_) => ContractBackendEventKind::Sound,
+        }
+    }
+
+    fn assert_metadata<T>(
+        raw: &BackendEventEnvelope,
+        typed: &ContractBackendEventEnvelope<T>,
+        kind: ContractBackendEventKind,
+    ) {
+        assert_eq!(typed.protocol, ContractBackendEventProtocol::V2);
+        assert_eq!(typed.id, raw.id);
+        assert_eq!(typed.kind, kind);
+        assert_eq!(typed.occurred_at, raw.occurred_at.to_rfc3339());
+        assert_eq!(typed.process_session_id, raw.process_session_id);
+        assert_eq!(typed.connection_epoch, raw.connection_epoch);
+        assert_eq!(typed.connection_attempt_id, raw.connection_attempt_id);
+        assert_eq!(typed.world_id, raw.world_id);
+        assert_eq!(typed.dimension, raw.dimension);
+        assert_eq!(typed.source, ContractFactSource::ServerObserved);
+    }
+
+    fn contract_entity_event_fixture() -> ContractProtocolEntityEvent {
+        ContractProtocolEntityEvent::Spawned {
+            entity: ContractProtocolEntitySnapshot {
+                entity_key: "entity-7".to_owned(),
+                protocol_entity_id: 7,
+                entity_type: "zombie".to_owned(),
+                name: Some("zombie".to_owned()),
+                username: None,
+                uuid: Some("uuid-7".to_owned()),
+                position: ContractVec3Value {
+                    x: 3.0,
+                    y: 64.0,
+                    z: 4.0,
+                },
+                velocity: ContractVec3Value {
+                    x: -0.25,
+                    y: 0.5,
+                    z: 0.75,
+                },
+                yaw: 0.125,
+                pitch: -0.25,
+                head_yaw: Some(0.5),
+                width: 0.625,
+                height: 1.875,
+                on_ground: false,
+                pose: Some("standing".to_owned()),
+                held_item_name: Some("iron_sword".to_owned()),
+                equipment: vec![ContractEntityEquipmentSnapshot {
+                    slot: 2,
+                    item_name: "iron_sword".to_owned(),
+                    count: 3,
+                }],
+                valid: true,
+            },
+        }
+    }
+
+    fn contract_block_event_fixture() -> ContractProtocolBlockEvent {
+        ContractProtocolBlockEvent::Updated {
+            old_block: None,
+            new_block: Some(ContractProtocolBlockSnapshot {
+                position: ContractBlockPosition { x: 3, y: 64, z: -2 },
+                name: "stone".to_owned(),
+                state_id: 42,
+                properties: [(
+                    "axis".to_owned(),
+                    ContractBlockPropertyValue::String("y".to_owned()),
+                )]
+                .into_iter()
+                .collect(),
+                collision_shapes: vec![[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]],
+                transparent_hint: false,
+                bounding_box: ContractBlockBoundingBox::Block,
+            }),
+        }
+    }
+
+    fn contract_sound_fixture() -> ContractProtocolSoundPayload {
+        ContractProtocolSoundPayload {
+            event_type: ContractHeardSoundType::Heard,
+            sound_key: "minecraft:block.note_block.harp".to_owned(),
+            sound_name: Some("note_block.harp".to_owned()),
+            sound_id: Some(12),
+            category: Some("blocks".to_owned()),
+            source_position: ContractVec3Value {
+                x: 1.5,
+                y: 64.25,
+                z: -2.0,
+            },
+            volume: 0.75,
+            pitch: 1.25,
+            protocol_source: ContractProtocolSoundSource::NamedSoundEffect,
+        }
+    }
+
+    fn backend_block_fixture() -> ProtocolBlockSnapshot {
+        ProtocolBlockSnapshot {
+            position: BlockPosition { x: 3, y: 64, z: -2 },
+            name: "stone".to_owned(),
+            state_id: 42,
+            properties: [("axis".to_owned(), "y".to_owned())].into_iter().collect(),
+            collision_shapes: vec![[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]],
+            transparent_hint: false,
+            bounding_box: BlockBoundingBox::Block,
+        }
     }
 
     #[test]
@@ -2494,14 +3205,15 @@ mod tests {
 
         let pose = source
             .self_pose()
-            .expect("current source pose should not be stale")
-            .expect("fixture pose should be present");
+            .expect("current source pose should not be stale");
         assert_eq!(pose.position.x, 1.0);
         assert_eq!(source.list_tracked_entities().unwrap().len(), 1);
-        assert!(source
-            .read_block(BlockPosition { x: 0, y: 64, z: 0 })
-            .expect("current source block read should not be stale")
-            .eq(&BlockReadResult::Unloaded));
+        assert_eq!(
+            source
+                .read_block(ContractBlockPosition { x: 0, y: 64, z: 0 })
+                .expect("current source block read should not be stale"),
+            ContractBlockReadResult::Unloaded
+        );
 
         handle.shared.begin_connection_attempt();
         assert_eq!(source.epoch(), 1, "old source must keep its bound epoch");
@@ -2517,17 +3229,29 @@ mod tests {
         assert_eq!(source.list_tracked_players(), Err(stale.clone()));
         assert_eq!(source.list_tracked_entities(), Err(stale.clone()));
         assert_eq!(
-            source.read_block(BlockPosition { x: 0, y: 64, z: 0 }),
+            source.read_block(ContractBlockPosition { x: 0, y: 64, z: 0 }),
             Err(stale.clone())
         );
         assert_eq!(source.snapshot_source(), Err(stale));
         assert!(matches!(
-            source.subscribe(),
+            ProtocolObservationSource::subscribe(&source, Arc::new(NoopListener)),
             Err(BackendError::StaleEpoch {
                 bound_epoch: 1,
                 current_epoch: 2,
             })
         ));
+    }
+
+    #[test]
+    fn self_pose_without_snapshot_is_stable_not_ready() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        handle.shared.begin_connection_attempt();
+        let source = handle.observation_source();
+        let expected = BackendError::NotReady {
+            state: "self_pose_unavailable".to_owned(),
+        };
+        assert_eq!(source.self_pose(), Err(expected.clone()));
+        assert_eq!(source.self_pose(), Err(expected));
     }
 
     #[test]
@@ -2540,21 +3264,110 @@ mod tests {
             .read_block_with_post_read_hook(BlockPosition { x: 0, y: 64, z: 0 }, || {
                 handle.shared.begin_connection_attempt()
             });
-        assert_eq!(
+        assert!(matches!(
             result,
             Err(BackendError::StaleEpoch {
                 bound_epoch: 1,
                 current_epoch: 2,
             })
+        ));
+    }
+
+    #[test]
+    fn protocol_observation_trait_object_maps_pose_entity_block_and_viewport_dto() {
+        let (_handle, concrete_source, _world) = ready_viewport_source();
+        let source: Arc<dyn ProtocolObservationSource> = Arc::new(concrete_source);
+
+        let pose = source
+            .self_pose()
+            .expect("trait object pose should be ready");
+        assert_eq!(
+            pose.position,
+            ContractVec3Value {
+                x: 1.0,
+                y: 64.0,
+                z: 2.0
+            }
         );
+        assert_eq!(
+            pose.velocity,
+            ContractVec3Value {
+                x: -1.5,
+                y: 0.25,
+                z: 2.75
+            }
+        );
+        assert_eq!(pose.yaw, 0.25_f32 as f64);
+        assert_eq!(pose.pitch, -0.1_f32 as f64);
+
+        let entities = source
+            .list_tracked_entities()
+            .expect("trait object entity list should be ready");
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].entity_key, "entity-7");
+        assert_eq!(entities[0].velocity.x, -0.25_f32 as f64);
+        assert_eq!(entities[0].head_yaw, Some(0.5_f32 as f64));
+        assert_eq!(entities[0].equipment[0].slot, 2);
+        assert_eq!(entities[0].equipment[0].count, 3);
+
+        assert_eq!(
+            source
+                .read_block(ContractBlockPosition { x: 0, y: 64, z: 0 })
+                .expect("trait object block read should be ready"),
+            ContractBlockReadResult::Unloaded
+        );
+        assert_eq!(
+            source
+                .read_block(ContractBlockPosition {
+                    x: 0,
+                    y: 10_000,
+                    z: 0
+                })
+                .expect("out-of-world block read should be explicit"),
+            ContractBlockReadResult::OutOfWorld
+        );
+
+        let converted = contract_block_snapshot(backend_block_fixture());
+        assert_eq!(
+            converted.position,
+            ContractBlockPosition { x: 3, y: 64, z: -2 }
+        );
+        assert_eq!(converted.name, "stone");
+        assert_eq!(converted.state_id, 42);
+        assert_eq!(
+            converted.properties["axis"],
+            ContractBlockPropertyValue::String("y".to_owned())
+        );
+        assert_eq!(
+            converted.collision_shapes,
+            vec![[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]
+        );
+        assert!(!converted.transparent_hint);
+        assert_eq!(converted.bounding_box, ContractBlockBoundingBox::Block);
+    }
+
+    #[tokio::test]
+    async fn protocol_observation_trait_object_delegates_atomic_viewport() {
+        let (_handle, concrete_source, _world) = ready_viewport_source();
+        let source: Arc<dyn ProtocolObservationSource> = Arc::new(concrete_source);
+        let read = source
+            .read_viewport(no_deadline_control())
+            .await
+            .expect("trait object viewport should delegate to atomic implementation");
+        assert_eq!(read.projection.frame.self_pose.position, [1.0, 64.0, 2.0]);
+        assert_eq!(read.source, ContractFactSource::ServerObserved);
+        assert!(read.revision > 0);
     }
 
     #[test]
     fn observation_subscription_filters_kind_and_epoch_without_background_tasks() {
         let handle = RuntimeHandle::new(RunConfig::default());
         handle.shared.begin_connection_attempt();
+        handle.shared.set_dimension("minecraft:overworld");
         let source = handle.observation_source();
-        let mut old_subscription = source.subscribe().expect("current source subscribes");
+        let (old_listener, old_events) = recording_listener();
+        let mut old_subscription =
+            ProtocolObservationSource::subscribe(&source, old_listener).expect("subscribe");
         assert_eq!(handle.shared.observation_subscribers.lock().len(), 1);
 
         for kind in [
@@ -2578,85 +3391,304 @@ mod tests {
             emit_test_fact(&handle, kind);
         }
 
-        for expected_kind in [
-            BackendEventKind::Entity,
-            BackendEventKind::Block,
-            BackendEventKind::Sound,
-        ] {
-            assert_eq!(
-                old_subscription
-                    .try_recv()
-                    .expect("observation fact should be delivered")
-                    .kind,
-                expected_kind
-            );
-        }
-        assert!(matches!(
-            old_subscription.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
+        let observed = old_events.lock();
+        assert_eq!(observed.len(), 3);
+        assert_eq!(
+            observed.iter().map(contract_event_kind).collect::<Vec<_>>(),
+            vec![
+                ContractBackendEventKind::Entity,
+                ContractBackendEventKind::Block,
+                ContractBackendEventKind::Sound
+            ]
+        );
+        drop(observed);
 
         handle.shared.begin_connection_attempt();
         emit_test_fact(&handle, BackendEventKind::Entity);
-        assert!(matches!(
-            old_subscription.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
+        assert_eq!(old_events.lock().len(), 3);
 
         let new_source = handle.observation_source();
-        let mut new_subscription = new_source.subscribe().expect("new source subscribes");
+        let (new_listener, new_events) = recording_listener();
+        let mut new_subscription = ProtocolObservationSource::subscribe(&new_source, new_listener)
+            .expect("new epoch source subscribes");
         emit_test_fact(&handle, BackendEventKind::Block);
+        assert_eq!(old_events.lock().len(), 3);
+        assert_eq!(new_events.lock().len(), 1);
         assert!(matches!(
-            old_subscription.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
+            &new_events.lock()[0],
+            ObservationEvent::Block(event) if event.connection_epoch == 2
         ));
-        assert_eq!(
-            new_subscription
-                .try_recv()
-                .expect("new epoch fact should be delivered")
-                .connection_epoch,
-            2
-        );
+
+        old_subscription.unsubscribe();
+        new_subscription.unsubscribe();
     }
 
     #[test]
-    fn observation_subscription_unsubscribe_and_drop_release_owned_sender() {
+    fn observation_subscription_registration_rechecks_epoch_after_reconnect_hook() {
         let handle = RuntimeHandle::new(RunConfig::default());
         handle.shared.begin_connection_attempt();
         let source = handle.observation_source();
+        let result = source.subscribe_with_post_register_hook(Arc::new(NoopListener), || {
+            handle.shared.begin_connection_attempt()
+        });
+        assert!(matches!(
+            result,
+            Err(BackendError::StaleEpoch {
+                bound_epoch: 1,
+                current_epoch: 2,
+            })
+        ));
+        assert_eq!(handle.shared.observation_subscribers.lock().len(), 0);
 
-        let mut unsubscribed = source.subscribe().expect("current source subscribes");
+        let new_source = handle.observation_source();
+        let subscription =
+            ProtocolObservationSource::subscribe(&new_source, Arc::new(NoopListener))
+                .expect("current epoch subscription should succeed");
+        assert!(!subscription.is_closed());
+        drop(subscription);
+        assert_eq!(handle.shared.observation_subscribers.lock().len(), 0);
+    }
+
+    #[test]
+    fn observation_subscription_unsubscribe_and_drop_release_listener_registry() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        handle.shared.begin_connection_attempt();
+        let source = handle.observation_source();
+        let (listener, events) = recording_listener();
+        let mut unsubscribed =
+            ProtocolObservationSource::subscribe(&source, listener).expect("subscribe");
         assert_eq!(handle.shared.observation_subscribers.lock().len(), 1);
+        unsubscribed.unsubscribe();
         unsubscribed.unsubscribe();
         assert!(unsubscribed.is_closed());
         assert_eq!(handle.shared.observation_subscribers.lock().len(), 0);
         emit_test_fact(&handle, BackendEventKind::Entity);
-        assert!(matches!(
-            unsubscribed.try_recv(),
-            Err(mpsc::error::TryRecvError::Disconnected)
-        ));
+        assert!(
+            events.lock().is_empty(),
+            "unsubscribe must prevent delivery"
+        );
 
-        let dropped = source.subscribe().expect("second subscription");
+        let (dropped_listener, _dropped_events) = recording_listener();
+        let dropped = ProtocolObservationSource::subscribe(&source, dropped_listener)
+            .expect("second subscription");
         assert_eq!(handle.shared.observation_subscribers.lock().len(), 1);
         drop(dropped);
         assert_eq!(handle.shared.observation_subscribers.lock().len(), 0);
-        emit_test_fact(&handle, BackendEventKind::Sound);
     }
 
-    #[tokio::test]
-    async fn observation_subscription_unsubscribe_discards_queued_events() {
+    #[test]
+    fn observation_events_convert_entity_block_sound_to_v2_typed_payloads() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        handle.shared.begin_connection_attempt();
+        handle.shared.set_dimension("minecraft:the_nether");
+        let source = handle.observation_source();
+        let (listener, events) = recording_listener();
+        let _subscription =
+            ProtocolObservationSource::subscribe(&source, listener).expect("subscribe");
+
+        let expected_entity = contract_entity_event_fixture();
+        let expected_block = contract_block_event_fixture();
+        let expected_sound = contract_sound_fixture();
+        let raw_entity = emit_and_capture(
+            &handle,
+            BackendEventKind::Entity,
+            serde_json::to_value(&expected_entity).expect("entity payload should encode"),
+        );
+        let raw_block = emit_and_capture(
+            &handle,
+            BackendEventKind::Block,
+            serde_json::to_value(&expected_block).expect("block payload should encode"),
+        );
+        let raw_sound = emit_and_capture(
+            &handle,
+            BackendEventKind::Sound,
+            serde_json::to_value(&expected_sound).expect("sound payload should encode"),
+        );
+
+        let observed = events.lock();
+        assert_eq!(observed.len(), 3);
+        match &observed[0] {
+            ObservationEvent::Entity(event) => {
+                assert_metadata(&raw_entity, event, ContractBackendEventKind::Entity);
+                assert_eq!(event.payload, expected_entity);
+            }
+            other => panic!("expected typed entity event, got {other:?}"),
+        }
+        match &observed[1] {
+            ObservationEvent::Block(event) => {
+                assert_metadata(&raw_block, event, ContractBackendEventKind::Block);
+                assert_eq!(event.payload, expected_block);
+            }
+            other => panic!("expected typed block event, got {other:?}"),
+        }
+        match &observed[2] {
+            ObservationEvent::Sound(event) => {
+                assert_metadata(&raw_sound, event, ContractBackendEventKind::Sound);
+                assert_eq!(event.payload, expected_sound);
+            }
+            other => panic!("expected typed sound event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_observation_payload_is_fail_contained_and_does_not_fake_a_fact() {
         let handle = RuntimeHandle::new(RunConfig::default());
         handle.shared.begin_connection_attempt();
         let source = handle.observation_source();
-        let mut subscription = source.subscribe().expect("current source subscribes");
+        let (listener, events) = recording_listener();
+        let _subscription =
+            ProtocolObservationSource::subscribe(&source, listener).expect("subscribe");
+
+        emit_and_capture(
+            &handle,
+            BackendEventKind::Entity,
+            json!({"type":"not_a_protocol_entity_event"}),
+        );
+        assert!(events.lock().is_empty());
+        emit_test_fact(&handle, BackendEventKind::Entity);
+        assert_eq!(events.lock().len(), 1);
+    }
+
+    #[test]
+    fn callback_panic_isolated_from_later_listeners_and_events() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        handle.shared.begin_connection_attempt();
+        let source = handle.observation_source();
+        let _panic_subscription =
+            ProtocolObservationSource::subscribe(&source, Arc::new(PanicListener))
+                .expect("panic listener subscription should succeed");
+        let (listener, events) = recording_listener();
+        let _recording_subscription =
+            ProtocolObservationSource::subscribe(&source, listener).expect("subscribe");
 
         emit_test_fact(&handle, BackendEventKind::Entity);
-        subscription.unsubscribe();
+        emit_test_fact(&handle, BackendEventKind::Block);
+        assert_eq!(events.lock().len(), 2);
+    }
 
-        assert!(matches!(
-            subscription.try_recv(),
-            Err(mpsc::error::TryRecvError::Disconnected)
-        ));
-        assert!(subscription.recv().await.is_none());
+    #[test]
+    fn callback_runs_outside_registry_lock_and_can_read_and_resubscribe() {
+        let (handle, source, _world) = ready_viewport_source();
+        let pose = Arc::new(parking_lot::Mutex::new(None));
+        let block = Arc::new(parking_lot::Mutex::new(None));
+        let listener = Arc::new(ReentrantListener {
+            source: source.clone(),
+            invoked: AtomicBool::new(false),
+            pose: pose.clone(),
+            block: block.clone(),
+            nested_subscription_succeeded: AtomicBool::new(false),
+        });
+        let _subscription =
+            ProtocolObservationSource::subscribe(&source, listener.clone()).expect("subscribe");
+
+        emit_test_fact(&handle, BackendEventKind::Entity);
+        assert!(listener
+            .nested_subscription_succeeded
+            .load(Ordering::SeqCst));
+        assert!(pose.lock().as_ref().is_some_and(Result::is_ok));
+        assert_eq!(
+            block.lock().as_ref(),
+            Some(&Ok(ContractBlockReadResult::Unloaded))
+        );
+    }
+
+    #[test]
+    fn unsubscribe_waits_for_active_callback_and_returns_before_no_new_delivery() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        handle.shared.begin_connection_attempt();
+        let source = handle.observation_source();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = Arc::new(BlockingListener {
+            entered: entered.clone(),
+            release: release.clone(),
+            calls: calls.clone(),
+        });
+        let subscription = ProtocolObservationSource::subscribe(&source, listener)
+            .expect("blocking subscription should succeed");
+        let holder = Arc::new(StdMutex::new(Some(subscription)));
+
+        let emitting_handle = handle.clone();
+        let emit_thread = thread::spawn(move || {
+            emit_test_fact(&emitting_handle, BackendEventKind::Entity);
+        });
+        entered.wait();
+
+        let (unsubscribed_tx, unsubscribed_rx) = std_mpsc::channel();
+        let unsubscribe_holder = holder.clone();
+        let unsubscribe_thread = thread::spawn(move || {
+            let mut subscription = unsubscribe_holder
+                .lock()
+                .expect("subscription mutex should not be poisoned")
+                .take()
+                .expect("subscription should be owned by unsubscribe thread");
+            subscription.unsubscribe();
+            unsubscribed_tx
+                .send(())
+                .expect("unsubscribe completion should be observable");
+        });
+        assert!(unsubscribed_rx
+            .recv_timeout(StdDuration::from_millis(100))
+            .is_err());
+
+        release.wait();
+        unsubscribed_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("unsubscribe should return after active callback finishes");
+        emit_thread.join().expect("event thread should not panic");
+        unsubscribe_thread
+            .join()
+            .expect("unsubscribe thread should not panic");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(handle.shared.observation_subscribers.lock().len(), 0);
+
+        emit_test_fact(&handle, BackendEventKind::Block);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn listener_a_can_unsubscribe_reserved_listener_b_without_deadlock_or_delivery() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        handle.shared.begin_connection_attempt();
+        let source = handle.observation_source();
+        let b_calls = Arc::new(AtomicUsize::new(0));
+        let b_holder = Arc::new(StdMutex::new(None));
+        let a_calls = Arc::new(AtomicUsize::new(0));
+        let a_listener = Arc::new(AUnsubscribesBListener {
+            b_subscription: b_holder.clone(),
+            calls: a_calls.clone(),
+        });
+        let _a_subscription = ProtocolObservationSource::subscribe(&source, a_listener)
+            .expect("A subscription should succeed");
+        let b_listener = Arc::new(BlockingListener {
+            entered: Arc::new(Barrier::new(1)),
+            release: Arc::new(Barrier::new(1)),
+            calls: b_calls.clone(),
+        });
+        let b_subscription = ProtocolObservationSource::subscribe(&source, b_listener)
+            .expect("B subscription should succeed");
+        *b_holder
+            .lock()
+            .expect("B subscription mutex should not be poisoned") = Some(b_subscription);
+
+        let emitting_handle = handle.clone();
+        let (emit_finished_tx, emit_finished_rx) = std_mpsc::channel();
+        let emit_thread = thread::spawn(move || {
+            emit_test_fact(&emitting_handle, BackendEventKind::Entity);
+            emit_finished_tx
+                .send(())
+                .expect("emit completion should be observable");
+        });
+        emit_finished_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("A unsubscribing reserved B must not deadlock dispatch");
+        emit_thread.join().expect("event thread should not panic");
+        assert_eq!(a_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(b_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(handle.shared.observation_subscribers.lock().len(), 1);
+
+        emit_test_fact(&handle, BackendEventKind::Block);
+        assert_eq!(b_calls.load(Ordering::SeqCst), 0);
     }
 }
