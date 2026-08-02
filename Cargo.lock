@@ -1776,6 +1776,7 @@ version = "0.0.1"
 dependencies = [
  "azalea",
  "chrono",
+ "mineintent-contracts",
  "parking_lot",
  "serde",
  "serde_json",
