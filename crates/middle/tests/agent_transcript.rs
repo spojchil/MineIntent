@@ -9,7 +9,7 @@ use mineintent_contracts::agent::{
     fixtures, JsonObject, ModelName, ModelUsage, RunId, ToolDefinitionName, WireToolDefinition,
 };
 use mineintent_middle::agent::{
-    transcript_path, AgentTranscriptRecord, FileTranscriptStore, TranscriptSink,
+    initial_messages, transcript_path, AgentTranscriptRecord, FileTranscriptStore, TranscriptSink,
     MAX_TRANSCRIPT_BYTES, MAX_TRANSCRIPT_CHARS,
 };
 use serde_json::{json, Value};
@@ -79,9 +79,12 @@ fn read_json_lines(path: &Path) -> Vec<Value> {
 #[test]
 fn success_record_has_exact_wire_fields_usage_and_replay_boundary() {
     let tools = vec![fixtures::tool_definition(), second_tool()];
+    let context = fixtures::agent_context_v5();
+    let initial = initial_messages(&context, &fixtures::prompt_template())
+        .expect("production v5 opening messages");
     let messages = vec![
-        object(json!({"role": "system", "content": "稳定"})),
-        object(json!({"role": "user", "content": "帧"})),
+        initial[0].clone(),
+        initial[1].clone(),
         object(json!({
             "role": "assistant",
             "reasoning_content": "观察",
@@ -150,6 +153,31 @@ fn success_record_has_exact_wire_fields_usage_and_replay_boundary() {
     );
     assert!(value["error"].is_null());
     assert_eq!(value["messages"], serde_json::to_value(messages).unwrap());
+    let opening_frame: Value = serde_json::from_str(
+        value["messages"][1]["content"]
+            .as_str()
+            .expect("transcript opening message is JSON"),
+    )
+    .expect("transcript stores v5 opening frame JSON");
+    assert_eq!(opening_frame, serde_json::to_value(&context.frame).unwrap());
+    assert_eq!(opening_frame["light"], 12);
+    assert_eq!(
+        opening_frame["hotbar"]["slots"]["0"],
+        json!(["oak_log", 12])
+    );
+    assert_eq!(opening_frame["chat"]["items"][1]["moved"], "events");
+    assert_eq!(opening_frame["events"][0]["type"], "player_chat");
+    assert_eq!(opening_frame["events"][0]["username"], "alice");
+    assert_eq!(opening_frame["events"][0]["text"], "帮我看看农田");
+    for forbidden in [
+        "player",
+        "self",
+        "inventory",
+        "timeOfDay",
+        "standingOnBlock",
+    ] {
+        assert!(opening_frame.get(forbidden).is_none(), "{forbidden}");
+    }
 }
 
 #[test]

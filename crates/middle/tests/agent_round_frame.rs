@@ -12,9 +12,10 @@ use std::{
 
 use mineintent_contracts::{
     agent::{
-        AgentError, AgentErrorCode, AgentRunner as ContractAgentRunner, CancellationSignal,
-        ContractFuture, Deadline, ExecutionControl, JsonObject, ModelProvider, ModelUsage, RunId,
-        ToolExecution, ToolInvocation, ViewportFrameMessage,
+        fixtures, AgentError, AgentErrorCode, AgentRunRequest, AgentRunner as ContractAgentRunner,
+        CancellationSignal, ContractFuture, Deadline, ExecutionControl, JsonAgentDecisionContextV5,
+        JsonObject, ModelProvider, ModelUsage, RunId, ToolExecution, ToolInvocation,
+        ViewportFrameMessage,
     },
     capability::{ExecutionResource, ToolDispatcher},
 };
@@ -35,6 +36,15 @@ fn initial_run() -> AgentRun {
         RunId::new("round-frame-run").expect("valid run id"),
         vec![object(json!({"role": "user", "content": "opening"}))],
     )
+}
+
+fn v5_request() -> AgentRunRequest<JsonAgentDecisionContextV5> {
+    AgentRunRequest {
+        run_id: RunId::new("run-1").expect("fixture run id is valid"),
+        context: fixtures::agent_context_v5(),
+        tools: vec![fixtures::tool_definition()],
+        prompt_template: fixtures::prompt_template(),
+    }
 }
 
 fn tool_call(id: &str, name: &str) -> Value {
@@ -991,15 +1001,45 @@ async fn frame_is_in_the_next_model_request_and_transcript() {
         RecordingSampler::success(json!({"round": 1})),
         sink.clone(),
     );
-    let request = mineintent_contracts::agent::fixtures::agent_run_request_v4();
+    let request = v5_request();
+    let expected_opening_frame =
+        serde_json::to_value(&request.context.frame).expect("v5 opening frame serializes");
     let signal = NeverCancelled;
     let deadline = Deadline::after(Instant::now(), Duration::from_secs(5)).expect("deadline");
     runner
-        .run(request, ExecutionControl::new(&signal, deadline))
+        .run(request.clone(), ExecutionControl::new(&signal, deadline))
         .await
         .expect("runner completes");
 
     let requests = runner.driver().model().requests.lock().expect("requests");
+    assert_eq!(requests.len(), 2);
+    let opening_frame: Value = serde_json::from_str(
+        requests[0].messages[1]["content"]
+            .as_str()
+            .expect("first opening message is JSON"),
+    )
+    .expect("first model request receives a JSON v5 frame");
+    assert_eq!(opening_frame, expected_opening_frame);
+    assert_eq!(opening_frame["light"], 12);
+    assert_eq!(
+        opening_frame["hotbar"]["slots"]["0"],
+        json!(["oak_log", 12])
+    );
+    assert_eq!(opening_frame["chat"]["items"][1]["moved"], "events");
+    assert_eq!(opening_frame["events"][0]["type"], "player_chat");
+    assert_eq!(opening_frame["events"][0]["username"], "alice");
+    assert_eq!(opening_frame["events"][0]["text"], "帮我看看农田");
+    for forbidden in [
+        "player",
+        "self",
+        "inventory",
+        "timeOfDay",
+        "standingOnBlock",
+    ] {
+        assert!(opening_frame.get(forbidden).is_none(), "{forbidden}");
+    }
+    assert_eq!(requests[1].messages[0], requests[0].messages[0]);
+    assert_eq!(requests[1].messages[1], requests[0].messages[1]);
     assert_eq!(
         frame_content(&requests[1].messages.last().unwrap())["viewport"]["visibleEntities"]
             ["items"][0]["player"],

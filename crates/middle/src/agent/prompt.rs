@@ -1,7 +1,8 @@
 use std::fmt;
 
 use mineintent_contracts::agent::{
-    AgentDecisionContextV4, JsonObject, PromptTemplateKey, PromptTemplateRef, PromptTemplateVersion,
+    AgentDecisionContextV4, JsonAgentDecisionContextV5, JsonObject, PromptTemplateKey,
+    PromptTemplateRef, PromptTemplateVersion,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -78,11 +79,23 @@ pub fn system_prompt(template: &PromptTemplateRef, memory: &str) -> Result<Strin
     Ok(prompt)
 }
 
-/// Creates the initial stable-system plus appended opening-frame messages.
+/// Creates the production v5 stable-system plus appended opening-frame messages.
 ///
 /// The frame is serialized once and handed to `AgentRun`; subsequent model
-/// requests replay the same prefix and append only assistant/tool messages.
-pub fn initial_messages<Status, Inventory, Sound, Omission>(
+/// requests replay the same prefix and append only assistant/tool turns. The
+/// concrete v5 context in this signature is intentional: production assembly
+/// cannot silently accept a replay-only context version.
+pub fn initial_messages(
+    context: &JsonAgentDecisionContextV5,
+    template: &PromptTemplateRef,
+) -> Result<Vec<JsonObject>, PromptError> {
+    initial_messages_for_frame(&context.stable.memory, &context.frame, template)
+}
+
+/// Explicit v4 replay helper. This path is retained for legacy transcript
+/// tools and tests only; it is not used by [`initial_messages`] or the
+/// production [`ConcreteAgentRunner`](super::ConcreteAgentRunner).
+pub fn initial_messages_v4_legacy<Status, Inventory, Sound, Omission>(
     context: &AgentDecisionContextV4<Status, Inventory, Sound, Omission>,
     template: &PromptTemplateRef,
 ) -> Result<Vec<JsonObject>, PromptError>
@@ -92,11 +105,21 @@ where
     Sound: Serialize,
     Omission: Serialize,
 {
-    let stable = system_prompt(template, &context.stable.memory)?;
-    let frame =
-        serde_json::to_string(&context.frame).map_err(|error| PromptError::FrameSerialization {
-            summary: error.to_string(),
-        })?;
+    initial_messages_for_frame(&context.stable.memory, &context.frame, template)
+}
+
+fn initial_messages_for_frame<Frame>(
+    memory: &str,
+    frame: &Frame,
+    template: &PromptTemplateRef,
+) -> Result<Vec<JsonObject>, PromptError>
+where
+    Frame: Serialize,
+{
+    let stable = system_prompt(template, memory)?;
+    let frame = serde_json::to_string(frame).map_err(|error| PromptError::FrameSerialization {
+        summary: error.to_string(),
+    })?;
 
     Ok(vec![message("system", stable), message("user", frame)])
 }

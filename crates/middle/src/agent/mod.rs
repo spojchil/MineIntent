@@ -16,7 +16,9 @@ pub use context::{
     AgentContextV5EventInput, AgentContextV5Input,
 };
 pub use driver::{AgentLoopDriver, AgentLoopOutcome, AgentModelRequest};
-pub use prompt::{initial_messages, system_prompt, template_text, PromptError};
+pub use prompt::{
+    initial_messages, initial_messages_v4_legacy, system_prompt, template_text, PromptError,
+};
 pub use run::{
     AgentRun, AgentRunStep, AgentToolResult, ModelCompletion, PlannedToolCall,
     MAX_MODEL_REQUESTS_PER_RUN, MAX_TOOL_CALLS_PER_RESPONSE, MAX_TOOL_CALLS_PER_RUN,

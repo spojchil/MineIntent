@@ -8,7 +8,7 @@ use mineintent_contracts::{
     agent::{
         AgentError, AgentErrorCode, AgentRunProtocol, AgentRunRequest,
         AgentRunner as ContractRunner, ContractFuture, ExecutionControl,
-        JsonAgentDecisionContextV4, ModelName, ModelProvider, ModelRunResult, RunId,
+        JsonAgentDecisionContextV5, ModelName, ModelProvider, ModelRunResult, RunId,
         WireToolDefinition,
     },
     capability::ToolDispatcher,
@@ -131,7 +131,7 @@ where
     Tools::Observation: Serialize,
     Sampler: RoundViewportSampler,
 {
-    type Context = JsonAgentDecisionContextV4;
+    type Context = JsonAgentDecisionContextV5;
 
     fn run<'a>(
         &'a self,

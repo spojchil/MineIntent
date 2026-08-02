@@ -9,9 +9,10 @@ use std::{
 
 use mineintent_contracts::{
     agent::{
-        fixtures, AgentError, AgentErrorCode, AgentRunner as ContractAgentRunner,
-        CancellationSignal, ContractFuture, Deadline, ExecutionControl, ModelProvider,
-        ModelRunResult, ModelUsage, PromptTemplateVersion, ToolExecution, ToolInvocation,
+        fixtures, AgentError, AgentErrorCode, AgentRunRequest, AgentRunner as ContractAgentRunner,
+        CancellationSignal, ContractFuture, Deadline, ExecutionControl, JsonAgentDecisionContextV5,
+        ModelProvider, ModelRunResult, ModelUsage, PromptTemplateVersion, RunId, ToolExecution,
+        ToolInvocation,
     },
     capability::ToolDispatcher,
 };
@@ -114,9 +115,18 @@ fn runner(
     AgentRunnerImpl::new(
         provider,
         dispatcher,
-        mineintent_contracts::agent::ModelName::new("model-v4")
+        mineintent_contracts::agent::ModelName::new("model-v5")
             .expect("fixture model name is valid"),
     )
+}
+
+fn v5_request() -> AgentRunRequest<JsonAgentDecisionContextV5> {
+    AgentRunRequest {
+        run_id: RunId::new("run-1").expect("fixture run id is valid"),
+        context: fixtures::agent_context_v5(),
+        tools: vec![fixtures::tool_definition()],
+        prompt_template: fixtures::prompt_template(),
+    }
 }
 
 #[derive(Default)]
@@ -151,7 +161,7 @@ impl TranscriptSink for PanickingTranscriptSink {
 }
 
 #[tokio::test]
-async fn concrete_runner_composes_v4_once_and_maps_run_id_tools_usage_and_model() {
+async fn concrete_runner_composes_v5_once_and_maps_run_id_tools_usage_and_model() {
     let provider = RecordingProvider::new(vec![
         completion(
             json!({
@@ -181,7 +191,7 @@ async fn concrete_runner_composes_v4_once_and_maps_run_id_tools_usage_and_model(
     ]);
     let dispatcher = RecordingDispatcher::default();
     let runner = runner(provider, dispatcher);
-    let request = fixtures::agent_run_request_v4();
+    let request = v5_request();
     let run_id = request.run_id.clone();
     let signal = NeverCancelled;
     let deadline = Deadline::after(Instant::now(), Duration::from_secs(5)).unwrap();
@@ -195,7 +205,7 @@ async fn concrete_runner_composes_v4_once_and_maps_run_id_tools_usage_and_model(
         result,
         ModelRunResult {
             protocol: mineintent_contracts::agent::AgentRunProtocol::V1,
-            model: mineintent_contracts::agent::ModelName::new("model-v4").unwrap(),
+            model: mineintent_contracts::agent::ModelName::new("model-v5").unwrap(),
             usage: Some(ModelUsage {
                 input_tokens: Some(42),
                 output_tokens: Some(13),
@@ -218,6 +228,31 @@ async fn concrete_runner_composes_v4_once_and_maps_run_id_tools_usage_and_model(
         .unwrap()
         .contains("## 你记得的事\n玩家怕高"));
     assert_eq!(requests[0].messages[1]["role"], "user");
+    let opening_frame: Value =
+        serde_json::from_str(requests[0].messages[1]["content"].as_str().unwrap())
+            .expect("first model request must receive a JSON v5 frame");
+    assert_eq!(
+        opening_frame,
+        serde_json::to_value(&request.context.frame).unwrap()
+    );
+    assert_eq!(opening_frame["light"], 12);
+    assert_eq!(
+        opening_frame["hotbar"]["slots"]["0"],
+        json!(["oak_log", 12])
+    );
+    assert_eq!(opening_frame["chat"]["items"][1]["moved"], "events");
+    assert_eq!(opening_frame["events"][0]["type"], "player_chat");
+    assert_eq!(opening_frame["events"][0]["username"], "alice");
+    assert_eq!(opening_frame["events"][0]["text"], "帮我看看农田");
+    for forbidden in [
+        "player",
+        "self",
+        "inventory",
+        "timeOfDay",
+        "standingOnBlock",
+    ] {
+        assert!(opening_frame.get(forbidden).is_none(), "{forbidden}");
+    }
     assert_eq!(requests[1].messages[0], requests[0].messages[0]);
     assert_eq!(requests[1].messages[1], requests[0].messages[1]);
     assert_eq!(requests[1].messages[2]["reasoning_content"], "inspect");
@@ -255,10 +290,7 @@ async fn closing_is_not_player_text_tool_output_or_model_result_content() {
     let signal = NeverCancelled;
     let deadline = Deadline::after(Instant::now(), Duration::from_secs(5)).unwrap();
     let result = runner
-        .run(
-            fixtures::agent_run_request_v4(),
-            ExecutionControl::new(&signal, deadline),
-        )
+        .run(v5_request(), ExecutionControl::new(&signal, deadline))
         .await
         .expect("closing is a normal transcript candidate");
 
@@ -286,7 +318,7 @@ async fn closing_is_not_player_text_tool_output_or_model_result_content() {
 async fn unknown_prompt_key_or_version_fails_closed_before_provider() {
     let provider = RecordingProvider::new(Vec::new());
     let runner = runner(provider, RecordingDispatcher::default());
-    let mut request = fixtures::agent_run_request_v4();
+    let mut request = v5_request();
     request.prompt_template.version = PromptTemplateVersion::new("v9").unwrap();
     let signal = NeverCancelled;
     let deadline = Deadline::after(Instant::now(), Duration::from_secs(5)).unwrap();
@@ -335,7 +367,7 @@ async fn concrete_runner_records_successful_replay_and_wire_usage() {
         mineintent_contracts::agent::ModelName::new("explicit-model").unwrap(),
         sink.clone(),
     );
-    let request = fixtures::agent_run_request_v4();
+    let request = v5_request();
     let signal = NeverCancelled;
     let deadline = Deadline::after(Instant::now(), Duration::from_secs(5)).unwrap();
 
@@ -391,10 +423,7 @@ async fn provider_failure_is_recorded_without_replacing_the_original_error() {
     let signal = NeverCancelled;
     let deadline = Deadline::after(Instant::now(), Duration::from_secs(5)).unwrap();
     let error = runner
-        .run(
-            fixtures::agent_run_request_v4(),
-            ExecutionControl::new(&signal, deadline),
-        )
+        .run(v5_request(), ExecutionControl::new(&signal, deadline))
         .await
         .expect_err("provider failure must remain an error");
 
@@ -428,10 +457,7 @@ async fn transcript_sink_errors_and_panics_are_fail_open() {
         let signal = NeverCancelled;
         let deadline = Deadline::after(Instant::now(), Duration::from_secs(5)).unwrap();
         let result = runner
-            .run(
-                fixtures::agent_run_request_v4(),
-                ExecutionControl::new(&signal, deadline),
-            )
+            .run(v5_request(), ExecutionControl::new(&signal, deadline))
             .await;
         assert!(
             result.is_ok(),
@@ -449,7 +475,7 @@ async fn validation_failure_does_not_create_a_transcript_record() {
         mineintent_contracts::agent::ModelName::new("explicit-model").unwrap(),
         sink.clone(),
     );
-    let mut request = fixtures::agent_run_request_v4();
+    let mut request = v5_request();
     request.tools = vec![fixtures::tool_definition(); 33];
     let signal = NeverCancelled;
     let deadline = Deadline::after(Instant::now(), Duration::from_secs(5)).unwrap();
