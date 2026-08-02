@@ -8,3 +8,4 @@ pub mod execution;
 pub mod information;
 pub mod memory;
 pub mod speech;
+pub mod telemetry;
