@@ -380,3 +380,19 @@
 - 维护侧 mutation 1：临时绕过手写 `Serialize` 的 validate，33-tool serialization 断言按预期失败；已恢复。
 - 维护侧 mutation 2：临时让 checked-add 溢出回退到 `now`，`Duration::MAX` 回归按预期失败；已恢复。
 - `cargo test -p mineintent-contracts --all-targets --locked --offline`：通过（agent 16、capability 8、Minecraft 26、Information 17）。
+
+## 2026-08-02｜AgentRunner 首批纯循环骨架
+
+### 实现边界
+
+- 按 `supplies/simple-agent` 的可步进 `AgentRun` 形状，在 `crates/middle/src/agent` 增加无 I/O 状态机；初始模型消息由后续 composer 注入，因此本批没有猜测 `agent-context v4` 的单文本 memory 字段名，也没有改 context v3 wire。
+- 固定 16 次模型请求、每响应 8 个 tool-call、每 run 32 个 tool-call；finish reason 只接受 `stop/tool_calls/function_call` 以及未报告/null。
+- 整批 tool-call ID 在任何 dispatch 计划暴露前完成形状校验和 run-wide 一次性 claim；name/arguments 无效时生成本地 failed 结果，不触发 dispatcher。结果批次要求数量、ID 与输入顺序严格 N 进 N 出。
+- assistant replay 保留 `reasoning_content`/tool-call ID；tool result 只向模型回放 `{result, observationAfter}`；跨轮四类 usage 计数使用 checked sum。
+
+### Oracle 映射、验证与延后项
+
+- 9 条 Rust 回归覆盖 Python 的 reasoning/ID replay、稳定初始前缀、整批 claim、无效调用本地失败、同轮数组顺序、finish-reason allowlist、8/32/16 三层上限及 JavaScript safe-integer arguments。
+- mutation：分别把每响应上限改为 9、移除 run-wide seen-ID 检查、移除结果顺序检查，对应测试均按预期失败；已全部恢复。
+- `cargo test -p mineintent-middle --all-targets --locked --offline`、middle all-target check、nightly/stable fmt 与 `git diff --check` 均通过。
+- 本批不宣称完整 `AgentRunner`：同一 deadline 的 async 驱动、`ToolDispatcher` 顺序执行与逐调用 panic 围栏、closing leak guard、transcript v1、外部 prompt/composer、context v4/MemoryStore 接线仍待后续批次。
