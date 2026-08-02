@@ -32,7 +32,7 @@ use mineintent_contracts::minecraft::{
     BackendEventEnvelope as ContractBackendEventEnvelope,
     BackendEventKind as ContractBackendEventKind,
     BackendEventMetadata as ContractBackendEventMetadata, BackendEventPayload, BackendFailure,
-    BackendFailureCode, BackendKick, BackendLifecyclePayload,
+    BackendFailureCode, BackendKick, BackendLifecyclePayload, BackendState,
     BlockBoundingBox as ContractBlockBoundingBox, BlockPosition as ContractBlockPosition,
     BlockReadResult as ContractBlockReadResult, BoxFuture, ChatPosition, DirectedViewportError,
     DirectedViewportProjection, EntityEquipmentSnapshot as ContractEntityEquipmentSnapshot,
@@ -80,6 +80,13 @@ pub struct RunConfig {
     pub duration: Duration,
     pub reconnect_delay: Duration,
     pub reconnect_enabled: bool,
+    /// The diagnostic CLI uses a finite duration; a composition root owns the
+    /// backend lifecycle and disables this timer for a production facade.
+    pub auto_stop: bool,
+    /// The diagnostic CLI exposes the event stream on stdout.  In-process
+    /// composition roots consume the same events through `subscribe` and keep
+    /// this boundary silent.
+    pub emit_stdout: bool,
     /// 仅用于本地验收 M2；正式集成通过 `RuntimeHandle::send_chat`。
     pub initial_chat: Option<String>,
 }
@@ -99,6 +106,8 @@ impl Default for RunConfig {
             duration: Duration::from_secs(30),
             reconnect_delay: Duration::from_secs(5),
             reconnect_enabled: true,
+            auto_stop: true,
+            emit_stdout: true,
             initial_chat: None,
         }
     }
@@ -148,11 +157,20 @@ impl EventWriter {
     }
 
     fn emit(&mut self, source: FactSource, payload: BackendEventPayload) -> BackendEventEnvelope {
+        self.emit_at(source, payload, now_utc().to_rfc3339())
+    }
+
+    fn emit_at(
+        &mut self,
+        source: FactSource,
+        payload: BackendEventPayload,
+        occurred_at: String,
+    ) -> BackendEventEnvelope {
         self.next_id += 1;
         BackendEventEnvelope::from_payload(
             mineintent_contracts::minecraft::BackendEventMetadata {
                 id: format!("event-{}", self.next_id),
-                occurred_at: now_utc().to_rfc3339(),
+                occurred_at,
                 process_session_id: self.process_session_id.clone(),
                 connection_epoch: self.connection_epoch,
                 connection_attempt_id: self.connection_attempt_id.clone(),
@@ -361,6 +379,9 @@ struct SharedRuntime {
     observation_subscribers: parking_lot::Mutex<Vec<ObservationSubscriber>>,
     next_observation_subscription_id: AtomicU64,
     observation: parking_lot::RwLock<ObservationState>,
+    /// Authoritative runtime lifecycle state.  The facade reads this value;
+    /// it does not reconstruct a second lifecycle machine from callbacks.
+    backend_state: parking_lot::RwLock<BackendState>,
     reported_dimension: parking_lot::Mutex<Option<String>>,
     snapshot_revision: AtomicU64,
     viewport_revision: AtomicU64,
@@ -422,6 +443,7 @@ impl SharedRuntime {
             observation_subscribers: parking_lot::Mutex::new(Vec::new()),
             next_observation_subscription_id: AtomicU64::new(0),
             observation: parking_lot::RwLock::new(ObservationState::default()),
+            backend_state: parking_lot::RwLock::new(BackendState::Idle),
             reported_dimension: parking_lot::Mutex::new(None),
             snapshot_revision: AtomicU64::new(0),
             viewport_revision: AtomicU64::new(0),
@@ -463,9 +485,35 @@ impl SharedRuntime {
         }
     }
 
+    fn set_backend_state(&self, state: BackendState) {
+        *self.backend_state.write() = state;
+    }
+
+    fn backend_state(&self) -> BackendState {
+        self.backend_state.read().clone()
+    }
+
+    fn connection_identity(&self) -> (u64, String, u32) {
+        let writer = self.writer.lock();
+        (
+            writer.connection_epoch,
+            writer.connection_attempt_id.clone(),
+            u32::try_from(writer.connection_epoch).unwrap_or(u32::MAX),
+        )
+    }
+
     /// Construct and enqueue one event. The caller may hold command admission,
     /// but this function never drains the queue or invokes a subscriber.
     fn enqueue_event(&self, source: FactSource, payload: BackendEventPayload) -> bool {
+        self.enqueue_event_at(source, payload, now_utc().to_rfc3339())
+    }
+
+    fn enqueue_event_at(
+        &self,
+        source: FactSource,
+        payload: BackendEventPayload,
+        occurred_at: String,
+    ) -> bool {
         let kind = payload.kind();
         if matches!(kind, BackendEventKind::Lifecycle) {
             self.lifecycle_revision.fetch_add(1, Ordering::AcqRel);
@@ -473,7 +521,7 @@ impl SharedRuntime {
         let mut dispatch = self.event_dispatch.lock();
         let event = {
             let mut writer = self.writer.lock();
-            writer.emit(source, payload)
+            writer.emit_at(source, payload, occurred_at)
         };
         dispatch.enqueue(event)
     }
@@ -537,10 +585,14 @@ impl SharedRuntime {
     }
 
     fn broadcast_event(&self, event: BackendEventEnvelope) {
-        // stdout 是跨进程事件流边界；唯一 drainer 保证打印顺序与入队顺序一致。
-        match serde_json::to_string(&event) {
-            Ok(line) => println!("{line}"),
-            Err(error) => eprintln!("事件编码失败：{error}"),
+        // stdout is only the diagnostic process boundary.  The production
+        // facade consumes the same FIFO through `subscribe` and explicitly
+        // disables this side effect.
+        if self.config.emit_stdout {
+            match serde_json::to_string(&event) {
+                Ok(line) => println!("{line}"),
+                Err(error) => eprintln!("事件编码失败：{error}"),
+            }
         }
         {
             let mut subscribers = self.subscribers.lock();
@@ -636,17 +688,29 @@ impl SharedRuntime {
         self.lifecycle_revision.fetch_add(1, Ordering::AcqRel);
 
         let mut dispatch = self.event_dispatch.lock();
-        let event = {
+        let (event, epoch, attempt_id, attempt) = {
             let mut writer = self.writer.lock();
             writer.new_attempt();
-            let attempt = writer.connection_epoch;
-            writer.emit(
-                FactSource::Commanded,
-                BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionRequested {
-                    attempt: attempt as u32,
-                }),
+            let epoch = writer.connection_epoch;
+            let attempt_id = writer.connection_attempt_id.clone();
+            let attempt = u32::try_from(epoch).unwrap_or(u32::MAX);
+            (
+                writer.emit(
+                    FactSource::Commanded,
+                    BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionRequested {
+                        attempt,
+                    }),
+                ),
+                epoch,
+                attempt_id,
+                attempt,
             )
         };
+        self.set_backend_state(BackendState::Connecting {
+            epoch,
+            attempt_id,
+            attempt,
+        });
         Some(dispatch.enqueue(event))
     }
 
@@ -921,10 +985,25 @@ impl SharedRuntime {
     }
 
     fn emit_transport_connected(&self) {
-        self.emit_if_running(
-            FactSource::ServerObserved,
-            BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected),
-        );
+        let should_drain = {
+            let _admission = self.command_admission.lock();
+            if !self.command_execution_allowed_without_lock() {
+                return;
+            }
+            let (epoch, attempt_id, attempt) = self.connection_identity();
+            self.set_backend_state(BackendState::LoggingIn {
+                epoch,
+                attempt_id,
+                attempt,
+            });
+            self.enqueue_event(
+                FactSource::ServerObserved,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected),
+            )
+        };
+        if should_drain {
+            self.drain_events();
+        }
     }
 
     fn emit_logged_in(&self, version: impl Into<String>, dimension: String) {
@@ -935,6 +1014,12 @@ impl SharedRuntime {
                 return;
             }
             self.set_dimension(dimension.clone());
+            let (epoch, attempt_id, attempt) = self.connection_identity();
+            self.set_backend_state(BackendState::Spawning {
+                epoch,
+                attempt_id,
+                attempt,
+            });
             self.enqueue_event(
                 FactSource::ServerObserved,
                 BackendEventPayload::Lifecycle(BackendLifecyclePayload::LoggedIn {
@@ -955,11 +1040,19 @@ impl SharedRuntime {
                 return;
             }
             self.ready.store(true, Ordering::Release);
-            self.enqueue_event(
+            let (epoch, attempt_id, _) = self.connection_identity();
+            let ready_at = now_utc().to_rfc3339();
+            self.set_backend_state(BackendState::Ready {
+                epoch,
+                attempt_id,
+                ready_at: ready_at.clone(),
+            });
+            self.enqueue_event_at(
                 FactSource::ServerObserved,
                 BackendEventPayload::Lifecycle(BackendLifecyclePayload::Ready {
                     snapshot_revision,
                 }),
+                ready_at,
             )
         };
         if should_drain {
@@ -977,9 +1070,17 @@ impl SharedRuntime {
                 return false;
             }
             self.ready.store(false, Ordering::Release);
-            self.enqueue_event(
+            let (epoch, attempt_id, _) = self.connection_identity();
+            let died_at = now_utc().to_rfc3339();
+            self.set_backend_state(BackendState::Dead {
+                epoch,
+                attempt_id,
+                died_at: died_at.clone(),
+            });
+            self.enqueue_event_at(
                 FactSource::ServerObserved,
                 BackendEventPayload::Lifecycle(BackendLifecyclePayload::Died),
+                died_at,
             )
         };
         if should_drain {
@@ -1001,6 +1102,13 @@ impl SharedRuntime {
                 return None;
             }
             self.ready.store(false, Ordering::Release);
+            let (epoch, attempt_id, _) = self.connection_identity();
+            let died_at = now_utc().to_rfc3339();
+            self.set_backend_state(BackendState::Dead {
+                epoch,
+                attempt_id,
+                died_at: died_at.clone(),
+            });
 
             let movement_id = self.active_movement_id.lock().clone();
             let had_movement = movement_id.is_some()
@@ -1039,9 +1147,10 @@ impl SharedRuntime {
                     },
                 );
             }
-            let should_drain = self.enqueue_event(
+            let should_drain = self.enqueue_event_at(
                 FactSource::ServerObserved,
                 BackendEventPayload::Lifecycle(BackendLifecyclePayload::Died),
+                died_at,
             );
             (released, should_drain)
         };
@@ -1229,6 +1338,9 @@ impl SharedRuntime {
             {
                 return false;
             }
+            self.set_backend_state(BackendState::Faulted {
+                failure: failure.clone(),
+            });
             self.enqueue_event(
                 FactSource::ServerObserved,
                 BackendEventPayload::Lifecycle(BackendLifecyclePayload::Faulted { failure }),
@@ -1242,19 +1354,26 @@ impl SharedRuntime {
 
     fn emit_reconnect_scheduled(&self, close: &BackendClose) -> Option<Duration> {
         let delay = self.config.reconnect_delay;
+        let retry_at = (now_utc()
+            + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::zero()))
+        .to_rfc3339();
         let should_drain = {
             let _admission = self.command_admission.lock();
             if !self.lifecycle_event_allowed_without_lock() {
                 return None;
             }
+            let attempt =
+                u32::try_from(self.connection_epoch().saturating_add(1)).unwrap_or(u32::MAX);
+            self.set_backend_state(BackendState::Reconnecting {
+                attempt,
+                retry_at: retry_at.clone(),
+                last_close: close.clone(),
+            });
             self.enqueue_event(
                 FactSource::ClientPredicted,
                 BackendEventPayload::Lifecycle(BackendLifecyclePayload::ReconnectScheduled {
-                    attempt: self.connection_epoch() as u32 + 1,
-                    retry_at: (now_utc()
-                        + chrono::Duration::from_std(delay)
-                            .unwrap_or_else(|_| chrono::Duration::zero()))
-                    .to_rfc3339(),
+                    attempt,
+                    retry_at,
                     close_code: close.code.clone(),
                 }),
             )
@@ -1420,6 +1539,9 @@ impl SharedRuntime {
             if self.stopped_reported.swap(true, Ordering::AcqRel) {
                 return;
             }
+            self.set_backend_state(BackendState::Stopped {
+                reason: Some(reason.clone()),
+            });
             let should_drain = self.enqueue_event(
                 FactSource::Commanded,
                 BackendEventPayload::Lifecycle(BackendLifecyclePayload::Stopped {
@@ -1771,7 +1893,13 @@ impl SharedRuntime {
             if self.stopping.swap(true, Ordering::AcqRel) {
                 return;
             }
-            *self.stop_reason.lock() = Some(reason.to_owned());
+            let reason = reason.to_owned();
+            *self.stop_reason.lock() = Some(reason.clone());
+            let epoch = self.connection_epoch();
+            self.set_backend_state(BackendState::Stopping {
+                epoch: (epoch != 0).then_some(epoch),
+                reason,
+            });
             self.reconnect_add_pending.store(false, Ordering::Release);
             self.reconnect_attempt_token.fetch_add(1, Ordering::AcqRel);
             self.reconnect_pending.store(false, Ordering::Release);
@@ -1800,6 +1928,21 @@ impl RuntimeHandle {
         Self {
             shared: Arc::new(SharedRuntime::new(config)),
         }
+    }
+
+    /// Read the lifecycle state owned by the real runtime admission paths.
+    /// Facades should delegate to this value instead of maintaining a second
+    /// state machine from a best-effort event subscription.
+    pub fn state(&self) -> BackendState {
+        self.shared.backend_state()
+    }
+
+    /// Return the epoch owned by the runtime admission state.  Facade-owned
+    /// observation and motor handles use this value to reject a handle from a
+    /// previous connection attempt before delegating to the concrete runtime
+    /// seam.
+    pub fn connection_epoch(&self) -> u64 {
+        self.shared.connection_epoch()
     }
 
     pub fn snapshot(&self) -> Option<MinecraftSnapshotV1> {
@@ -1915,6 +2058,54 @@ impl RuntimeHandle {
     /// 主动结束运行时；停止动作本身会写入 `commanded` 事件。
     pub fn stop(&self, reason: &str) {
         self.shared.initiate_stop(reason);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_drive_event(&self, source: FactSource, payload: BackendEventPayload) {
+        match payload.clone() {
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected) => {
+                self.shared.emit_transport_connected();
+            }
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::LoggedIn {
+                version,
+                dimension,
+            }) => {
+                self.shared.emit_logged_in(version, dimension);
+            }
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::Ready {
+                snapshot_revision,
+            }) => {
+                self.shared.emit_ready(snapshot_revision);
+            }
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::Faulted { failure }) => {
+                self.shared.emit_faulted(failure);
+            }
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::Stopped { ref reason }) => {
+                self.shared.initiate_stop(reason);
+            }
+            _ => self.shared.emit(source, payload),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_settle_next_command(&self, result: Result<(), BackendError>) -> bool {
+        while let Some(command) = self.shared.pop_command() {
+            if command
+                .completion
+                .as_ref()
+                .is_some_and(|completion| completion.cancelled.load(Ordering::Acquire))
+            {
+                continue;
+            }
+            finish_command(&command.completion, result);
+            return true;
+        }
+        false
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_has_pending_command(&self) -> bool {
+        !self.shared.commands.lock().is_empty()
     }
 }
 
@@ -2760,6 +2951,12 @@ fn observation_event_from_backend(event: &BackendEventEnvelope) -> Option<Observ
 
 struct CommandCompletionState {
     sender: parking_lot::Mutex<Option<oneshot::Sender<Result<(), BackendError>>>>,
+    settled_result: parking_lot::Mutex<Option<Result<(), BackendError>>>,
+    settled_cv: parking_lot::Condvar,
+    /// Owns the single finishing transition. `settled` is published only
+    /// after result, physical-release bookkeeping, and the oneshot have all
+    /// been published under this ownership.
+    finish_lock: parking_lot::Mutex<()>,
     cancelled: AtomicBool,
     active_release: AtomicBool,
     release_on_cancel: AtomicBool,
@@ -2770,13 +2967,20 @@ struct CommandCompletionState {
 
 impl CommandCompletionState {
     fn finish(&self, result: Result<(), BackendError>) {
-        if self.settled.swap(true, Ordering::AcqRel) {
+        let _finish = self.finish_lock.lock();
+        if self.settled.load(Ordering::Acquire) {
             return;
         }
+        *self.settled_result.lock() = Some(result.clone());
         self.active_release.store(false, Ordering::Release);
         if let Some(sender) = self.sender.lock().take() {
             let _ = sender.send(result);
         }
+        // This is deliberately the last publication in the finishing
+        // transition. Waiters that observe `settled` therefore also observe
+        // the result and the completed physical-release bookkeeping.
+        self.settled.store(true, Ordering::Release);
+        self.settled_cv.notify_all();
         self.settled_signal.notify_one();
     }
 
@@ -2833,6 +3037,9 @@ impl CommandCompletion {
         let (sender, receiver) = oneshot::channel();
         let state = Arc::new(CommandCompletionState {
             sender: parking_lot::Mutex::new(Some(sender)),
+            settled_result: parking_lot::Mutex::new(None),
+            settled_cv: parking_lot::Condvar::new(),
+            finish_lock: parking_lot::Mutex::new(()),
             cancelled: AtomicBool::new(false),
             active_release: AtomicBool::new(false),
             release_on_cancel: AtomicBool::new(false),
@@ -2865,6 +3072,39 @@ impl CommandCompletion {
             Err(_) => Err(BackendError::Cancelled {
                 operation: format!("command:{}", self.command_id),
             }),
+        }
+    }
+
+    /// Synchronous companion used by the frozen `release_all` facade method.
+    /// The condition variable is independent of Tokio, so this remains safe
+    /// to call from a caller that happens to be inside another async runtime.
+    pub(crate) fn wait_blocking(self) -> Result<(), BackendError> {
+        let mut result = self.state.settled_result.lock();
+        while result.is_none() {
+            self.state.settled_cv.wait(&mut result);
+        }
+        result
+            .take()
+            .expect("settled result exists after completion wait")
+    }
+
+    pub(crate) fn cancellation_handle(&self) -> CommandCompletionCancellation {
+        CommandCompletionCancellation(self.state.clone())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CommandCompletionCancellation(Arc<CommandCompletionState>);
+
+impl CommandCompletionCancellation {
+    pub(crate) fn cancel(&self) {
+        self.0
+            .cancel("command completion cancelled by caller".to_owned(), true);
+    }
+
+    pub(crate) async fn wait_settled(&self) {
+        while !self.0.settled.load(Ordering::Acquire) {
+            self.0.settled_signal.notified().await;
         }
     }
 }
@@ -3648,7 +3888,7 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                 shared.command_execution_allowed_without_lock()
                     && !shared.timer_started.swap(true, Ordering::AcqRel)
             };
-            if start_timer {
+            if start_timer && shared.config.auto_stop {
                 let duration = shared.config.duration;
                 let shared = state.shared.clone();
                 tokio::task::spawn_local(async move {
@@ -4749,6 +4989,28 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_state_timestamps_match_the_strict_v2_lifecycle_facts() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        handle.shared.begin_connection_attempt();
+        let _request = events.try_recv().expect("connection request");
+
+        handle.shared.emit_ready(7);
+        let ready_event = events.try_recv().expect("ready event");
+        let BackendState::Ready { ready_at, .. } = handle.state() else {
+            panic!("ready state should be visible after ready admission");
+        };
+        assert_eq!(ready_at, ready_event.occurred_at);
+
+        handle.shared.emit_died();
+        let died_event = events.try_recv().expect("died event");
+        let BackendState::Dead { died_at, .. } = handle.state() else {
+            panic!("dead state should be visible after death admission");
+        };
+        assert_eq!(died_at, died_event.occurred_at);
+    }
+
+    #[test]
     fn stopped_runtime_rejects_late_attempt_and_ready_without_resurrection() {
         let handle = RuntimeHandle::new(RunConfig::default());
         let mut events = handle.subscribe();
@@ -5363,6 +5625,38 @@ mod tests {
             }),
         );
         assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn command_completion_settled_signal_waits_for_release_and_result_publication() {
+        for _ in 0..64 {
+            let (completion, state) = CommandCompletion::channel("settlement-race".to_owned());
+            state.begin_active_release(Arc::new(Notify::new()));
+            let barrier = Arc::new(Barrier::new(2));
+            let waiter_state = state.clone();
+            let observed_state = waiter_state.clone();
+            let waiter_barrier = barrier.clone();
+            let waiter = thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("settlement waiter runtime");
+                runtime.block_on(async move {
+                    waiter_barrier.wait();
+                    CommandCompletionCancellation(waiter_state.clone())
+                        .wait_settled()
+                        .await;
+                });
+                assert!(!observed_state.active_release.load(Ordering::Acquire));
+                assert!(observed_state.settled_result.lock().is_some());
+            });
+            barrier.wait();
+            state.finish(Ok(()));
+            waiter
+                .join()
+                .expect("settlement waiter should not race early");
+            assert_eq!(completion.wait_blocking(), Ok(()));
+        }
     }
 
     #[tokio::test]
