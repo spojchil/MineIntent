@@ -578,8 +578,12 @@ fn oracle_perception_maps_current_pose_revision_blocks_and_self_entity_key() {
 }
 
 #[test]
-fn perception_unavailable_and_nonfinite_inputs_fail_without_out_of_world_identity() {
+fn perception_snapshot_unavailable_keeps_ts_nearby_fallback_and_rejects_nonfinite_inputs() {
     let source = FakeObservationSource::new();
+    *lock_recover(&source.entities) = vec![
+        entity("self:1", Some("MineFixture")),
+        entity("2:alex", Some("alex")),
+    ];
     lock_recover(&source.blocks).insert(
         BlockPosition { x: 0, y: 70, z: 0 },
         BlockReadResult::OutOfWorld,
@@ -621,10 +625,10 @@ fn perception_unavailable_and_nonfinite_inputs_fail_without_out_of_world_identit
     .is_err());
 
     backend.set_snapshot(Err(not_ready()));
-    assert!(catch_unwind(AssertUnwindSafe(|| {
-        perception.nearby_entities();
-    }))
-    .is_err());
+    let fallback_nearby = perception.nearby_entities();
+    assert_eq!(fallback_nearby.len(), 2);
+    assert_eq!(fallback_nearby[0].username.as_deref(), Some("MineFixture"));
+    assert_eq!(fallback_nearby[1].username.as_deref(), Some("alex"));
 
     backend.set_snapshot(Ok(snapshot()));
     lock_recover(&source.pose).yaw = f64::NAN;
