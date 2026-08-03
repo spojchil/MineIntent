@@ -8,7 +8,7 @@
 | 运行当前代码 | [运行指南](./guides/run.md) |
 | 检查、测试或验证 | [验证指南](./guides/validation.md) |
 | 理解当前实现 | [当前实现结构](./architecture.md)，再阅读其中链接的代码产生方 |
-| 追溯历史 | [历史来源与旧路径迁移表](./history/index.md)，再进入不可变 commit、Issue 或 PR |
+| 查找历史研究、架构或算法资产 | [历史技术资产、来源与旧路径](./history/index.md)，再进入不可变 commit、Issue 或 PR |
 | 准备贡献 | [贡献流程](../CONTRIBUTING.md) |
 
 ## 文件权威等级
@@ -20,7 +20,7 @@
 | [`docs/architecture.md`](./architecture.md) | 绑定到指定版本的当前实现说明 | 无 |
 | [`docs/guides/run.md`](./guides/run.md) | 安装、配置、运行和排障 | 无 |
 | [`docs/guides/validation.md`](./guides/validation.md) | 检查、测试和验证边界 | 无 |
-| [`docs/history/index.md`](./history/index.md) | 历史证据和旧路径导航 | 无 |
+| [`docs/history/index.md`](./history/index.md) | 历史技术资产、证据和旧路径导航 | 无 |
 | [`README.md`](../README.md) | 项目导航和最短启动 | 无 |
 | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | 人类贡献工作流 | 无 |
 | [`CLAUDE.md`](../CLAUDE.md) | 开发代理工作规则 | 无 |

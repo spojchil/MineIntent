@@ -12,7 +12,7 @@ MineIntent 是一个把 AI 接入 Minecraft Java Edition 世界的实验项目�
 | 运行检查或 Paper 集成验证 | [验证指南](./docs/guides/validation.md) |
 | 理解当前代码如何组成 | [当前实现结构](./docs/architecture.md) |
 | 贡献代码或文档 | [贡献流程](./CONTRIBUTING.md) |
-| 追溯历史判断和旧文档 | [历史来源与旧路径](./docs/history/index.md) |
+| 查找历史研究、架构、算法和旧文档 | [历史技术资产、来源与旧路径](./docs/history/index.md) |
 | 查看完整文档地图和权威等级 | [文档入口](./docs/README.md) |
 
 ## 最短启动
