@@ -19,6 +19,18 @@ pub struct BackendReady {
     pub snapshot: MinecraftSnapshotV1,
 }
 
+/// One coherent backend observation used to assemble a frame.
+///
+/// This is deliberately an in-process DTO rather than a wire type.  The
+/// snapshot keeps the frozen `MinecraftSnapshotV1` schema; armor and light
+/// are optional facts supplied by the backend's observation seam.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MinecraftFrameFacts {
+    pub snapshot: MinecraftSnapshotV1,
+    pub armor: Option<u8>,
+    pub light: Option<u8>,
+}
+
 /// 逐调用取消抽象；具体 token、线程或 executor 不属于 contracts。
 pub trait CancellationSignal: Send + Sync {
     fn is_cancelled(&self) -> bool;
@@ -239,6 +251,16 @@ pub trait MinecraftBackendApi: Send + Sync {
     ) -> BoxFuture<'_, Result<(), BackendError>>;
     fn state(&self) -> BackendState;
     fn snapshot(&self) -> Result<MinecraftSnapshotV1, BackendError>;
+    /// Capture the snapshot and frame-only self facts from one backend
+    /// observation.  Existing implementations remain snapshot-only until
+    /// they opt into the atomic seam.
+    fn capture_frame_facts(&self) -> Result<MinecraftFrameFacts, BackendError> {
+        Ok(MinecraftFrameFacts {
+            snapshot: self.snapshot()?,
+            armor: None,
+            light: None,
+        })
+    }
     fn subscribe(
         &self,
         listener: Arc<dyn BackendEventListener>,
@@ -246,4 +268,75 @@ pub trait MinecraftBackendApi: Send + Sync {
     fn observation_source(&self) -> Result<Arc<dyn ProtocolObservationSource>, BackendError>;
     fn motor(&self) -> Result<Arc<dyn MinecraftMotorDriverApi>, BackendError>;
     fn send_chat(&self, message: String) -> Result<(), BackendError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct SnapshotOnlyBackend(MinecraftSnapshotV1);
+
+    impl MinecraftBackendApi for SnapshotOnlyBackend {
+        fn start(
+            &self,
+            _control: OperationControl,
+        ) -> BoxFuture<'_, Result<BackendReady, BackendError>> {
+            Box::pin(async {
+                Err(BackendError::NotReady {
+                    state: "test".to_owned(),
+                })
+            })
+        }
+
+        fn stop(
+            &self,
+            _reason: String,
+            _control: OperationControl,
+        ) -> BoxFuture<'_, Result<(), BackendError>> {
+            Box::pin(async {
+                Err(BackendError::NotReady {
+                    state: "test".to_owned(),
+                })
+            })
+        }
+
+        fn state(&self) -> BackendState {
+            BackendState::Idle
+        }
+
+        fn snapshot(&self) -> Result<MinecraftSnapshotV1, BackendError> {
+            Ok(self.0.clone())
+        }
+
+        fn subscribe(
+            &self,
+            _listener: Arc<dyn BackendEventListener>,
+        ) -> Result<Box<dyn Subscription>, BackendError> {
+            panic!("not used by the default frame-facts test")
+        }
+
+        fn observation_source(&self) -> Result<Arc<dyn ProtocolObservationSource>, BackendError> {
+            panic!("not used by the default frame-facts test")
+        }
+
+        fn motor(&self) -> Result<Arc<dyn MinecraftMotorDriverApi>, BackendError> {
+            panic!("not used by the default frame-facts test")
+        }
+
+        fn send_chat(&self, _message: String) -> Result<(), BackendError> {
+            panic!("not used by the default frame-facts test")
+        }
+    }
+
+    #[test]
+    fn default_capture_frame_facts_is_snapshot_only() {
+        let snapshot = crate::minecraft::fixture_snapshot();
+        let facts = SnapshotOnlyBackend(snapshot.clone())
+            .capture_frame_facts()
+            .expect("default frame-facts seam should delegate to snapshot");
+
+        assert_eq!(facts.snapshot, snapshot);
+        assert_eq!(facts.armor, None);
+        assert_eq!(facts.light, None);
+    }
 }

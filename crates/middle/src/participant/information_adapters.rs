@@ -390,6 +390,38 @@ impl SoundHistory {
             let _ = catch_unwind(AssertUnwindSafe(|| subscription.unsubscribe()));
         }
     }
+
+    /// Reads the already-recorded B5 sound bundle for an explicitly supplied
+    /// backend scope.  Participant frame capture passes the scope from the
+    /// same atomic `MinecraftFrameFacts` DTO, so this path never performs a
+    /// second backend snapshot.
+    pub fn recent_for_scope(
+        &self,
+        process_session_id: &str,
+        connection_epoch: u64,
+        world_id: &str,
+        dimension: Option<&str>,
+        limit: f64,
+    ) -> Vec<SoundObservation> {
+        let limit = recent_limit(limit);
+        if limit == 0 {
+            return Vec::new();
+        }
+        let state = lock_recover(&self.inner.state);
+        state
+            .entries
+            .iter()
+            .rev()
+            .filter(|entry| {
+                entry.process_session_id == process_session_id
+                    && entry.connection_epoch == connection_epoch
+                    && entry.world_id == world_id
+                    && (entry.dimension.is_none() || entry.dimension.as_deref() == dimension)
+            })
+            .take(limit)
+            .map(|entry| entry.observation.clone())
+            .collect()
+    }
 }
 
 impl Drop for SoundHistory {
@@ -404,25 +436,13 @@ impl SoundHistoryPort for SoundHistory {
             Ok(snapshot) => snapshot,
             Err(_) => return Vec::new(),
         };
-        let limit = recent_limit(limit);
-        if limit == 0 {
-            return Vec::new();
-        }
-        let state = lock_recover(&self.inner.state);
-        state
-            .entries
-            .iter()
-            .rev()
-            .filter(|entry| {
-                entry.process_session_id == snapshot.process_session_id
-                    && entry.connection_epoch == snapshot.connection_epoch
-                    && entry.world_id == snapshot.world.world_id
-                    && (entry.dimension.is_none()
-                        || entry.dimension.as_deref() == Some(snapshot.world.dimension.as_str()))
-            })
-            .take(limit)
-            .map(|entry| entry.observation.clone())
-            .collect()
+        self.recent_for_scope(
+            &snapshot.process_session_id,
+            snapshot.connection_epoch,
+            &snapshot.world.world_id,
+            Some(snapshot.world.dimension.as_str()),
+            limit,
+        )
     }
 
     fn revision(&self) -> f64 {

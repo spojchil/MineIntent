@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     error::Error,
     net::SocketAddr,
     sync::{
@@ -17,33 +17,38 @@ use azalea::{
     bot::DefaultBotPlugins,
     ecs::{
         message::{MessageReader, MessageWriter},
-        prelude::{Commands, On, Query, With},
+        prelude::{Add, Commands, On, Query, With},
         system::Res,
     },
-    entity::{Dead, LocalEntity, Physics, Position},
+    entity::{dimensions::EntityDimensions, Dead, LocalEntity, Physics, Position},
     prelude::{bevy_ecs, Account, Component, Resource},
     protocol::address::{ResolvedAddr, ServerAddr},
     swarm::{DefaultSwarmPlugins, Swarm, SwarmBuilder, SwarmEvent},
     Client, DefaultPlugins, Event, SprintDirection, WalkDirection,
 };
+use bevy_ecs::schedule::IntoScheduleConfigs;
 use mineintent_contracts::capability::validate_directed_positions;
 use mineintent_contracts::minecraft::{
     parse_block_property_value, BackendClose, BackendCloseError, BackendError,
     BackendEventEnvelope as ContractBackendEventEnvelope,
     BackendEventKind as ContractBackendEventKind,
     BackendEventMetadata as ContractBackendEventMetadata, BackendEventPayload, BackendFailure,
-    BackendFailureCode, BackendKick, BackendLifecyclePayload, BackendState,
+    BackendFailureCode, BackendKick, BackendLifecyclePayload, BackendState, BackendTimeouts,
     BlockBoundingBox as ContractBlockBoundingBox, BlockPosition as ContractBlockPosition,
     BlockReadResult as ContractBlockReadResult, BoxFuture, ChatPosition, DirectedViewportError,
     DirectedViewportProjection, EntityEquipmentSnapshot as ContractEntityEquipmentSnapshot,
-    FactSource as ContractFactSource, ObservationEvent, ObservationEventListener, OperationControl,
-    ProtocolBlockEvent as ContractProtocolBlockEvent,
+    EntityRemovalReason as ContractEntityRemovalReason, FactSource as ContractFactSource,
+    HeardSoundType as ContractHeardSoundType, ObservationEvent, ObservationEventListener,
+    OperationControl, ProtocolBlockEvent as ContractProtocolBlockEvent,
     ProtocolBlockSnapshot as ContractProtocolBlockSnapshot,
     ProtocolChatEvent as ContractProtocolChatEvent,
+    ProtocolEntityEvent as ContractProtocolEntityEvent,
     ProtocolEntitySnapshot as ContractProtocolEntitySnapshot, ProtocolObservationSource,
     ProtocolPlayerListEvent as ContractProtocolPlayerListEvent,
     ProtocolSelfEvent as ContractProtocolSelfEvent,
-    ProtocolSnapshotChangedEvent as ContractProtocolSnapshotChangedEvent, RelativeMovementFlags,
+    ProtocolSnapshotChangedEvent as ContractProtocolSnapshotChangedEvent,
+    ProtocolSoundPayload as ContractProtocolSoundPayload,
+    ProtocolSoundSource as ContractProtocolSoundSource, ReconnectPolicy, RelativeMovementFlags,
     SelfPose as ContractSelfPose, Subscription, Vec3Value as ContractVec3Value,
     ViewportBlock as ContractViewportBlock, ViewportFrame as ContractViewportFrame,
     ViewportLegend as ContractViewportLegend, ViewportProjection as ContractViewportProjection,
@@ -55,12 +60,17 @@ use mineintent_contracts::minecraft::{
 use tokio::sync::{oneshot, Notify};
 
 use crate::{
+    entity_events::{
+        compact_pitch_radians, compact_rotation_radians, EntityIdentity, EntityMovePatch,
+        EntityProducerCache, EntityProducerInput, EntityProducerToken, NormalizedEntityEvent,
+        NormalizedEntitySnapshot,
+    },
     protocol::{
         now_utc, BackendCommand, BackendCommandEnvelope, BackendEventEnvelope, BackendEventKind,
         FactSource, MotorDirection, BACKEND_COMMAND_PROTOCOL,
     },
     snapshot::{
-        block_snapshot, capture, capture_tracked_entities, BlockBoundingBox, BlockPosition,
+        block_snapshot, canonical_entity_type, capture, BlockBoundingBox, BlockPosition,
         BlockReadResult, MinecraftSnapshotV1, PoseSnapshot, ProtocolBlockSnapshot,
         ProtocolEntitySnapshot, TrackedPlayerSnapshot, Vec3Value,
     },
@@ -78,8 +88,10 @@ pub struct RunConfig {
     pub username: String,
     pub world_id: String,
     pub duration: Duration,
-    pub reconnect_delay: Duration,
-    pub reconnect_enabled: bool,
+    /// 传输阶段 deadline；与上层 `OperationControl` 的 deadline 相互独立。
+    pub timeouts: BackendTimeouts,
+    /// 传输级指数重连策略，字段与冻结 contracts DTO 一一对应。
+    pub reconnect: ReconnectPolicy,
     /// The diagnostic CLI uses a finite duration; a composition root owns the
     /// backend lifecycle and disables this timer for a production facade.
     pub auto_stop: bool,
@@ -104,11 +116,134 @@ impl Default for RunConfig {
             username: "MineIntentBot".to_owned(),
             world_id: "paper-local-world".to_owned(),
             duration: Duration::from_secs(30),
-            reconnect_delay: Duration::from_secs(5),
-            reconnect_enabled: true,
+            timeouts: BackendTimeouts {
+                connect_ms: 10_000,
+                login_ms: 20_000,
+                spawn_ms: 30_000,
+                stop_ms: 5_000,
+            },
+            reconnect: ReconnectPolicy {
+                enabled: true,
+                initial_delay_ms: 1_000,
+                multiplier: 2.0,
+                max_delay_ms: 30_000,
+                jitter_ratio: 0.2,
+                stable_reset_ms: 60_000,
+            },
             auto_stop: true,
             emit_stdout: true,
             initial_chat: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RetrySchedule {
+    delay: Duration,
+    retry_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransportPhase {
+    Connecting,
+    LoggingIn,
+    Spawning,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PhaseDeadlineToken {
+    epoch: u64,
+    attempt: u64,
+    phase: TransportPhase,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StableResetToken {
+    epoch: u64,
+    attempt: u64,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StopWatchdogToken {
+    generation: u64,
+}
+
+/// 计算 TS oracle 的重连退避。`attempt` 是当前已经开始的 retry ordinal，因而首次
+/// 重连使用 exponent 0。所有浮点中间值都在转入 `Duration` 前饱和，避免极大 multiplier
+/// 或 ordinal 造成 panic/wrap。
+fn reconnect_schedule_at(
+    policy: &ReconnectPolicy,
+    attempt: u64,
+    random: f64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> RetrySchedule {
+    let exponent = attempt.saturating_sub(1) as f64;
+    let initial = policy.initial_delay_ms as f64;
+    let maximum = policy.max_delay_ms as f64;
+    let grown = initial * policy.multiplier.powf(exponent);
+    let base = if !grown.is_finite() {
+        maximum
+    } else {
+        grown.min(maximum)
+    };
+    let random = if random.is_finite() {
+        random.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let jitter = (random * 2.0 - 1.0) * policy.jitter_ratio;
+    let adjusted = base * (1.0 + jitter);
+    let rounded = if !adjusted.is_finite() {
+        maximum
+    } else {
+        // All valid policy values make the intended quantity non-negative.
+        // Keep the guard explicit because this helper is also the runtime
+        // boundary for manually constructed RunConfig values.
+        (adjusted.max(0.0) + 0.5).floor()
+    };
+    let delay_ms = if !rounded.is_finite() || rounded >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        rounded as u64
+    };
+    let delay = Duration::from_millis(delay_ms);
+    let retry_at = retry_at_with_delay(now, delay_ms);
+    RetrySchedule { delay, retry_at }
+}
+
+fn retry_at_with_delay(
+    now: chrono::DateTime<chrono::Utc>,
+    delay_ms: u64,
+) -> chrono::DateTime<chrono::Utc> {
+    let chrono_ms = i64::try_from(delay_ms).unwrap_or(i64::MAX);
+    now.checked_add_signed(chrono::Duration::milliseconds(chrono_ms))
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+}
+
+fn next_reconnect_random(seed: &AtomicU64) -> f64 {
+    // A small local seam is sufficient for jitter; it avoids adding a new
+    // manifest dependency and can be replaced by a deterministic test seed.
+    let mut current = seed.load(Ordering::Relaxed);
+    loop {
+        let next = current
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        match seed.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return (next >> 11) as f64 / (1u64 << 53) as f64,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn checked_atomic_increment(counter: &AtomicU64) -> Option<u64> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = current.checked_add(1)?;
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(next),
+            Err(observed) => current = observed,
         }
     }
 }
@@ -138,9 +273,9 @@ impl EventWriter {
         }
     }
 
-    fn new_attempt(&mut self) {
-        self.connection_epoch += 1;
-        self.connection_attempt_id = format!("attempt-{}", self.connection_epoch);
+    fn new_attempt(&mut self, epoch: u64) {
+        self.connection_epoch = epoch;
+        self.connection_attempt_id = format!("attempt-{}", epoch);
         self.dimension = None;
     }
 
@@ -875,6 +1010,409 @@ impl Drop for ObservationCallbackGuard {
 
 type SharedWorld = Arc<parking_lot::RwLock<azalea::world::World>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LightSectionGeometry {
+    min_light_section: i32,
+    light_section_count: usize,
+}
+
+impl LightSectionGeometry {
+    fn from_world(world: &azalea::world::World) -> Option<Self> {
+        let min_y = world.chunks.min_y();
+        let height = world.chunks.height();
+        if height == 0 || height % 16 != 0 || min_y % 16 != 0 {
+            return None;
+        }
+        let min_light_section = (min_y >> 4).checked_sub(1)?;
+        let light_section_count = usize::try_from(height / 16 + 2).ok()?;
+        (light_section_count > 0).then_some(Self {
+            min_light_section,
+            light_section_count,
+        })
+    }
+
+    fn index_for_section_y(self, section_y: i32) -> Option<usize> {
+        let index = section_y.checked_sub(self.min_light_section)?;
+        let index = usize::try_from(index).ok()?;
+        (index < self.light_section_count).then_some(index)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct CachedLightChunk {
+    sky: Vec<Option<Box<[u8; 4096]>>>,
+    block: Vec<Option<Box<[u8; 4096]>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LightCacheContext {
+    epoch: u64,
+    scope_generation: u64,
+    dimension: String,
+    has_skylight: Option<bool>,
+    geometry: Option<LightSectionGeometry>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LightCache {
+    context: Option<LightCacheContext>,
+    chunks: HashMap<(i32, i32), CachedLightChunk>,
+}
+
+impl LightCache {
+    fn clear(&mut self) {
+        self.context = None;
+        self.chunks.clear();
+    }
+
+    fn reset_scope(
+        &mut self,
+        epoch: u64,
+        scope_generation: u64,
+        dimension: Option<String>,
+        has_skylight: Option<bool>,
+    ) {
+        self.chunks.clear();
+        self.context = dimension.map(|dimension| LightCacheContext {
+            epoch,
+            scope_generation,
+            dimension,
+            has_skylight,
+            geometry: None,
+        });
+    }
+
+    fn context_matches(
+        context: &LightCacheContext,
+        source: CanonicalSourceAdmission,
+        dimension: &str,
+    ) -> bool {
+        context.epoch == source.epoch
+            && context.scope_generation == source.scope_generation
+            && context.dimension == dimension
+    }
+
+    fn ensure_context(
+        &mut self,
+        source: CanonicalSourceAdmission,
+        dimension: String,
+        has_skylight: Option<bool>,
+        geometry: LightSectionGeometry,
+    ) -> bool {
+        let Some(context) = self.context.as_mut() else {
+            self.context = Some(LightCacheContext {
+                epoch: source.epoch,
+                scope_generation: source.scope_generation,
+                dimension,
+                has_skylight,
+                geometry: Some(geometry),
+            });
+            return true;
+        };
+        if !Self::context_matches(context, source, &dimension) {
+            return false;
+        }
+        if context.has_skylight != has_skylight {
+            // A dimension's skylight property is part of the same scope.  If
+            // the registry proof changes underneath a packet, refuse the
+            // packet instead of silently reinterpreting old layers.
+            return false;
+        }
+        match context.geometry {
+            Some(current) if current != geometry => false,
+            None => {
+                context.geometry = Some(geometry);
+                true
+            }
+            Some(_) => true,
+        }
+    }
+
+    fn apply_packet(
+        &mut self,
+        source: CanonicalSourceAdmission,
+        dimension: String,
+        has_skylight: Option<bool>,
+        geometry: LightSectionGeometry,
+        chunk_x: i32,
+        chunk_z: i32,
+        data: &azalea::protocol::packets::game::c_light_update::ClientboundLightUpdatePacketData,
+        replace_chunk: bool,
+    ) -> bool {
+        if !self.ensure_context(source, dimension, has_skylight, geometry) {
+            return false;
+        }
+        let chunk = self.chunks.entry((chunk_x, chunk_z)).or_default();
+        if replace_chunk
+            || chunk.sky.len() != geometry.light_section_count
+            || chunk.block.len() != geometry.light_section_count
+        {
+            chunk.sky = vec![None; geometry.light_section_count];
+            chunk.block = vec![None; geometry.light_section_count];
+        }
+
+        apply_light_layer_mask(
+            &mut chunk.sky,
+            &data.sky_y_mask,
+            &data.empty_sky_y_mask,
+            data.sky_updates.as_ref(),
+            geometry.light_section_count,
+            has_skylight == Some(false),
+        );
+        apply_light_layer_mask(
+            &mut chunk.block,
+            &data.block_y_mask,
+            &data.empty_block_y_mask,
+            data.block_updates.as_ref(),
+            geometry.light_section_count,
+            false,
+        );
+        true
+    }
+
+    fn remove_chunk(
+        &mut self,
+        source: CanonicalSourceAdmission,
+        dimension: &str,
+        chunk_x: i32,
+        chunk_z: i32,
+    ) -> bool {
+        let Some(context) = self.context.as_ref() else {
+            return false;
+        };
+        if !Self::context_matches(context, source, dimension) {
+            return false;
+        }
+        self.chunks.remove(&(chunk_x, chunk_z));
+        true
+    }
+
+    fn value_at(
+        &self,
+        position: &Vec3Value,
+        epoch: u64,
+        scope_generation: u64,
+        dimension: &str,
+    ) -> Option<u8> {
+        let context = self.context.as_ref()?;
+        if context.epoch != epoch
+            || context.scope_generation != scope_generation
+            || context.dimension != dimension
+        {
+            return None;
+        }
+        let x = floor_block_coordinate(position.x)?;
+        let y = floor_block_coordinate(position.y)?;
+        let z = floor_block_coordinate(position.z)?;
+        let section_y = y.div_euclid(16);
+        let section_index = context.geometry?.index_for_section_y(section_y)?;
+        let chunk_x = x.div_euclid(16);
+        let chunk_z = z.div_euclid(16);
+        let local_x = usize::try_from(x.rem_euclid(16)).ok()?;
+        let local_y = usize::try_from(y.rem_euclid(16)).ok()?;
+        let local_z = usize::try_from(z.rem_euclid(16)).ok()?;
+        let layer_index = (local_y << 8) | (local_z << 4) | local_x;
+        let chunk = self.chunks.get(&(chunk_x, chunk_z));
+        let sky = if context.has_skylight == Some(false) {
+            Some(0)
+        } else {
+            chunk
+                .and_then(|chunk| chunk.sky.get(section_index))
+                .and_then(|layer| layer.as_ref())
+                .and_then(|layer| layer.get(layer_index).copied())
+        };
+        let block = chunk
+            .and_then(|chunk| chunk.block.get(section_index))
+            .and_then(|layer| layer.as_ref())
+            .and_then(|layer| layer.get(layer_index).copied());
+
+        match (sky, block) {
+            (Some(sky), Some(block)) => Some(sky.max(block)),
+            (Some(15), None) | (None, Some(15)) => Some(15),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn layer(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+        section_index: usize,
+        sky: bool,
+    ) -> Option<&Box<[u8; 4096]>> {
+        self.chunks
+            .get(&(chunk_x, chunk_z))
+            .and_then(|chunk| {
+                if sky {
+                    chunk.sky.get(section_index)
+                } else {
+                    chunk.block.get(section_index)
+                }
+            })
+            .and_then(Option::as_ref)
+    }
+}
+
+fn apply_light_layer_mask(
+    layers: &mut [Option<Box<[u8; 4096]>>],
+    data_mask: &azalea::core::bitset::BitSet,
+    empty_mask: &azalea::core::bitset::BitSet,
+    updates: &[Box<[u8]>],
+    light_section_count: usize,
+    force_zero: bool,
+) {
+    let mut update_index = 0;
+    for section_index in data_mask.iter_ones() {
+        let update = updates.get(update_index);
+        update_index += 1;
+        if section_index >= light_section_count {
+            continue;
+        }
+        layers[section_index] = if force_zero {
+            Some(zero_light_layer())
+        } else {
+            update.and_then(|update| decode_light_layer(update))
+        };
+    }
+
+    for section_index in empty_mask.iter_ones() {
+        if section_index >= light_section_count || data_mask.get(section_index) == Some(true) {
+            continue;
+        }
+        layers[section_index] = Some(zero_light_layer());
+    }
+}
+
+fn zero_light_layer() -> Box<[u8; 4096]> {
+    Box::new([0; 4096])
+}
+
+fn decode_light_layer(bytes: &[u8]) -> Option<Box<[u8; 4096]>> {
+    if bytes.len() != 2048 {
+        return None;
+    }
+    let mut layer = Box::new([0; 4096]);
+    for local_y in 0..16 {
+        for local_z in 0..16 {
+            for local_x in 0..16 {
+                let index = (local_y << 8) | (local_z << 4) | local_x;
+                let packed = bytes[index >> 1];
+                layer[index] = if index & 1 == 0 {
+                    packed & 0x0f
+                } else {
+                    packed >> 4
+                };
+            }
+        }
+    }
+    Some(layer)
+}
+
+fn floor_block_coordinate(value: f64) -> Option<i32> {
+    if !value.is_finite() {
+        return None;
+    }
+    let value = value.floor();
+    (value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX)).then_some(value as i32)
+}
+
+/// Reproduce `AttributeInstance`'s grouped operation order.  The packet's
+/// modifier vector is first reduced to a Java-map-shaped last-write-wins map;
+/// operation iteration is never used to determine the three group order.
+fn calculate_armor_snapshot(
+    snapshot: &azalea::protocol::packets::game::c_update_attributes::AttributeSnapshot,
+) -> Option<u8> {
+    calculate_armor_values(
+        snapshot.base,
+        &snapshot.modifiers,
+        |modifier| modifier.id.clone(),
+        |modifier| modifier.amount,
+        |modifier| modifier.operation,
+    )
+}
+
+fn calculate_armor_values<T, K, Id, Amount, Operation>(
+    base: f64,
+    modifiers: &[T],
+    mut id: Id,
+    mut amount: Amount,
+    mut operation: Operation,
+) -> Option<u8>
+where
+    K: PartialEq,
+    Id: FnMut(&T) -> K,
+    Amount: FnMut(&T) -> f64,
+    Operation: FnMut(&T) -> azalea::core::attribute_modifier_operation::AttributeModifierOperation,
+{
+    use azalea::core::attribute_modifier_operation::AttributeModifierOperation;
+
+    if !base.is_finite() {
+        return None;
+    }
+    let mut modifier_indices = Vec::<usize>::new();
+    for index in 0..modifiers.len() {
+        if let Some(existing) = modifier_indices
+            .iter()
+            .position(|existing| id(&modifiers[*existing]) == id(&modifiers[index]))
+        {
+            modifier_indices[existing] = index;
+        } else {
+            modifier_indices.push(index);
+        }
+    }
+
+    let mut add_value = base;
+    let mut multiplied_base_sum: f64 = 0.0;
+    let mut multiplied_total = Vec::new();
+    for index in modifier_indices {
+        let modifier_amount = amount(&modifiers[index]);
+        if !modifier_amount.is_finite() {
+            return None;
+        }
+        match operation(&modifiers[index]) {
+            AttributeModifierOperation::AddValue => {
+                add_value += modifier_amount;
+                if !add_value.is_finite() {
+                    return None;
+                }
+            }
+            AttributeModifierOperation::AddMultipliedBase => {
+                multiplied_base_sum += modifier_amount;
+                if !multiplied_base_sum.is_finite() {
+                    return None;
+                }
+            }
+            AttributeModifierOperation::AddMultipliedTotal => {
+                multiplied_total.push(modifier_amount);
+            }
+        }
+    }
+
+    let mut value = add_value + add_value * multiplied_base_sum;
+    if !value.is_finite() {
+        return None;
+    }
+    for amount in multiplied_total {
+        let factor = 1.0 + amount;
+        if !factor.is_finite() {
+            return None;
+        }
+        value *= factor;
+        if !value.is_finite() {
+            return None;
+        }
+    }
+
+    // The vanilla attribute sanitizer's lower bound is zero for armor.  The
+    // public frame fact additionally follows the frozen 0..20 wire range.
+    let sanitized = value.max(0.0);
+    if !sanitized.is_finite() {
+        return None;
+    }
+    Some(sanitized.floor().clamp(0.0, 20.0) as u8)
+}
+
 /// The observation values used by one viewport capture share one short-lived
 /// generation lock. The world itself remains behind its own read/write lock;
 /// this lock only binds the world handle, snapshot, source and entities to one
@@ -882,9 +1420,44 @@ type SharedWorld = Arc<parking_lot::RwLock<azalea::world::World>>;
 struct ObservationState {
     world: Option<SharedWorld>,
     snapshot: Option<MinecraftSnapshotV1>,
+    /// The producer scope that authored `snapshot`.  The public snapshot wire
+    /// intentionally has no scope field; this private stamp prevents frame
+    /// facts from being combined with a snapshot captured before Respawn.
+    snapshot_scope_generation: u64,
     source: Option<FactSource>,
     tracked_entities: Vec<ProtocolEntitySnapshot>,
+    /// Packet fields Azalea does not expose in the ECS capture, or a packet
+    /// velocity which its handler intentionally leaves untouched.  This is a
+    /// live-entity residual, not an event queue: it is cleared on scope/world
+    /// reset and removed with the tracked entity.
+    entity_residuals: Vec<EntityObservationResidual>,
+    /// Armor is a connection fact.  It deliberately survives same-epoch
+    /// Login/Respawn scope resets, but the epoch stamp makes a new connection
+    /// automatically unavailable.
+    armor: Option<u8>,
+    armor_epoch: Option<u64>,
+    light_cache: LightCache,
     generation: u64,
+}
+
+/// The packet fields that are not necessarily represented by the ECS capture
+/// have an explicit authority transition.  In particular, a new Spawn or a
+/// Teleport starts a new velocity authority; it must not inherit a residual
+/// from the previous incarnation of the same protocol id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EntityResidualAction {
+    Retain,
+    Update,
+    Clear,
+}
+
+const ENTITY_OBSERVATION_RESIDUAL_CAPACITY: usize = 1024;
+
+#[derive(Clone, Debug, PartialEq)]
+struct EntityObservationResidual {
+    entity_key: String,
+    head_yaw: Option<f32>,
+    velocity: Option<[f64; 3]>,
 }
 
 impl Default for ObservationState {
@@ -892,8 +1465,13 @@ impl Default for ObservationState {
         Self {
             world: None,
             snapshot: None,
+            snapshot_scope_generation: 0,
             source: None,
             tracked_entities: Vec::new(),
+            entity_residuals: Vec::new(),
+            armor: None,
+            armor_epoch: None,
+            light_cache: LightCache::default(),
             generation: 0,
         }
     }
@@ -903,11 +1481,2266 @@ impl ObservationState {
     fn bump_generation(&mut self) {
         self.generation = self.generation.wrapping_add(1);
     }
+
+    fn clear_all_frame_facts(&mut self) {
+        self.armor = None;
+        self.armor_epoch = None;
+        self.light_cache.clear();
+    }
+
+    fn clear_light_for_scope(
+        &mut self,
+        epoch: u64,
+        scope_generation: u64,
+        dimension: Option<String>,
+        has_skylight: Option<bool>,
+    ) {
+        self.light_cache
+            .reset_scope(epoch, scope_generation, dimension, has_skylight);
+    }
 }
 
 enum ActiveMovementRegistration {
     Started { cancel_signal: Option<Arc<Notify>> },
     Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttemptAdmissionState {
+    NotStarted,
+    Reserved {
+        epoch: u64,
+        reconnect_token: Option<u64>,
+        join_started_epoch: Option<u64>,
+        /// The vendor `AttemptToken` admitted by the canonical
+        /// `StartJoinServerEvent`, if the attempt was stamped. `None` is the
+        /// legacy/unstamped path.
+        attempt_token: Option<azalea::join::AttemptToken>,
+    },
+    Bound {
+        epoch: u64,
+        entity: bevy_ecs::entity::Entity,
+        reconnect_token: Option<u64>,
+        attempt_token: Option<azalea::join::AttemptToken>,
+    },
+    Closed {
+        epoch: u64,
+    },
+}
+
+impl Default for AttemptAdmissionState {
+    fn default() -> Self {
+        Self::NotStarted
+    }
+}
+
+/// A backend-only fence for sources that Azalea does not stamp with a
+/// connection identity.  `Entity` is reusable across reconnects, so after a
+/// same-entity handoff there is no sound predicate that can distinguish a
+/// delayed A message from a new B message.  The conservative state is to
+/// reject all unstamped source messages after that point.  A stamped
+/// reconnect-return token may still install the owner, but it does not clear
+/// this fence; clearing it would falsely claim provenance that the vendor
+/// event does not carry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct EntitySourceFence {
+    last_bound_entity: Option<bevy_ecs::entity::Entity>,
+    pending_rebind_entity: Option<bevy_ecs::entity::Entity>,
+    ambiguous: bool,
+}
+
+impl EntitySourceFence {
+    fn begin_attempt(&mut self) {
+        self.pending_rebind_entity = self.last_bound_entity;
+    }
+
+    fn allows_unstamped(&self, entity: bevy_ecs::entity::Entity) -> bool {
+        !self.ambiguous && self.pending_rebind_entity != Some(entity)
+    }
+
+    fn allows_unstamped_global(&self) -> bool {
+        !self.ambiguous && self.pending_rebind_entity.is_none()
+    }
+
+    fn bind(&mut self, entity: bevy_ecs::entity::Entity) {
+        if self.last_bound_entity == Some(entity) {
+            self.ambiguous = true;
+        }
+        self.last_bound_entity = Some(entity);
+        self.pending_rebind_entity = None;
+    }
+}
+
+/// The short-lived identity captured when a canonical Azalea source is read.
+/// Publication rechecks all three pieces under `command_admission`; an event
+/// cannot be stamped with a later owner, epoch, or scope after a handoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CanonicalSourceAdmission {
+    entity: bevy_ecs::entity::Entity,
+    epoch: u64,
+    scope_generation: u64,
+    /// The vendor attempt token captured at the canonical source, if the
+    /// source was stamped. `None` only for the legacy/unstamped fallback.
+    attempt_token: Option<azalea::join::AttemptToken>,
+}
+
+/// One-to-one vendor `AttemptToken` ↔ backend epoch bindings for the whole
+/// `RuntimeSession`.
+///
+/// Growth boundary: every successfully stamped join attempt adds at most one
+/// pair of entries, and entries are intentionally never removed so that a
+/// historical token can never be re-registered on a later epoch. The size is
+/// therefore bounded by the number of stamped join attempts in the session.
+#[derive(Default)]
+struct SourceTokenBindings {
+    token_to_epoch: std::collections::HashMap<azalea::join::AttemptToken, u64>,
+    epoch_to_token: std::collections::HashMap<u64, azalea::join::AttemptToken>,
+}
+
+impl SourceTokenBindings {
+    /// Register `token` for `epoch` exactly once. Returns `false` (without
+    /// mutating anything) when the token is already bound to a different
+    /// epoch or the epoch is already bound to a different token; the same
+    /// pair is idempotent.
+    fn bind(&mut self, token: azalea::join::AttemptToken, epoch: u64) -> bool {
+        if let Some(bound_epoch) = self.token_to_epoch.get(&token) {
+            return *bound_epoch == epoch;
+        }
+        if let Some(bound_token) = self.epoch_to_token.get(&epoch) {
+            return *bound_token == token;
+        }
+        self.token_to_epoch.insert(token, epoch);
+        self.epoch_to_token.insert(epoch, token);
+        true
+    }
+
+    fn matches(&self, token: azalea::join::AttemptToken, epoch: u64) -> bool {
+        self.token_to_epoch.get(&token) == Some(&epoch)
+    }
+}
+
+#[derive(Default)]
+struct EntityProducerRuntimeState {
+    owner: Option<(bevy_ecs::entity::Entity, u64)>,
+    scope_generation: u64,
+    attempt: AttemptAdmissionState,
+    /// A bounded hand-off from the canonical ECS ConnectionFailed source to
+    /// Azalea's high-level event handler.  It only exists for the current
+    /// pre-Init attempt and is cleared on every attempt transition.
+    pending_connection_failure: Option<(bevy_ecs::entity::Entity, u64)>,
+    source_fence: EntitySourceFence,
+    source_token_bindings: SourceTokenBindings,
+    cache: EntityProducerCache,
+}
+
+impl EntityProducerRuntimeState {
+    fn reset_scope(&mut self, epoch: u64) {
+        self.scope_generation = self.scope_generation.wrapping_add(1);
+        self.cache.reset_scope(epoch);
+    }
+
+    fn deactivate_scope(&mut self) {
+        self.scope_generation = self.scope_generation.wrapping_add(1);
+        self.cache.deactivate_scope();
+    }
+}
+
+#[cfg(test)]
+mod entity_events_owner_tests {
+    use super::*;
+
+    /// The vendor `AttemptToken` bound by a test app's owner setup and used by
+    /// its packet queue helpers, so stamped canonical sources are exercised
+    /// end-to-end instead of falling back to the legacy fence.
+    #[derive(Clone, Copy, Resource)]
+    pub(super) struct TestAttemptToken(pub(super) azalea::join::AttemptToken);
+
+    fn snapshot(epoch: u64, protocol_id: i32, x: f64) -> NormalizedEntitySnapshot {
+        NormalizedEntitySnapshot {
+            identity: EntityIdentity::new(epoch, protocol_id),
+            entity_type: "minecraft:pig".to_owned(),
+            uuid: Some(format!("entity-{protocol_id}")),
+            name: None,
+            username: None,
+            position: [x, 64.0, -3.0],
+            velocity: [0.25, 0.0, -0.5],
+            yaw: 45.0,
+            pitch: -11.25,
+            head_yaw: Some(90.0),
+            width: 0.9,
+            height: 0.9,
+            on_ground: true,
+            pose: None,
+            held_item_name: None,
+            equipment: Vec::new(),
+            valid: true,
+        }
+    }
+
+    fn token(epoch: u64, admission: u64) -> EntityProducerToken {
+        EntityProducerToken::new(epoch, format!("packet:{admission}"))
+    }
+
+    fn scope_snapshot(epoch: u64) -> MinecraftSnapshotV1 {
+        MinecraftSnapshotV1 {
+            protocol: crate::snapshot::SNAPSHOT_PROTOCOL.to_owned(),
+            snapshot_revision: 1,
+            lifecycle_revision: 1,
+            captured_at: now_utc(),
+            process_session_id: "scope-test".to_owned(),
+            connection_epoch: epoch,
+            connection_attempt_id: format!("attempt-{epoch}"),
+            world: crate::snapshot::WorldSnapshot {
+                world_id: "scope-world".to_owned(),
+                dimension: "minecraft:overworld".to_owned(),
+                minecraft_version: "26.1.2".to_owned(),
+                protocol_version: 775,
+                game_mode: "survival".to_owned(),
+                min_y: -64,
+                height: 384,
+            },
+            self_snapshot: crate::snapshot::SelfSnapshot {
+                entity_key: "scope-self".to_owned(),
+                username: "scope".to_owned(),
+                position: Vec3Value {
+                    x: 0.0,
+                    y: 64.0,
+                    z: 0.0,
+                },
+                velocity: Vec3Value {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                yaw: 0.0,
+                pitch: 0.0,
+                on_ground: true,
+                alive: true,
+                health: 20.0,
+                food: 20,
+                food_saturation: 5.0,
+                experience: crate::snapshot::ExperienceSnapshot {
+                    level: 0,
+                    progress: 0.0,
+                    total: 0,
+                },
+            },
+            inventory: crate::snapshot::InventorySnapshot {
+                selected_hotbar_slot: 0,
+                slots: Vec::new(),
+            },
+            tracked_players: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn owner_binding_rejects_late_a_and_preserves_b_epoch2_shadow() {
+        let shared = Arc::new(SharedRuntime::new(RunConfig::default()));
+        let mut world = bevy_ecs::world::World::new();
+        let owner_a = world.spawn_empty().id();
+        let owner_b = world.spawn_empty().id();
+
+        assert!(shared.begin_connection_attempt());
+        assert_eq!(
+            shared.consume_attempt_for_transport_init_and_bind(owner_a),
+            Some(1)
+        );
+        assert_eq!(shared.entity_producer_epoch_for(owner_a), Some(1));
+        assert!(matches!(
+            shared.apply_entity_input_for_owner(
+                owner_a,
+                1,
+                EntityProducerInput::Spawn {
+                    token: token(1, 1),
+                    snapshot: snapshot(1, 7, 1.0),
+                },
+            ),
+            Some(NormalizedEntityEvent::Spawned { .. })
+        ));
+
+        assert!(shared.begin_connection_attempt());
+        assert_eq!(
+            shared.consume_attempt_for_transport_init_and_bind(owner_b),
+            Some(2)
+        );
+        assert_eq!(shared.entity_producer_epoch_for(owner_a), None);
+        assert_eq!(shared.entity_producer_epoch_for(owner_b), Some(2));
+
+        assert!(shared
+            .apply_entity_input_for_owner(
+                owner_a,
+                1,
+                EntityProducerInput::Spawn {
+                    token: token(1, 2),
+                    snapshot: snapshot(1, 8, 99.0),
+                },
+            )
+            .is_none());
+
+        let spawned = shared.apply_entity_input_for_owner(
+            owner_b,
+            2,
+            EntityProducerInput::Spawn {
+                token: token(2, 1),
+                snapshot: snapshot(2, 7, 10.0),
+            },
+        );
+        assert!(matches!(
+            spawned,
+            Some(NormalizedEntityEvent::Spawned { ref entity })
+                if entity.entity_key() == "2:7" && entity.position[0] == 10.0
+        ));
+
+        // A late lifecycle message cannot reset or deactivate B's scope.
+        assert!(!shared.reset_entity_scope_for_owner(owner_a));
+        assert!(!shared.deactivate_entity_producer_owner(owner_a));
+        assert_eq!(shared.entity_producer_epoch_for(owner_b), Some(2));
+
+        let moved = shared.apply_entity_input_for_owner(
+            owner_b,
+            2,
+            EntityProducerInput::Move {
+                token: token(2, 2),
+                patch: EntityMovePatch::relative(
+                    EntityIdentity::new(2, 7),
+                    Some([4096, 0, 0]),
+                    None,
+                    false,
+                ),
+            },
+        );
+        assert!(matches!(
+            moved,
+            Some(NormalizedEntityEvent::Moved { ref entity })
+                if entity.entity_key() == "2:7"
+                    && entity.position[0] == 11.0
+                    && !entity.on_ground
+        ));
+
+        let removed = shared.apply_entity_input_for_owner(
+            owner_b,
+            2,
+            EntityProducerInput::Remove {
+                token: token(2, 3),
+                entity: EntityIdentity::new(2, 7),
+            },
+        );
+        assert!(matches!(
+            removed,
+            Some(NormalizedEntityEvent::Removed { entity, ref last })
+                if entity.key() == "2:7" && last.position[0] == 11.0
+        ));
+
+        assert!(shared.deactivate_entity_producer_owner(owner_b));
+        assert_eq!(shared.entity_producer_epoch_for(owner_b), None);
+        assert!(shared
+            .entity_producer
+            .lock()
+            .cache
+            .apply(
+                2,
+                EntityProducerInput::Spawn {
+                    token: token(2, 4),
+                    snapshot: snapshot(2, 9, 12.0),
+                },
+            )
+            .is_none());
+        assert!(shared
+            .apply_entity_input_for_owner(
+                owner_b,
+                2,
+                EntityProducerInput::Spawn {
+                    token: token(2, 5),
+                    snapshot: snapshot(2, 9, 12.0),
+                },
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn accepted_a_payload_is_dropped_after_b_binds_instead_of_using_b_envelope() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        let mut world = bevy_ecs::world::World::new();
+        let owner_a = world.spawn_empty().id();
+        let owner_b = world.spawn_empty().id();
+
+        assert!(handle.shared.begin_connection_attempt());
+        let request_a = events.try_recv().expect("attempt 1 request");
+        assert_eq!(request_a.connection_epoch, 1);
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind(owner_a),
+            Some(1)
+        );
+        let _transport_a = events.try_recv().expect("A transport connected");
+
+        let after_apply = Arc::new(std::sync::Barrier::new(2));
+        let release_publish = Arc::new(std::sync::Barrier::new(2));
+        handle
+            .shared
+            .set_entity_publish_after_apply_hook(Some(Arc::new({
+                let after_apply = after_apply.clone();
+                let release_publish = release_publish.clone();
+                move || {
+                    after_apply.wait();
+                    release_publish.wait();
+                }
+            })));
+
+        let emitter_shared = handle.shared.clone();
+        let emitter = std::thread::spawn(move || {
+            emitter_shared.emit_entity_input(
+                owner_a,
+                1,
+                EntityProducerInput::Spawn {
+                    token: token(1, 1),
+                    snapshot: snapshot(1, 7, 1.0),
+                },
+            )
+        });
+        after_apply.wait();
+
+        // The old implementation would resume A after this complete switch
+        // and let EventWriter stamp A's payload with epoch 2.
+        assert!(handle.shared.begin_connection_attempt());
+        let request_b = events.try_recv().expect("attempt 2 request");
+        assert_eq!(request_b.connection_epoch, 2);
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind(owner_b),
+            Some(2)
+        );
+        let _transport_b = events.try_recv().expect("B transport connected");
+        assert!(handle.shared.emit_entity_input(
+            owner_b,
+            2,
+            EntityProducerInput::Spawn {
+                token: token(2, 1),
+                snapshot: snapshot(2, 7, 10.0),
+            },
+        ));
+        let spawned_b = events.try_recv().expect("B spawn");
+        assert_eq!(spawned_b.connection_epoch, 2);
+        match spawned_b.payload {
+            BackendEventPayload::Entity(ContractProtocolEntityEvent::Spawned { entity }) => {
+                assert_eq!(entity.entity_key, "2:7");
+                assert_eq!(entity.position.x, 10.0);
+            }
+            payload => panic!("expected B spawned payload, got {payload:?}"),
+        }
+
+        release_publish.wait();
+        assert!(!emitter.join().expect("A emitter"));
+        assert!(
+            events.try_recv().is_err(),
+            "accepted A payload must not appear under B metadata"
+        );
+
+        assert!(handle.shared.emit_entity_input(
+            owner_b,
+            2,
+            EntityProducerInput::Move {
+                token: token(2, 2),
+                patch: EntityMovePatch::relative(
+                    EntityIdentity::new(2, 7),
+                    Some([4096, 0, 0]),
+                    None,
+                    false,
+                ),
+            },
+        ));
+        assert!(handle.shared.emit_entity_input(
+            owner_b,
+            2,
+            EntityProducerInput::Remove {
+                token: token(2, 3),
+                entity: EntityIdentity::new(2, 7),
+            },
+        ));
+        let moved_b = events.try_recv().expect("B move");
+        let removed_b = events.try_recv().expect("B remove");
+        assert_eq!(moved_b.connection_epoch, 2);
+        assert_eq!(removed_b.connection_epoch, 2);
+        match removed_b.payload {
+            BackendEventPayload::Entity(ContractProtocolEntityEvent::Removed {
+                entity_key,
+                last,
+                ..
+            }) => {
+                assert_eq!(entity_key, "2:7");
+                assert_eq!(last.entity_key, "2:7");
+                assert_eq!(last.position.x, 11.0);
+            }
+            payload => panic!("expected B removed payload, got {payload:?}"),
+        }
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn init_owner_bind_and_attempt_transition_share_one_epoch_transaction() {
+        let shared = Arc::new(SharedRuntime::new(RunConfig::default()));
+        let mut world = bevy_ecs::world::World::new();
+        let owner_a = world.spawn_empty().id();
+        let owner_b = world.spawn_empty().id();
+
+        assert!(shared.begin_connection_attempt());
+        let bind_epoch_read = Arc::new(std::sync::Barrier::new(2));
+        let release_bind = Arc::new(std::sync::Barrier::new(2));
+        shared.set_entity_owner_bind_hook(Some(Arc::new({
+            let bind_epoch_read = bind_epoch_read.clone();
+            let release_bind = release_bind.clone();
+            move || {
+                bind_epoch_read.wait();
+                release_bind.wait();
+            }
+        })));
+
+        let init_shared = shared.clone();
+        let init = std::thread::spawn(move || {
+            init_shared.consume_attempt_for_transport_init_and_bind(owner_a)
+        });
+        bind_epoch_read.wait();
+        assert!(
+            shared.command_admission.try_lock().is_none(),
+            "Init must retain lifecycle admission through owner installation"
+        );
+        assert_eq!(shared.writer.lock().connection_epoch, 1);
+
+        let (transition_started_tx, transition_started_rx) = std::sync::mpsc::channel();
+        let (transition_done_tx, transition_done_rx) = std::sync::mpsc::channel();
+        let transition_shared = shared.clone();
+        let transition = std::thread::spawn(move || {
+            transition_started_tx
+                .send(())
+                .expect("attempt transition start signal");
+            let result = transition_shared.begin_connection_attempt();
+            transition_done_tx
+                .send(result)
+                .expect("attempt transition result");
+        });
+        transition_started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("attempt 2 must start competing");
+        assert!(
+            transition_done_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "attempt 2 must not advance while Init owns admission"
+        );
+        assert_eq!(shared.writer.lock().connection_epoch, 1);
+
+        release_bind.wait();
+        assert_eq!(init.join().expect("attempt 1 Init"), Some(1));
+        assert!(transition_done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("attempt 2 completes after Init transaction"));
+        transition.join().expect("attempt 2 transition");
+
+        assert_eq!(shared.writer.lock().connection_epoch, 2);
+        assert_eq!(shared.entity_producer_epoch_for(owner_a), None);
+        assert_eq!(
+            shared.consume_attempt_for_transport_init_and_bind(owner_b),
+            Some(2)
+        );
+        assert_eq!(shared.entity_producer_epoch_for(owner_b), Some(2));
+    }
+
+    #[test]
+    fn swarm_disconnect_deactivates_current_owner_but_late_a_disconnect_cannot_clear_b() {
+        let shared = Arc::new(SharedRuntime::new(RunConfig::default()));
+        let mut world = bevy_ecs::world::World::new();
+        let owner_a = world.spawn_empty().id();
+        let owner_b = world.spawn_empty().id();
+
+        assert!(shared.begin_connection_attempt());
+        assert_eq!(
+            shared.consume_attempt_for_transport_init_and_bind(owner_a),
+            Some(1)
+        );
+        assert!(shared.begin_connection_attempt());
+        assert_eq!(
+            shared.consume_attempt_for_transport_init_and_bind(owner_b),
+            Some(2)
+        );
+        assert_eq!(shared.entity_producer_epoch_for(owner_b), Some(2));
+
+        // The entity-bearing canonical source closes B first.  The later
+        // entity-less SwarmEvent is only the reconnect fallback.
+        assert!(shared
+            .admit_canonical_disconnected(owner_b, 2, Some("B canonical disconnect".to_owned()))
+            .is_some());
+        assert!(shared.claim_reconnect());
+        assert_eq!(shared.entity_producer_epoch_for(owner_b), None);
+        assert!(!shared.deactivate_entity_producer_owner(owner_a));
+        assert!(shared
+            .apply_entity_input_for_owner(
+                owner_b,
+                2,
+                EntityProducerInput::Spawn {
+                    token: token(2, 1),
+                    snapshot: snapshot(2, 7, 10.0),
+                },
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn late_entity_lifecycle_cannot_close_b_but_current_b_disconnect_closes_once() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        let mut world = bevy_ecs::world::World::new();
+        let owner_a = world.spawn_empty().id();
+        let owner_b = world.spawn_empty().id();
+
+        assert!(handle.shared.begin_connection_attempt());
+        let _request_a = events.try_recv().expect("attempt 1 request");
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind(owner_a),
+            Some(1)
+        );
+        let _transport_a = events.try_recv().expect("A transport connected");
+        assert!(handle.shared.begin_connection_attempt());
+        let _request_b = events.try_recv().expect("attempt 2 request");
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind(owner_b),
+            Some(2)
+        );
+        let _transport_b = events.try_recv().expect("B transport connected");
+
+        {
+            let mut observation = handle.shared.observation.write();
+            observation.generation = 77;
+            observation.source = Some(FactSource::ServerObserved);
+        }
+        handle
+            .send_chat("must survive stale lifecycle")
+            .expect("pending command admission");
+
+        assert!(handle
+            .shared
+            .admit_canonical_disconnected(owner_a, 1, Some("late A disconnect".to_owned()))
+            .is_none());
+        assert!(handle
+            .shared
+            .admit_canonical_connection_failed(owner_a, 1, "late A failure".to_owned())
+            .is_none());
+
+        assert_eq!(handle.shared.entity_producer_epoch_for(owner_b), Some(2));
+        assert!(!handle.shared.disconnect_reported.load(Ordering::Acquire));
+        assert!(handle.shared.last_close.lock().is_none());
+        assert!(handle.shared.last_failure.lock().is_none());
+        assert_eq!(handle.shared.observation.read().generation, 77);
+        assert_eq!(
+            handle.shared.observation.read().source,
+            Some(FactSource::ServerObserved)
+        );
+        assert_eq!(handle.shared.commands.lock().len(), 1);
+        assert!(events.try_recv().is_err());
+        assert!(matches!(
+            handle.state(),
+            BackendState::LoggingIn { epoch: 2, .. }
+        ));
+
+        assert!(handle
+            .shared
+            .admit_canonical_disconnected(owner_b, 2, Some("current B disconnect".to_owned()))
+            .is_some());
+        let closed = events.try_recv().expect("current B close");
+        assert_eq!(closed.connection_epoch, 2);
+        assert_eq!(
+            serde_json::to_value(&closed.payload).expect("close payload")["type"],
+            "connection_closed"
+        );
+        assert!(events.try_recv().is_err(), "close must be emitted once");
+        assert_eq!(handle.shared.entity_producer_epoch_for(owner_b), None);
+        assert!(handle.shared.commands.lock().is_empty());
+    }
+
+    #[test]
+    fn pre_init_connection_failed_claims_only_the_unbound_current_attempt() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        let mut world = bevy_ecs::world::World::new();
+        let owner = world.spawn_empty().id();
+
+        assert!(handle.shared.begin_connection_attempt());
+        let _request = events.try_recv().expect("pre-Init attempt request");
+        assert!(handle.shared.admit_canonical_join_started(1));
+        assert!(handle
+            .shared
+            .admit_canonical_connection_failed(owner, 1, "failed before Init".to_owned())
+            .is_some());
+        let closed = events.try_recv().expect("pre-Init failure close");
+        assert_eq!(closed.connection_epoch, 1);
+        assert_eq!(
+            serde_json::to_value(&closed.payload).expect("close payload")["type"],
+            "connection_closed"
+        );
+        assert!(handle
+            .shared
+            .admit_canonical_connection_failed(owner, 1, "duplicate pre-Init failure".to_owned())
+            .is_none());
+        assert!(handle
+            .shared
+            .take_canonical_connection_failure_followup(owner));
+        assert!(!handle
+            .shared
+            .take_canonical_connection_failure_followup(owner));
+        assert!(handle.shared.entity_producer_epoch_for(owner).is_none());
+        assert!(matches!(
+            handle.shared.entity_producer.lock().attempt,
+            AttemptAdmissionState::Closed { epoch: 1 }
+        ));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn same_entity_reconnect_return_binds_without_init_and_publishes_spawn_move_remove() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        let mut world = bevy_ecs::world::World::new();
+        let entity = world.spawn_empty().id();
+
+        assert!(handle.shared.begin_connection_attempt());
+        let _request_a = events.try_recv().expect("A request");
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind(entity),
+            Some(1)
+        );
+        let _transport_a = events.try_recv().expect("A transport");
+        assert!(handle
+            .shared
+            .admit_canonical_disconnected(entity, 1, Some("A ended".to_owned()))
+            .is_some());
+        let _close_a = events.try_recv().expect("A close");
+
+        assert!(handle.shared.claim_reconnect());
+        let reconnect_token = handle
+            .shared
+            .admit_reconnect_attempt()
+            .expect("B reconnect admission");
+        let _request_b = events.try_recv().expect("B request");
+
+        // B has no Init.  The returned client consumes the reserved B
+        // identity directly, before finish_reconnect_attempt can close it.
+        assert_eq!(
+            handle.shared.bind_reconnect_return(reconnect_token, entity),
+            Some(2)
+        );
+        let transport_b = events.try_recv().expect("B transport");
+        assert_eq!(transport_b.connection_epoch, 2);
+        handle.shared.finish_reconnect_attempt(reconnect_token);
+        assert_eq!(handle.shared.entity_producer_epoch_for(entity), Some(2));
+        let source = handle.observation_source();
+
+        // A late Init is an idempotent no-op after the return bind.
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind(entity),
+            Some(2)
+        );
+        assert!(events.try_recv().is_err());
+
+        assert!(handle.shared.emit_entity_input(
+            entity,
+            2,
+            EntityProducerInput::Spawn {
+                token: token(2, 1),
+                snapshot: snapshot(2, 7, 10.0),
+            },
+        ));
+        let after_spawn = source.list_tracked_entities().expect("spawn observation");
+        assert_eq!(after_spawn.len(), 1);
+        assert_eq!(after_spawn[0].entity_key, "2:7");
+        assert_eq!(after_spawn[0].entity_type, "minecraft:pig");
+        assert_eq!(after_spawn[0].position.x, 10.0);
+        assert_eq!(after_spawn[0].head_yaw, Some(90.0));
+        assert!(handle.shared.emit_entity_input(
+            entity,
+            2,
+            EntityProducerInput::Move {
+                token: token(2, 2),
+                patch: EntityMovePatch::relative(
+                    EntityIdentity::new(2, 7),
+                    Some([4096, 0, 0]),
+                    None,
+                    false,
+                ),
+            },
+        ));
+        let after_move = source.list_tracked_entities().expect("move observation");
+        assert_eq!(after_move[0].entity_key, "2:7");
+        assert_eq!(after_move[0].position.x, 11.0);
+        assert_eq!(after_move[0].entity_type, "minecraft:pig");
+        assert!(handle.shared.emit_entity_input(
+            entity,
+            2,
+            EntityProducerInput::Remove {
+                token: token(2, 3),
+                entity: EntityIdentity::new(2, 7),
+            },
+        ));
+        assert!(source
+            .list_tracked_entities()
+            .expect("remove observation")
+            .is_empty());
+
+        let spawned = events.try_recv().expect("B spawn");
+        let moved = events.try_recv().expect("B move");
+        let removed = events.try_recv().expect("B remove");
+        assert_eq!(spawned.connection_epoch, 2);
+        assert_eq!(moved.connection_epoch, 2);
+        assert_eq!(removed.connection_epoch, 2);
+        match (spawned.payload, moved.payload, removed.payload) {
+            (
+                BackendEventPayload::Entity(ContractProtocolEntityEvent::Spawned { entity: spawn }),
+                BackendEventPayload::Entity(ContractProtocolEntityEvent::Moved { entity: move_ }),
+                BackendEventPayload::Entity(ContractProtocolEntityEvent::Removed {
+                    entity_key: remove_key,
+                    last,
+                    ..
+                }),
+            ) => {
+                assert_eq!(spawn.entity_key, "2:7");
+                assert_eq!(move_.entity_key, "2:7");
+                assert_eq!(remove_key, "2:7");
+                assert_eq!(last.entity_key, "2:7");
+                assert_eq!(last.position.x, 11.0);
+            }
+            payloads => panic!("expected Spawn/Move/Remove, got {payloads:?}"),
+        }
+    }
+
+    #[test]
+    fn same_entity_late_a_source_epoch_is_inert_before_and_after_b_bind() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        let mut world = bevy_ecs::world::World::new();
+        let entity = world.spawn_empty().id();
+
+        assert!(handle.shared.begin_connection_attempt());
+        let _request_a = events.try_recv().expect("A request");
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind(entity),
+            Some(1)
+        );
+        let _transport_a = events.try_recv().expect("A transport");
+        assert!(handle
+            .shared
+            .admit_canonical_disconnected(entity, 1, Some("A ended".to_owned()))
+            .is_some());
+        let _close_a = events.try_recv().expect("A close");
+
+        assert!(handle.shared.claim_reconnect());
+        let reconnect_token = handle
+            .shared
+            .admit_reconnect_attempt()
+            .expect("B reconnect admission");
+        let _request_b = events.try_recv().expect("B request");
+
+        // B is reserved but not bound.  Explicit source epoch 1 is rejected;
+        // Entity alone would incorrectly identify this as the same client.
+        assert!(handle
+            .shared
+            .admit_canonical_disconnected(entity, 1, Some("late A".to_owned()))
+            .is_none());
+        assert!(handle
+            .shared
+            .admit_canonical_connection_failed(entity, 1, "late A failure".to_owned())
+            .is_none());
+        assert!(!handle
+            .shared
+            .admit_canonical_packet_source_for_epoch(entity, 1));
+
+        assert_eq!(
+            handle.shared.bind_reconnect_return(reconnect_token, entity),
+            Some(2)
+        );
+        let _transport_b = events.try_recv().expect("B transport");
+        handle.shared.finish_reconnect_attempt(reconnect_token);
+        assert!(handle.shared.emit_entity_input(
+            entity,
+            2,
+            EntityProducerInput::Spawn {
+                token: token(2, 10),
+                snapshot: snapshot(2, 7, 20.0),
+            },
+        ));
+        let _spawn = events.try_recv().expect("B spawn");
+
+        // The same stale-A evidence remains inert after B owns the entity.
+        assert!(handle
+            .shared
+            .admit_canonical_disconnected(entity, 1, Some("late A 2".to_owned()))
+            .is_none());
+        assert!(handle
+            .shared
+            .admit_canonical_connection_failed(entity, 1, "late A failure 2".to_owned())
+            .is_none());
+        assert!(!handle
+            .shared
+            .admit_canonical_packet_source_for_epoch(entity, 1));
+        assert!(!handle
+            .shared
+            .reset_entity_scope_for_owner_at_epoch(entity, 1));
+        assert!(handle
+            .shared
+            .apply_entity_input_for_owner(
+                entity,
+                1,
+                EntityProducerInput::Spawn {
+                    token: token(1, 11),
+                    snapshot: snapshot(1, 7, 999.0),
+                },
+            )
+            .is_none());
+
+        assert!(handle.shared.emit_entity_input(
+            entity,
+            2,
+            EntityProducerInput::Move {
+                token: token(2, 12),
+                patch: EntityMovePatch::relative(
+                    EntityIdentity::new(2, 7),
+                    Some([4096, 0, 0]),
+                    None,
+                    true,
+                ),
+            },
+        ));
+        let moved = events.try_recv().expect("B move after stale A");
+        match moved.payload {
+            BackendEventPayload::Entity(ContractProtocolEntityEvent::Moved { entity }) => {
+                assert_eq!(entity.entity_key, "2:7");
+                assert_eq!(entity.position.x, 21.0);
+            }
+            payload => panic!("expected B moved payload, got {payload:?}"),
+        }
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn same_entity_current_preinit_failure_and_bound_closes_preserve_reason_once() {
+        let pre_init = RuntimeHandle::new(RunConfig::default());
+        let mut pre_events = pre_init.subscribe();
+        let mut world = bevy_ecs::world::World::new();
+        let entity = world.spawn_empty().id();
+
+        assert!(pre_init.shared.begin_connection_attempt());
+        let _request = pre_events.try_recv().expect("pre-Init request");
+        assert!(pre_init.shared.admit_canonical_join_started(1));
+        assert!(pre_init
+            .shared
+            .admit_canonical_connection_failed(entity, 1, "pre-init exact error".to_owned())
+            .is_some());
+        let close = pre_events.try_recv().expect("pre-Init close");
+        match close.payload {
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionClosed { close }) => {
+                assert_eq!(close.code, "connection_failed");
+                assert_eq!(
+                    close.error.expect("failure error").message,
+                    "pre-init exact error"
+                );
+            }
+            payload => panic!("expected pre-Init close, got {payload:?}"),
+        }
+        assert!(pre_init
+            .shared
+            .admit_canonical_connection_failed(entity, 1, "duplicate".to_owned())
+            .is_none());
+        assert!(pre_init
+            .shared
+            .take_canonical_connection_failure_followup(entity));
+        assert!(!pre_init
+            .shared
+            .take_canonical_connection_failure_followup(entity));
+        assert!(pre_events.try_recv().is_err());
+
+        let bound = RuntimeHandle::new(RunConfig::default());
+        let mut bound_events = bound.subscribe();
+        let mut bound_world = bevy_ecs::world::World::new();
+        let bound_entity = bound_world.spawn_empty().id();
+        assert!(bound.shared.begin_connection_attempt());
+        let _request = bound_events.try_recv().expect("bound request");
+        assert_eq!(
+            bound
+                .shared
+                .consume_attempt_for_transport_init_and_bind(bound_entity),
+            Some(1)
+        );
+        let _transport = bound_events.try_recv().expect("bound transport");
+        assert!(bound
+            .shared
+            .admit_canonical_disconnected(
+                bound_entity,
+                1,
+                Some("current B exact reason".to_owned()),
+            )
+            .is_some());
+        let close = bound_events.try_recv().expect("bound close");
+        match close.payload {
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionClosed { close }) => {
+                assert_eq!(close.code, "unclassified_kick");
+                assert_eq!(close.end_reason.as_deref(), Some("current B exact reason"));
+            }
+            payload => panic!("expected bound close, got {payload:?}"),
+        }
+        assert!(bound
+            .shared
+            .admit_canonical_disconnected(bound_entity, 1, Some("duplicate reason".to_owned()),)
+            .is_none());
+        assert!(bound_events.try_recv().is_err());
+    }
+
+    #[test]
+    fn same_reserved_attempt_init_is_rejected_and_return_is_idempotent() {
+        fn exercise(init_first: bool) {
+            let handle = RuntimeHandle::new(RunConfig::default());
+            let mut events = handle.subscribe();
+            let mut world = bevy_ecs::world::World::new();
+            let entity = world.spawn_empty().id();
+
+            assert!(handle.shared.begin_connection_attempt());
+            let _request_a = events.try_recv().expect("A request");
+            assert_eq!(
+                handle
+                    .shared
+                    .consume_attempt_for_transport_init_and_bind(entity),
+                Some(1)
+            );
+            let _transport_a = events.try_recv().expect("A transport");
+            assert!(handle
+                .shared
+                .admit_canonical_disconnected(entity, 1, Some("A ended".to_owned()))
+                .is_some());
+            let _close_a = events.try_recv().expect("A close");
+            assert!(handle.shared.claim_reconnect());
+            let reconnect_token = handle
+                .shared
+                .admit_reconnect_attempt()
+                .expect("B admission");
+            let _request_b = events.try_recv().expect("B request");
+
+            if init_first {
+                assert!(!handle.shared.admit_canonical_join_started(2));
+                assert_eq!(
+                    handle
+                        .shared
+                        .consume_attempt_for_transport_init_and_bind(entity),
+                    None
+                );
+                assert_eq!(
+                    handle.shared.bind_reconnect_return(reconnect_token, entity),
+                    Some(2)
+                );
+                let _transport_b = events.try_recv().expect("B transport");
+            } else {
+                assert_eq!(
+                    handle.shared.bind_reconnect_return(reconnect_token, entity),
+                    Some(2)
+                );
+                let _transport_b = events.try_recv().expect("B transport");
+                assert_eq!(
+                    handle
+                        .shared
+                        .consume_attempt_for_transport_init_and_bind(entity),
+                    Some(2)
+                );
+            }
+            assert_eq!(
+                handle.shared.bind_reconnect_return(reconnect_token, entity),
+                Some(2)
+            );
+            assert_eq!(
+                handle
+                    .shared
+                    .consume_attempt_for_transport_init_and_bind(entity),
+                Some(2)
+            );
+            handle.shared.finish_reconnect_attempt(reconnect_token);
+            assert_eq!(handle.shared.entity_producer_epoch_for(entity), Some(2));
+            assert!(events.try_recv().is_err());
+        }
+
+        exercise(true);
+        exercise(false);
+    }
+
+    fn synthetic_attempt_token() -> azalea::join::AttemptToken {
+        azalea::join::AttemptToken::mint()
+    }
+
+    fn send_production_entity_packet(
+        app: &mut App,
+        owner: bevy_ecs::entity::Entity,
+        packet: azalea::protocol::packets::game::ClientboundGamePacket,
+    ) {
+        queue_production_entity_packet(app, owner, packet);
+        app.update();
+    }
+
+    fn queue_production_entity_packet(
+        app: &mut App,
+        owner: bevy_ecs::entity::Entity,
+        packet: azalea::protocol::packets::game::ClientboundGamePacket,
+    ) {
+        let attempt_token = app.world().resource::<TestAttemptToken>().0;
+        app.world_mut()
+            .write_message(azalea::packet::game::ReceiveGamePacketEvent {
+                entity: owner,
+                packet: Arc::new(packet),
+                attempt_token,
+            });
+    }
+
+    fn production_add_packet(id: i32) -> azalea::protocol::packets::game::ClientboundGamePacket {
+        azalea::protocol::packets::game::ClientboundGamePacket::AddEntity(
+            azalea::protocol::packets::game::ClientboundAddEntity {
+                id: id.into(),
+                uuid: Default::default(),
+                entity_type: azalea::registry::builtin::EntityKind::DarkOakChestBoat,
+                position: azalea::Vec3::new(10.0, 64.0, 2.0),
+                movement: azalea::core::delta::LpVec3::from_vec3(azalea::Vec3::new(
+                    0.25, 0.0, -0.5,
+                )),
+                x_rot: -8,
+                y_rot: 16,
+                y_head_rot: 32,
+                data: 0,
+            },
+        )
+    }
+
+    fn production_common_spawn_info(
+        dimension: &str,
+    ) -> azalea::protocol::packets::common::CommonPlayerSpawnInfo {
+        use azalea::core::game_type::{GameMode, OptionalGameType};
+        use azalea::protocol::packets::common::CommonPlayerSpawnInfo;
+        use azalea::registry::data::DimensionKind;
+
+        let dimension_type = <DimensionKind as azalea::registry::DataRegistry>::new_raw(0);
+        CommonPlayerSpawnInfo {
+            dimension_type,
+            dimension: azalea::Identifier::from(dimension),
+            seed: 0,
+            game_type: GameMode::Survival,
+            previous_game_type: OptionalGameType(None),
+            is_debug: false,
+            is_flat: false,
+            last_death_location: None,
+            portal_cooldown: 0,
+            sea_level: 63,
+        }
+    }
+
+    fn production_login_packet(
+        player_id: i32,
+        dimension: &str,
+    ) -> azalea::protocol::packets::game::ClientboundGamePacket {
+        azalea::protocol::packets::game::ClientboundGamePacket::Login(
+            azalea::protocol::packets::game::ClientboundLogin {
+                player_id: player_id.into(),
+                hardcore: false,
+                levels: Vec::new(),
+                max_players: 1,
+                chunk_radius: 8,
+                simulation_distance: 8,
+                reduced_debug_info: false,
+                show_death_screen: true,
+                do_limited_crafting: false,
+                common: production_common_spawn_info(dimension),
+                enforces_secure_chat: false,
+            },
+        )
+    }
+
+    fn production_respawn_packet(
+        dimension: &str,
+    ) -> azalea::protocol::packets::game::ClientboundGamePacket {
+        azalea::protocol::packets::game::ClientboundGamePacket::Respawn(
+            azalea::protocol::packets::game::ClientboundRespawn {
+                common: production_common_spawn_info(dimension),
+                data_to_keep: 0,
+            },
+        )
+    }
+
+    fn production_position_packets() -> [azalea::protocol::packets::game::ClientboundGamePacket; 6]
+    {
+        [
+            azalea::protocol::packets::game::ClientboundGamePacket::MoveEntityPos(
+                azalea::protocol::packets::game::ClientboundMoveEntityPos {
+                    entity_id: 7.into(),
+                    delta: azalea::core::delta::PositionDelta8 {
+                        xa: 4096,
+                        ya: 0,
+                        za: 0,
+                    },
+                    on_ground: false,
+                },
+            ),
+            azalea::protocol::packets::game::ClientboundGamePacket::TeleportEntity(
+                azalea::protocol::packets::game::ClientboundTeleportEntity {
+                    id: 7.into(),
+                    change: azalea::protocol::common::movements::PositionMoveRotation {
+                        pos: azalea::Vec3::new(20.0, 1.0, -4.0),
+                        delta: azalea::Vec3::new(0.5, 0.0, 0.25),
+                        look_direction: azalea::entity::LookDirection::new(90.0, -10.0),
+                    },
+                    relative: azalea::protocol::common::movements::RelativeMovements {
+                        x: false,
+                        y: true,
+                        z: false,
+                        y_rot: false,
+                        x_rot: false,
+                        delta_x: true,
+                        delta_y: false,
+                        delta_z: true,
+                        rotate_delta: false,
+                    },
+                    on_ground: true,
+                },
+            ),
+            azalea::protocol::packets::game::ClientboundGamePacket::EntityPositionSync(
+                azalea::protocol::packets::game::ClientboundEntityPositionSync {
+                    id: 7.into(),
+                    values: azalea::protocol::common::movements::PositionMoveRotation {
+                        pos: azalea::Vec3::new(30.0, 66.0, -5.0),
+                        delta: azalea::Vec3::new(0.0, 1.0, 0.0),
+                        look_direction: azalea::entity::LookDirection::new(120.0, -20.0),
+                    },
+                    on_ground: false,
+                },
+            ),
+            azalea::protocol::packets::game::ClientboundGamePacket::SetEntityMotion(
+                azalea::protocol::packets::game::ClientboundSetEntityMotion {
+                    id: 7.into(),
+                    delta: azalea::core::delta::LpVec3::from_vec3(azalea::Vec3::new(2.0, 3.0, 4.0)),
+                },
+            ),
+            azalea::protocol::packets::game::ClientboundGamePacket::RotateHead(
+                azalea::protocol::packets::game::ClientboundRotateHead {
+                    entity_id: 7.into(),
+                    y_head_rot: 64,
+                },
+            ),
+            azalea::protocol::packets::game::ClientboundGamePacket::RemoveEntities(
+                azalea::protocol::packets::game::ClientboundRemoveEntities {
+                    entity_ids: vec![7.into()],
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn production_packet_batch_keeps_each_callback_at_post_state() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        let mut app = App::new();
+        app.add_message::<azalea::packet::game::ReceiveGamePacketEvent>();
+        let owner = app
+            .world_mut()
+            .spawn((LocalEntity, azalea::core::entity_id::MinecraftEntityId(99)))
+            .id();
+        app.insert_resource(SwarmState {
+            shared: handle.shared.clone(),
+        });
+        app.add_systems(Update, produce_entity_packet_events);
+
+        assert!(handle.shared.begin_connection_attempt());
+        let _request = events.try_recv().expect("packet seam request");
+        let test_token = synthetic_attempt_token();
+        assert!(handle
+            .shared
+            .admit_canonical_join_started_with_token(1, Some(test_token)));
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind_with_token(owner, Some(test_token)),
+            Some(1)
+        );
+        app.world_mut()
+            .insert_resource(TestAttemptToken(test_token));
+        let _transport = events.try_recv().expect("packet seam transport");
+        let source = handle.observation_source();
+        let states = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _subscription = ProtocolObservationSource::subscribe(
+            &source,
+            Arc::new(ImmediateEntityObservationReader {
+                source: source.clone(),
+                states: states.clone(),
+            }),
+        )
+        .expect("callback subscription");
+
+        queue_production_entity_packet(&mut app, owner, production_add_packet(7));
+        for packet in production_position_packets() {
+            queue_production_entity_packet(&mut app, owner, packet);
+        }
+        app.update();
+
+        let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            emitted.len(),
+            6,
+            "SetEntityMotion must not emit an envelope"
+        );
+        assert!(matches!(
+            &emitted[0].payload,
+            BackendEventPayload::Entity(ContractProtocolEntityEvent::Spawned { entity })
+                if entity.entity_key == "1:7"
+        ));
+        assert!(matches!(
+            &emitted[1].payload,
+            BackendEventPayload::Entity(ContractProtocolEntityEvent::Moved { entity })
+                if entity.position.x == 11.0
+        ));
+        assert!(matches!(
+            &emitted[2].payload,
+            BackendEventPayload::Entity(ContractProtocolEntityEvent::Moved { entity })
+                if entity.position.x == 20.0
+        ));
+        assert!(matches!(
+            &emitted[3].payload,
+            BackendEventPayload::Entity(ContractProtocolEntityEvent::Moved { entity })
+                if entity.position.x == 30.0
+        ));
+        assert!(matches!(
+            &emitted[4].payload,
+            BackendEventPayload::Entity(ContractProtocolEntityEvent::Moved { entity })
+                if entity.head_yaw.is_some_and(|value| {
+                    (value - std::f64::consts::FRAC_PI_2).abs() < 1e-6
+                })
+        ));
+        assert!(
+            matches!(
+                &emitted[5].payload,
+                BackendEventPayload::Entity(ContractProtocolEntityEvent::Removed { last, .. })
+                    if last.entity_key == "1:7" && (last.velocity.x - 2.0).abs() < 0.001
+            ),
+            "unexpected Remove payload: {:?}",
+            emitted[5].payload
+        );
+
+        let states = states.lock();
+        assert_eq!(states.len(), 6);
+        assert_eq!(states[0][0].position.x, 10.0);
+        assert_eq!(states[1][0].position.x, 11.0);
+        assert_eq!(
+            (
+                states[2][0].position.x,
+                states[2][0].position.y,
+                states[2][0].position.z
+            ),
+            (20.0, 65.0, -4.0)
+        );
+        assert_eq!(
+            (
+                states[3][0].position.x,
+                states[3][0].position.y,
+                states[3][0].position.z
+            ),
+            (30.0, 66.0, -5.0)
+        );
+        assert!((states[3][0].velocity.y - 1.0).abs() < 1e-6);
+        assert!((states[4][0].velocity.x - 2.0).abs() < 0.001);
+        assert!((states[4][0].velocity.y - 3.0).abs() < 0.001);
+        assert!((states[4][0].velocity.z - 4.0).abs() < 0.001);
+        assert!(
+            states[5].is_empty(),
+            "Remove callback must see an empty list"
+        );
+    }
+
+    #[test]
+    fn production_packet_batch_login_respawn_add_preserves_dimension_order() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        let mut app = App::new();
+        app.add_message::<azalea::packet::game::ReceiveGamePacketEvent>();
+        let owner = app
+            .world_mut()
+            .spawn((LocalEntity, azalea::core::entity_id::MinecraftEntityId(99)))
+            .id();
+        app.insert_resource(SwarmState {
+            shared: handle.shared.clone(),
+        });
+        app.add_systems(Update, produce_entity_packet_events);
+
+        assert!(handle.shared.begin_connection_attempt());
+        let _request = events.try_recv().expect("packet seam request");
+        let test_token = synthetic_attempt_token();
+        assert!(handle
+            .shared
+            .admit_canonical_join_started_with_token(1, Some(test_token)));
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind_with_token(owner, Some(test_token)),
+            Some(1)
+        );
+        app.world_mut()
+            .insert_resource(TestAttemptToken(test_token));
+        let _transport = events.try_recv().expect("packet seam transport");
+        let source = handle.observation_source();
+
+        queue_production_entity_packet(
+            &mut app,
+            owner,
+            production_login_packet(99, "minecraft:overworld"),
+        );
+        queue_production_entity_packet(&mut app, owner, production_add_packet(7));
+        app.update();
+
+        let initial = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            initial.len(),
+            1,
+            "initial Login must not invent a dimension change"
+        );
+        assert_eq!(initial[0].dimension.as_deref(), Some("minecraft:overworld"));
+        assert!(matches!(
+            &initial[0].payload,
+            BackendEventPayload::Entity(ContractProtocolEntityEvent::Spawned { entity })
+                if entity.entity_key == "1:7"
+        ));
+
+        queue_production_entity_packet(
+            &mut app,
+            owner,
+            production_respawn_packet("minecraft:the_nether"),
+        );
+        queue_production_entity_packet(&mut app, owner, production_add_packet(8));
+        app.update();
+
+        let respawn = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(respawn.len(), 2);
+        assert!(matches!(
+            &respawn[0].payload,
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::DimensionChanged { from, to })
+                if from == "minecraft:overworld" && to == "minecraft:the_nether"
+        ));
+        assert_eq!(
+            respawn[0].dimension.as_deref(),
+            Some("minecraft:the_nether")
+        );
+        assert!(matches!(
+            &respawn[1].payload,
+            BackendEventPayload::Entity(ContractProtocolEntityEvent::Spawned { entity })
+                if entity.entity_key == "1:8"
+        ));
+        assert_eq!(
+            respawn[1].dimension.as_deref(),
+            Some("minecraft:the_nether")
+        );
+        let tracked = source.list_tracked_entities().expect("respawn observation");
+        assert_eq!(tracked.len(), 1);
+        assert_eq!(tracked[0].entity_key, "1:8");
+    }
+
+    #[test]
+    fn production_packet_adapter_keeps_each_packet_post_state_and_excludes_self() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        let mut app = App::new();
+        app.add_message::<azalea::packet::game::ReceiveGamePacketEvent>();
+        let owner = app
+            .world_mut()
+            .spawn((LocalEntity, azalea::core::entity_id::MinecraftEntityId(99)))
+            .id();
+        app.insert_resource(SwarmState {
+            shared: handle.shared.clone(),
+        });
+        app.add_systems(Update, produce_entity_packet_events);
+
+        assert!(handle.shared.begin_connection_attempt());
+        let _request = events.try_recv().expect("packet seam request");
+        let test_token = synthetic_attempt_token();
+        assert!(handle
+            .shared
+            .admit_canonical_join_started_with_token(1, Some(test_token)));
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind_with_token(owner, Some(test_token)),
+            Some(1)
+        );
+        app.world_mut()
+            .insert_resource(TestAttemptToken(test_token));
+        let _transport = events.try_recv().expect("packet seam transport");
+        let source = handle.observation_source();
+
+        send_production_entity_packet(&mut app, owner, production_add_packet(7));
+        let spawned = source
+            .list_tracked_entities()
+            .expect("packet Add observation");
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(spawned[0].entity_key, "1:7");
+        assert_eq!(spawned[0].entity_type, "dark_oak_chest_boat");
+        assert_eq!(spawned[0].position.x, 10.0);
+        assert!(
+            (spawned[0].head_yaw.expect("spawn head yaw") - std::f64::consts::FRAC_PI_4).abs()
+                < 1e-6
+        );
+        assert!(matches!(
+            events.try_recv().expect("Spawn envelope").payload,
+            BackendEventPayload::Entity(ContractProtocolEntityEvent::Spawned { entity })
+                if entity.entity_key == "1:7" && entity.entity_type == "dark_oak_chest_boat"
+        ));
+
+        send_production_entity_packet(
+            &mut app,
+            owner,
+            azalea::protocol::packets::game::ClientboundGamePacket::MoveEntityPos(
+                azalea::protocol::packets::game::ClientboundMoveEntityPos {
+                    entity_id: 7.into(),
+                    delta: azalea::core::delta::PositionDelta8 {
+                        xa: 4096,
+                        ya: 0,
+                        za: 0,
+                    },
+                    on_ground: false,
+                },
+            ),
+        );
+        assert_eq!(source.list_tracked_entities().unwrap()[0].position.x, 11.0);
+        assert!(matches!(
+            events.try_recv().expect("relative Move envelope").payload,
+            BackendEventPayload::Entity(ContractProtocolEntityEvent::Moved { entity })
+                if entity.entity_key == "1:7" && entity.position.x == 11.0
+        ));
+
+        send_production_entity_packet(
+            &mut app,
+            owner,
+            azalea::protocol::packets::game::ClientboundGamePacket::TeleportEntity(
+                azalea::protocol::packets::game::ClientboundTeleportEntity {
+                    id: 7.into(),
+                    change: azalea::protocol::common::movements::PositionMoveRotation {
+                        pos: azalea::Vec3::new(20.0, 1.0, -4.0),
+                        delta: azalea::Vec3::new(0.5, 0.0, 0.25),
+                        look_direction: azalea::entity::LookDirection::new(90.0, -10.0),
+                    },
+                    relative: azalea::protocol::common::movements::RelativeMovements {
+                        x: false,
+                        y: true,
+                        z: false,
+                        y_rot: false,
+                        x_rot: false,
+                        delta_x: true,
+                        delta_y: false,
+                        delta_z: true,
+                        rotate_delta: false,
+                    },
+                    on_ground: true,
+                },
+            ),
+        );
+        let teleported = source.list_tracked_entities().unwrap();
+        assert_eq!(
+            (teleported[0].position.x, teleported[0].position.y),
+            (20.0, 65.0)
+        );
+        assert_eq!(teleported[0].position.z, -4.0);
+        assert!(matches!(
+            events.try_recv().expect("Teleport envelope").payload,
+            BackendEventPayload::Entity(ContractProtocolEntityEvent::Moved { entity })
+                if entity.position.x == 20.0
+        ));
+
+        send_production_entity_packet(
+            &mut app,
+            owner,
+            azalea::protocol::packets::game::ClientboundGamePacket::EntityPositionSync(
+                azalea::protocol::packets::game::ClientboundEntityPositionSync {
+                    id: 7.into(),
+                    values: azalea::protocol::common::movements::PositionMoveRotation {
+                        pos: azalea::Vec3::new(30.0, 66.0, -5.0),
+                        delta: azalea::Vec3::new(0.0, 1.0, 0.0),
+                        look_direction: azalea::entity::LookDirection::new(120.0, -20.0),
+                    },
+                    on_ground: false,
+                },
+            ),
+        );
+        let synced = source.list_tracked_entities().unwrap();
+        assert_eq!(synced[0].position.x, 30.0);
+        assert_eq!(synced[0].velocity.y, 1.0);
+        assert!(matches!(
+            events.try_recv().expect("PositionSync envelope").payload,
+            BackendEventPayload::Entity(ContractProtocolEntityEvent::Moved { entity })
+                if entity.position.x == 30.0
+        ));
+
+        send_production_entity_packet(
+            &mut app,
+            owner,
+            azalea::protocol::packets::game::ClientboundGamePacket::RotateHead(
+                azalea::protocol::packets::game::ClientboundRotateHead {
+                    entity_id: 7.into(),
+                    y_head_rot: 64,
+                },
+            ),
+        );
+        assert_eq!(
+            source.list_tracked_entities().unwrap()[0].head_yaw,
+            Some((std::f64::consts::FRAC_PI_2 as f32) as f64)
+        );
+        assert!(matches!(
+            events.try_recv().expect("RotateHead envelope").payload,
+            BackendEventPayload::Entity(ContractProtocolEntityEvent::Moved { entity })
+                if entity
+                    .head_yaw
+                    .is_some_and(|value| (value - std::f64::consts::FRAC_PI_2).abs() < 1e-6)
+        ));
+
+        send_production_entity_packet(
+            &mut app,
+            owner,
+            azalea::protocol::packets::game::ClientboundGamePacket::SetEntityMotion(
+                azalea::protocol::packets::game::ClientboundSetEntityMotion {
+                    id: 7.into(),
+                    delta: azalea::core::delta::LpVec3::from_vec3(azalea::Vec3::new(2.0, 3.0, 4.0)),
+                },
+            ),
+        );
+        assert!((source.list_tracked_entities().unwrap()[0].velocity.x - 2.0).abs() < 0.001);
+        assert!(
+            events.try_recv().is_err(),
+            "SetEntityMotion has no envelope"
+        );
+
+        send_production_entity_packet(
+            &mut app,
+            owner,
+            azalea::protocol::packets::game::ClientboundGamePacket::RemoveEntities(
+                azalea::protocol::packets::game::ClientboundRemoveEntities {
+                    entity_ids: vec![7.into()],
+                },
+            ),
+        );
+        assert!(source.list_tracked_entities().unwrap().is_empty());
+        match events.try_recv().expect("Remove envelope").payload {
+            BackendEventPayload::Entity(ContractProtocolEntityEvent::Removed { last, .. }) => {
+                assert_eq!(last.entity_key, "1:7");
+                assert_eq!(last.position.x, 30.0);
+                assert_eq!(
+                    last.head_yaw,
+                    Some((std::f64::consts::FRAC_PI_2 as f32) as f64)
+                );
+                assert!((last.velocity.x - 2.0).abs() < 0.001);
+            }
+            payload => panic!("expected Remove envelope, got {payload:?}"),
+        }
+
+        // Every entity packet branch is fail-closed for the local protocol id.
+        for packet in [
+            production_add_packet(99),
+            azalea::protocol::packets::game::ClientboundGamePacket::MoveEntityPos(
+                azalea::protocol::packets::game::ClientboundMoveEntityPos {
+                    entity_id: 99.into(),
+                    delta: Default::default(),
+                    on_ground: false,
+                },
+            ),
+            azalea::protocol::packets::game::ClientboundGamePacket::MoveEntityPosRot(
+                azalea::protocol::packets::game::ClientboundMoveEntityPosRot {
+                    entity_id: 99.into(),
+                    delta: Default::default(),
+                    look_direction: Default::default(),
+                    on_ground: false,
+                },
+            ),
+            azalea::protocol::packets::game::ClientboundGamePacket::MoveEntityRot(
+                azalea::protocol::packets::game::ClientboundMoveEntityRot {
+                    entity_id: 99.into(),
+                    look_direction: Default::default(),
+                    on_ground: false,
+                },
+            ),
+            azalea::protocol::packets::game::ClientboundGamePacket::TeleportEntity(
+                azalea::protocol::packets::game::ClientboundTeleportEntity {
+                    id: 99.into(),
+                    change: azalea::protocol::common::movements::PositionMoveRotation {
+                        pos: azalea::Vec3::ZERO,
+                        delta: azalea::Vec3::ZERO,
+                        look_direction: Default::default(),
+                    },
+                    relative: Default::default(),
+                    on_ground: false,
+                },
+            ),
+            azalea::protocol::packets::game::ClientboundGamePacket::EntityPositionSync(
+                azalea::protocol::packets::game::ClientboundEntityPositionSync {
+                    id: 99.into(),
+                    values: azalea::protocol::common::movements::PositionMoveRotation {
+                        pos: azalea::Vec3::ZERO,
+                        delta: azalea::Vec3::ZERO,
+                        look_direction: Default::default(),
+                    },
+                    on_ground: false,
+                },
+            ),
+            azalea::protocol::packets::game::ClientboundGamePacket::RotateHead(
+                azalea::protocol::packets::game::ClientboundRotateHead {
+                    entity_id: 99.into(),
+                    y_head_rot: 1,
+                },
+            ),
+            azalea::protocol::packets::game::ClientboundGamePacket::SetEntityMotion(
+                azalea::protocol::packets::game::ClientboundSetEntityMotion {
+                    id: 99.into(),
+                    delta: azalea::core::delta::LpVec3::Zero,
+                },
+            ),
+            azalea::protocol::packets::game::ClientboundGamePacket::RemoveEntities(
+                azalea::protocol::packets::game::ClientboundRemoveEntities {
+                    entity_ids: vec![99.into()],
+                },
+            ),
+        ] {
+            send_production_entity_packet(&mut app, owner, packet);
+        }
+        assert!(source.list_tracked_entities().unwrap().is_empty());
+        assert!(events.try_recv().is_err());
+
+        // If LocalEntity/MinecraftEntityId cannot be proven at the adapter's
+        // schedule point, entity packets are rejected rather than fail-open.
+        app.world_mut().entity_mut(owner).remove::<LocalEntity>();
+        send_production_entity_packet(&mut app, owner, production_add_packet(8));
+        assert!(source.list_tracked_entities().unwrap().is_empty());
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn observation_source_reads_rotate_and_motion_post_state_without_motion_envelope() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        let mut world = bevy_ecs::world::World::new();
+        let owner = world.spawn_empty().id();
+        assert!(handle.shared.begin_connection_attempt());
+        let _request = events.try_recv().expect("request");
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind(owner),
+            Some(1)
+        );
+        let _transport = events.try_recv().expect("transport");
+        let source = handle.observation_source();
+
+        assert!(handle.shared.emit_entity_input(
+            owner,
+            1,
+            EntityProducerInput::Spawn {
+                token: token(1, 1),
+                snapshot: snapshot(1, 7, 1.0),
+            },
+        ));
+        let _spawn = events.try_recv().expect("spawn");
+        assert!(handle.shared.emit_entity_input(
+            owner,
+            1,
+            EntityProducerInput::Move {
+                token: token(1, 2),
+                patch: EntityMovePatch::rotate_head(EntityIdentity::new(1, 7), 64),
+            },
+        ));
+        assert_eq!(
+            source.list_tracked_entities().unwrap()[0].head_yaw,
+            Some((std::f64::consts::FRAC_PI_2 as f32) as f64)
+        );
+        let _rotate = events.try_recv().expect("rotate envelope");
+
+        assert!(handle.shared.emit_entity_motion_residual(
+            owner,
+            1,
+            EntityProducerToken::new(1, "set-motion:1"),
+            EntityIdentity::new(1, 7),
+            [7.0, 8.0, 9.0],
+        ));
+        let motion = source.list_tracked_entities().unwrap();
+        assert_eq!(motion[0].velocity.x, 7.0);
+        assert!(events.try_recv().is_err(), "motion has no entity envelope");
+
+        assert!(handle.shared.begin_connection_attempt());
+        let stale = BackendError::StaleEpoch {
+            bound_epoch: 1,
+            current_epoch: 2,
+        };
+        assert_eq!(source.list_tracked_entities(), Err(stale));
+    }
+
+    struct ImmediateEntityObservationReader {
+        source: RuntimeObservationSource,
+        states: Arc<parking_lot::Mutex<Vec<Vec<ContractProtocolEntitySnapshot>>>>,
+    }
+
+    impl ObservationEventListener for ImmediateEntityObservationReader {
+        fn on_event(&self, _event: ObservationEvent) {
+            self.states.lock().push(
+                self.source
+                    .list_tracked_entities()
+                    .expect("callback observation"),
+            );
+        }
+    }
+
+    #[test]
+    fn entity_callback_reads_spawn_move_rotate_remove_post_state_immediately() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        let mut world = bevy_ecs::world::World::new();
+        let owner = world.spawn_empty().id();
+        assert!(handle.shared.begin_connection_attempt());
+        let _request = events.try_recv().expect("request");
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind(owner),
+            Some(1)
+        );
+        let _transport = events.try_recv().expect("transport");
+        let source = handle.observation_source();
+        let states = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _subscription = ProtocolObservationSource::subscribe(
+            &source,
+            Arc::new(ImmediateEntityObservationReader {
+                source: source.clone(),
+                states: states.clone(),
+            }),
+        )
+        .expect("callback subscription");
+
+        assert!(handle.shared.emit_entity_input(
+            owner,
+            1,
+            EntityProducerInput::Spawn {
+                token: token(1, 21),
+                snapshot: snapshot(1, 7, 10.0),
+            },
+        ));
+        assert!(handle.shared.emit_entity_input(
+            owner,
+            1,
+            EntityProducerInput::Move {
+                token: token(1, 22),
+                patch: EntityMovePatch::relative(
+                    EntityIdentity::new(1, 7),
+                    Some([4096, 0, 0]),
+                    None,
+                    false,
+                ),
+            },
+        ));
+        assert!(handle.shared.emit_entity_input(
+            owner,
+            1,
+            EntityProducerInput::Move {
+                token: token(1, 23),
+                patch: EntityMovePatch::rotate_head(EntityIdentity::new(1, 7), 64),
+            },
+        ));
+        assert!(handle.shared.emit_entity_input(
+            owner,
+            1,
+            EntityProducerInput::Remove {
+                token: token(1, 24),
+                entity: EntityIdentity::new(1, 7),
+            },
+        ));
+
+        let states = states.lock();
+        assert_eq!(states.len(), 4);
+        assert_eq!(states[0][0].entity_key, "1:7");
+        assert_eq!(states[0][0].position.x, 10.0);
+        assert_eq!(states[1][0].position.x, 11.0);
+        assert_eq!(
+            states[2][0].head_yaw,
+            Some((std::f64::consts::FRAC_PI_2 as f32) as f64)
+        );
+        assert!(states[3].is_empty());
+    }
+
+    #[test]
+    fn refresh_merge_only_preserves_explicit_residuals_and_ecs_fields_advance() {
+        let key = "4:7".to_owned();
+        let mut captured = ProtocolEntitySnapshot {
+            entity_key: key.clone(),
+            protocol_entity_id: 7,
+            entity_type: "old:shadow".to_owned(),
+            name: None,
+            username: None,
+            uuid: Some("old-uuid".to_owned()),
+            position: Vec3Value {
+                x: 3.0,
+                y: 64.0,
+                z: 4.0,
+            },
+            velocity: Vec3Value {
+                x: -0.25,
+                y: 0.5,
+                z: 0.75,
+            },
+            yaw: 0.125,
+            pitch: -0.25,
+            head_yaw: Some(0.5),
+            width: 0.625,
+            height: 1.875,
+            on_ground: false,
+            pose: Some("standing".to_owned()),
+            held_item_name: None,
+            equipment: Vec::new(),
+            valid: true,
+        };
+        captured.entity_type = "ecs:dark_oak_chest_boat".to_owned();
+        captured.uuid = Some("ecs-uuid".to_owned());
+        captured.position.x = 99.0;
+        captured.velocity.x = 6.0;
+        captured.head_yaw = None;
+        captured.pose = Some("crouching".to_owned());
+        captured.on_ground = true;
+        let mut residuals = vec![EntityObservationResidual {
+            entity_key: key.clone(),
+            head_yaw: Some(135.0),
+            velocity: Some([8.0, 9.0, 10.0]),
+        }];
+        let merged = merge_refreshed_tracked_entities(vec![captured.clone()], &mut residuals, 4);
+        assert_eq!(merged[0].position.x, 99.0);
+        assert_eq!(merged[0].entity_type, "ecs:dark_oak_chest_boat");
+        assert_eq!(merged[0].uuid.as_deref(), Some("ecs-uuid"));
+        assert_eq!(merged[0].pose.as_deref(), Some("crouching"));
+        assert!(merged[0].on_ground);
+        assert_eq!(merged[0].head_yaw, Some(135.0));
+        assert_eq!(merged[0].velocity.x, 8.0);
+
+        let mut no_residuals = Vec::new();
+        let no_residual =
+            merge_refreshed_tracked_entities(vec![captured.clone()], &mut no_residuals, 4);
+        assert_eq!(no_residual[0], captured);
+
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut world = bevy_ecs::world::World::new();
+        let owner = world.spawn_empty().id();
+        assert!(handle.shared.begin_connection_attempt());
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind(owner),
+            Some(1)
+        );
+        {
+            let mut observation = handle.shared.observation.write();
+            observation.tracked_entities.push(captured);
+            observation.entity_residuals = residuals;
+        }
+        assert!(handle
+            .shared
+            .reset_entity_scope_for_owner_at_epoch(owner, 1));
+        let observation = handle.shared.observation.read();
+        assert!(observation.tracked_entities.is_empty());
+        assert!(observation.entity_residuals.is_empty());
+    }
+
+    #[test]
+    fn remove_then_refresh_with_membership_excluded_capture_does_not_revive() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        let mut world = bevy_ecs::world::World::new();
+        let owner = world.spawn_empty().id();
+        assert!(handle.shared.begin_connection_attempt());
+        let _request = events.try_recv().expect("request");
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind(owner),
+            Some(1)
+        );
+        let _transport = events.try_recv().expect("transport");
+        let source = handle.observation_source();
+        let identity = EntityIdentity::new(1, 7);
+
+        assert!(handle.shared.emit_entity_input(
+            owner,
+            1,
+            EntityProducerInput::Spawn {
+                token: token(1, 42),
+                snapshot: snapshot(1, 7, 10.0),
+            },
+        ));
+        let _spawn = events.try_recv().expect("spawn");
+        assert!(handle.shared.emit_entity_motion_residual(
+            owner,
+            1,
+            EntityProducerToken::new(1, "capture-remove:motion"),
+            identity,
+            [3.0, 4.0, 5.0],
+        ));
+        assert!(handle.shared.emit_entity_input(
+            owner,
+            1,
+            EntityProducerInput::Remove {
+                token: token(1, 43),
+                entity: identity,
+            },
+        ));
+        let _remove = events.try_recv().expect("remove");
+        assert!(source.list_tracked_entities().unwrap().is_empty());
+        {
+            let observation = handle.shared.observation.read();
+            assert!(observation.tracked_entities.is_empty());
+            assert!(observation.entity_residuals.is_empty());
+        }
+
+        // This is the runtime half of the capture boundary: the membership
+        // predicate supplies an empty capture while ECS deferred-despawn may
+        // still leave the old entity addressable. Refresh must not resurrect
+        // either the entity or a residual for it.
+        let mut residuals = vec![EntityObservationResidual {
+            entity_key: identity.key(),
+            head_yaw: None,
+            velocity: Some([3.0, 4.0, 5.0]),
+        }];
+        let refreshed = merge_refreshed_tracked_entities(Vec::new(), &mut residuals, 1);
+        assert!(refreshed.is_empty());
+        assert!(residuals.is_empty());
+        assert!(source.list_tracked_entities().unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_motion_then_teleport_clears_velocity_before_refresh_and_spawn_reuse() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        let mut world = bevy_ecs::world::World::new();
+        let owner = world.spawn_empty().id();
+        assert!(handle.shared.begin_connection_attempt());
+        let _request = events.try_recv().expect("request");
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind(owner),
+            Some(1)
+        );
+        let _transport = events.try_recv().expect("transport");
+
+        let identity = EntityIdentity::new(1, 7);
+        assert!(handle.shared.emit_entity_input(
+            owner,
+            1,
+            EntityProducerInput::Spawn {
+                token: token(1, 31),
+                snapshot: snapshot(1, 7, 1.0),
+            },
+        ));
+        let _spawn = events.try_recv().expect("spawn");
+        assert!(handle.shared.emit_entity_motion_residual(
+            owner,
+            1,
+            EntityProducerToken::new(1, "set-motion:v1"),
+            identity,
+            [1.0, 2.0, 3.0],
+        ));
+        assert_eq!(
+            handle.shared.observation.read().entity_residuals[0].velocity,
+            Some([1.0, 2.0, 3.0])
+        );
+
+        assert!(handle.shared.emit_entity_input_with_velocity_residual(
+            owner,
+            1,
+            EntityProducerInput::Move {
+                token: token(1, 32),
+                patch: EntityMovePatch::teleport(
+                    identity,
+                    [20.0, 65.0, 2.0],
+                    [0.0, 0.0],
+                    [false; 3],
+                    [false; 2],
+                    [4.0, 5.0, 6.0],
+                    [false; 3],
+                    false,
+                    true,
+                ),
+            },
+            EntityResidualAction::Clear,
+        ));
+        let _teleport = events.try_recv().expect("teleport");
+        let observation = handle.shared.observation.read();
+        assert_eq!(observation.tracked_entities[0].velocity.x, 4.0);
+        assert!(!observation.entity_residuals.iter().any(|residual| {
+            residual.entity_key == "1:7" && residual.velocity == Some([1.0, 2.0, 3.0])
+        }));
+        let mut captured = observation.tracked_entities.clone();
+        captured[0].velocity.x = 9.0;
+        let mut residuals = observation.entity_residuals.clone();
+        drop(observation);
+        let refreshed = merge_refreshed_tracked_entities(captured, &mut residuals, 1);
+        assert_eq!(refreshed[0].velocity.x, 9.0);
+
+        assert!(handle.shared.emit_entity_motion_residual(
+            owner,
+            1,
+            EntityProducerToken::new(1, "set-motion:reuse-old"),
+            identity,
+            [7.0, 8.0, 9.0],
+        ));
+        assert!(handle.shared.emit_entity_input(
+            owner,
+            1,
+            EntityProducerInput::Spawn {
+                token: token(1, 33),
+                snapshot: {
+                    let mut reused = snapshot(1, 7, 40.0);
+                    reused.velocity = [11.0, 12.0, 13.0];
+                    reused
+                },
+            },
+        ));
+        let observation = handle.shared.observation.read();
+        assert_eq!(observation.tracked_entities[0].velocity.x, 11.0);
+        assert!(!observation.entity_residuals.iter().any(|residual| {
+            residual.entity_key == "1:7" && residual.velocity == Some([7.0, 8.0, 9.0])
+        }));
+    }
+
+    #[test]
+    fn residuals_are_bounded_and_refresh_drops_orphans() {
+        let mut observation = ObservationState::default();
+        for id in 0..=ENTITY_OBSERVATION_RESIDUAL_CAPACITY {
+            record_entity_residual(
+                &mut observation,
+                &format!("1:{id}"),
+                None,
+                Some([id as f64, 0.0, 0.0]),
+                EntityResidualAction::Update,
+            );
+        }
+        assert_eq!(
+            observation.entity_residuals.len(),
+            ENTITY_OBSERVATION_RESIDUAL_CAPACITY
+        );
+        assert!(!observation
+            .entity_residuals
+            .iter()
+            .any(|residual| residual.entity_key == "1:0"));
+        assert!(observation
+            .entity_residuals
+            .iter()
+            .any(|residual| residual.entity_key == "1:1024"));
+
+        let mut residuals = vec![
+            EntityObservationResidual {
+                entity_key: "1:7".to_owned(),
+                head_yaw: None,
+                velocity: Some([1.0, 0.0, 0.0]),
+            },
+            EntityObservationResidual {
+                entity_key: "1:orphan".to_owned(),
+                head_yaw: None,
+                velocity: Some([2.0, 0.0, 0.0]),
+            },
+            EntityObservationResidual {
+                entity_key: "2:stale".to_owned(),
+                head_yaw: None,
+                velocity: Some([3.0, 0.0, 0.0]),
+            },
+        ];
+        let captured = vec![normalized_entity_snapshot_to_protocol(&snapshot(1, 7, 5.0))
+            .expect("finite snapshot should convert")];
+        let _ = merge_refreshed_tracked_entities(captured, &mut residuals, 1);
+        assert_eq!(residuals.len(), 1);
+        assert_eq!(residuals[0].entity_key, "1:7");
+    }
+
+    #[test]
+    fn same_owner_epoch_reset_invalidates_an_apply_waiting_to_publish() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        let mut world = bevy_ecs::world::World::new();
+        let owner = world.spawn_empty().id();
+        assert!(handle.shared.begin_connection_attempt());
+        let _request = events.try_recv().expect("request");
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind(owner),
+            Some(1)
+        );
+        let _transport = events.try_recv().expect("transport");
+
+        {
+            let mut observation = handle.shared.observation.write();
+            observation.world = Some(Arc::new(parking_lot::RwLock::new(
+                azalea::world::World::default(),
+            )));
+            observation.snapshot = Some(scope_snapshot(1));
+            observation.source = Some(FactSource::ServerObserved);
+            observation
+                .tracked_entities
+                .push(normalized_entity_snapshot_to_protocol(&snapshot(1, 6, 0.0)).unwrap());
+            observation
+                .entity_residuals
+                .push(EntityObservationResidual {
+                    entity_key: "1:6".to_owned(),
+                    head_yaw: None,
+                    velocity: Some([1.0, 0.0, 0.0]),
+                });
+        }
+
+        let after_apply = Arc::new(std::sync::Barrier::new(2));
+        let release_publish = Arc::new(std::sync::Barrier::new(2));
+        handle
+            .shared
+            .set_entity_publish_after_apply_hook(Some(Arc::new({
+                let after_apply = after_apply.clone();
+                let release_publish = release_publish.clone();
+                move || {
+                    after_apply.wait();
+                    release_publish.wait();
+                }
+            })));
+
+        let emitter_shared = handle.shared.clone();
+        let emitter = std::thread::spawn(move || {
+            emitter_shared.emit_entity_input(
+                owner,
+                1,
+                EntityProducerInput::Spawn {
+                    token: token(1, 41),
+                    snapshot: snapshot(1, 7, 1.0),
+                },
+            )
+        });
+        after_apply.wait();
+
+        assert!(handle
+            .shared
+            .reset_entity_scope_for_owner_at_epoch(owner, 1));
+        release_publish.wait();
+        assert!(!emitter.join().expect("publisher thread should finish"));
+        assert!(
+            events.try_recv().is_err(),
+            "reset must suppress stale envelope"
+        );
+        let observation = handle.shared.observation.read();
+        assert!(observation.world.is_none());
+        assert!(observation.snapshot.is_none());
+        assert!(observation.source.is_none());
+        assert!(observation.tracked_entities.is_empty());
+        assert!(observation.entity_residuals.is_empty());
+    }
 }
 
 struct SharedRuntime {
@@ -924,6 +3757,9 @@ struct SharedRuntime {
     commands: parking_lot::Mutex<VecDeque<QueuedCommand>>,
     subscribers: parking_lot::Mutex<Vec<Arc<RuntimeEventQueue>>>,
     observation_subscribers: parking_lot::Mutex<Vec<ObservationSubscriber>>,
+    entity_producer: parking_lot::Mutex<EntityProducerRuntimeState>,
+    entity_packet_admission: AtomicU64,
+    sound_packet_sequence: AtomicU64,
     next_observation_subscription_id: AtomicU64,
     observation: parking_lot::RwLock<ObservationState>,
     /// Authoritative runtime lifecycle state.  The facade reads this value;
@@ -960,7 +3796,17 @@ struct SharedRuntime {
     reconnect_pending: AtomicBool,
     reconnect_add_pending: AtomicBool,
     reconnect_attempt_token: AtomicU64,
-    attempt_epoch_reserved: AtomicBool,
+    /// Retry ordinal is independent from the never-reset connection epoch.
+    retry_ordinal: AtomicU64,
+    reconnect_rng: AtomicU64,
+    phase_generation: AtomicU64,
+    phase_cancel: Arc<Notify>,
+    stable_generation: AtomicU64,
+    stable_cancel: Arc<Notify>,
+    stop_watchdog_generation: AtomicU64,
+    stop_watchdog_cancel: Arc<Notify>,
+    active_client: parking_lot::Mutex<Option<Client>>,
+    timers_enabled: AtomicBool,
     ready: AtomicBool,
     stopping: AtomicBool,
     #[cfg(test)]
@@ -976,9 +3822,19 @@ struct SharedRuntime {
     #[cfg(test)]
     stop_signal_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
+    stop_watchdog_completion_probe: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
+    #[cfg(test)]
     runtime_broker_backpressure_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     disconnect_cleanup_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    entity_publish_after_apply_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    entity_owner_bind_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    observation_write_boundary_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    canonical_publication_probe: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl SharedRuntime {
@@ -997,6 +3853,9 @@ impl SharedRuntime {
             commands: parking_lot::Mutex::new(VecDeque::new()),
             subscribers: parking_lot::Mutex::new(Vec::new()),
             observation_subscribers: parking_lot::Mutex::new(Vec::new()),
+            entity_producer: parking_lot::Mutex::new(EntityProducerRuntimeState::default()),
+            entity_packet_admission: AtomicU64::new(0),
+            sound_packet_sequence: AtomicU64::new(0),
             next_observation_subscription_id: AtomicU64::new(0),
             observation: parking_lot::RwLock::new(ObservationState::default()),
             backend_state: parking_lot::RwLock::new(BackendState::Idle),
@@ -1025,7 +3884,16 @@ impl SharedRuntime {
             reconnect_pending: AtomicBool::new(false),
             reconnect_add_pending: AtomicBool::new(false),
             reconnect_attempt_token: AtomicU64::new(0),
-            attempt_epoch_reserved: AtomicBool::new(false),
+            retry_ordinal: AtomicU64::new(0),
+            reconnect_rng: AtomicU64::new(0x4d494e45494e5441),
+            phase_generation: AtomicU64::new(0),
+            phase_cancel: Arc::new(Notify::new()),
+            stable_generation: AtomicU64::new(0),
+            stable_cancel: Arc::new(Notify::new()),
+            stop_watchdog_generation: AtomicU64::new(0),
+            stop_watchdog_cancel: Arc::new(Notify::new()),
+            active_client: parking_lot::Mutex::new(None),
+            timers_enabled: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             #[cfg(test)]
@@ -1041,9 +3909,19 @@ impl SharedRuntime {
             #[cfg(test)]
             stop_signal_hook: parking_lot::Mutex::new(None),
             #[cfg(test)]
+            stop_watchdog_completion_probe: parking_lot::Mutex::new(None),
+            #[cfg(test)]
             runtime_broker_backpressure_hook: parking_lot::Mutex::new(None),
             #[cfg(test)]
             disconnect_cleanup_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            entity_publish_after_apply_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            entity_owner_bind_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            observation_write_boundary_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            canonical_publication_probe: parking_lot::Mutex::new(None),
         }
     }
 
@@ -1057,11 +3935,905 @@ impl SharedRuntime {
 
     fn connection_identity(&self) -> (u64, String, u32) {
         let writer = self.writer.lock();
+        let retry_ordinal = self.retry_ordinal.load(Ordering::Acquire);
         (
             writer.connection_epoch,
             writer.connection_attempt_id.clone(),
-            u32::try_from(writer.connection_epoch).unwrap_or(u32::MAX),
+            u32::try_from(retry_ordinal).unwrap_or(u32::MAX),
         )
+    }
+
+    fn arm_phase_deadline_locked(&self, phase: TransportPhase) -> Option<PhaseDeadlineToken> {
+        let generation = checked_atomic_increment(&self.phase_generation)?;
+        let epoch = self.writer.lock().connection_epoch;
+        Some(PhaseDeadlineToken {
+            epoch,
+            attempt: self.retry_ordinal.load(Ordering::Acquire),
+            phase,
+            generation,
+        })
+    }
+
+    fn arm_stable_reset_locked(&self) -> Option<StableResetToken> {
+        let generation = checked_atomic_increment(&self.stable_generation)?;
+        let epoch = self.writer.lock().connection_epoch;
+        Some(StableResetToken {
+            epoch,
+            attempt: self.retry_ordinal.load(Ordering::Acquire),
+            generation,
+        })
+    }
+
+    fn invalidate_phase_locked(&self) {
+        let _ = checked_atomic_increment(&self.phase_generation);
+    }
+
+    fn invalidate_stable_reset_locked(&self) {
+        let _ = checked_atomic_increment(&self.stable_generation);
+    }
+
+    fn phase_timeout(&self, phase: TransportPhase) -> Duration {
+        let millis = match phase {
+            TransportPhase::Connecting => self.config.timeouts.connect_ms,
+            TransportPhase::LoggingIn => self.config.timeouts.login_ms,
+            TransportPhase::Spawning => self.config.timeouts.spawn_ms,
+        };
+        Duration::from_millis(millis)
+    }
+
+    fn phase_deadline_matches_locked(&self, token: PhaseDeadlineToken) -> bool {
+        if self.stopping.load(Ordering::Acquire)
+            || self.stop_requested.load(Ordering::Acquire)
+            || self.stopped_reported.load(Ordering::Acquire)
+            || self.disconnect_reported.load(Ordering::Acquire)
+            || self.phase_generation.load(Ordering::Acquire) != token.generation
+            || self.retry_ordinal.load(Ordering::Acquire) != token.attempt
+            || self.writer.lock().connection_epoch != token.epoch
+        {
+            return false;
+        }
+        let attempt = u32::try_from(token.attempt).unwrap_or(u32::MAX);
+        match self.backend_state() {
+            BackendState::Connecting {
+                epoch,
+                attempt: state_attempt,
+                ..
+            } => {
+                token.phase == TransportPhase::Connecting
+                    && epoch == token.epoch
+                    && state_attempt == attempt
+            }
+            BackendState::LoggingIn {
+                epoch,
+                attempt: state_attempt,
+                ..
+            } => {
+                token.phase == TransportPhase::LoggingIn
+                    && epoch == token.epoch
+                    && state_attempt == attempt
+            }
+            BackendState::Spawning {
+                epoch,
+                attempt: state_attempt,
+                ..
+            } => {
+                token.phase == TransportPhase::Spawning
+                    && epoch == token.epoch
+                    && state_attempt == attempt
+            }
+            _ => false,
+        }
+    }
+
+    fn stable_reset_matches_locked(&self, token: StableResetToken) -> bool {
+        if self.stopping.load(Ordering::Acquire)
+            || self.stop_requested.load(Ordering::Acquire)
+            || self.stopped_reported.load(Ordering::Acquire)
+            || self.disconnect_reported.load(Ordering::Acquire)
+            || self.stable_generation.load(Ordering::Acquire) != token.generation
+            || self.retry_ordinal.load(Ordering::Acquire) != token.attempt
+            || self.writer.lock().connection_epoch != token.epoch
+        {
+            return false;
+        }
+        matches!(
+            self.backend_state(),
+            BackendState::Ready { epoch, .. } if epoch == token.epoch
+        )
+    }
+
+    fn spawn_phase_deadline(self: &Arc<Self>, token: PhaseDeadlineToken) {
+        // The pre-Init connect phase is deliberately not scheduled here:
+        // Azalea 0.16 does not expose a safe cancellation handle for its
+        // already-polled add/start future.  Login and spawn begin only after
+        // a Client/Init identity exists and are production-safe to cancel via
+        // the active Client path.
+        if token.phase == TransportPhase::Connecting || !self.timers_enabled.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let shared = self.clone();
+        let cancel = self.phase_cancel.clone();
+        let duration = self.phase_timeout(token.phase);
+        tokio::task::spawn_local(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(duration) => shared.fire_phase_deadline(token),
+                _ = cancel.notified() => {}
+            }
+        });
+    }
+
+    fn spawn_stable_reset(self: &Arc<Self>, token: StableResetToken) {
+        if !self.timers_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let shared = self.clone();
+        let cancel = self.stable_cancel.clone();
+        let duration = Duration::from_millis(self.config.reconnect.stable_reset_ms);
+        tokio::task::spawn_local(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(duration) => shared.fire_stable_reset(token),
+                _ = cancel.notified() => {}
+            }
+        });
+    }
+
+    fn fire_stable_reset(&self, token: StableResetToken) {
+        let _admission = self.command_admission.lock();
+        if self.stable_reset_matches_locked(token) {
+            self.retry_ordinal.store(0, Ordering::Release);
+        }
+    }
+
+    fn timeout_close_evidence(phase: TransportPhase) -> CloseEvidence {
+        let code = match phase {
+            TransportPhase::Connecting => "connection_timeout",
+            TransportPhase::LoggingIn => "login_timeout",
+            TransportPhase::Spawning => "spawn_timeout",
+        };
+        CloseEvidence {
+            code: code.to_owned(),
+            retryable: true,
+            deliberate: false,
+            kick: None,
+            error: None,
+            end_reason: Some(code.to_owned()),
+            failure: None,
+        }
+    }
+
+    fn fire_phase_deadline(&self, token: PhaseDeadlineToken) {
+        let (close, should_drain, duplicate_cleanup, client) = {
+            let _admission = self.command_admission.lock();
+            if !self.phase_deadline_matches_locked(token) {
+                return;
+            }
+            self.invalidate_phase_locked();
+            let client = self.active_client.lock().clone();
+            let result = self
+                .mark_disconnected_evidence_locked(Self::timeout_close_evidence(token.phase), None);
+            (result.0, result.1, result.2, client)
+        };
+        self.phase_cancel.notify_waiters();
+        if duplicate_cleanup {
+            self.cancel_active_movement(true);
+            self.cancel_pending_commands();
+            self.clear_observations();
+        }
+        if should_drain {
+            self.drain_events();
+        }
+        if close.deliberate || self.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        // A login/spawn timeout has an active Client.  Let Azalea's canonical
+        // DisconnectEvent/SwarmEvent path supply the account/join options for
+        // the one reconnect policy; this avoids a second lifecycle reducer.
+        if let Some(client) = client {
+            client.disconnect();
+        }
+        if !self.config.reconnect.enabled {
+            self.emit_faulted(self.failure_for_close(&close));
+            self.request_shutdown();
+        }
+    }
+
+    #[cfg(test)]
+    fn test_current_phase_token(&self, phase: TransportPhase) -> PhaseDeadlineToken {
+        PhaseDeadlineToken {
+            epoch: self.connection_epoch(),
+            attempt: self.retry_ordinal.load(Ordering::Acquire),
+            phase,
+            generation: self.phase_generation.load(Ordering::Acquire),
+        }
+    }
+
+    #[cfg(test)]
+    fn test_current_stable_token(&self) -> StableResetToken {
+        StableResetToken {
+            epoch: self.connection_epoch(),
+            attempt: self.retry_ordinal.load(Ordering::Acquire),
+            generation: self.stable_generation.load(Ordering::Acquire),
+        }
+    }
+
+    #[cfg(test)]
+    fn test_current_stop_watchdog_token(&self) -> StopWatchdogToken {
+        StopWatchdogToken {
+            generation: self.stop_watchdog_generation.load(Ordering::Acquire),
+        }
+    }
+
+    /// Caller holds `command_admission`, which also serializes every writer
+    /// epoch transition. Installing the owner and resetting its shadow are
+    /// therefore part of the same attempt identity transaction.
+    fn bind_entity_producer_owner_locked(&self, entity: bevy_ecs::entity::Entity, epoch: u64) {
+        #[cfg(test)]
+        self.invoke_entity_owner_bind_hook();
+        let mut producer = self.entity_producer.lock();
+        producer.source_fence.bind(entity);
+        producer.owner = Some((entity, epoch));
+        producer.reset_scope(epoch);
+    }
+
+    #[cfg(test)]
+    fn entity_producer_epoch_for(&self, entity: bevy_ecs::entity::Entity) -> Option<u64> {
+        self.entity_producer
+            .lock()
+            .owner
+            .and_then(|(owner, epoch)| (owner == entity).then_some(epoch))
+    }
+
+    #[cfg(test)]
+    fn reset_entity_scope_for_owner(&self, entity: bevy_ecs::entity::Entity) -> bool {
+        let mut producer = self.entity_producer.lock();
+        let Some((owner, epoch)) = producer.owner else {
+            return false;
+        };
+        if owner != entity {
+            return false;
+        }
+        producer.reset_scope(epoch);
+        true
+    }
+
+    #[cfg(test)]
+    fn deactivate_entity_producer_owner(&self, entity: bevy_ecs::entity::Entity) -> bool {
+        let mut producer = self.entity_producer.lock();
+        if producer.owner.is_none_or(|(owner, _)| owner != entity) {
+            return false;
+        }
+        producer.owner = None;
+        producer.deactivate_scope();
+        true
+    }
+
+    /// A swarm-level disconnect has no Bevy client entity to compare. It is a
+    /// lifecycle-wide boundary, so its reconnect claim deactivates only the
+    /// single owner that is current at that admission point. Entity-specific
+    /// late disconnects continue through `deactivate_entity_producer_owner`.
+    fn deactivate_current_entity_producer_owner(&self) -> bool {
+        let mut producer = self.entity_producer.lock();
+        if producer.owner.is_none() {
+            return false;
+        }
+        producer.owner = None;
+        producer.deactivate_scope();
+        true
+    }
+
+    /// Claim an entity-specific lifecycle transition while holding
+    /// `command_admission`. The caller supplies the epoch observed at the
+    /// canonical ECS source. This is the source discriminator that an Azalea
+    /// high-level `Event` lacks when the same Bevy entity is reused.
+    fn admit_entity_lifecycle_owner_locked(
+        &self,
+        entity: bevy_ecs::entity::Entity,
+        expected_epoch: u64,
+        allow_unbound_attempt: bool,
+        attempt_token: Option<azalea::join::AttemptToken>,
+    ) -> bool {
+        let current_epoch = self.writer.lock().connection_epoch;
+        if current_epoch != expected_epoch {
+            return false;
+        }
+        let mut producer = self.entity_producer.lock();
+        if let Some(token) = attempt_token {
+            // Stamped source: the token must already be bound one-to-one to
+            // this exact epoch. The legacy source fence does not apply.
+            if !producer
+                .source_token_bindings
+                .matches(token, expected_epoch)
+            {
+                return false;
+            }
+        } else if !producer.source_fence.allows_unstamped(entity) {
+            // The event carries no source epoch.  In the same-entity rebind
+            // case this is deliberately fail-closed; using `expected_epoch`
+            // from the current writer would stamp a possible late A event as
+            // B.
+            return false;
+        }
+        match producer.attempt {
+            AttemptAdmissionState::Bound {
+                epoch,
+                entity: bound_entity,
+                attempt_token: bound_attempt_token,
+                ..
+            } if epoch == expected_epoch
+                && bound_entity == entity
+                && bound_attempt_token == attempt_token
+                && producer.owner == Some((entity, expected_epoch)) =>
+            {
+                producer.owner = None;
+                producer.deactivate_scope();
+                true
+            }
+            AttemptAdmissionState::Reserved {
+                epoch,
+                join_started_epoch,
+                attempt_token: reserved_attempt_token,
+                ..
+            } if allow_unbound_attempt
+                && epoch == expected_epoch
+                && reserved_attempt_token == attempt_token
+                && join_started_epoch == Some(expected_epoch) =>
+            {
+                producer.deactivate_scope();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn next_entity_packet_admission(&self) -> u64 {
+        self.entity_packet_admission.fetch_add(1, Ordering::AcqRel)
+    }
+
+    /// Admit an unstamped canonical Azalea source.  The returned context is
+    /// intentionally short-lived: the producer must pass it back through
+    /// `emit_canonical_observation_event`, which rechecks the same owner,
+    /// epoch, scope generation, and source fence immediately before queue
+    /// insertion.
+    #[cfg(test)]
+    fn admit_canonical_source(
+        &self,
+        entity: bevy_ecs::entity::Entity,
+    ) -> Option<CanonicalSourceAdmission> {
+        self.admit_canonical_source_with_token(entity, None)
+    }
+
+    /// Stamped variant of [`Self::admit_canonical_source`]. The vendor event
+    /// token must already be bound one-to-one to the current owner's epoch;
+    /// the legacy source fence is never consulted for a stamped source.
+    fn admit_canonical_source_with_token(
+        &self,
+        entity: bevy_ecs::entity::Entity,
+        attempt_token: Option<azalea::join::AttemptToken>,
+    ) -> Option<CanonicalSourceAdmission> {
+        let _admission = self.command_admission.lock();
+        let epoch = self.writer.lock().connection_epoch;
+        let producer = self.entity_producer.lock();
+        let admitted = producer.owner == Some((entity, epoch))
+            && match attempt_token {
+                Some(token) => producer.source_token_bindings.matches(token, epoch),
+                None => producer.source_fence.allows_unstamped(entity),
+            };
+        admitted.then_some(CanonicalSourceAdmission {
+            entity,
+            epoch,
+            scope_generation: producer.scope_generation,
+            attempt_token,
+        })
+    }
+
+    fn canonical_source_still_valid_locked(&self, source: CanonicalSourceAdmission) -> bool {
+        if self.writer.lock().connection_epoch != source.epoch {
+            return false;
+        }
+        let producer = self.entity_producer.lock();
+        producer.owner == Some((source.entity, source.epoch))
+            && producer.scope_generation == source.scope_generation
+            && match source.attempt_token {
+                Some(token) => producer.source_token_bindings.matches(token, source.epoch),
+                None => producer.source_fence.allows_unstamped(source.entity),
+            }
+    }
+
+    /// Apply one self-armor packet at the packet's source position.  The
+    /// reducer supplies only a source stamp from the current local owner; the
+    /// admission lock is intentionally reacquired here before touching the
+    /// observation generation.
+    fn apply_armor_packet(
+        &self,
+        source: CanonicalSourceAdmission,
+        values: &[azalea::protocol::packets::game::c_update_attributes::AttributeSnapshot],
+    ) -> bool {
+        let mut armor = None;
+        let mut saw_armor = false;
+        for value in values {
+            if !matches!(value.attribute, azalea::registry::builtin::Attribute::Armor) {
+                continue;
+            }
+            saw_armor = true;
+            armor = calculate_armor_snapshot(value);
+        }
+        if !saw_armor {
+            return false;
+        }
+
+        let _admission = self.command_admission.lock();
+        if !self.canonical_source_still_valid_locked(source)
+            || !self.command_execution_allowed_without_lock()
+        {
+            return false;
+        }
+        let mut observation = self.observation.write();
+        observation.armor = armor;
+        observation.armor_epoch = Some(source.epoch);
+        observation.bump_generation();
+        true
+    }
+
+    /// Apply light data without consulting a later Bevy scope.  `source` is
+    /// the immutable stamp captured while the raw packet was at the reducer's
+    /// cursor; a scope reset between the two checks therefore rejects the
+    /// packet instead of relabeling it with the final scope.
+    fn apply_light_packet(
+        &self,
+        source: CanonicalSourceAdmission,
+        geometry: LightSectionGeometry,
+        chunk_x: i32,
+        chunk_z: i32,
+        data: &azalea::protocol::packets::game::c_light_update::ClientboundLightUpdatePacketData,
+        replace_chunk: bool,
+    ) -> bool {
+        let _admission = self.command_admission.lock();
+        if !self.canonical_source_still_valid_locked(source)
+            || !self.command_execution_allowed_without_lock()
+        {
+            return false;
+        }
+        let Some(dimension) = self.writer.lock().dimension.clone() else {
+            return false;
+        };
+        let has_skylight = self
+            .observation
+            .read()
+            .light_cache
+            .context
+            .as_ref()
+            .and_then(|context| context.has_skylight);
+        let mut observation = self.observation.write();
+        if !observation.light_cache.apply_packet(
+            source,
+            dimension,
+            has_skylight,
+            geometry,
+            chunk_x,
+            chunk_z,
+            data,
+            replace_chunk,
+        ) {
+            return false;
+        }
+        observation.bump_generation();
+        true
+    }
+
+    fn remove_light_chunk(
+        &self,
+        source: CanonicalSourceAdmission,
+        chunk_x: i32,
+        chunk_z: i32,
+    ) -> bool {
+        let _admission = self.command_admission.lock();
+        if !self.canonical_source_still_valid_locked(source)
+            || !self.command_execution_allowed_without_lock()
+        {
+            return false;
+        }
+        let Some(dimension) = self.writer.lock().dimension.clone() else {
+            return false;
+        };
+        let mut observation = self.observation.write();
+        if !observation
+            .light_cache
+            .remove_chunk(source, &dimension, chunk_x, chunk_z)
+        {
+            return false;
+        }
+        observation.bump_generation();
+        true
+    }
+
+    #[cfg(test)]
+    fn admit_canonical_packet_source_for_epoch(
+        &self,
+        entity: bevy_ecs::entity::Entity,
+        source_epoch: u64,
+    ) -> bool {
+        let _admission = self.command_admission.lock();
+        self.writer.lock().connection_epoch == source_epoch
+            && self.entity_producer.lock().owner == Some((entity, source_epoch))
+    }
+
+    #[cfg(test)]
+    fn reset_entity_scope_for_owner_at_epoch(
+        &self,
+        entity: bevy_ecs::entity::Entity,
+        expected_epoch: u64,
+    ) -> bool {
+        self.reset_entity_scope_for_owner_at_epoch_with_dimension_and_light(
+            entity,
+            expected_epoch,
+            None,
+            None,
+        )
+    }
+
+    /// Reset every public authority at a raw Login/Respawn packet boundary.
+    /// The dimension, when supplied by that same packet, is admitted after
+    /// the reset while the same command-admission lock is held, preserving
+    /// packet order and preventing a late boundary from mutating a new owner.
+    fn reset_entity_scope_for_owner_at_epoch_with_dimension_and_light(
+        &self,
+        entity: bevy_ecs::entity::Entity,
+        expected_epoch: u64,
+        dimension: Option<String>,
+        has_skylight: Option<bool>,
+    ) -> bool {
+        let (accepted, should_drain) = {
+            let _admission = self.command_admission.lock();
+            if self.writer.lock().connection_epoch != expected_epoch {
+                return false;
+            }
+            let mut producer = self.entity_producer.lock();
+            if producer.owner != Some((entity, expected_epoch))
+                || !producer.source_fence.allows_unstamped(entity)
+            {
+                return false;
+            }
+            producer.reset_scope(expected_epoch);
+            let scope_generation = producer.scope_generation;
+            drop(producer);
+
+            {
+                let mut observation = self.observation.write();
+                observation.world = None;
+                observation.snapshot = None;
+                observation.snapshot_scope_generation = 0;
+                observation.source = None;
+                observation.tracked_entities.clear();
+                observation.entity_residuals.clear();
+                if observation.armor_epoch != Some(expected_epoch) {
+                    observation.armor = None;
+                    observation.armor_epoch = None;
+                }
+                observation.clear_light_for_scope(
+                    expected_epoch,
+                    scope_generation,
+                    dimension.clone(),
+                    has_skylight,
+                );
+                observation.bump_generation();
+            }
+
+            let should_drain = dimension
+                .map(|dimension| {
+                    let Some(previous) = self.set_dimension(dimension.clone()) else {
+                        return false;
+                    };
+                    if previous == dimension {
+                        return false;
+                    }
+                    self.enqueue_event(
+                        FactSource::ServerObserved,
+                        BackendEventPayload::Lifecycle(BackendLifecyclePayload::DimensionChanged {
+                            from: previous,
+                            to: dimension,
+                        }),
+                    )
+                })
+                .unwrap_or(false);
+            (true, should_drain)
+        };
+        if should_drain {
+            self.drain_events();
+        }
+        accepted
+    }
+
+    #[cfg(test)]
+    fn apply_entity_input_for_owner(
+        &self,
+        owner: bevy_ecs::entity::Entity,
+        epoch: u64,
+        input: EntityProducerInput,
+    ) -> Option<NormalizedEntityEvent> {
+        self.apply_entity_input_for_owner_with_generation(owner, epoch, input)
+            .map(|(event, _generation)| event)
+    }
+
+    fn apply_entity_input_for_owner_with_generation(
+        &self,
+        owner: bevy_ecs::entity::Entity,
+        epoch: u64,
+        input: EntityProducerInput,
+    ) -> Option<(NormalizedEntityEvent, u64)> {
+        let mut producer = self.entity_producer.lock();
+        if producer.owner != Some((owner, epoch)) {
+            return None;
+        }
+        producer
+            .cache
+            .apply(epoch, input)
+            .map(|event| (event, producer.scope_generation))
+    }
+
+    fn emit_entity_input(
+        &self,
+        owner: bevy_ecs::entity::Entity,
+        epoch: u64,
+        input: EntityProducerInput,
+    ) -> bool {
+        let residual_action = match &input {
+            EntityProducerInput::Spawn { .. } => EntityResidualAction::Clear,
+            _ => EntityResidualAction::Retain,
+        };
+        self.emit_entity_input_with_velocity_residual(owner, epoch, input, residual_action)
+    }
+
+    fn emit_entity_input_with_velocity_residual(
+        &self,
+        owner: bevy_ecs::entity::Entity,
+        epoch: u64,
+        input: EntityProducerInput,
+        residual_action: EntityResidualAction,
+    ) -> bool {
+        let normalized = self.apply_entity_input_for_owner_with_generation(owner, epoch, input);
+        let Some((normalized, scope_generation)) = normalized else {
+            return false;
+        };
+        #[cfg(test)]
+        self.invoke_entity_publish_after_apply_hook();
+
+        let should_drain = {
+            let _admission = self.command_admission.lock();
+            let producer = self.entity_producer.lock();
+            if producer.owner != Some((owner, epoch))
+                || producer.scope_generation != scope_generation
+            {
+                return false;
+            }
+            // The packet producer's shadow is the immediate post-state
+            // authority.  Publish the same state into the public observation
+            // list before queueing the event so an observation callback can
+            // read it synchronously.
+            if !self.apply_entity_observation_event_locked(epoch, &normalized, residual_action) {
+                return false;
+            }
+            let payload =
+                BackendEventPayload::Entity(normalized_entity_event_to_contract(normalized));
+            let Some(should_drain) = self.enqueue_entity_event_if_running_locked(
+                epoch,
+                FactSource::ServerObserved,
+                payload,
+            ) else {
+                return false;
+            };
+            // Keep the owner stable through envelope construction and queue
+            // insertion. Queue draining and callbacks happen below, lock-free.
+            drop(producer);
+            should_drain
+        };
+        if should_drain {
+            self.drain_events();
+        }
+        true
+    }
+
+    fn emit_entity_motion_residual(
+        &self,
+        owner: bevy_ecs::entity::Entity,
+        epoch: u64,
+        token: EntityProducerToken,
+        entity: EntityIdentity,
+        velocity: [f64; 3],
+    ) -> bool {
+        let normalized = {
+            let mut producer = self.entity_producer.lock();
+            if producer.owner != Some((owner, epoch)) {
+                return false;
+            }
+            producer
+                .cache
+                .apply_velocity_residual(epoch, token, entity, velocity)
+                .map(|snapshot| (snapshot, producer.scope_generation))
+        };
+        let Some((normalized, scope_generation)) = normalized else {
+            return false;
+        };
+        let _admission = self.command_admission.lock();
+        let producer = self.entity_producer.lock();
+        if producer.owner != Some((owner, epoch)) || producer.scope_generation != scope_generation {
+            return false;
+        }
+        let mut observation = self.observation.write();
+        let Some(snapshot) = normalized_entity_snapshot_to_protocol(&normalized) else {
+            return false;
+        };
+        upsert_entity_observation(&mut observation, snapshot);
+        record_entity_residual(
+            &mut observation,
+            &normalized.entity_key(),
+            None,
+            Some(normalized.velocity),
+            EntityResidualAction::Update,
+        );
+        true
+    }
+
+    /// Synchronize the public tracked-entity observation with the exact
+    /// producer post-state that is about to be emitted.  The caller holds
+    /// `command_admission` and the producer guard; callbacks/drain remain
+    /// outside all of those locks.
+    fn apply_entity_observation_event_locked(
+        &self,
+        epoch: u64,
+        event: &NormalizedEntityEvent,
+        residual_action: EntityResidualAction,
+    ) -> bool {
+        let mut observation = self.observation.write();
+        match event {
+            NormalizedEntityEvent::Spawned { entity }
+            | NormalizedEntityEvent::Moved { entity }
+            | NormalizedEntityEvent::Updated { entity, .. } => {
+                let Some(snapshot) = normalized_entity_snapshot_to_protocol(entity) else {
+                    return false;
+                };
+                if entity.identity.epoch != epoch {
+                    return false;
+                }
+                let key = snapshot.entity_key.clone();
+                upsert_entity_observation(&mut observation, snapshot);
+                record_entity_residual(
+                    &mut observation,
+                    &key,
+                    entity.head_yaw,
+                    Some(entity.velocity),
+                    residual_action,
+                );
+                true
+            }
+            NormalizedEntityEvent::Removed { entity, .. } => {
+                if entity.epoch != epoch {
+                    return false;
+                }
+                let key = entity.key();
+                let before = observation.tracked_entities.len();
+                let residual_before = observation.entity_residuals.len();
+                observation
+                    .tracked_entities
+                    .retain(|snapshot| snapshot.entity_key != key);
+                observation
+                    .entity_residuals
+                    .retain(|residual| residual.entity_key != key);
+                if before != observation.tracked_entities.len()
+                    || residual_before != observation.entity_residuals.len()
+                {
+                    observation.bump_generation();
+                }
+                true
+            }
+            NormalizedEntityEvent::Animation { .. } | NormalizedEntityEvent::Hurt { .. } => true,
+        }
+    }
+
+    fn enqueue_entity_event_if_running_locked(
+        &self,
+        expected_epoch: u64,
+        source: FactSource,
+        payload: BackendEventPayload,
+    ) -> Option<bool> {
+        if !self.command_execution_allowed_without_lock() {
+            return None;
+        }
+        #[cfg(test)]
+        self.invoke_event_admission_hook();
+
+        let mut dispatch = self.event_dispatch.lock();
+        let event = {
+            let mut writer = self.writer.lock();
+            // Metadata is created while this exact check is protected by the
+            // attempt admission lock; an entity payload can never be stamped
+            // with a later connection's envelope epoch.
+            if writer.connection_epoch != expected_epoch {
+                return None;
+            }
+            writer.emit(source, payload)
+        };
+        Some(self.enqueue_dispatch_locked(&mut dispatch, event))
+    }
+
+    /// Publish one canonical block/sound observation after applying the
+    /// source fact.  Admission and writer envelope construction share the
+    /// command lock, while draining and callbacks happen only after all
+    /// world/producer locks have been released by the caller.
+    fn emit_canonical_observation_event(
+        &self,
+        source: CanonicalSourceAdmission,
+        payload: BackendEventPayload,
+    ) -> bool {
+        // Test probe runs *outside* the command admission lock, so a
+        // deterministic test can rebind the owner between source admission
+        // and publication without deadlocking.
+        #[cfg(test)]
+        self.invoke_canonical_publication_probe();
+        let should_drain = {
+            let _admission = self.command_admission.lock();
+            if !self.canonical_source_still_valid_locked(source) {
+                return false;
+            }
+            let Some(should_drain) = self.enqueue_entity_event_if_running_locked(
+                source.epoch,
+                FactSource::ServerObserved,
+                payload,
+            ) else {
+                return false;
+            };
+            should_drain
+        };
+        if should_drain {
+            self.drain_events();
+        }
+        true
+    }
+
+    fn emit_canonical_sound(
+        &self,
+        source: CanonicalSourceAdmission,
+        sound_name: String,
+        source_position: [f64; 3],
+        volume: f64,
+        pitch: f64,
+    ) -> bool {
+        let should_drain = {
+            let _admission = self.command_admission.lock();
+            if !self.canonical_source_still_valid_locked(source)
+                || !self.command_execution_allowed_without_lock()
+            {
+                return false;
+            }
+            let sound_sequence = self.sound_packet_sequence.fetch_add(1, Ordering::AcqRel) + 1;
+            let payload = BackendEventPayload::Sound(ContractProtocolSoundPayload {
+                event_type: ContractHeardSoundType::Heard,
+                sound_key: format!("sound-{}-{sound_sequence}", source.epoch),
+                sound_name: Some(sound_name),
+                sound_id: None,
+                category: None,
+                source_position: ContractVec3Value {
+                    x: source_position[0],
+                    y: source_position[1],
+                    z: source_position[2],
+                },
+                volume,
+                pitch,
+                protocol_source: ContractProtocolSoundSource::NamedSoundEffect,
+            });
+            let Some(should_drain) = self.enqueue_entity_event_if_running_locked(
+                source.epoch,
+                FactSource::ServerObserved,
+                payload,
+            ) else {
+                return false;
+            };
+            should_drain
+        };
+        if should_drain {
+            self.drain_events();
+        }
+        true
     }
 
     /// Construct and enqueue one event. The caller may hold command admission,
@@ -1262,6 +5034,8 @@ impl SharedRuntime {
         if should_drain {
             self.drain_events();
         }
+        self.phase_cancel.notify_waiters();
+        self.stable_cancel.notify_waiters();
         true
     }
 
@@ -1275,27 +5049,44 @@ impl SharedRuntime {
             }
             self.reconnect_add_pending.store(true, Ordering::Release);
         }
-        self.attempt_epoch_reserved.store(true, Ordering::Release);
+        let (epoch, retry_ordinal) = {
+            let writer = self.writer.lock();
+            (
+                writer.connection_epoch.checked_add(1)?,
+                self.retry_ordinal.load(Ordering::Acquire).checked_add(1)?,
+            )
+        };
         self.disconnect_reported.store(false, Ordering::Release);
         self.stopped_reported.store(false, Ordering::Release);
         self.faulted_reported.store(false, Ordering::Release);
         self.shutdown_requested.store(false, Ordering::Release);
+        self.active_client.lock().take();
+        self.invalidate_phase_locked();
+        self.invalidate_stable_reset_locked();
         if !self.stop_requested.load(Ordering::Acquire) {
             self.dispatch_cancelled.store(false, Ordering::Release);
         }
         *self.stop_reason.lock() = None;
         *self.last_close.lock() = None;
         *self.last_failure.lock() = None;
+        {
+            let mut producer = self.entity_producer.lock();
+            producer.source_fence.begin_attempt();
+            producer.owner = None;
+            producer.attempt = AttemptAdmissionState::NotStarted;
+            producer.pending_connection_failure = None;
+            producer.deactivate_scope();
+        }
         self.clear_observations();
         self.lifecycle_revision.fetch_add(1, Ordering::AcqRel);
 
         let mut dispatch = self.event_dispatch.lock();
         let (event, epoch, attempt_id, attempt) = {
             let mut writer = self.writer.lock();
-            writer.new_attempt();
-            let epoch = writer.connection_epoch;
+            writer.new_attempt(epoch);
+            self.retry_ordinal.store(retry_ordinal, Ordering::Release);
             let attempt_id = writer.connection_attempt_id.clone();
-            let attempt = u32::try_from(epoch).unwrap_or(u32::MAX);
+            let attempt = u32::try_from(retry_ordinal).unwrap_or(u32::MAX);
             (
                 writer.emit(
                     FactSource::Commanded,
@@ -1308,6 +5099,15 @@ impl SharedRuntime {
                 attempt,
             )
         };
+        {
+            let mut producer = self.entity_producer.lock();
+            producer.attempt = AttemptAdmissionState::Reserved {
+                epoch,
+                reconnect_token,
+                join_started_epoch: None,
+                attempt_token: None,
+            };
+        }
         self.set_backend_state(BackendState::Connecting {
             epoch,
             attempt_id,
@@ -1319,29 +5119,330 @@ impl SharedRuntime {
     /// `Event::Init` 消费连接发起前预留的身份，而不是再创建一个 epoch。
     /// 防御性 fallback 仍走同一入口，确保即使 Azalea 新增调用路径，也先有
     /// `connection_requested`，随后才发 transport 生命周期事件。
-    fn consume_attempt_for_transport_init(&self) -> bool {
-        if !self.attempt_epoch_reserved.swap(false, Ordering::AcqRel) {
-            if !self.begin_connection_attempt() {
-                return false;
-            }
-            self.attempt_epoch_reserved.store(false, Ordering::Release);
-        }
-        let _admission = self.command_admission.lock();
-        if self.stopping.load(Ordering::Acquire) {
-            return false;
-        }
-        self.disconnect_reported.store(false, Ordering::Release);
-        self.clear_observations();
-        true
+    #[cfg(test)]
+    fn admit_canonical_join_started(&self, source_epoch: u64) -> bool {
+        self.admit_canonical_join_started_with_token(source_epoch, None)
     }
 
-    fn claim_reconnect(&self) -> bool {
+    /// Stamped variant of [`Self::admit_canonical_join_started`]: the vendor
+    /// `StartJoinServerEvent.attempt_token` is bound one-to-one to the
+    /// reservation's epoch. The legacy source fence only applies to the
+    /// tokenless path.
+    fn admit_canonical_join_started_with_token(
+        &self,
+        source_epoch: u64,
+        attempt_token: Option<azalea::join::AttemptToken>,
+    ) -> bool {
         let _admission = self.command_admission.lock();
-        if self.stopping.load(Ordering::Acquire)
-            || self.reconnect_pending.swap(true, Ordering::AcqRel)
+        if self.writer.lock().connection_epoch != source_epoch {
+            return false;
+        }
+        let mut producer = self.entity_producer.lock();
+        if let Some(token) = attempt_token {
+            // Stamped source: the token must not already belong to another
+            // epoch and this epoch must not already belong to another token.
+            if !producer.source_token_bindings.bind(token, source_epoch) {
+                return false;
+            }
+        } else if !producer.source_fence.allows_unstamped_global() {
+            // Init/StartJoin has no token.  In a same-entity reconnect window
+            // it cannot safely consume the reservation belonging to B.
+            return false;
+        }
+        let AttemptAdmissionState::Reserved {
+            epoch,
+            reconnect_token,
+            join_started_epoch,
+            attempt_token: reserved_token,
+        } = producer.attempt
+        else {
+            return false;
+        };
+        if epoch != source_epoch
+            || reserved_token.is_some_and(|reserved| Some(reserved) != attempt_token)
+            || reconnect_token.is_some_and(|token| {
+                self.reconnect_attempt_token.load(Ordering::Acquire) != token
+                    || !self.reconnect_add_pending.load(Ordering::Acquire)
+            })
         {
             return false;
         }
+        if join_started_epoch == Some(source_epoch) {
+            return true;
+        }
+        producer.attempt = AttemptAdmissionState::Reserved {
+            epoch,
+            reconnect_token,
+            join_started_epoch: Some(source_epoch),
+            attempt_token,
+        };
+        true
+    }
+
+    fn bind_reserved_attempt_locked(
+        &self,
+        entity: bevy_ecs::entity::Entity,
+        expected_reconnect_token: Option<u64>,
+        init_path: bool,
+        expected_attempt_token: Option<azalea::join::AttemptToken>,
+    ) -> Option<(u64, bool, Option<PhaseDeadlineToken>)> {
+        if self.stopping.load(Ordering::Acquire) {
+            return None;
+        }
+        if let Some(token) = expected_reconnect_token {
+            if !self.reconnect_add_pending.load(Ordering::Acquire)
+                || self.reconnect_attempt_token.load(Ordering::Acquire) != token
+            {
+                return None;
+            }
+        }
+
+        let epoch = self.writer.lock().connection_epoch;
+        let mut producer = self.entity_producer.lock();
+        let attempt = producer.attempt;
+        let source_token = expected_attempt_token;
+        if source_token.is_some_and(|token| !producer.source_token_bindings.matches(token, epoch)) {
+            // A stamped client must already be bound one-to-one to this exact
+            // epoch by its StartJoinServerEvent; a token from a different
+            // attempt can never consume this reservation.
+            return None;
+        }
+        if init_path
+            && matches!(
+                attempt,
+                AttemptAdmissionState::Reserved {
+                    reconnect_token: Some(_),
+                    ..
+                }
+            )
+        {
+            // `Event::Init` has no reconnect token.  It must not consume B's
+            // reservation, even when the returned client happens to use a
+            // different Bevy entity.  Only the stamped reconnect-return path
+            // can prove which reservation it belongs to.
+            return None;
+        }
+        if init_path
+            && matches!(attempt, AttemptAdmissionState::Reserved { .. })
+            && source_token.is_none()
+            && !producer.source_fence.allows_unstamped(entity)
+        {
+            return None;
+        }
+        if let Some(token) = source_token {
+            // Idempotent re-registration: the binding was established by
+            // StartJoinServerEvent and must still be exact.
+            if !producer.source_token_bindings.bind(token, epoch) {
+                return None;
+            }
+        }
+        drop(producer);
+        match attempt {
+            AttemptAdmissionState::Reserved {
+                epoch: reserved_epoch,
+                reconnect_token,
+                attempt_token: reserved_attempt_token,
+                ..
+            } if reserved_epoch == epoch
+                && (init_path || reconnect_token == expected_reconnect_token)
+                && reserved_attempt_token == source_token =>
+            {
+                self.clear_observations();
+                self.bind_entity_producer_owner_locked(entity, epoch);
+                let mut producer = self.entity_producer.lock();
+                producer.attempt = AttemptAdmissionState::Bound {
+                    epoch,
+                    entity,
+                    reconnect_token,
+                    attempt_token: source_token,
+                };
+                drop(producer);
+            }
+            AttemptAdmissionState::Bound {
+                epoch: bound_epoch,
+                entity: bound_entity,
+                reconnect_token,
+                attempt_token: bound_attempt_token,
+            } if bound_epoch == epoch
+                && bound_entity == entity
+                && (init_path || reconnect_token == expected_reconnect_token)
+                && bound_attempt_token == source_token =>
+            {
+                return Some((epoch, false, None));
+            }
+            _ => return None,
+        }
+
+        if !self.command_execution_allowed_without_lock() {
+            return Some((epoch, false, None));
+        }
+        let (attempt_id, attempt) = {
+            let writer = self.writer.lock();
+            (
+                writer.connection_attempt_id.clone(),
+                u32::try_from(self.retry_ordinal.load(Ordering::Acquire)).unwrap_or(u32::MAX),
+            )
+        };
+        self.set_backend_state(BackendState::LoggingIn {
+            epoch,
+            attempt_id,
+            attempt,
+        });
+        self.invalidate_stable_reset_locked();
+        let phase_token = self.arm_phase_deadline_locked(TransportPhase::LoggingIn);
+        let should_drain = self.enqueue_event(
+            FactSource::ServerObserved,
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected),
+        );
+        Some((epoch, should_drain, phase_token))
+    }
+
+    fn bind_reserved_attempt(
+        self: &Arc<Self>,
+        entity: bevy_ecs::entity::Entity,
+        expected_reconnect_token: Option<u64>,
+        init_path: bool,
+        expected_attempt_token: Option<azalea::join::AttemptToken>,
+    ) -> Option<u64> {
+        let (epoch, should_drain, phase_token) = {
+            let _admission = self.command_admission.lock();
+            self.bind_reserved_attempt_locked(
+                entity,
+                expected_reconnect_token,
+                init_path,
+                expected_attempt_token,
+            )?
+        };
+        if should_drain {
+            self.drain_events();
+        }
+        self.phase_cancel.notify_waiters();
+        if let Some(token) = phase_token {
+            self.spawn_phase_deadline(token);
+        }
+        Some(epoch)
+    }
+
+    #[cfg(test)]
+    fn consume_attempt_for_transport_init_and_bind(
+        self: &Arc<Self>,
+        entity: bevy_ecs::entity::Entity,
+    ) -> Option<u64> {
+        self.consume_attempt_for_transport_init_and_bind_with_token(entity, None)
+    }
+
+    fn consume_attempt_for_transport_init_and_bind_with_token(
+        self: &Arc<Self>,
+        entity: bevy_ecs::entity::Entity,
+        attempt_token: Option<azalea::join::AttemptToken>,
+    ) -> Option<u64> {
+        let (epoch, should_drain, phase_token) = {
+            let _admission = self.command_admission.lock();
+            if self.stopping.load(Ordering::Acquire) {
+                return None;
+            }
+
+            let needs_fallback = {
+                let producer = self.entity_producer.lock();
+                matches!(producer.attempt, AttemptAdmissionState::NotStarted)
+            };
+            let mut should_drain = false;
+            if needs_fallback {
+                should_drain = self.begin_connection_attempt_locked(None)?;
+            }
+            self.disconnect_reported.store(false, Ordering::Release);
+            let (epoch, bind_should_drain, phase_token) =
+                self.bind_reserved_attempt_locked(entity, None, true, attempt_token)?;
+            (epoch, should_drain || bind_should_drain, phase_token)
+        };
+        if should_drain {
+            self.drain_events();
+        }
+        self.phase_cancel.notify_waiters();
+        if let Some(token) = phase_token {
+            self.spawn_phase_deadline(token);
+        }
+        Some(epoch)
+    }
+
+    #[cfg(test)]
+    fn bind_reconnect_return(
+        self: &Arc<Self>,
+        token: u64,
+        entity: bevy_ecs::entity::Entity,
+    ) -> Option<u64> {
+        self.bind_reconnect_return_with_token(token, entity, None)
+    }
+
+    fn bind_reconnect_return_with_token(
+        self: &Arc<Self>,
+        token: u64,
+        entity: bevy_ecs::entity::Entity,
+        attempt_token: Option<azalea::join::AttemptToken>,
+    ) -> Option<u64> {
+        self.bind_reserved_attempt(entity, Some(token), false, attempt_token)
+    }
+
+    #[cfg(test)]
+    fn claim_reconnect(&self) -> bool {
+        self.claim_reconnect_with_token(None)
+    }
+
+    fn claim_reconnect_with_token(
+        &self,
+        attempt_token: Option<azalea::join::AttemptToken>,
+    ) -> bool {
+        let _admission = self.command_admission.lock();
+        if self.stopping.load(Ordering::Acquire) || self.reconnect_pending.load(Ordering::Acquire) {
+            return false;
+        }
+        // A SwarmEvent::Disconnect has no client entity and can also be
+        // emitted by an old per-add copy task.  Once a current owner is bound,
+        // only the canonical ECS disconnect admission may authorize it.  The
+        // precise source runs before the high-level listener, so a real
+        // current disconnect has already set this bit.
+        let disconnect_reported = self.disconnect_reported.load(Ordering::Acquire);
+        let current_epoch = self.writer.lock().connection_epoch;
+        let (owner, attempt) = {
+            let producer = self.entity_producer.lock();
+            if let Some(token) = attempt_token {
+                // Stamped swarm disconnect: the token must belong to the
+                // current epoch. A stale A swarm copy can never claim B.
+                if !producer.source_token_bindings.matches(token, current_epoch) {
+                    return false;
+                }
+            } else if producer.source_fence.ambiguous
+                || producer.source_fence.pending_rebind_entity.is_some()
+            {
+                // An entity-less swarm event without a token cannot prove
+                // whether it belongs to A or B.  It must not close the
+                // current B owner.
+                return false;
+            }
+            (producer.owner, producer.attempt)
+        };
+        if !disconnect_reported
+            && (owner.is_some()
+                || matches!(
+                    attempt,
+                    AttemptAdmissionState::Reserved {
+                        reconnect_token: Some(_),
+                        ..
+                    }
+                ))
+        {
+            // A current bound attempt, or a reconnect reservation that is
+            // already being added, must first receive its canonical close
+            // evidence.  This is the finite barrier that keeps an old
+            // entity-less swarm copy from claiming B.
+            return false;
+        }
+        self.reconnect_pending.store(true, Ordering::Release);
+        // SwarmEvent::Disconnect is the lifecycle-wide fallback and carries
+        // no client entity. Deactivate the owner selected by this same
+        // admission; a late entity-specific Event::Disconnect cannot use this
+        // path because it remains owner-gated.
+        self.deactivate_current_entity_producer_owner();
         true
     }
 
@@ -1353,7 +5454,7 @@ impl SharedRuntime {
             {
                 return None;
             }
-            let token = self.reconnect_attempt_token.fetch_add(1, Ordering::AcqRel) + 1;
+            let token = checked_atomic_increment(&self.reconnect_attempt_token)?;
             let Some(should_drain) = self.begin_connection_attempt_locked(Some(token)) else {
                 return None;
             };
@@ -1362,6 +5463,8 @@ impl SharedRuntime {
         if should_drain {
             self.drain_events();
         }
+        self.phase_cancel.notify_waiters();
+        self.stable_cancel.notify_waiters();
         Some(token)
     }
 
@@ -1376,6 +5479,18 @@ impl SharedRuntime {
         let _admission = self.command_admission.lock();
         if self.reconnect_attempt_token.load(Ordering::Acquire) == token {
             self.reconnect_add_pending.store(false, Ordering::Release);
+            let mut producer = self.entity_producer.lock();
+            if matches!(
+                producer.attempt,
+                AttemptAdmissionState::Reserved {
+                    reconnect_token: Some(current),
+                    ..
+                } if current == token
+            ) {
+                let epoch = self.writer.lock().connection_epoch;
+                producer.attempt = AttemptAdmissionState::Closed { epoch };
+                producer.deactivate_scope();
+            }
         }
         self.reconnect_pending.store(false, Ordering::Release);
     }
@@ -1399,6 +5514,7 @@ impl SharedRuntime {
         true
     }
 
+    #[cfg(test)]
     fn observe_dimension(&self, dimension: impl Into<String>) {
         let dimension = dimension.into();
         let should_drain = {
@@ -1423,6 +5539,65 @@ impl SharedRuntime {
         if should_drain {
             self.drain_events();
         }
+    }
+
+    /// Consume the WorldLoaded boundary only when it still belongs to the
+    /// current unstamped owner.  Dimension metadata and its optional event
+    /// must share the same admission as the owner/fence check; a separate
+    /// check-then-write would let a delayed A boundary update B.
+    #[cfg(test)]
+    fn observe_dimension_from_world_boundary(
+        &self,
+        entity: bevy_ecs::entity::Entity,
+        dimension: impl Into<String>,
+    ) -> bool {
+        self.observe_dimension_from_world_boundary_with_token(entity, dimension, None)
+    }
+
+    fn observe_dimension_from_world_boundary_with_token(
+        &self,
+        entity: bevy_ecs::entity::Entity,
+        dimension: impl Into<String>,
+        attempt_token: Option<azalea::join::AttemptToken>,
+    ) -> bool {
+        let dimension = dimension.into();
+        let should_drain = {
+            let _admission = self.command_admission.lock();
+            if !self.command_execution_allowed_without_lock() {
+                return false;
+            }
+            let epoch = self.writer.lock().connection_epoch;
+            let producer = self.entity_producer.lock();
+            if producer.owner != Some((entity, epoch)) {
+                return false;
+            }
+            let admitted = match attempt_token {
+                Some(token) => producer.source_token_bindings.matches(token, epoch),
+                None => producer.source_fence.allows_unstamped(entity),
+            };
+            if !admitted {
+                return false;
+            }
+            drop(producer);
+
+            let Some(previous) = self.set_dimension(dimension.clone()) else {
+                return true;
+            };
+            if previous == dimension {
+                return true;
+            }
+            self.enqueue_event(
+                FactSource::ServerObserved,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::DimensionChanged {
+                    from: previous,
+                    to: dimension,
+                }),
+            )
+        };
+        if should_drain {
+            self.drain_events();
+        }
+        true
     }
 
     fn connection_epoch(&self) -> u64 {
@@ -1468,11 +5643,63 @@ impl SharedRuntime {
         true
     }
 
+    fn set_active_client_if_current(&self, client: &Client) -> bool {
+        let _admission = self.command_admission.lock();
+        let epoch = self.writer.lock().connection_epoch;
+        if !self.command_execution_allowed_without_lock()
+            || self.entity_producer.lock().owner != Some((client.entity, epoch))
+        {
+            return false;
+        }
+        let producer = self.entity_producer.lock();
+        let source_token_matches = match client.attempt_token() {
+            Some(token) => producer.source_token_bindings.matches(token, epoch),
+            None => producer.source_fence.allows_unstamped(client.entity),
+        };
+        if !source_token_matches {
+            return false;
+        }
+        drop(producer);
+        *self.active_client.lock() = Some(client.clone());
+        true
+    }
+
+    /// High-level `Event`s arrive paired with their `Client`.  Every side
+    /// effect must first prove that the client still belongs to the current
+    /// bound owner: a stamped client's token must match the current epoch's
+    /// one-to-one binding, and an unstamped (legacy) client is only admitted
+    /// while the legacy source fence still allows it.
+    fn client_is_current_owner(&self, client: &Client) -> bool {
+        let _admission = self.command_admission.lock();
+        let epoch = self.writer.lock().connection_epoch;
+        let producer = self.entity_producer.lock();
+        if producer.owner != Some((client.entity, epoch)) {
+            return false;
+        }
+        match client.attempt_token() {
+            Some(token) => producer.source_token_bindings.matches(token, epoch),
+            None => producer.source_fence.allows_unstamped(client.entity),
+        }
+    }
+
     fn set_world_if_running(&self, world: SharedWorld) -> bool {
         let _admission = self.command_admission.lock();
         if !self.command_execution_allowed_without_lock() {
             return false;
         }
+        let (current_epoch, current_dimension) = {
+            let writer = self.writer.lock();
+            (writer.connection_epoch, writer.dimension.clone())
+        };
+        let (current_scope_generation, current_owner_matches_epoch) = {
+            let producer = self.entity_producer.lock();
+            (
+                producer.scope_generation,
+                producer
+                    .owner
+                    .is_some_and(|(_, epoch)| epoch == current_epoch),
+            )
+        };
         let mut observation = self.observation.write();
         let replaced = observation
             .world
@@ -1481,8 +5708,23 @@ impl SharedRuntime {
         observation.world = Some(world);
         if replaced {
             observation.snapshot = None;
+            observation.snapshot_scope_generation = 0;
             observation.source = None;
             observation.tracked_entities.clear();
+            observation.entity_residuals.clear();
+            let preserve_light = current_owner_matches_epoch
+                && observation
+                    .light_cache
+                    .context
+                    .as_ref()
+                    .is_some_and(|context| {
+                        context.epoch == current_epoch
+                            && context.scope_generation == current_scope_generation
+                            && current_dimension.as_deref() == Some(context.dimension.as_str())
+                    });
+            if !preserve_light {
+                observation.light_cache.clear();
+            }
         }
         observation.bump_generation();
         true
@@ -1490,11 +5732,16 @@ impl SharedRuntime {
 
     fn clear_observations(&self) {
         *self.reported_dimension.lock() = None;
+        #[cfg(test)]
+        self.invoke_observation_write_boundary_hook();
         let mut observation = self.observation.write();
         observation.world = None;
         observation.snapshot = None;
+        observation.snapshot_scope_generation = 0;
         observation.source = None;
         observation.tracked_entities.clear();
+        observation.entity_residuals.clear();
+        observation.clear_all_frame_facts();
         observation.bump_generation();
     }
 
@@ -1586,6 +5833,7 @@ impl SharedRuntime {
         }
     }
 
+    #[cfg(test)]
     fn emit_transport_connected(&self) {
         let should_drain = {
             let _admission = self.command_admission.lock();
@@ -1608,35 +5856,42 @@ impl SharedRuntime {
         }
     }
 
-    fn emit_logged_in(&self, version: impl Into<String>, dimension: String) {
+    fn emit_logged_in(self: &Arc<Self>, version: impl Into<String>, dimension: String) {
         let version = version.into();
-        let should_drain = {
+        let (should_drain, phase_token) = {
             let _admission = self.command_admission.lock();
             if !self.command_execution_allowed_without_lock() {
                 return;
             }
             self.set_dimension(dimension.clone());
             let (epoch, attempt_id, attempt) = self.connection_identity();
+            self.invalidate_stable_reset_locked();
             self.set_backend_state(BackendState::Spawning {
                 epoch,
                 attempt_id,
                 attempt,
             });
-            self.enqueue_event(
+            let phase_token = self.arm_phase_deadline_locked(TransportPhase::Spawning);
+            let should_drain = self.enqueue_event(
                 FactSource::ServerObserved,
                 BackendEventPayload::Lifecycle(BackendLifecyclePayload::LoggedIn {
                     version,
                     dimension,
                 }),
-            )
+            );
+            (should_drain, phase_token)
         };
         if should_drain {
             self.drain_events();
         }
+        self.phase_cancel.notify_waiters();
+        if let Some(token) = phase_token {
+            self.spawn_phase_deadline(token);
+        }
     }
 
-    fn emit_ready(&self, snapshot_revision: u64) {
-        let should_drain = {
+    fn emit_ready(self: &Arc<Self>, snapshot_revision: u64) {
+        let (should_drain, stable_token) = {
             let _admission = self.command_admission.lock();
             if !self.command_execution_allowed_without_lock() {
                 return;
@@ -1644,21 +5899,29 @@ impl SharedRuntime {
             self.ready.store(true, Ordering::Release);
             let (epoch, attempt_id, _) = self.connection_identity();
             let ready_at = now_utc().to_rfc3339();
+            self.invalidate_phase_locked();
+            let stable_token = self.arm_stable_reset_locked();
             self.set_backend_state(BackendState::Ready {
                 epoch,
                 attempt_id,
                 ready_at: ready_at.clone(),
             });
-            self.enqueue_event_at(
+            let should_drain = self.enqueue_event_at(
                 FactSource::ServerObserved,
                 BackendEventPayload::Lifecycle(BackendLifecyclePayload::Ready {
                     snapshot_revision,
                 }),
                 ready_at,
-            )
+            );
+            (should_drain, stable_token)
         };
         if should_drain {
             self.drain_events();
+        }
+        self.phase_cancel.notify_waiters();
+        self.stable_cancel.notify_waiters();
+        if let Some(token) = stable_token {
+            self.spawn_stable_reset(token);
         }
     }
 
@@ -1787,6 +6050,7 @@ impl SharedRuntime {
         self.mark_disconnected_evidence(self.close_evidence(reason))
     }
 
+    #[cfg(test)]
     fn mark_connection_failed(&self, error: String) -> BackendClose {
         self.mark_disconnected_evidence(CloseEvidence {
             code: "connection_failed".to_owned(),
@@ -1808,91 +6072,155 @@ impl SharedRuntime {
     }
 
     fn mark_disconnected_evidence(&self, evidence: CloseEvidence) -> BackendClose {
+        self.mark_disconnected_evidence_with_owner(evidence, None, None, false, None, None)
+            .expect("unconditional disconnect admission cannot be rejected")
+    }
+
+    #[cfg(test)]
+    fn admit_canonical_disconnected(
+        &self,
+        entity: bevy_ecs::entity::Entity,
+        source_epoch: u64,
+        reason: Option<String>,
+    ) -> Option<BackendClose> {
+        self.admit_canonical_disconnected_with_token(entity, source_epoch, reason, None)
+    }
+
+    fn admit_canonical_disconnected_with_token(
+        &self,
+        entity: bevy_ecs::entity::Entity,
+        source_epoch: u64,
+        reason: Option<String>,
+        attempt_token: Option<azalea::join::AttemptToken>,
+    ) -> Option<BackendClose> {
+        self.mark_disconnected_evidence_with_owner(
+            self.close_evidence(reason),
+            Some(entity),
+            Some(source_epoch),
+            true,
+            None,
+            attempt_token,
+        )
+    }
+
+    fn admit_canonical_disconnected_source_with_token(
+        &self,
+        entity: bevy_ecs::entity::Entity,
+        reason: Option<String>,
+        attempt_token: Option<azalea::join::AttemptToken>,
+    ) -> Option<BackendClose> {
+        let source_epoch = self.connection_epoch();
+        self.admit_canonical_disconnected_with_token(entity, source_epoch, reason, attempt_token)
+    }
+
+    #[cfg(test)]
+    fn admit_canonical_connection_failed(
+        &self,
+        entity: bevy_ecs::entity::Entity,
+        source_epoch: u64,
+        error: String,
+    ) -> Option<BackendClose> {
+        self.admit_canonical_connection_failed_with_token(entity, source_epoch, error, None)
+    }
+
+    fn admit_canonical_connection_failed_with_token(
+        &self,
+        entity: bevy_ecs::entity::Entity,
+        source_epoch: u64,
+        error: String,
+        attempt_token: Option<azalea::join::AttemptToken>,
+    ) -> Option<BackendClose> {
+        self.mark_disconnected_evidence_with_owner(
+            CloseEvidence {
+                code: "connection_failed".to_owned(),
+                retryable: true,
+                deliberate: false,
+                kick: None,
+                error: Some(BackendCloseError {
+                    name: "connection_failed".to_owned(),
+                    message: error.clone(),
+                    code: None,
+                }),
+                end_reason: Some(error.clone()),
+                failure: Some(BackendFailure {
+                    code: BackendFailureCode::ProtocolError,
+                    message: error,
+                    retryable: true,
+                }),
+            },
+            Some(entity),
+            Some(source_epoch),
+            true,
+            Some(entity),
+            attempt_token,
+        )
+    }
+
+    fn admit_canonical_connection_failed_source_with_token(
+        &self,
+        entity: bevy_ecs::entity::Entity,
+        error: String,
+        attempt_token: Option<azalea::join::AttemptToken>,
+    ) -> Option<BackendClose> {
+        let source_epoch = self.connection_epoch();
+        self.admit_canonical_connection_failed_with_token(
+            entity,
+            source_epoch,
+            error,
+            attempt_token,
+        )
+    }
+
+    #[cfg(test)]
+    fn take_canonical_connection_failure_followup(&self, entity: bevy_ecs::entity::Entity) -> bool {
+        self.take_canonical_connection_failure_followup_with_token(entity, None)
+    }
+
+    fn take_canonical_connection_failure_followup_with_token(
+        &self,
+        entity: bevy_ecs::entity::Entity,
+        attempt_token: Option<azalea::join::AttemptToken>,
+    ) -> bool {
+        let _admission = self.command_admission.lock();
+        let epoch = self.writer.lock().connection_epoch;
+        let mut producer = self.entity_producer.lock();
+        let pending_matches = producer.pending_connection_failure == Some((entity, epoch))
+            && attempt_token
+                .is_none_or(|token| producer.source_token_bindings.matches(token, epoch));
+        if pending_matches {
+            producer.pending_connection_failure = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn mark_disconnected_evidence_with_owner(
+        &self,
+        evidence: CloseEvidence,
+        entity: Option<bevy_ecs::entity::Entity>,
+        expected_epoch: Option<u64>,
+        allow_unbound_attempt: bool,
+        failure_entity: Option<bevy_ecs::entity::Entity>,
+        attempt_token: Option<azalea::join::AttemptToken>,
+    ) -> Option<BackendClose> {
         let (close, should_drain, duplicate_cleanup) = {
             let _admission = self.command_admission.lock();
-            if self.stopped_reported.load(Ordering::Acquire) {
-                return self
-                    .last_close
-                    .lock()
-                    .clone()
-                    .unwrap_or_else(|| BackendClose {
-                        epoch: self.connection_epoch(),
-                        at: now_utc().to_rfc3339(),
-                        code: "connection_ended".to_owned(),
-                        retryable: true,
-                        deliberate: false,
-                        kick: None,
-                        error: None,
-                        end_reason: None,
-                    });
+            if expected_epoch.is_some_and(|epoch| self.connection_epoch() != epoch) {
+                return None;
             }
-
-            // Once stop has won admission, a late Azalea disconnect cannot
-            // replace the caller's deliberate close evidence.
-            let evidence = if self.stopping.load(Ordering::Acquire) && !evidence.deliberate {
-                CloseEvidence {
-                    code: "deliberate_stop".to_owned(),
-                    retryable: false,
-                    deliberate: true,
-                    kick: None,
-                    error: None,
-                    end_reason: Some("deliberate_stop".to_owned()),
-                    failure: None,
+            if let Some(entity) = entity {
+                let source_epoch = expected_epoch.unwrap_or_else(|| self.connection_epoch());
+                if !self.admit_entity_lifecycle_owner_locked(
+                    entity,
+                    source_epoch,
+                    allow_unbound_attempt,
+                    attempt_token,
+                ) {
+                    return None;
                 }
-            } else {
-                evidence
-            };
-
-            // Publish the disconnect bit and enqueue close under one admission
-            // point. The queue is drained only after this lock is released.
-            if self.disconnect_reported.swap(true, Ordering::AcqRel) {
-                let close = self
-                    .last_close
-                    .lock()
-                    .clone()
-                    .unwrap_or_else(|| BackendClose {
-                        epoch: self.connection_epoch(),
-                        at: now_utc().to_rfc3339(),
-                        code: "connection_ended".to_owned(),
-                        retryable: true,
-                        deliberate: false,
-                        kick: None,
-                        error: None,
-                        end_reason: None,
-                    });
-                (close, false, true)
-            } else {
-                self.ready.store(false, Ordering::Release);
-                let close = BackendClose {
-                    epoch: self.connection_epoch(),
-                    at: now_utc().to_rfc3339(),
-                    code: evidence.code,
-                    retryable: evidence.retryable,
-                    deliberate: evidence.deliberate,
-                    kick: evidence.kick,
-                    error: evidence.error,
-                    end_reason: evidence.end_reason,
-                };
-                *self.last_close.lock() = Some(close.clone());
-                *self.last_failure.lock() = evidence.failure;
-
-                // Seal and clean the attempt before making its close visible.
-                // Stop takes the same admission lock, so it cannot enqueue or
-                // drain `stopped` between close admission and local cleanup.
-                #[cfg(test)]
-                self.invoke_disconnect_cleanup_hook();
-                self.cancel_active_movement(true);
-                self.cancel_pending_commands();
-                self.clear_observations();
-
-                let should_drain = self.enqueue_event(
-                    FactSource::ServerObserved,
-                    BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionClosed {
-                        close: close.clone(),
-                    }),
-                );
-                (close, should_drain, false)
             }
+            self.mark_disconnected_evidence_locked(evidence, failure_entity)
         };
 
         // A duplicate can race a registration that is finishing after the
@@ -1907,7 +6235,114 @@ impl SharedRuntime {
         if should_drain {
             self.drain_events();
         }
-        close
+        Some(close)
+    }
+
+    /// Caller holds `command_admission`; owner claiming and global close
+    /// admission therefore share one lifecycle linearization point.
+    fn mark_disconnected_evidence_locked(
+        &self,
+        evidence: CloseEvidence,
+        failure_entity: Option<bevy_ecs::entity::Entity>,
+    ) -> (BackendClose, bool, bool) {
+        if self.stopped_reported.load(Ordering::Acquire) {
+            let close = self
+                .last_close
+                .lock()
+                .clone()
+                .unwrap_or_else(|| BackendClose {
+                    epoch: self.connection_epoch(),
+                    at: now_utc().to_rfc3339(),
+                    code: "connection_ended".to_owned(),
+                    retryable: true,
+                    deliberate: false,
+                    kick: None,
+                    error: None,
+                    end_reason: None,
+                });
+            return (close, false, false);
+        }
+
+        // Once stop has won admission, a late Azalea disconnect cannot
+        // replace the caller's deliberate close evidence.
+        let evidence = if self.stopping.load(Ordering::Acquire) && !evidence.deliberate {
+            CloseEvidence {
+                code: "deliberate_stop".to_owned(),
+                retryable: false,
+                deliberate: true,
+                kick: None,
+                error: None,
+                end_reason: Some("deliberate_stop".to_owned()),
+                failure: None,
+            }
+        } else {
+            evidence
+        };
+
+        // Publish the disconnect bit and enqueue close under one admission
+        // point. The queue is drained only after this lock is released.
+        if self.disconnect_reported.swap(true, Ordering::AcqRel) {
+            let close = self
+                .last_close
+                .lock()
+                .clone()
+                .unwrap_or_else(|| BackendClose {
+                    epoch: self.connection_epoch(),
+                    at: now_utc().to_rfc3339(),
+                    code: "connection_ended".to_owned(),
+                    retryable: true,
+                    deliberate: false,
+                    kick: None,
+                    error: None,
+                    end_reason: None,
+                });
+            (close, false, true)
+        } else {
+            self.ready.store(false, Ordering::Release);
+            self.invalidate_phase_locked();
+            self.invalidate_stable_reset_locked();
+            self.active_client.lock().take();
+            let close = BackendClose {
+                epoch: self.connection_epoch(),
+                at: now_utc().to_rfc3339(),
+                code: evidence.code,
+                retryable: evidence.retryable,
+                deliberate: evidence.deliberate,
+                kick: evidence.kick,
+                error: evidence.error,
+                end_reason: evidence.end_reason,
+            };
+            *self.last_close.lock() = Some(close.clone());
+            *self.last_failure.lock() = evidence.failure;
+
+            let mut producer = self.entity_producer.lock();
+            producer.owner = None;
+            producer.deactivate_scope();
+            producer.attempt = AttemptAdmissionState::Closed { epoch: close.epoch };
+            producer.pending_connection_failure = if close.code == "connection_failed" {
+                failure_entity.map(|entity| (entity, close.epoch))
+            } else {
+                None
+            };
+            drop(producer);
+
+            // Seal and clean the attempt before making its close visible.
+            // Stop takes the same admission lock, so it cannot enqueue or
+            // drain `stopped` between close admission and local cleanup.
+            #[cfg(test)]
+            self.invoke_disconnect_cleanup_hook();
+            self.cancel_active_movement(true);
+            self.cancel_pending_commands();
+            self.clear_observations();
+
+            let should_drain = self.enqueue_event(
+                FactSource::ServerObserved,
+                BackendEventPayload::Lifecycle(BackendLifecyclePayload::ConnectionClosed {
+                    close: close.clone(),
+                }),
+            );
+            (close, should_drain, false)
+        }
     }
 
     fn failure_for_close(&self, close: &BackendClose) -> BackendFailure {
@@ -1918,7 +6353,7 @@ impl SharedRuntime {
         if let Some(failure) = recorded.as_ref().filter(|failure| !failure.retryable) {
             return failure.clone();
         }
-        if close.retryable && !self.config.reconnect_enabled {
+        if close.retryable && !self.config.reconnect.enabled {
             return BackendFailure {
                 code: BackendFailureCode::ReconnectDisabled,
                 message: format!("reconnect disabled after close {}", close.code),
@@ -1955,17 +6390,21 @@ impl SharedRuntime {
     }
 
     fn emit_reconnect_scheduled(&self, close: &BackendClose) -> Option<Duration> {
-        let delay = self.config.reconnect_delay;
-        let retry_at = (now_utc()
-            + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::zero()))
-        .to_rfc3339();
+        let current_attempt = self.retry_ordinal.load(Ordering::Acquire);
+        let next_attempt = current_attempt.checked_add(1)?;
+        let schedule = reconnect_schedule_at(
+            &self.config.reconnect,
+            current_attempt,
+            next_reconnect_random(&self.reconnect_rng),
+            now_utc(),
+        );
+        let retry_at = schedule.retry_at.to_rfc3339();
         let should_drain = {
             let _admission = self.command_admission.lock();
             if !self.lifecycle_event_allowed_without_lock() {
                 return None;
             }
-            let attempt =
-                u32::try_from(self.connection_epoch().saturating_add(1)).unwrap_or(u32::MAX);
+            let attempt = u32::try_from(next_attempt).unwrap_or(u32::MAX);
             self.set_backend_state(BackendState::Reconnecting {
                 attempt,
                 retry_at: retry_at.clone(),
@@ -1983,7 +6422,7 @@ impl SharedRuntime {
         if should_drain {
             self.drain_events();
         }
-        Some(delay)
+        Some(schedule.delay)
     }
 
     fn exit_swarm(&self) -> bool {
@@ -2111,6 +6550,58 @@ impl SharedRuntime {
         }
     }
 
+    #[cfg(test)]
+    fn set_entity_publish_after_apply_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.entity_publish_after_apply_hook.lock() = hook;
+    }
+
+    #[cfg(test)]
+    fn invoke_entity_publish_after_apply_hook(&self) {
+        let hook = self.entity_publish_after_apply_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_entity_owner_bind_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.entity_owner_bind_hook.lock() = hook;
+    }
+
+    #[cfg(test)]
+    fn invoke_entity_owner_bind_hook(&self) {
+        let hook = self.entity_owner_bind_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_canonical_publication_probe(&self, probe: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.canonical_publication_probe.lock() = probe;
+    }
+
+    #[cfg(test)]
+    fn invoke_canonical_publication_probe(&self) {
+        let probe = self.canonical_publication_probe.lock().take();
+        if let Some(probe) = probe {
+            probe();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_observation_write_boundary_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.observation_write_boundary_hook.lock() = hook;
+    }
+
+    #[cfg(test)]
+    fn invoke_observation_write_boundary_hook(&self) {
+        let hook = self.observation_write_boundary_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     fn command_execution_allowed(&self) -> bool {
         let _admission = self.command_admission.lock();
         self.command_execution_allowed_without_lock()
@@ -2180,24 +6671,35 @@ impl SharedRuntime {
             let Some(reason) = self.stop_reason.lock().take() else {
                 return;
             };
-            if self.stopped_reported.swap(true, Ordering::AcqRel) {
-                return;
-            }
-            self.set_backend_state(BackendState::Stopped {
-                reason: Some(reason.clone()),
-            });
-            let should_drain = self.enqueue_event(
-                FactSource::Commanded,
-                BackendEventPayload::Lifecycle(BackendLifecyclePayload::Stopped {
-                    reason: reason.clone(),
-                }),
-            );
-            should_drain
+            self.enqueue_stopped_locked(reason, true)
         };
         if should_drain {
             self.drain_events();
         }
         self.request_shutdown();
+    }
+
+    /// 唯一的 Stopped reducer；正常 cleanup 与 watchdog 都通过这里发布终态。
+    fn enqueue_stopped_locked(&self, reason: String, cancel_watchdog: bool) -> bool {
+        if self.stopped_reported.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        self.invalidate_stop_watchdog_locked();
+        // This is a one-shot permit, not a broadcast.  `notify_one` retains the
+        // permit when the watchdog task has been spawned but has not been polled
+        // yet, so normal cleanup cannot leave the long stop timer holding the
+        // runtime alive.  The unique Stopped gate above keeps forced cleanup or
+        // duplicate finalizers from issuing another permit.
+        if cancel_watchdog {
+            self.stop_watchdog_cancel.notify_one();
+        }
+        self.set_backend_state(BackendState::Stopped {
+            reason: Some(reason.clone()),
+        });
+        self.enqueue_event(
+            FactSource::Commanded,
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::Stopped { reason }),
+        )
     }
 
     fn enqueue_command_if_running(&self, command: BackendCommandEnvelope) -> Result<(), String> {
@@ -2338,6 +6840,115 @@ impl SharedRuntime {
 
     fn command_execution_allowed_without_lock(&self) -> bool {
         !self.stopping.load(Ordering::Acquire) && !self.disconnect_reported.load(Ordering::Acquire)
+    }
+
+    fn arm_stop_watchdog_locked(&self) -> Option<StopWatchdogToken> {
+        Some(StopWatchdogToken {
+            generation: checked_atomic_increment(&self.stop_watchdog_generation)?,
+        })
+    }
+
+    fn invalidate_stop_watchdog_locked(&self) {
+        let _ = checked_atomic_increment(&self.stop_watchdog_generation);
+    }
+
+    fn spawn_stop_watchdog(self: &Arc<Self>, token: StopWatchdogToken) {
+        if !self.timers_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let shared = self.clone();
+        let cancel = self.stop_watchdog_cancel.clone();
+        let duration = Duration::from_millis(self.config.timeouts.stop_ms);
+        #[cfg(test)]
+        let completion_probe = self.stop_watchdog_completion_probe.lock().take();
+        tokio::task::spawn_local(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(duration) => shared.fire_stop_watchdog(token),
+                _ = cancel.notified() => {}
+            }
+            #[cfg(test)]
+            {
+                // Drop the task's last RuntimeShared capture before resolving
+                // the probe, so the test can also verify Arc lifetime rather
+                // than merely observing a late inert callback.
+                drop(shared);
+                if let Some(probe) = completion_probe {
+                    let _ = probe.send(());
+                }
+            }
+        });
+    }
+
+    fn fire_stop_watchdog(&self, token: StopWatchdogToken) {
+        let (reason, should_drain, client, swarm, completion, pending) = {
+            let _admission = self.command_admission.lock();
+            if !self.stopping.load(Ordering::Acquire)
+                || self.stopped_reported.load(Ordering::Acquire)
+                || self.stop_watchdog_generation.load(Ordering::Acquire) != token.generation
+            {
+                return;
+            }
+            self.invalidate_stop_watchdog_locked();
+            let reason = self
+                .stop_reason
+                .lock()
+                .take()
+                .unwrap_or_else(|| "stop_watchdog".to_owned());
+            self.phase_generation.store(u64::MAX, Ordering::Release);
+            self.stable_generation.store(u64::MAX, Ordering::Release);
+            self.reconnect_add_pending.store(false, Ordering::Release);
+            self.reconnect_pending.store(false, Ordering::Release);
+            let _ = checked_atomic_increment(&self.reconnect_attempt_token);
+            self.ready.store(false, Ordering::Release);
+            self.active_movement_registration
+                .store(false, Ordering::Release);
+            self.active_movement.store(false, Ordering::Release);
+            self.movement_generation.store(u64::MAX, Ordering::Release);
+            *self.active_movement_id.lock() = None;
+            self.active_movement_cancel_signal.lock().take();
+            let completion = self.active_movement_completion.lock().take();
+            let client = self.active_client.lock().take();
+            let swarm = self.swarm.lock().take();
+            let pending = self
+                .commands
+                .lock()
+                .drain(..)
+                .filter_map(|command| command.completion)
+                .collect::<Vec<_>>();
+            // The watchdog task is already executing this forced path; do not
+            // leave a cancellation permit behind for a hypothetical later
+            // generation.  The unique reducer still seals Stopped exactly once.
+            let should_drain = self.enqueue_stopped_locked(reason.clone(), false);
+            (reason, should_drain, client, swarm, completion, pending)
+        };
+
+        self.phase_cancel.notify_waiters();
+        self.stable_cancel.notify_waiters();
+        self.reconnect_cancel.notify_one();
+        if let Some(completion) = completion {
+            completion.cancel("stop_watchdog".to_owned(), false);
+            completion.finish(Err(BackendError::Cancelled {
+                operation: "stop_watchdog".to_owned(),
+            }));
+        }
+        for completion in pending {
+            completion.cancel("stop_watchdog".to_owned(), false);
+            completion.finish(Err(BackendError::Cancelled {
+                operation: "stop_watchdog".to_owned(),
+            }));
+        }
+        self.clear_observations();
+        if let Some(client) = client {
+            client.disconnect();
+        }
+        if let Some(swarm) = swarm {
+            swarm.exit();
+        }
+        if should_drain {
+            self.drain_events();
+        }
+        let _ = reason;
+        self.request_shutdown();
     }
 
     fn clear_registered_active_movement(
@@ -2481,7 +7092,7 @@ impl SharedRuntime {
             // 伪造成坐标，也不能调用 query_self 触发 panic。
             return None;
         };
-        let entities = capture_tracked_entities(bot);
+        let entities = crate::snapshot::capture_tracked_entities_for_epoch(bot, connection_epoch);
         if self.connection_epoch() != connection_epoch {
             return None;
         }
@@ -2489,12 +7100,18 @@ impl SharedRuntime {
         if !self.command_execution_allowed_without_lock() {
             return None;
         }
+        let scope_generation = self.entity_producer.lock().scope_generation;
         let mut observation = self.observation.write();
         if observation.generation != capture_generation
             || self.connection_epoch() != connection_epoch
         {
             return None;
         }
+        let entities = merge_refreshed_tracked_entities(
+            entities,
+            &mut observation.entity_residuals,
+            connection_epoch,
+        );
         let changed = observation
             .snapshot
             .as_ref()
@@ -2504,6 +7121,7 @@ impl SharedRuntime {
             self.snapshot_revision
                 .store(next_revision, Ordering::Release);
             observation.snapshot = Some(candidate.clone());
+            observation.snapshot_scope_generation = scope_generation;
             observation.source = Some(source);
             observation.bump_generation();
             Some(candidate)
@@ -2517,6 +7135,52 @@ impl SharedRuntime {
         self.observation.read().snapshot.clone()
     }
 
+    fn capture_frame_facts(&self) -> Option<RuntimeFrameFacts> {
+        self.capture_frame_facts_locked(|| {}, || {})
+    }
+
+    fn capture_frame_facts_locked<F, G>(
+        &self,
+        before_values: F,
+        after_boundary: G,
+    ) -> Option<RuntimeFrameFacts>
+    where
+        F: FnOnce(),
+        G: FnOnce(),
+    {
+        let observation = self.observation.read();
+        let snapshot = observation.snapshot.clone()?;
+        before_values();
+        after_boundary();
+        let armor = (observation.armor_epoch == Some(snapshot.connection_epoch))
+            .then_some(observation.armor)
+            .flatten();
+        let light = observation.light_cache.value_at(
+            &snapshot.self_snapshot.position,
+            snapshot.connection_epoch,
+            observation.snapshot_scope_generation,
+            &snapshot.world.dimension,
+        );
+        Some(RuntimeFrameFacts {
+            snapshot,
+            armor,
+            light,
+        })
+    }
+
+    #[cfg(test)]
+    fn capture_frame_facts_with_test_hooks<F, G>(
+        &self,
+        before_values: F,
+        after_boundary: G,
+    ) -> Option<RuntimeFrameFacts>
+    where
+        F: FnOnce(),
+        G: FnOnce(),
+    {
+        self.capture_frame_facts_locked(before_values, after_boundary)
+    }
+
     fn emit_snapshot(&self, snapshot: MinecraftSnapshotV1, source: FactSource) {
         self.emit_if_running(
             source,
@@ -2527,7 +7191,7 @@ impl SharedRuntime {
         );
     }
 
-    fn initiate_stop(&self, reason: &str) {
+    fn initiate_stop(self: &Arc<Self>, reason: &str) {
         // Signal cancellation before taking command admission. A producer may
         // already hold that lock while waiting for this finite dispatch queue;
         // stop must be able to wake that producer instead of waiting for it.
@@ -2535,7 +7199,7 @@ impl SharedRuntime {
         self.cancel_event_admission();
         #[cfg(test)]
         self.invoke_stop_signal_hook();
-        {
+        let watchdog_token = {
             // Make stop admission atomic with the start of a Move
             // registration.  Once either side owns this short lock, the
             // other side has a clear linearization point and stopped cannot
@@ -2552,11 +7216,19 @@ impl SharedRuntime {
                 reason,
             });
             self.reconnect_add_pending.store(false, Ordering::Release);
-            self.reconnect_attempt_token.fetch_add(1, Ordering::AcqRel);
+            let _ = checked_atomic_increment(&self.reconnect_attempt_token);
             self.reconnect_pending.store(false, Ordering::Release);
             self.ready.store(false, Ordering::Release);
-        }
+            self.invalidate_phase_locked();
+            self.invalidate_stable_reset_locked();
+            self.arm_stop_watchdog_locked()
+        };
         self.reconnect_cancel.notify_one();
+        self.phase_cancel.notify_waiters();
+        self.stable_cancel.notify_waiters();
+        if let Some(token) = watchdog_token {
+            self.spawn_stop_watchdog(token);
+        }
         self.cancel_pending_commands();
         if self.connection_epoch() > 0 && !self.disconnect_reported.load(Ordering::Acquire) {
             self.mark_disconnected(Some("deliberate_stop".to_owned()));
@@ -2566,6 +7238,16 @@ impl SharedRuntime {
         self.exit_swarm();
         self.finalize_stop_if_ready();
     }
+}
+
+/// Runtime's internal representation of one atomic frame capture.  It is
+/// converted to `mineintent_contracts::minecraft::MinecraftFrameFacts` by the
+/// facade after this read lock has already captured all three values.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeFrameFacts {
+    pub snapshot: MinecraftSnapshotV1,
+    pub armor: Option<u8>,
+    pub light: Option<u8>,
 }
 
 /// 对齐 MineIntent `snapshot/subscribe/motor/sendChat` 边界的本地运行时句柄。
@@ -2598,6 +7280,71 @@ impl RuntimeHandle {
 
     pub fn snapshot(&self) -> Option<MinecraftSnapshotV1> {
         self.shared.stored_snapshot()
+    }
+
+    /// Capture snapshot, armor, and self-light from one observation read.
+    pub fn capture_frame_facts(&self) -> Option<RuntimeFrameFacts> {
+        self.shared.capture_frame_facts()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_frame_facts(
+        &self,
+        snapshot: MinecraftSnapshotV1,
+        armor: Option<u8>,
+        light: Option<u8>,
+    ) {
+        let scope_generation = self.shared.entity_producer.lock().scope_generation;
+        let mut observation = self.shared.observation.write();
+        observation.snapshot = Some(snapshot.clone());
+        observation.snapshot_scope_generation = scope_generation;
+        observation.armor = armor;
+        observation.armor_epoch = Some(snapshot.connection_epoch);
+
+        let geometry = LightSectionGeometry {
+            min_light_section: (snapshot.world.min_y >> 4) - 1,
+            light_section_count: (snapshot.world.height / 16 + 2) as usize,
+        };
+        observation.light_cache.reset_scope(
+            snapshot.connection_epoch,
+            scope_generation,
+            Some(snapshot.world.dimension.clone()),
+            Some(false),
+        );
+        observation.light_cache.context =
+            observation.light_cache.context.take().map(|mut context| {
+                context.geometry = Some(geometry);
+                context
+            });
+        if let Some(light) = light {
+            let Some(x) = floor_block_coordinate(snapshot.self_snapshot.position.x) else {
+                return;
+            };
+            let Some(y) = floor_block_coordinate(snapshot.self_snapshot.position.y) else {
+                return;
+            };
+            let Some(z) = floor_block_coordinate(snapshot.self_snapshot.position.z) else {
+                return;
+            };
+            let Some(section_index) = geometry.index_for_section_y(y.div_euclid(16)) else {
+                return;
+            };
+            let layer_index = ((y.rem_euclid(16) as usize) << 8)
+                | ((z.rem_euclid(16) as usize) << 4)
+                | (x.rem_euclid(16) as usize);
+            let mut layer = Box::new([0; 4096]);
+            layer[layer_index] = light;
+            let mut chunk = CachedLightChunk {
+                sky: vec![None; geometry.light_section_count],
+                block: vec![None; geometry.light_section_count],
+            };
+            chunk.block[section_index] = Some(layer);
+            observation
+                .light_cache
+                .chunks
+                .insert((x.div_euclid(16), z.div_euclid(16)), chunk);
+        }
+        observation.bump_generation();
     }
 
     /// 返回当前 `snapshot()` 的事实来源；调用方不得把 `client_predicted`
@@ -3917,6 +8664,234 @@ fn read_block_from_world(world: &azalea::world::World, position: BlockPosition) 
     }
 }
 
+fn finite_f32(value: f64) -> Option<f32> {
+    let value = value as f32;
+    value.is_finite().then_some(value)
+}
+
+fn finite_f64(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
+}
+
+fn normalized_entity_snapshot_to_protocol(
+    snapshot: &NormalizedEntitySnapshot,
+) -> Option<ProtocolEntitySnapshot> {
+    let position = [
+        finite_f64(snapshot.position[0])?,
+        finite_f64(snapshot.position[1])?,
+        finite_f64(snapshot.position[2])?,
+    ];
+    let velocity = [
+        finite_f64(snapshot.velocity[0])?,
+        finite_f64(snapshot.velocity[1])?,
+        finite_f64(snapshot.velocity[2])?,
+    ];
+    let yaw = finite_f32(snapshot.yaw)?;
+    let pitch = finite_f32(snapshot.pitch)?;
+    let head_yaw = match snapshot.head_yaw {
+        Some(value) => Some(finite_f32(value)?),
+        None => None,
+    };
+    let width = finite_f32(snapshot.width)?;
+    let height = finite_f32(snapshot.height)?;
+    let equipment = snapshot
+        .equipment
+        .iter()
+        .map(|(slot, item_name, count)| {
+            Some(crate::snapshot::EntityEquipmentSnapshot {
+                slot: u8::try_from(*slot).ok()?,
+                item_name: item_name.clone(),
+                count: i32::try_from(*count).ok()?,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(ProtocolEntitySnapshot {
+        entity_key: snapshot.entity_key(),
+        protocol_entity_id: snapshot.identity.protocol_id,
+        entity_type: snapshot.entity_type.clone(),
+        name: snapshot.name.clone(),
+        username: snapshot.username.clone(),
+        uuid: snapshot.uuid.clone(),
+        position: Vec3Value {
+            x: position[0],
+            y: position[1],
+            z: position[2],
+        },
+        velocity: Vec3Value {
+            x: velocity[0],
+            y: velocity[1],
+            z: velocity[2],
+        },
+        yaw,
+        pitch,
+        head_yaw,
+        width,
+        height,
+        on_ground: snapshot.on_ground,
+        pose: snapshot.pose.clone(),
+        held_item_name: snapshot.held_item_name.clone(),
+        equipment,
+        valid: snapshot.valid,
+    })
+}
+
+fn upsert_entity_observation(observation: &mut ObservationState, snapshot: ProtocolEntitySnapshot) {
+    if let Some(existing) = observation
+        .tracked_entities
+        .iter_mut()
+        .find(|existing| existing.entity_key == snapshot.entity_key)
+    {
+        *existing = snapshot;
+    } else {
+        observation.tracked_entities.push(snapshot);
+    }
+    observation
+        .tracked_entities
+        .sort_by(|left, right| left.entity_key.cmp(&right.entity_key));
+    observation.bump_generation();
+}
+
+fn record_entity_residual(
+    observation: &mut ObservationState,
+    entity_key: &str,
+    head_yaw: Option<f64>,
+    velocity: Option<[f64; 3]>,
+    action: EntityResidualAction,
+) {
+    if matches!(action, EntityResidualAction::Clear) {
+        observation
+            .entity_residuals
+            .retain(|residual| residual.entity_key != entity_key);
+    }
+
+    let update_head_yaw = head_yaw.and_then(finite_f32);
+    let update_velocity = match action {
+        EntityResidualAction::Update => velocity,
+        EntityResidualAction::Retain | EntityResidualAction::Clear => None,
+    };
+    if update_head_yaw.is_none() && update_velocity.is_none() {
+        return;
+    }
+
+    if let Some(existing) = observation
+        .entity_residuals
+        .iter_mut()
+        .find(|residual| residual.entity_key == entity_key)
+    {
+        if update_head_yaw.is_some() {
+            existing.head_yaw = update_head_yaw;
+        }
+        if update_velocity.is_some() {
+            existing.velocity = update_velocity;
+        }
+        return;
+    }
+
+    if observation.entity_residuals.len() >= ENTITY_OBSERVATION_RESIDUAL_CAPACITY {
+        observation.entity_residuals.remove(0);
+    }
+    observation
+        .entity_residuals
+        .push(EntityObservationResidual {
+            entity_key: entity_key.to_owned(),
+            head_yaw: update_head_yaw,
+            velocity: update_velocity,
+        });
+}
+
+fn normalized_entity_snapshot_to_contract(
+    snapshot: NormalizedEntitySnapshot,
+) -> ContractProtocolEntitySnapshot {
+    contract_entity_snapshot(
+        normalized_entity_snapshot_to_protocol(&snapshot)
+            .expect("entity producer admits only finite representable snapshots"),
+    )
+    .expect("normalized entity snapshot should satisfy contract conversion")
+}
+
+fn merge_refreshed_tracked_entities(
+    mut captured: Vec<ProtocolEntitySnapshot>,
+    residuals: &mut Vec<EntityObservationResidual>,
+    connection_epoch: u64,
+) -> Vec<ProtocolEntitySnapshot> {
+    residuals.retain(|residual| {
+        residual
+            .entity_key
+            .starts_with(&format!("{connection_epoch}:"))
+            && captured
+                .iter()
+                .any(|snapshot| snapshot.entity_key == residual.entity_key)
+    });
+    for snapshot in &mut captured {
+        if !snapshot
+            .entity_key
+            .starts_with(&format!("{connection_epoch}:"))
+        {
+            continue;
+        }
+        let Some(residual) = residuals
+            .iter()
+            .find(|current| current.entity_key == snapshot.entity_key)
+        else {
+            continue;
+        };
+        // ECS owns the fields Azalea captures (position, velocity, body look,
+        // dimensions, pose, UUID, and on-ground). Only fields with an explicit
+        // packet residual survive refresh: head rotation is not represented
+        // by capture, and PositionSync/SetEntityMotion velocity is retained
+        // only when the lower handler does not write it into Physics.
+        if residual.head_yaw.is_some() {
+            snapshot.head_yaw = residual.head_yaw;
+        }
+        if let Some(velocity) = residual.velocity {
+            snapshot.velocity = Vec3Value {
+                x: velocity[0],
+                y: velocity[1],
+                z: velocity[2],
+            };
+        }
+    }
+    captured.sort_by(|left, right| left.entity_key.cmp(&right.entity_key));
+    captured
+}
+
+fn normalized_entity_event_to_contract(
+    event: NormalizedEntityEvent,
+) -> ContractProtocolEntityEvent {
+    match event {
+        NormalizedEntityEvent::Spawned { entity } => ContractProtocolEntityEvent::Spawned {
+            entity: normalized_entity_snapshot_to_contract(entity),
+        },
+        NormalizedEntityEvent::Moved { entity } => ContractProtocolEntityEvent::Moved {
+            entity: normalized_entity_snapshot_to_contract(entity),
+        },
+        NormalizedEntityEvent::Updated { entity, changed } => {
+            ContractProtocolEntityEvent::Updated {
+                entity: normalized_entity_snapshot_to_contract(entity),
+                changed,
+            }
+        }
+        NormalizedEntityEvent::Animation {
+            entity, animation, ..
+        } => ContractProtocolEntityEvent::Animation {
+            entity_key: entity.key(),
+            animation,
+        },
+        NormalizedEntityEvent::Hurt {
+            entity,
+            possible_source,
+        } => ContractProtocolEntityEvent::Hurt {
+            entity_key: entity.key(),
+            possible_source_entity_key: possible_source.map(EntityIdentity::key),
+        },
+        NormalizedEntityEvent::Removed { entity, last } => ContractProtocolEntityEvent::Removed {
+            entity_key: entity.key(),
+            last: normalized_entity_snapshot_to_contract(last),
+            reason: ContractEntityRemovalReason::ProtocolRemoved,
+        },
+    }
+}
+
 #[derive(Clone, Component)]
 struct BotState {
     shared: Arc<SharedRuntime>,
@@ -3946,6 +8921,773 @@ impl Default for SwarmState {
 /// 在 Azalea 自己的 ECS schedule 内发送退出消息，避免跨任务直接写消息时
 /// 与 Bevy 的双缓冲消息更新时序竞争。
 struct RuntimeShutdownPlugin;
+
+/// Publishes the entity packet facts after Azalea's packet handler has
+/// applied them to ECS.  RemoveEntities is intentionally handled from the
+/// shadow cache only because its handler has already despawned the entities.
+struct EntityProducerPlugin;
+
+impl Plugin for EntityProducerPlugin {
+    fn build(&self, app: &mut App) {
+        // These readers sit on the canonical ECS side of Azalea's adapters.
+        // The high-level Event channel has no attempt token when a reconnect
+        // reuses an entity, so lifecycle admission is made before those
+        // listeners copy events to LocalPlayerEvents.
+        app.add_systems(
+            Update,
+            (
+                admit_canonical_join_source.before(azalea::join::handle_start_join_server_event),
+                admit_canonical_disconnect_source
+                    .before(azalea::events::disconnect_listener)
+                    .before(azalea::join::handle_start_join_server_event),
+                admit_canonical_connection_failure_source
+                    .after(azalea::join::poll_create_connection_task)
+                    .before(azalea::events::connection_failed_listener),
+            ),
+        )
+        // `read_packets` applies each raw packet to ECS and then writes the
+        // ReceiveGamePacketEvent batch. Reading immediately after it in the
+        // same PreUpdate keeps the source epoch tied to that ordered batch;
+        // no packet message is allowed to sit across an attempt transition.
+        .add_systems(
+            azalea::app::PreUpdate,
+            produce_entity_packet_events.after(azalea::connection::read_packets),
+        );
+    }
+}
+
+/// Completes the backend-owned block/chunk/sound observation seam around
+/// Azalea's existing ordered packet queue and world handlers.  It deliberately
+/// leaves light, armor, transport, and SoundEntity outside this slice.
+struct BlockSoundProducerPlugin;
+
+/// Immutable source stamps produced by the one ordered raw-packet reducer.
+///
+/// The payloads remain in Azalea's own queue/messages. These vectors contain
+/// only one optional admission stamp per vendor queue item / ReceiveChunkEvent,
+/// are consumed by the corresponding Update system, and are cleared on every
+/// consumption even when their length does not match. A mismatch therefore
+/// fails closed for observation without becoming a cross-tick spill queue.
+#[derive(Component, Default)]
+struct CanonicalPacketSourceMetadata {
+    block_updates: Vec<Option<CanonicalSourceAdmission>>,
+    chunk_loads: VecDeque<CanonicalChunkLoadStamp>,
+}
+
+#[derive(Clone, Copy)]
+struct CanonicalChunkLoadStamp {
+    source: Option<CanonicalSourceAdmission>,
+    chunk_x: i32,
+    chunk_z: i32,
+}
+
+impl Plugin for BlockSoundProducerPlugin {
+    fn build(&self, app: &mut App) {
+        // The entity producer is the sole ordered raw-packet reducer. It
+        // stamps block/chunk items and publishes direct sound/unload facts at
+        // their packet positions before any Login/Respawn scope transition
+        // can be observed by a later raw item.
+        app.add_observer(attach_canonical_packet_source_metadata)
+            // Chunk loading must be observed after Azalea has completed its
+            // ReceiveChunkEvent handler.  Block updates then replace the vendor
+            // handler at the same ordering boundary, preserving packet order and
+            // post-state callbacks one item at a time.
+            .add_systems(
+                Update,
+                (produce_chunk_loaded_events, produce_block_update_events)
+                    .chain()
+                    .after(azalea::chunks::handle_receive_chunk_event)
+                    .before(azalea::block_update::handle_block_update_event),
+            );
+    }
+}
+
+fn attach_canonical_packet_source_metadata(
+    trigger: On<Add, azalea::block_update::QueuedServerBlockUpdates>,
+    mut commands: Commands,
+) {
+    commands
+        .entity(trigger.entity)
+        .insert(CanonicalPacketSourceMetadata::default());
+}
+
+fn canonical_sound_name(
+    sound: &azalea::registry::Holder<
+        azalea::registry::builtin::SoundEvent,
+        azalea::core::sound::CustomSound,
+    >,
+) -> Option<String> {
+    let name = match sound {
+        azalea::registry::Holder::Direct(custom) => custom.sound_id.to_string(),
+        azalea::registry::Holder::Reference(known) => known.to_string(),
+    };
+    (!name.is_empty()).then_some(name)
+}
+
+fn canonical_sound_packet(
+    packet: &azalea::protocol::packets::game::ClientboundSound,
+) -> Option<(String, [f64; 3], f64, f64)> {
+    let name = canonical_sound_name(&packet.sound)?;
+    let volume = f64::from(packet.volume);
+    let pitch = f64::from(packet.pitch);
+    if !volume.is_finite() || volume < 0.0 || !pitch.is_finite() {
+        return None;
+    }
+    Some((
+        name,
+        [
+            f64::from(packet.x) / 8.0,
+            f64::from(packet.y) / 8.0,
+            f64::from(packet.z) / 8.0,
+        ],
+        volume,
+        pitch,
+    ))
+}
+
+fn prove_has_skylight(
+    common: &azalea::protocol::packets::common::CommonPlayerSpawnInfo,
+    holder: &azalea::local_player::WorldHolder,
+) -> Option<bool> {
+    let world = holder.shared.read();
+    let (_, dimension_data) = common.dimension_type(&world.registries)?;
+    let value = dimension_data._extra.get("has_skylight")?;
+    match value {
+        azalea::protocol::simdnbt::owned::NbtTag::Byte(value) => match *value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn current_light_geometry(
+    holder: &azalea::local_player::WorldHolder,
+) -> Option<LightSectionGeometry> {
+    let world = holder.shared.read();
+    LightSectionGeometry::from_world(&world)
+}
+
+fn record_canonical_packet_source_metadata(
+    metadata: &mut Query<&mut CanonicalPacketSourceMetadata>,
+    event: &azalea::packet::game::ReceiveGamePacketEvent,
+    source: Option<CanonicalSourceAdmission>,
+) {
+    let Ok(mut metadata) = metadata.get_mut(event.entity) else {
+        // The Update consumer will see the missing component as a metadata
+        // mismatch and apply the vendor payloads without publishing them.
+        return;
+    };
+    match event.packet.as_ref() {
+        azalea::protocol::packets::game::ClientboundGamePacket::BlockUpdate(_) => {
+            metadata.block_updates.push(source);
+        }
+        azalea::protocol::packets::game::ClientboundGamePacket::SectionBlocksUpdate(packet) => {
+            for _ in &packet.states {
+                metadata.block_updates.push(source);
+            }
+        }
+        azalea::protocol::packets::game::ClientboundGamePacket::LevelChunkWithLight(packet) => {
+            metadata.chunk_loads.push_back(CanonicalChunkLoadStamp {
+                source,
+                chunk_x: packet.x,
+                chunk_z: packet.z,
+            });
+        }
+        _ => {}
+    }
+}
+
+fn produce_chunk_loaded_events(
+    mut events: MessageReader<azalea::chunks::ReceiveChunkEvent>,
+    state: Res<SwarmState>,
+    world_holders: Query<&azalea::local_player::WorldHolder>,
+    mut source_metadata: Query<&mut CanonicalPacketSourceMetadata>,
+) {
+    let mut pending = Vec::new();
+    let mut metadata_aligned = true;
+    for event in events.read() {
+        let stamp = source_metadata
+            .get_mut(event.entity)
+            .ok()
+            .and_then(|mut metadata| metadata.chunk_loads.pop_front());
+        if stamp.is_none_or(|stamp| {
+            stamp.chunk_x != event.packet.x
+                || stamp.chunk_z != event.packet.z
+                || stamp
+                    .source
+                    .is_some_and(|source| source.entity != event.entity)
+        }) {
+            metadata_aligned = false;
+        }
+        pending.push((event, stamp));
+    }
+    // A missing or extra ReceiveChunkEvent is a metadata mismatch, never a
+    // reason to retain stamps for a later tick.
+    for mut metadata in source_metadata.iter_mut() {
+        if !metadata.chunk_loads.is_empty() {
+            metadata_aligned = false;
+        }
+        metadata.chunk_loads.clear();
+    }
+    if !metadata_aligned {
+        return;
+    }
+
+    for (event, stamp) in pending {
+        let Some(source) = stamp.and_then(|stamp| stamp.source) else {
+            continue;
+        };
+        let loaded = world_holders.get(event.entity).ok().is_some_and(|holder| {
+            holder
+                .shared
+                .read()
+                .chunks
+                .get(&azalea::core::position::ChunkPos::new(
+                    event.packet.x,
+                    event.packet.z,
+                ))
+                .is_some()
+        });
+        if !loaded {
+            continue;
+        }
+        state.shared.emit_canonical_observation_event(
+            source,
+            BackendEventPayload::Block(ContractProtocolBlockEvent::ChunkLoaded {
+                chunk_x: event.packet.x,
+                chunk_z: event.packet.z,
+            }),
+        );
+    }
+}
+
+fn produce_block_update_events(
+    mut query: Query<(
+        bevy_ecs::entity::Entity,
+        &mut azalea::block_update::QueuedServerBlockUpdates,
+        &azalea::local_player::WorldHolder,
+        &mut azalea::interact::BlockStatePredictionHandler,
+        Option<&mut CanonicalPacketSourceMetadata>,
+    )>,
+    state: Res<SwarmState>,
+) {
+    for (entity, mut queued, world_holder, mut prediction_handler, source_metadata) in
+        query.iter_mut()
+    {
+        // This takes ownership of Azalea's existing ordered queue storage; it
+        // is not a second shadow/spill queue.  Every item is applied in order
+        // and published/drained before the next callback can run.
+        let updates = std::mem::take(&mut queued.list);
+        let block_stamps =
+            source_metadata.map(|mut metadata| std::mem::take(&mut metadata.block_updates));
+        let stamps_aligned = block_stamps.as_ref().is_some_and(|stamps| {
+            stamps.len() == updates.len()
+                && stamps
+                    .iter()
+                    .all(|stamp| stamp.is_none_or(|source| source.entity == entity))
+        });
+        for (index, (position, block_state)) in updates.into_iter().enumerate() {
+            let old_block = {
+                let world = world_holder.shared.read();
+                match read_block_from_world(
+                    &world,
+                    BlockPosition {
+                        x: position.x,
+                        y: position.y,
+                        z: position.z,
+                    },
+                ) {
+                    BlockReadResult::Loaded { block } => Some(block),
+                    BlockReadResult::Unloaded | BlockReadResult::OutOfWorld => None,
+                }
+            };
+
+            // Match Azalea's vendor handler exactly: a prediction acknowledgement
+            // consumes the server state without rewriting the world; otherwise
+            // the packet state is written to the shared world.
+            let prediction_consumed =
+                prediction_handler.update_known_server_state(position, block_state);
+            if !prediction_consumed {
+                let world = world_holder.shared.read();
+                world.chunks.set_block_state(position, block_state);
+            }
+
+            let source = stamps_aligned
+                .then(|| {
+                    block_stamps
+                        .as_ref()
+                        .and_then(|stamps| stamps.get(index).copied())
+                })
+                .flatten()
+                .flatten();
+            let Some(source) = source else {
+                continue;
+            };
+            let new_block = block_snapshot(
+                BlockPosition {
+                    x: position.x,
+                    y: position.y,
+                    z: position.z,
+                },
+                block_state,
+            );
+            state.shared.emit_canonical_observation_event(
+                source,
+                BackendEventPayload::Block(ContractProtocolBlockEvent::Updated {
+                    old_block: old_block.map(contract_block_snapshot),
+                    new_block: Some(contract_block_snapshot(new_block)),
+                }),
+            );
+        }
+    }
+}
+
+fn admit_canonical_join_source(
+    mut events: MessageReader<azalea::join::StartJoinServerEvent>,
+    state: Res<SwarmState>,
+) {
+    for event in events.read() {
+        let source_epoch = state.shared.connection_epoch();
+        state
+            .shared
+            .admit_canonical_join_started_with_token(source_epoch, Some(event.attempt_token));
+    }
+}
+
+fn admit_canonical_disconnect_source(
+    mut events: MessageReader<azalea::disconnect::DisconnectEvent>,
+    state: Res<SwarmState>,
+) {
+    for event in events.read() {
+        state.shared.admit_canonical_disconnected_source_with_token(
+            event.entity,
+            event.reason.as_ref().map(ToString::to_string),
+            event.attempt_token,
+        );
+    }
+}
+
+fn admit_canonical_connection_failure_source(
+    mut events: MessageReader<azalea::join::ConnectionFailedEvent>,
+    state: Res<SwarmState>,
+) {
+    for event in events.read() {
+        state
+            .shared
+            .admit_canonical_connection_failed_source_with_token(
+                event.entity,
+                format!("{:?}", event.error),
+                Some(event.attempt_token),
+            );
+    }
+}
+
+fn is_admitted_non_local_entity(local_protocol_id: Option<i32>, target_id: i32) -> bool {
+    local_protocol_id.is_some_and(|local_id| local_id != target_id)
+}
+
+fn produce_entity_packet_events(
+    mut packets: MessageReader<azalea::packet::game::ReceiveGamePacketEvent>,
+    state: Res<SwarmState>,
+    local_entities: Query<&azalea::core::entity_id::MinecraftEntityId, With<LocalEntity>>,
+    world_holders: Query<&azalea::local_player::WorldHolder>,
+    mut source_metadata: Query<&mut CanonicalPacketSourceMetadata>,
+) {
+    for event in packets.read() {
+        let source = state
+            .shared
+            .admit_canonical_source_with_token(event.entity, Some(event.attempt_token));
+        record_canonical_packet_source_metadata(&mut source_metadata, event, source);
+
+        match event.packet.as_ref() {
+            azalea::protocol::packets::game::ClientboundGamePacket::Sound(packet) => {
+                if let (Some(source), Some((sound_name, source_position, volume, pitch))) =
+                    (source, canonical_sound_packet(packet))
+                {
+                    state.shared.emit_canonical_sound(
+                        source,
+                        sound_name,
+                        source_position,
+                        volume,
+                        pitch,
+                    );
+                }
+                continue;
+            }
+            azalea::protocol::packets::game::ClientboundGamePacket::ForgetLevelChunk(packet) => {
+                if let Some(source) = source {
+                    let _ = state
+                        .shared
+                        .remove_light_chunk(source, packet.pos.x, packet.pos.z);
+                    state.shared.emit_canonical_observation_event(
+                        source,
+                        BackendEventPayload::Block(ContractProtocolBlockEvent::ChunkUnloaded {
+                            chunk_x: packet.pos.x,
+                            chunk_z: packet.pos.z,
+                        }),
+                    );
+                }
+                continue;
+            }
+            // Azalea's typed packet holder cannot represent an unknown numeric
+            // registry reference, and the Mineflayer oracle has no
+            // soundEntity listener. Do not fabricate a SoundEffect payload or
+            // attach SoundEntity to this seam.
+            azalea::protocol::packets::game::ClientboundGamePacket::SoundEntity(_) => continue,
+            azalea::protocol::packets::game::ClientboundGamePacket::LightUpdate(packet) => {
+                if let (Some(source), Ok(_holder), Some(geometry)) = (
+                    source,
+                    world_holders.get(event.entity),
+                    world_holders
+                        .get(event.entity)
+                        .ok()
+                        .and_then(current_light_geometry),
+                ) {
+                    let _ = state.shared.apply_light_packet(
+                        source,
+                        geometry,
+                        packet.x,
+                        packet.z,
+                        &packet.light_data,
+                        false,
+                    );
+                }
+                continue;
+            }
+            azalea::protocol::packets::game::ClientboundGamePacket::LevelChunkWithLight(packet) => {
+                if let (Some(source), Ok(_holder), Some(geometry)) = (
+                    source,
+                    world_holders.get(event.entity),
+                    world_holders
+                        .get(event.entity)
+                        .ok()
+                        .and_then(current_light_geometry),
+                ) {
+                    let _ = state.shared.apply_light_packet(
+                        source,
+                        geometry,
+                        packet.x,
+                        packet.z,
+                        &packet.light_data,
+                        true,
+                    );
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        let Some(epoch) = source.map(|source| source.epoch) else {
+            // Block/chunk metadata was already recorded as None above. The
+            // Update systems will still apply vendor payloads but publish no
+            // observation from an invalid source.
+            continue;
+        };
+
+        // Login and Respawn handlers emit WorldLoadedEvent on a separate
+        // Bevy stream while connection::read_packets queues all received
+        // packet messages until the raw-packet loop ends. These raw packet
+        // variants are the authoritative boundary positions: reset the
+        // complete scope and publish the packet's dimension before the next
+        // packet in this same read batch is admitted.
+        match event.packet.as_ref() {
+            azalea::protocol::packets::game::ClientboundGamePacket::Login(packet) => {
+                let has_skylight = world_holders
+                    .get(event.entity)
+                    .ok()
+                    .and_then(|holder| prove_has_skylight(&packet.common, holder));
+                state
+                    .shared
+                    .reset_entity_scope_for_owner_at_epoch_with_dimension_and_light(
+                        event.entity,
+                        epoch,
+                        Some(packet.common.dimension.to_string()),
+                        has_skylight,
+                    );
+                continue;
+            }
+            azalea::protocol::packets::game::ClientboundGamePacket::Respawn(packet) => {
+                let has_skylight = world_holders
+                    .get(event.entity)
+                    .ok()
+                    .and_then(|holder| prove_has_skylight(&packet.common, holder));
+                state
+                    .shared
+                    .reset_entity_scope_for_owner_at_epoch_with_dimension_and_light(
+                        event.entity,
+                        epoch,
+                        Some(packet.common.dimension.to_string()),
+                        has_skylight,
+                    );
+                continue;
+            }
+            _ => {}
+        }
+
+        // The packet adapter is fail-closed: without both LocalEntity and its
+        // protocol id we cannot prove that an entity packet is not self. The
+        // login/respawn boundary above remains processable so it can establish
+        // the next ECS scope before local identity is available again.
+        let local_protocol_id = local_entities.get(event.entity).ok().map(|id| **id);
+
+        if let azalea::protocol::packets::game::ClientboundGamePacket::UpdateAttributes(packet) =
+            event.packet.as_ref()
+        {
+            if source.is_some_and(|source| {
+                local_protocol_id == Some(packet.entity_id.0)
+                    && state.shared.apply_armor_packet(source, &packet.values)
+            }) {
+                // The cache mutation, including an invalid armor result,
+                // already happened under the canonical admission.
+            }
+            continue;
+        }
+
+        let admission = state.shared.next_entity_packet_admission();
+        match event.packet.as_ref() {
+            azalea::protocol::packets::game::ClientboundGamePacket::AddEntity(packet) => {
+                if !is_admitted_non_local_entity(local_protocol_id, packet.id.0) {
+                    continue;
+                }
+                let movement = packet.movement.to_vec3();
+                let dimensions = EntityDimensions::from(packet.entity_type);
+                let entity_type = canonical_entity_type(&packet.entity_type.to_string());
+                state.shared.emit_entity_input(
+                    event.entity,
+                    epoch,
+                    EntityProducerInput::Spawn {
+                        token: EntityProducerToken::new(
+                            epoch,
+                            format!("packet-admission:{admission}:add"),
+                        ),
+                        snapshot: NormalizedEntitySnapshot {
+                            identity: EntityIdentity::new(epoch, packet.id.0),
+                            entity_type,
+                            uuid: Some(packet.uuid.to_string()),
+                            name: None,
+                            username: None,
+                            position: [packet.position.x, packet.position.y, packet.position.z],
+                            velocity: [movement.x, movement.y, movement.z],
+                            yaw: compact_rotation_radians(packet.y_rot),
+                            pitch: compact_pitch_radians(packet.x_rot),
+                            head_yaw: Some(compact_rotation_radians(packet.y_head_rot)),
+                            width: f64::from(dimensions.width),
+                            height: f64::from(dimensions.height),
+                            on_ground: false,
+                            pose: Some("standing".to_owned()),
+                            held_item_name: None,
+                            equipment: Vec::new(),
+                            valid: true,
+                        },
+                    },
+                );
+            }
+            azalea::protocol::packets::game::ClientboundGamePacket::MoveEntityPos(packet) => {
+                if !is_admitted_non_local_entity(local_protocol_id, packet.entity_id.0) {
+                    continue;
+                }
+                state.shared.emit_entity_input(
+                    event.entity,
+                    epoch,
+                    EntityProducerInput::Move {
+                        token: EntityProducerToken::new(
+                            epoch,
+                            format!("packet-admission:{admission}:move-pos"),
+                        ),
+                        patch: EntityMovePatch::relative(
+                            EntityIdentity::new(epoch, packet.entity_id.0),
+                            Some([
+                                i64::from(packet.delta.xa),
+                                i64::from(packet.delta.ya),
+                                i64::from(packet.delta.za),
+                            ]),
+                            None,
+                            packet.on_ground,
+                        ),
+                    },
+                );
+            }
+            azalea::protocol::packets::game::ClientboundGamePacket::MoveEntityPosRot(packet) => {
+                if !is_admitted_non_local_entity(local_protocol_id, packet.entity_id.0) {
+                    continue;
+                }
+                state.shared.emit_entity_input(
+                    event.entity,
+                    epoch,
+                    EntityProducerInput::Move {
+                        token: EntityProducerToken::new(
+                            epoch,
+                            format!("packet-admission:{admission}:move-pos-rot"),
+                        ),
+                        patch: EntityMovePatch::relative(
+                            EntityIdentity::new(epoch, packet.entity_id.0),
+                            Some([
+                                i64::from(packet.delta.xa),
+                                i64::from(packet.delta.ya),
+                                i64::from(packet.delta.za),
+                            ]),
+                            Some([packet.look_direction.y_rot, packet.look_direction.x_rot]),
+                            packet.on_ground,
+                        ),
+                    },
+                );
+            }
+            azalea::protocol::packets::game::ClientboundGamePacket::MoveEntityRot(packet) => {
+                if !is_admitted_non_local_entity(local_protocol_id, packet.entity_id.0) {
+                    continue;
+                }
+                state.shared.emit_entity_input(
+                    event.entity,
+                    epoch,
+                    EntityProducerInput::Move {
+                        token: EntityProducerToken::new(
+                            epoch,
+                            format!("packet-admission:{admission}:move-rot"),
+                        ),
+                        patch: EntityMovePatch::relative(
+                            EntityIdentity::new(epoch, packet.entity_id.0),
+                            None,
+                            Some([packet.look_direction.y_rot, packet.look_direction.x_rot]),
+                            packet.on_ground,
+                        ),
+                    },
+                );
+            }
+            azalea::protocol::packets::game::ClientboundGamePacket::TeleportEntity(packet) => {
+                if !is_admitted_non_local_entity(local_protocol_id, packet.id.0) {
+                    continue;
+                }
+                state.shared.emit_entity_input_with_velocity_residual(
+                    event.entity,
+                    epoch,
+                    EntityProducerInput::Move {
+                        token: EntityProducerToken::new(
+                            epoch,
+                            format!("packet-admission:{admission}:teleport"),
+                        ),
+                        patch: EntityMovePatch::teleport(
+                            EntityIdentity::new(epoch, packet.id.0),
+                            [
+                                packet.change.pos.x,
+                                packet.change.pos.y,
+                                packet.change.pos.z,
+                            ],
+                            [
+                                f64::from(packet.change.look_direction.y_rot()),
+                                f64::from(packet.change.look_direction.x_rot()),
+                            ],
+                            [packet.relative.x, packet.relative.y, packet.relative.z],
+                            [packet.relative.y_rot, packet.relative.x_rot],
+                            [
+                                packet.change.delta.x,
+                                packet.change.delta.y,
+                                packet.change.delta.z,
+                            ],
+                            [
+                                packet.relative.delta_x,
+                                packet.relative.delta_y,
+                                packet.relative.delta_z,
+                            ],
+                            packet.relative.rotate_delta,
+                            packet.on_ground,
+                        ),
+                    },
+                    EntityResidualAction::Clear,
+                );
+            }
+            azalea::protocol::packets::game::ClientboundGamePacket::EntityPositionSync(packet) => {
+                if !is_admitted_non_local_entity(local_protocol_id, packet.id.0) {
+                    continue;
+                }
+                state.shared.emit_entity_input_with_velocity_residual(
+                    event.entity,
+                    epoch,
+                    EntityProducerInput::Move {
+                        token: EntityProducerToken::new(
+                            epoch,
+                            format!("packet-admission:{admission}:position-sync"),
+                        ),
+                        patch: EntityMovePatch::position_sync(
+                            EntityIdentity::new(epoch, packet.id.0),
+                            [
+                                packet.values.pos.x,
+                                packet.values.pos.y,
+                                packet.values.pos.z,
+                            ],
+                            [
+                                f64::from(packet.values.look_direction.y_rot()),
+                                f64::from(packet.values.look_direction.x_rot()),
+                            ],
+                            [
+                                packet.values.delta.x,
+                                packet.values.delta.y,
+                                packet.values.delta.z,
+                            ],
+                            packet.on_ground,
+                        ),
+                    },
+                    EntityResidualAction::Update,
+                );
+            }
+            azalea::protocol::packets::game::ClientboundGamePacket::RotateHead(packet) => {
+                if !is_admitted_non_local_entity(local_protocol_id, packet.entity_id.0) {
+                    continue;
+                }
+                state.shared.emit_entity_input(
+                    event.entity,
+                    epoch,
+                    EntityProducerInput::Move {
+                        token: EntityProducerToken::new(
+                            epoch,
+                            format!("packet-admission:{admission}:rotate-head"),
+                        ),
+                        patch: EntityMovePatch::rotate_head(
+                            EntityIdentity::new(epoch, packet.entity_id.0),
+                            packet.y_head_rot,
+                        ),
+                    },
+                );
+            }
+            azalea::protocol::packets::game::ClientboundGamePacket::SetEntityMotion(packet) => {
+                if !is_admitted_non_local_entity(local_protocol_id, packet.id.0) {
+                    continue;
+                }
+                let velocity = packet.delta.to_vec3();
+                state.shared.emit_entity_motion_residual(
+                    event.entity,
+                    epoch,
+                    EntityProducerToken::new(
+                        epoch,
+                        format!("packet-admission:{admission}:set-motion"),
+                    ),
+                    EntityIdentity::new(epoch, packet.id.0),
+                    [velocity.x, velocity.y, velocity.z],
+                );
+            }
+            azalea::protocol::packets::game::ClientboundGamePacket::RemoveEntities(packet) => {
+                for (index, id) in packet.entity_ids.iter().copied().enumerate() {
+                    if !is_admitted_non_local_entity(local_protocol_id, id.0) {
+                        continue;
+                    }
+                    state.shared.emit_entity_input(
+                        event.entity,
+                        epoch,
+                        EntityProducerInput::Remove {
+                            token: EntityProducerToken::new(
+                                epoch,
+                                format!("packet-admission:{admission}:remove:{id:?}:{index}"),
+                            ),
+                            entity: EntityIdentity::new(epoch, id.0),
+                        },
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
 
 /// 只从 Azalea 的底层接收包消息中筛选服务端位置校正。
 ///
@@ -3978,7 +9720,16 @@ fn reset_spawn_marker_on_world_loaded(
     state: Res<SwarmState>,
 ) {
     for event in world_loaded.read() {
-        state.shared.observe_dimension(event.name.to_string());
+        if !state
+            .shared
+            .observe_dimension_from_world_boundary_with_token(
+                event.entity,
+                event.name.to_string(),
+                Some(event.attempt_token),
+            )
+        {
+            continue;
+        }
         commands.entity(event.entity).remove::<(
             azalea::events::SentSpawnEvent,
             azalea::entity::InLoadedChunk,
@@ -4022,10 +9773,16 @@ fn record_server_position_corrections(
         else {
             continue;
         };
+        let Some(source) = state
+            .shared
+            .admit_canonical_source_with_token(event.entity, Some(event.attempt_token))
+        else {
+            continue;
+        };
         // 这是服务端主动校正玩家位置的协议事实；它不代表每个 tick
         // 都有一个服务端坐标包，因此客户端预测轨迹仍单独记录。
-        state.shared.emit_if_running(
-            FactSource::ServerObserved,
+        state.shared.emit_canonical_observation_event(
+            source,
             BackendEventPayload::SelfState(ContractProtocolSelfEvent::ServerPositionCorrection {
                 teleport_id: packet.id,
                 position: ContractVec3Value {
@@ -4503,13 +10260,20 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             // Swarm 重连在某些路径复用已有本地玩家事件发送器，不一定再次发出
             // Event::Init；重连调度器会预留 epoch，若 Init 到达则消费该预留，避免
             // 同一次握手被错误地记成两个 epoch。
-            if !shared.consume_attempt_for_transport_init() || !shared.command_execution_allowed() {
+            if shared
+                .consume_attempt_for_transport_init_and_bind_with_token(
+                    bot.entity,
+                    bot.attempt_token(),
+                )
+                .is_none()
+                || !shared.command_execution_allowed()
+                || !shared.set_active_client_if_current(&bot)
+            {
                 return;
             }
-            shared.emit_transport_connected();
         }
         Event::Login => {
-            if !shared.command_execution_allowed() {
+            if !shared.client_is_current_owner(&bot) || !shared.command_execution_allowed() {
                 return;
             }
             let dimension = bot
@@ -4525,7 +10289,7 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             shared.emit_logged_in("26.1.2", dimension);
         }
         Event::Spawn => {
-            if !shared.command_execution_allowed() {
+            if !shared.client_is_current_owner(&bot) || !shared.command_execution_allowed() {
                 return;
             }
             let (spawn_allowed, was_dead) = {
@@ -4585,6 +10349,9 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
         }
         Event::KeepAlive(_id) => {}
         Event::Chat(packet) => {
+            if !shared.client_is_current_owner(&bot) {
+                return;
+            }
             shared.emit_if_running(
                 FactSource::ServerObserved,
                 BackendEventPayload::Chat(ContractProtocolChatEvent {
@@ -4596,6 +10363,9 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             );
         }
         Event::Death(_) => {
+            if !shared.client_is_current_owner(&bot) {
+                return;
+            }
             if shared
                 .admit_death_and_release(|| {
                     let released = try_set_movement_flags(&bot, false, false);
@@ -4611,19 +10381,30 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                 shared.emit_snapshot(snapshot, FactSource::ServerObserved);
             }
         }
-        Event::Disconnect(reason) => {
-            let reason = reason.map(|value| value.to_string());
-            shared.mark_disconnected(reason);
+        Event::Disconnect(_reason) => {
+            // This channel has no attempt token. Canonical DisconnectEvent
+            // admission already ran before the listener copied this event.
             // Disconnect 会由 Azalea 同步移除本地玩家的运动组件；此处只
             // 更新运行时状态，不再向已失效的实体投递 walk/jump/crouch 消息。
         }
-        Event::ConnectionFailed(error) => {
-            shared.mark_connection_failed(format!("{error:?}"));
+        Event::ConnectionFailed(_error) => {
+            // The canonical ECS source already admitted and closed this
+            // exact entity/epoch.  A high-level event without that bounded
+            // hand-off is source-less and must have no lifecycle side effect.
+            if !shared.take_canonical_connection_failure_followup_with_token(
+                bot.entity,
+                bot.attempt_token(),
+            ) {
+                return;
+            }
             // ConnectionFailed 不一定伴随单独的 swarm disconnect；显式断开让
             // 统一的 close/reconnect 分支接管，不把内部错误泄漏成旧 error kind。
             let _ = shared.with_disconnect_admission(|| bot.disconnect());
         }
         Event::AddPlayer(info) => {
+            if !shared.client_is_current_owner(&bot) {
+                return;
+            }
             shared.emit_if_running(
                 FactSource::ServerObserved,
                 BackendEventPayload::PlayerList(ContractProtocolPlayerListEvent::Add {
@@ -4633,6 +10414,9 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             );
         }
         Event::RemovePlayer(info) => {
+            if !shared.client_is_current_owner(&bot) {
+                return;
+            }
             shared.emit_if_running(
                 FactSource::ServerObserved,
                 BackendEventPayload::PlayerList(ContractProtocolPlayerListEvent::Remove {
@@ -4642,6 +10426,9 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             );
         }
         Event::UpdatePlayer(info) => {
+            if !shared.client_is_current_owner(&bot) {
+                return;
+            }
             shared.emit_if_running(
                 FactSource::ServerObserved,
                 BackendEventPayload::PlayerList(ContractProtocolPlayerListEvent::Update {
@@ -4651,16 +10438,17 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             );
         }
         Event::ReceiveChunk(position) => {
-            shared.emit_if_running(
-                FactSource::ServerObserved,
-                BackendEventPayload::Block(ContractProtocolBlockEvent::ChunkLoaded {
-                    chunk_x: position.x,
-                    chunk_z: position.z,
-                }),
-            );
+            // ChunkLoaded is produced once from the completed canonical
+            // ReceiveChunkEvent boundary.  The high-level Event::ReceiveChunk
+            // is retained for Azalea's other high-level behavior but must not
+            // produce a second observation envelope.
+            let _ = position;
         }
         Event::Tick => {
-            if shared.command_execution_allowed() && shared.ready.load(Ordering::Acquire) {
+            if shared.client_is_current_owner(&bot)
+                && shared.command_execution_allowed()
+                && shared.ready.load(Ordering::Acquire)
+            {
                 let tick = shared.tick_revision.fetch_add(1, Ordering::AcqRel);
                 if tick % 5 != 0 {
                     return;
@@ -4685,8 +10473,8 @@ async fn handle_swarm(swarm: Swarm, event: SwarmEvent, state: SwarmState) {
             return;
         }
     }
-    if let SwarmEvent::Disconnect(account, join_opts) = event {
-        if !shared.claim_reconnect() {
+    if let SwarmEvent::Disconnect(account, join_opts, attempt_token) = event {
+        if !shared.claim_reconnect_with_token(attempt_token) {
             return;
         }
         if shared.stopping.load(Ordering::Acquire) {
@@ -4701,7 +10489,7 @@ async fn handle_swarm(swarm: Swarm, event: SwarmEvent, state: SwarmState) {
             shared.reconnect_pending.store(false, Ordering::Release);
             return;
         }
-        if !close.retryable || !shared.config.reconnect_enabled {
+        if !close.retryable || !shared.config.reconnect.enabled {
             shared.emit_faulted(shared.failure_for_close(&close));
             shared.request_shutdown();
             shared.reconnect_pending.store(false, Ordering::Release);
@@ -4736,8 +10524,17 @@ async fn handle_swarm(swarm: Swarm, event: SwarmEvent, state: SwarmState) {
             // and exits the swarm; once this future returns, an invalid token
             // explicitly disconnects the returned client as the final guard.
             let client = swarm.add_with_opts(&account, state, &join_opts).await;
-            if !shared.reconnect_add_is_allowed(token) {
+            // Bind while the reservation/token/stop admission is held by the
+            // backend.  Do not perform a separate read-then-bind check: a
+            // stop or token transition between those reads must invalidate
+            // the returned client instead of installing its owner.
+            let bound = shared
+                .bind_reconnect_return_with_token(token, client.entity, client.attempt_token())
+                .is_some();
+            if !bound {
                 client.disconnect();
+            } else {
+                let _ = shared.set_active_client_if_current(&client);
             }
             shared.finish_reconnect_attempt(token);
         });
@@ -4758,6 +10555,7 @@ pub async fn run_with_handle(
     validate_run_config(&config)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let shared = handle.shared.clone();
+    shared.timers_enabled.store(true, Ordering::Release);
     if !shared.begin_connection_attempt() {
         return Ok(());
     }
@@ -4779,6 +10577,8 @@ pub async fn run_with_handle(
             .disable::<AutoRespawnPlugin>()
             .disable::<AcceptResourcePacksPlugin>()
             .disable::<AutoReconnectPlugin>(),
+        EntityProducerPlugin,
+        BlockSoundProducerPlugin,
         ServerPositionCorrectionPlugin,
         RuntimeShutdownPlugin,
         DefaultSwarmPlugins,
@@ -4819,6 +10619,21 @@ fn validate_run_config(config: &RunConfig) -> Result<(), String> {
     }
     if config.world_id.trim().is_empty() {
         return Err("world_id 不能为空".to_owned());
+    }
+    if config.timeouts.connect_ms == 0
+        || config.timeouts.login_ms == 0
+        || config.timeouts.spawn_ms == 0
+        || config.timeouts.stop_ms == 0
+    {
+        return Err("transport timeout 必须大于 0".to_owned());
+    }
+    if !config.reconnect.multiplier.is_finite() || config.reconnect.multiplier < 1.0 {
+        return Err("reconnect multiplier 必须是有限且不小于 1 的数".to_owned());
+    }
+    if !config.reconnect.jitter_ratio.is_finite()
+        || !(0.0..=1.0).contains(&config.reconnect.jitter_ratio)
+    {
+        return Err("reconnect jitter ratio 必须在 0 到 1 之间".to_owned());
     }
     Ok(())
 }
@@ -5037,6 +10852,34 @@ mod tests {
         Arc::new(parking_lot::RwLock::new(azalea::world::World::default()))
     }
 
+    fn install_dimension_registry(
+        shared_world: &SharedWorld,
+        dimension: &str,
+        has_skylight: Option<bool>,
+    ) {
+        let mut values = vec![
+            (
+                "height".into(),
+                azalea::protocol::simdnbt::owned::NbtTag::Int(384),
+            ),
+            (
+                "min_y".into(),
+                azalea::protocol::simdnbt::owned::NbtTag::Int(-64),
+            ),
+        ];
+        if let Some(has_skylight) = has_skylight {
+            values.push((
+                "has_skylight".into(),
+                azalea::protocol::simdnbt::owned::NbtTag::Byte(i8::from(has_skylight)),
+            ));
+        }
+        let entry = azalea::protocol::simdnbt::owned::NbtCompound::from_values(values);
+        shared_world.write().registries.append(
+            azalea::Identifier::from("minecraft:dimension_type"),
+            vec![(azalea::Identifier::from(dimension), Some(entry))],
+        );
+    }
+
     fn install_viewport_observation(
         handle: &RuntimeHandle,
         snapshot: MinecraftSnapshotV1,
@@ -5044,9 +10887,11 @@ mod tests {
         entities: Vec<ProtocolEntitySnapshot>,
         world: SharedWorld,
     ) {
+        let scope_generation = handle.shared.entity_producer.lock().scope_generation;
         let mut observation = handle.shared.observation.write();
         observation.world = Some(world);
         observation.snapshot = Some(snapshot);
+        observation.snapshot_scope_generation = scope_generation;
         observation.source = Some(source);
         observation.tracked_entities = entities;
         observation.bump_generation();
@@ -5524,6 +11369,9 @@ mod tests {
     fn connection_request_preallocates_and_init_reuses_each_attempt_identity() {
         let handle = RuntimeHandle::new(RunConfig::default());
         let mut events = handle.subscribe();
+        let mut owner_world = bevy_ecs::world::World::new();
+        let first_owner = owner_world.spawn_empty().id();
+        let second_owner = owner_world.spawn_empty().id();
         assert!(events.try_recv().is_err());
 
         handle.shared.begin_connection_attempt();
@@ -5535,10 +11383,11 @@ mod tests {
         assert_eq!(first_payload["attempt"], 1);
         assert!(first_request.dimension.is_none());
 
-        handle.shared.consume_attempt_for_transport_init();
-        handle.shared.emit(
-            FactSource::ServerObserved,
-            BackendEventPayload::Lifecycle(BackendLifecyclePayload::TransportConnected),
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind(first_owner),
+            Some(1)
         );
         let first_init = events.try_recv().expect("首次连接初始化事件");
         assert_eq!(
@@ -5561,7 +11410,13 @@ mod tests {
         assert_eq!(second_payload["attempt"], 2);
         assert!(second_request.dimension.is_none());
 
-        handle.shared.consume_attempt_for_transport_init();
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind(second_owner),
+            Some(2)
+        );
+        let _second_transport = events.try_recv().expect("second transport connected");
         assert_eq!(handle.shared.context().1, 2);
         assert!(events.try_recv().is_err());
     }
@@ -5612,6 +11467,41 @@ mod tests {
         assert_eq!(changed_payload["from"], "minecraft:overworld");
         assert_eq!(changed_payload["to"], "minecraft:the_nether");
         assert_eq!(changed.dimension.as_deref(), Some("minecraft:the_nether"));
+    }
+
+    #[test]
+    fn world_loaded_dimension_boundary_is_idempotent_for_the_bound_owner() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        let mut world = bevy_ecs::world::World::new();
+        let owner = world.spawn_empty().id();
+        assert!(handle.shared.begin_connection_attempt());
+        let _request = events.try_recv().expect("request");
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind(owner),
+            Some(1)
+        );
+        let _transport = events.try_recv().expect("transport");
+
+        assert!(handle
+            .shared
+            .observe_dimension_from_world_boundary(owner, "minecraft:overworld"));
+        assert!(events.try_recv().is_err());
+        assert!(handle
+            .shared
+            .observe_dimension_from_world_boundary(owner, "minecraft:overworld"));
+        assert!(events.try_recv().is_err());
+        assert!(handle
+            .shared
+            .observe_dimension_from_world_boundary(owner, "minecraft:the_nether"));
+        let changed = events.try_recv().expect("one dimension change");
+        assert_eq!(payload_json(&changed)["type"], "dimension_changed");
+        assert!(handle
+            .shared
+            .observe_dimension_from_world_boundary(owner, "minecraft:the_nether"));
+        assert!(events.try_recv().is_err());
     }
 
     #[test]
@@ -5700,13 +11590,18 @@ mod tests {
     fn stopped_runtime_rejects_late_attempt_and_ready_without_resurrection() {
         let handle = RuntimeHandle::new(RunConfig::default());
         let mut events = handle.subscribe();
+        let mut owner_world = bevy_ecs::world::World::new();
+        let owner = owner_world.spawn_empty().id();
         handle.stop("late_event_stop");
         let stopped = events.try_recv().expect("stopped event");
         assert_eq!(payload_json(&stopped)["type"], "stopped");
         assert!(handle.shared.shutdown_requested.load(Ordering::Acquire));
 
         assert!(!handle.shared.begin_connection_attempt());
-        assert!(!handle.shared.consume_attempt_for_transport_init());
+        assert!(handle
+            .shared
+            .consume_attempt_for_transport_init_and_bind(owner)
+            .is_none());
         handle.shared.emit_transport_connected();
         handle
             .shared
@@ -6074,7 +11969,7 @@ mod tests {
     #[test]
     fn runtime_fatal_close_emits_faulted_without_reconnect_disabled_rewrite() {
         let mut config = RunConfig::default();
-        config.reconnect_enabled = false;
+        config.reconnect.enabled = false;
         let handle = RuntimeHandle::new(config);
         let mut events = handle.subscribe();
         handle.shared.begin_connection_attempt();
@@ -6103,7 +11998,7 @@ mod tests {
     #[test]
     fn runtime_invalid_session_close_uses_permission_denied_with_authentication_failure() {
         let mut config = RunConfig::default();
-        config.reconnect_enabled = false;
+        config.reconnect.enabled = false;
         let handle = RuntimeHandle::new(config);
         let mut events = handle.subscribe();
         handle.shared.begin_connection_attempt();
@@ -6177,7 +12072,7 @@ mod tests {
         let failure = handle.shared.failure_for_close(&close);
         assert_eq!(failure.code, BackendFailureCode::PermissionDenied);
         assert!(!failure.retryable);
-        assert!(!handle.shared.config.reconnect_enabled || !close.retryable);
+        assert!(!handle.shared.config.reconnect.enabled || !close.retryable);
         handle.shared.emit_faulted(failure);
 
         let _closed = events.try_recv().expect("unclassified kick close event");
@@ -6213,7 +12108,7 @@ mod tests {
     #[test]
     fn runtime_retryable_close_with_disabled_reconnect_emits_reconnect_disabled() {
         let mut config = RunConfig::default();
-        config.reconnect_enabled = false;
+        config.reconnect.enabled = false;
         let handle = RuntimeHandle::new(config);
         let mut events = handle.subscribe();
         handle.shared.begin_connection_attempt();
@@ -8751,5 +14646,2896 @@ mod tests {
             .expect("dropped receiver must not create control backpressure");
         producer.join().expect("dropped receiver producer");
         assert_eq!(handle.shared.subscribers.lock().len(), 0);
+    }
+
+    struct ImmediateBlockObservationReader {
+        source: RuntimeObservationSource,
+        seen: Arc<parking_lot::Mutex<Vec<(Option<u32>, u32, Option<u32>)>>>,
+    }
+
+    impl ObservationEventListener for ImmediateBlockObservationReader {
+        fn on_event(&self, event: ObservationEvent) {
+            let ObservationEvent::Block(envelope) = event else {
+                return;
+            };
+            let ContractProtocolBlockEvent::Updated {
+                old_block,
+                new_block,
+            } = envelope.payload
+            else {
+                return;
+            };
+            let new_block = new_block.expect("accepted block update has a new block");
+            let position = ContractBlockPosition {
+                x: new_block.position.x,
+                y: new_block.position.y,
+                z: new_block.position.z,
+            };
+            let read_state_id = match self
+                .source
+                .read_block(position)
+                .expect("callback block read")
+            {
+                ContractBlockReadResult::Loaded { block } => Some(block.state_id),
+                ContractBlockReadResult::Unloaded => None,
+                other => panic!("callback block read left the world height, got {other:?}"),
+            };
+            self.seen.lock().push((
+                old_block.map(|block| block.state_id),
+                new_block.state_id,
+                read_state_id,
+            ));
+        }
+    }
+
+    fn producer_test_app() -> (
+        RuntimeHandle,
+        App,
+        bevy_ecs::entity::Entity,
+        SharedWorld,
+        RuntimeObservationSource,
+        RuntimeEventReceiver,
+    ) {
+        let (handle, app, owner, shared_world, source, events) = producer_test_app_without_world();
+        assert!(handle.shared.set_world_if_running(shared_world.clone()));
+        (handle, app, owner, shared_world, source, events)
+    }
+
+    fn producer_test_app_without_world() -> (
+        RuntimeHandle,
+        App,
+        bevy_ecs::entity::Entity,
+        SharedWorld,
+        RuntimeObservationSource,
+        RuntimeEventReceiver,
+    ) {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut app = App::new();
+        app.add_message::<azalea::packet::game::ReceiveGamePacketEvent>();
+        app.add_message::<azalea::chunks::ReceiveChunkEvent>();
+        let owner = app
+            .world_mut()
+            .spawn((LocalEntity, azalea::core::entity_id::MinecraftEntityId(99)))
+            .id();
+        let shared_world = empty_world();
+        app.world_mut().entity_mut(owner).insert((
+            azalea::local_player::WorldHolder::new(owner, shared_world.clone()),
+            azalea::block_update::QueuedServerBlockUpdates::default(),
+            azalea::interact::BlockStatePredictionHandler::default(),
+            CanonicalPacketSourceMetadata::default(),
+        ));
+        app.insert_resource(SwarmState {
+            shared: handle.shared.clone(),
+        });
+        app.add_systems(azalea::app::PreUpdate, produce_entity_packet_events);
+        app.add_systems(
+            Update,
+            (
+                azalea::chunks::handle_receive_chunk_event,
+                azalea::block_update::handle_block_update_event,
+            ),
+        );
+        app.add_plugins(BlockSoundProducerPlugin);
+
+        assert!(handle.shared.begin_connection_attempt());
+        let test_token = synthetic_attempt_token();
+        assert!(handle
+            .shared
+            .admit_canonical_join_started_with_token(1, Some(test_token)));
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind_with_token(owner, Some(test_token)),
+            Some(1)
+        );
+        app.world_mut()
+            .insert_resource(super::entity_events_owner_tests::TestAttemptToken(
+                test_token,
+            ));
+        let source = handle.observation_source();
+        let events = handle.subscribe();
+        (handle, app, owner, shared_world, source, events)
+    }
+
+    fn test_block_state(id: u32) -> azalea::block::BlockState {
+        azalea::block::BlockState::try_from(id).expect("test block state id")
+    }
+
+    fn synthetic_attempt_token() -> azalea::join::AttemptToken {
+        azalea::join::AttemptToken::mint()
+    }
+
+    fn install_shared_chunk(
+        shared_world: &SharedWorld,
+        pos: azalea::core::position::ChunkPos,
+    ) -> Arc<parking_lot::RwLock<azalea::world::Chunk>> {
+        shared_world
+            .write()
+            .chunks
+            .upsert(pos, azalea::world::Chunk::default())
+    }
+
+    fn expose_shared_chunk(
+        app: &mut App,
+        owner: bevy_ecs::entity::Entity,
+        pos: azalea::core::position::ChunkPos,
+        chunk: Arc<parking_lot::RwLock<azalea::world::Chunk>>,
+    ) {
+        let holder = app
+            .world_mut()
+            .get::<azalea::local_player::WorldHolder>(owner)
+            .expect("test world holder")
+            .clone();
+        holder.partial.write().chunks.limited_set(&pos, Some(chunk));
+    }
+
+    fn queue_production_block_packet(
+        app: &mut App,
+        owner: bevy_ecs::entity::Entity,
+        position: azalea::BlockPos,
+        state: azalea::block::BlockState,
+    ) {
+        let packet = azalea::protocol::packets::game::ClientboundGamePacket::BlockUpdate(
+            azalea::protocol::packets::game::ClientboundBlockUpdate {
+                pos: position,
+                block_state: state,
+            },
+        );
+        azalea::packet::game::process_packet(
+            app.world_mut(),
+            owner,
+            &packet,
+            synthetic_attempt_token(),
+        );
+        queue_producer_packet(app, owner, packet);
+    }
+
+    fn queue_producer_packet(
+        app: &mut App,
+        owner: bevy_ecs::entity::Entity,
+        packet: azalea::protocol::packets::game::ClientboundGamePacket,
+    ) {
+        let attempt_token = app
+            .world()
+            .resource::<super::entity_events_owner_tests::TestAttemptToken>()
+            .0;
+        app.world_mut()
+            .write_message(azalea::packet::game::ReceiveGamePacketEvent {
+                entity: owner,
+                packet: Arc::new(packet),
+                attempt_token,
+            });
+    }
+
+    fn block_events(events: &mut RuntimeEventReceiver) -> Vec<ContractProtocolBlockEvent> {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event.payload {
+                BackendEventPayload::Block(payload) => Some(payload),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn production_block_sound_updates_are_ordered_post_state_and_preserve_null_old() {
+        let (handle, mut app, owner, shared_world, source, mut events) = producer_test_app();
+        let position = azalea::BlockPos {
+            x: -17,
+            y: -46,
+            z: 30,
+        };
+        let chunk_pos = azalea::core::position::ChunkPos::new(-2, 1);
+        let chunk = install_shared_chunk(&shared_world, chunk_pos);
+        expose_shared_chunk(&mut app, owner, chunk_pos, chunk);
+
+        let state_a = test_block_state(1);
+        let state_b = test_block_state(2);
+        let state_c = test_block_state(3);
+        shared_world
+            .read()
+            .chunks
+            .set_block_state(position, state_a);
+
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _subscription = ProtocolObservationSource::subscribe(
+            &source,
+            Arc::new(ImmediateBlockObservationReader {
+                source: source.clone(),
+                seen: seen.clone(),
+            }),
+        )
+        .expect("block callback subscription");
+
+        queue_production_block_packet(&mut app, owner, position, state_b);
+        queue_production_block_packet(&mut app, owner, position, state_c);
+        app.update();
+        assert_eq!(
+            *seen.lock(),
+            vec![
+                (
+                    Some(u32::from(state_a.id())),
+                    u32::from(state_b.id()),
+                    Some(u32::from(state_b.id())),
+                ),
+                (
+                    Some(u32::from(state_b.id())),
+                    u32::from(state_c.id()),
+                    Some(u32::from(state_c.id())),
+                ),
+            ]
+        );
+        queue_production_block_packet(
+            &mut app,
+            owner,
+            azalea::BlockPos {
+                x: 145,
+                y: -46,
+                z: 145,
+            },
+            test_block_state(4),
+        );
+        app.update();
+
+        assert_eq!(
+            *seen.lock(),
+            vec![
+                (
+                    Some(u32::from(state_a.id())),
+                    u32::from(state_b.id()),
+                    Some(u32::from(state_b.id())),
+                ),
+                (
+                    Some(u32::from(state_b.id())),
+                    u32::from(state_c.id()),
+                    Some(u32::from(state_c.id())),
+                ),
+                (None, 4, None),
+            ]
+        );
+        let updates = block_events(&mut events)
+            .into_iter()
+            .filter_map(|event| match event {
+                ContractProtocolBlockEvent::Updated {
+                    old_block,
+                    new_block,
+                } => Some((old_block, new_block.expect("new block"))),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 3);
+        assert_eq!(
+            updates[0].0.as_ref().expect("full old block").position,
+            ContractBlockPosition {
+                x: -17,
+                y: -46,
+                z: 30,
+            }
+        );
+        assert_eq!(
+            updates[0].1.position,
+            updates[0].0.as_ref().unwrap().position
+        );
+        assert_eq!(updates[0].1.state_id, u32::from(state_b.id()));
+        assert!(!updates[0].1.name.is_empty());
+        assert!(
+            updates[0].1.bounding_box == ContractBlockBoundingBox::Block
+                || updates[0].1.bounding_box == ContractBlockBoundingBox::Empty
+        );
+        assert!(
+            updates[2].0.is_none(),
+            "unloaded oldBlock must be JSON null"
+        );
+        assert_eq!(handle.connection_epoch(), 1);
+    }
+
+    #[test]
+    fn production_block_sound_section_updates_flatten_in_wire_order_with_negative_section() {
+        let (_handle, mut app, owner, shared_world, _source, mut events) = producer_test_app();
+        let chunk_pos = azalea::core::position::ChunkPos::new(-2, 1);
+        let chunk = install_shared_chunk(&shared_world, chunk_pos);
+        expose_shared_chunk(&mut app, owner, chunk_pos, chunk);
+        let packet = azalea::protocol::packets::game::ClientboundGamePacket::SectionBlocksUpdate(
+            azalea::protocol::packets::game::ClientboundSectionBlocksUpdate {
+                section_pos: azalea::core::position::ChunkSectionPos { x: -2, y: -3, z: 1 },
+                states: vec![
+                    azalea::protocol::packets::game::c_section_blocks_update::BlockStateWithPosition {
+                        pos: azalea::core::position::ChunkSectionBlockPos { x: 1, y: 2, z: 3 },
+                        state: test_block_state(5),
+                    },
+                    azalea::protocol::packets::game::c_section_blocks_update::BlockStateWithPosition {
+                        pos: azalea::core::position::ChunkSectionBlockPos { x: 15, y: 0, z: 0 },
+                        state: test_block_state(6),
+                    },
+                ],
+            },
+        );
+        azalea::packet::game::process_packet(
+            app.world_mut(),
+            owner,
+            &packet,
+            synthetic_attempt_token(),
+        );
+        queue_producer_packet(&mut app, owner, packet);
+        app.update();
+
+        let updates = block_events(&mut events)
+            .into_iter()
+            .filter_map(|event| match event {
+                ContractProtocolBlockEvent::Updated { new_block, .. } => {
+                    Some(new_block.expect("section new block"))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(
+            updates
+                .iter()
+                .map(|block| (
+                    block.position.x,
+                    block.position.y,
+                    block.position.z,
+                    block.state_id
+                ))
+                .collect::<Vec<_>>(),
+            vec![(-31, -46, 19, 5), (-17, -48, 16, 6)]
+        );
+    }
+
+    fn sound_packet(
+        sound: azalea::registry::Holder<
+            azalea::registry::builtin::SoundEvent,
+            azalea::core::sound::CustomSound,
+        >,
+        volume: f32,
+        pitch: f32,
+    ) -> azalea::protocol::packets::game::ClientboundGamePacket {
+        azalea::protocol::packets::game::ClientboundGamePacket::Sound(
+            azalea::protocol::packets::game::ClientboundSound {
+                sound,
+                source: azalea::protocol::packets::game::c_sound::SoundSource::Master,
+                x: 9,
+                y: -8,
+                z: 16,
+                volume,
+                pitch,
+                seed: 42,
+            },
+        )
+    }
+
+    fn empty_chunk_packet(
+        x: i32,
+        z: i32,
+    ) -> azalea::protocol::packets::game::ClientboundGamePacket {
+        azalea::protocol::packets::game::ClientboundGamePacket::LevelChunkWithLight(
+            azalea::protocol::packets::game::ClientboundLevelChunkWithLight {
+                x,
+                z,
+                chunk_data: azalea::protocol::packets::game::c_level_chunk_with_light::ClientboundLevelChunkPacketData {
+                    heightmaps: Vec::new(),
+                    data: Arc::new(Vec::<u8>::new().into_boxed_slice()),
+                    block_entities: Vec::new(),
+                },
+                light_data: Default::default(),
+            },
+        )
+    }
+
+    fn packed_light_layer(values: &[(usize, u8)]) -> Box<[u8]> {
+        let mut bytes = vec![0; 2048];
+        for &(index, value) in values {
+            assert!(index < 4096);
+            assert!(value <= 15);
+            let byte = &mut bytes[index >> 1];
+            if index & 1 == 0 {
+                *byte = (*byte & 0xf0) | value;
+            } else {
+                *byte = (*byte & 0x0f) | (value << 4);
+            }
+        }
+        bytes.into_boxed_slice()
+    }
+
+    fn light_data_with_masks(
+        sky_bits: &[usize],
+        block_bits: &[usize],
+        empty_sky_bits: &[usize],
+        empty_block_bits: &[usize],
+        sky_updates: Vec<Box<[u8]>>,
+        block_updates: Vec<Box<[u8]>>,
+    ) -> azalea::protocol::packets::game::c_light_update::ClientboundLightUpdatePacketData {
+        let mut sky_y_mask = azalea::core::bitset::BitSet::new(64);
+        for &bit in sky_bits {
+            sky_y_mask.set(bit);
+        }
+        let mut block_y_mask = azalea::core::bitset::BitSet::new(64);
+        for &bit in block_bits {
+            block_y_mask.set(bit);
+        }
+        let mut empty_sky_y_mask = azalea::core::bitset::BitSet::new(64);
+        for &bit in empty_sky_bits {
+            empty_sky_y_mask.set(bit);
+        }
+        let mut empty_block_y_mask = azalea::core::bitset::BitSet::new(64);
+        for &bit in empty_block_bits {
+            empty_block_y_mask.set(bit);
+        }
+        azalea::protocol::packets::game::c_light_update::ClientboundLightUpdatePacketData {
+            sky_y_mask,
+            block_y_mask,
+            empty_sky_y_mask,
+            empty_block_y_mask,
+            sky_updates: Arc::new(sky_updates.into_boxed_slice()),
+            block_updates: Arc::new(block_updates.into_boxed_slice()),
+        }
+    }
+
+    fn light_chunk_packet(
+        x: i32,
+        z: i32,
+        light_data: azalea::protocol::packets::game::c_light_update::ClientboundLightUpdatePacketData,
+    ) -> azalea::protocol::packets::game::ClientboundGamePacket {
+        azalea::protocol::packets::game::ClientboundGamePacket::LevelChunkWithLight(
+            azalea::protocol::packets::game::ClientboundLevelChunkWithLight {
+                x,
+                z,
+                chunk_data: azalea::protocol::packets::game::c_level_chunk_with_light::ClientboundLevelChunkPacketData {
+                    heightmaps: Vec::new(),
+                    data: Arc::new(Vec::<u8>::new().into_boxed_slice()),
+                    block_entities: Vec::new(),
+                },
+                light_data,
+            },
+        )
+    }
+
+    fn light_update_packet(
+        x: i32,
+        z: i32,
+        light_data: azalea::protocol::packets::game::c_light_update::ClientboundLightUpdatePacketData,
+    ) -> azalea::protocol::packets::game::ClientboundGamePacket {
+        azalea::protocol::packets::game::ClientboundGamePacket::LightUpdate(
+            azalea::protocol::packets::game::ClientboundLightUpdate { x, z, light_data },
+        )
+    }
+
+    fn attributes_packet(
+        entity_id: i32,
+        values: Vec<azalea::protocol::packets::game::c_update_attributes::AttributeSnapshot>,
+    ) -> azalea::protocol::packets::game::ClientboundGamePacket {
+        azalea::protocol::packets::game::ClientboundGamePacket::UpdateAttributes(
+            azalea::protocol::packets::game::ClientboundUpdateAttributes {
+                entity_id: azalea::core::entity_id::MinecraftEntityId(entity_id),
+                values,
+            },
+        )
+    }
+
+    fn armor_snapshot(
+        attribute: azalea::registry::builtin::Attribute,
+        base: f64,
+    ) -> azalea::protocol::packets::game::c_update_attributes::AttributeSnapshot {
+        azalea::protocol::packets::game::c_update_attributes::AttributeSnapshot {
+            attribute,
+            base,
+            modifiers: Vec::new(),
+        }
+    }
+
+    fn armor_snapshot_with_modifiers(
+        base: f64,
+        modifiers: Vec<azalea::inventory::components::AttributeModifier>,
+    ) -> azalea::protocol::packets::game::c_update_attributes::AttributeSnapshot {
+        azalea::protocol::packets::game::c_update_attributes::AttributeSnapshot {
+            attribute: azalea::registry::builtin::Attribute::Armor,
+            base,
+            modifiers,
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestArmorModifier {
+        id: u8,
+        amount: f64,
+        operation: azalea::core::attribute_modifier_operation::AttributeModifierOperation,
+    }
+
+    fn test_armor_value(base: f64, modifiers: &[TestArmorModifier]) -> Option<u8> {
+        calculate_armor_values(
+            base,
+            modifiers,
+            |modifier| modifier.id,
+            |modifier| modifier.amount,
+            |modifier| modifier.operation,
+        )
+    }
+
+    #[test]
+    fn armor_formula_groups_operations_and_fails_closed_for_bad_values() {
+        use azalea::core::attribute_modifier_operation::AttributeModifierOperation as Op;
+
+        let modifiers = [
+            TestArmorModifier {
+                id: 3,
+                amount: 0.25,
+                operation: Op::AddMultipliedTotal,
+            },
+            TestArmorModifier {
+                id: 2,
+                amount: 0.5,
+                operation: Op::AddMultipliedBase,
+            },
+            TestArmorModifier {
+                id: 1,
+                amount: 2.0,
+                operation: Op::AddValue,
+            },
+        ];
+        // d1 = 4 + 2 = 6; d3 = 6 + 6*0.5 = 9; d3 *= 1.25 = 11.25.
+        assert_eq!(test_armor_value(4.0, &modifiers), Some(11));
+
+        let duplicate_id = [
+            TestArmorModifier {
+                id: 1,
+                amount: 1.0,
+                operation: Op::AddValue,
+            },
+            TestArmorModifier {
+                id: 1,
+                amount: 3.0,
+                operation: Op::AddValue,
+            },
+        ];
+        assert_eq!(test_armor_value(10.0, &duplicate_id), Some(13));
+
+        assert_eq!(test_armor_value(-5.0, &[]), Some(0));
+        assert_eq!(test_armor_value(30.0, &[]), Some(20));
+        assert_eq!(test_armor_value(0.0, &[]), Some(0));
+        assert_eq!(test_armor_value(f64::NAN, &[]), None);
+        assert_eq!(
+            test_armor_value(
+                1.0,
+                &[TestArmorModifier {
+                    id: 1,
+                    amount: f64::INFINITY,
+                    operation: Op::AddValue,
+                }],
+            ),
+            None
+        );
+        assert_eq!(
+            test_armor_value(
+                f64::MAX,
+                &[TestArmorModifier {
+                    id: 1,
+                    amount: f64::MAX,
+                    operation: Op::AddValue,
+                }],
+            ),
+            None
+        );
+        assert_eq!(
+            test_armor_value(
+                f64::MAX,
+                &[TestArmorModifier {
+                    id: 1,
+                    amount: f64::MAX,
+                    operation: Op::AddMultipliedTotal,
+                }],
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn production_armor_reducer_is_local_ordered_and_epoch_bound() {
+        let (handle, mut app, owner, _shared_world, _source, _events) = producer_test_app();
+
+        queue_producer_packet(
+            &mut app,
+            owner,
+            attributes_packet(
+                98,
+                vec![armor_snapshot(
+                    azalea::registry::builtin::Attribute::Armor,
+                    19.0,
+                )],
+            ),
+        );
+        app.update();
+        assert_eq!(handle.shared.observation.read().armor, None);
+
+        queue_producer_packet(
+            &mut app,
+            owner,
+            attributes_packet(
+                99,
+                vec![
+                    armor_snapshot(azalea::registry::builtin::Attribute::Armor, 4.0),
+                    armor_snapshot(azalea::registry::builtin::Attribute::MaxHealth, 100.0),
+                    armor_snapshot(azalea::registry::builtin::Attribute::Armor, 7.0),
+                ],
+            ),
+        );
+        app.update();
+        assert_eq!(handle.shared.observation.read().armor, Some(7));
+
+        queue_producer_packet(
+            &mut app,
+            owner,
+            attributes_packet(
+                99,
+                vec![armor_snapshot(
+                    azalea::registry::builtin::Attribute::MaxHealth,
+                    100.0,
+                )],
+            ),
+        );
+        app.update();
+        assert_eq!(handle.shared.observation.read().armor, Some(7));
+
+        use azalea::core::attribute_modifier_operation::AttributeModifierOperation as Op;
+        let duplicate_modifier_id = azalea::Identifier::from("test:duplicate");
+        let grouped_packet = attributes_packet(
+            99,
+            vec![armor_snapshot_with_modifiers(
+                10.0,
+                vec![
+                    azalea::inventory::components::AttributeModifier {
+                        id: duplicate_modifier_id.clone(),
+                        amount: 100.0,
+                        operation: Op::AddValue,
+                    },
+                    azalea::inventory::components::AttributeModifier {
+                        id: duplicate_modifier_id,
+                        amount: 1.0,
+                        operation: Op::AddValue,
+                    },
+                    azalea::inventory::components::AttributeModifier {
+                        id: azalea::Identifier::from("test:base"),
+                        amount: 0.5,
+                        operation: Op::AddMultipliedBase,
+                    },
+                    azalea::inventory::components::AttributeModifier {
+                        id: azalea::Identifier::from("test:total"),
+                        amount: 0.1,
+                        operation: Op::AddMultipliedTotal,
+                    },
+                ],
+            )],
+        );
+        queue_producer_packet(&mut app, owner, grouped_packet);
+        app.update();
+        // The duplicate ID uses the last entry (1.0), then d1=11,
+        // d3=16.5, and finally d3*=1.1 -> floor 18.
+        assert_eq!(handle.shared.observation.read().armor, Some(18));
+
+        queue_producer_packet(
+            &mut app,
+            owner,
+            attributes_packet(
+                99,
+                vec![armor_snapshot_with_modifiers(
+                    10.0,
+                    vec![azalea::inventory::components::AttributeModifier {
+                        id: azalea::Identifier::from("test:infinite"),
+                        amount: f64::INFINITY,
+                        operation: Op::AddMultipliedTotal,
+                    }],
+                )],
+            ),
+        );
+        app.update();
+        assert_eq!(handle.shared.observation.read().armor, None);
+
+        for (base, expected) in [(-2.0, Some(0)), (25.0, Some(20)), (0.0, Some(0))] {
+            queue_producer_packet(
+                &mut app,
+                owner,
+                attributes_packet(
+                    99,
+                    vec![armor_snapshot(
+                        azalea::registry::builtin::Attribute::Armor,
+                        base,
+                    )],
+                ),
+            );
+            app.update();
+            assert_eq!(handle.shared.observation.read().armor, expected);
+        }
+
+        queue_producer_packet(
+            &mut app,
+            owner,
+            attributes_packet(
+                99,
+                vec![armor_snapshot(
+                    azalea::registry::builtin::Attribute::Armor,
+                    f64::NAN,
+                )],
+            ),
+        );
+        app.update();
+        assert_eq!(handle.shared.observation.read().armor, None);
+
+        assert!(handle
+            .shared
+            .reset_entity_scope_for_owner_at_epoch_with_dimension_and_light(
+                owner,
+                1,
+                Some("minecraft:overworld".to_owned()),
+                Some(true),
+            ));
+        assert_eq!(handle.shared.observation.read().armor, None);
+
+        queue_producer_packet(
+            &mut app,
+            owner,
+            attributes_packet(
+                99,
+                vec![armor_snapshot(
+                    azalea::registry::builtin::Attribute::Armor,
+                    6.0,
+                )],
+            ),
+        );
+        app.update();
+        assert_eq!(handle.shared.observation.read().armor, Some(6));
+
+        assert!(handle.shared.begin_connection_attempt());
+        assert_eq!(handle.shared.observation.read().armor, None);
+    }
+
+    #[test]
+    fn production_light_survives_first_world_attach_and_same_epoch_respawn_scope() {
+        let (handle, mut app, owner, shared_world, _source, _events) =
+            producer_test_app_without_world();
+        let index = (3 << 8) | (2 << 4) | 1;
+        let first_light = light_data_with_masks(
+            &[1],
+            &[1],
+            &[],
+            &[],
+            vec![packed_light_layer(&[(index, 11)])],
+            vec![packed_light_layer(&[(index, 4)])],
+        );
+
+        // This is the Login boundary equivalent used by the raw reducer:
+        // it establishes the packet scope before the first chunk light packet.
+        assert!(handle
+            .shared
+            .reset_entity_scope_for_owner_at_epoch_with_dimension_and_light(
+                owner,
+                1,
+                Some("minecraft:overworld".to_owned()),
+                Some(true),
+            ));
+        let generation_after_scope_reset = handle.shared.observation.read().generation;
+        let first_chunk = light_chunk_packet(0, 0, first_light);
+        azalea::packet::game::process_packet(
+            app.world_mut(),
+            owner,
+            &first_chunk,
+            synthetic_attempt_token(),
+        );
+        queue_producer_packet(&mut app, owner, first_chunk);
+        app.update();
+
+        assert_eq!(
+            handle
+                .shared
+                .observation
+                .read()
+                .light_cache
+                .context
+                .as_ref()
+                .and_then(|context| context.has_skylight),
+            Some(true)
+        );
+        assert_eq!(
+            handle.shared.observation.read().generation,
+            generation_after_scope_reset + 1,
+            "scope reset and full chunk apply must each publish a generation"
+        );
+
+        // The first Event::Spawn attaches the WorldHolder after the raw Login
+        // and chunk packet. The existing implementation cleared the cache here.
+        assert!(handle.shared.set_world_if_running(shared_world.clone()));
+        let mut first_snapshot = snapshot_at(1, 1.25, -61.0, 2.75);
+        first_snapshot.world.dimension = "minecraft:overworld".to_owned();
+        install_viewport_observation(
+            &handle,
+            first_snapshot,
+            FactSource::ServerObserved,
+            Vec::new(),
+            shared_world.clone(),
+        );
+        handle.shared.observation.write().snapshot_scope_generation =
+            handle.shared.entity_producer.lock().scope_generation;
+        let first_facts = handle
+            .capture_frame_facts()
+            .expect("first attached world should have a snapshot");
+        assert_eq!(first_facts.light, Some(11));
+        assert_eq!(
+            handle
+                .shared
+                .observation
+                .read()
+                .light_cache
+                .context
+                .as_ref()
+                .and_then(|context| context.has_skylight),
+            Some(true)
+        );
+
+        // Same-epoch Respawn resets the light scope but preserves armor. A new
+        // chunk in the new scope must likewise survive its first world attach.
+        {
+            let mut observation = handle.shared.observation.write();
+            observation.armor = Some(7);
+            observation.armor_epoch = Some(1);
+            observation.bump_generation();
+        }
+        assert!(handle
+            .shared
+            .reset_entity_scope_for_owner_at_epoch_with_dimension_and_light(
+                owner,
+                1,
+                Some("minecraft:the_nether".to_owned()),
+                Some(true),
+            ));
+        {
+            let observation = handle.shared.observation.read();
+            assert!(observation.snapshot.is_none());
+            assert!(observation.light_cache.chunks.is_empty());
+            assert_eq!(observation.armor, Some(7));
+            assert_eq!(observation.armor_epoch, Some(1));
+        }
+        let stale_attach_world = empty_world();
+        assert!(handle
+            .shared
+            .set_world_if_running(stale_attach_world.clone()));
+        assert!(handle
+            .shared
+            .observation
+            .read()
+            .light_cache
+            .chunks
+            .is_empty());
+        assert!(handle
+            .shared
+            .reset_entity_scope_for_owner_at_epoch_with_dimension_and_light(
+                owner,
+                1,
+                Some("minecraft:the_nether".to_owned()),
+                Some(true),
+            ));
+
+        let second_index = 0;
+        let second_light = light_data_with_masks(
+            &[1],
+            &[1],
+            &[],
+            &[],
+            vec![packed_light_layer(&[(second_index, 9)])],
+            vec![packed_light_layer(&[(second_index, 3)])],
+        );
+        let second_chunk = light_chunk_packet(0, 0, second_light);
+        assert_eq!(
+            LightSectionGeometry::from_world(&shared_world.read()),
+            Some(LightSectionGeometry {
+                min_light_section: -5,
+                light_section_count: 26,
+            })
+        );
+        assert!(handle.shared.admit_canonical_source(owner).is_some());
+        let generation_before_second_light = handle.shared.observation.read().generation;
+        azalea::packet::game::process_packet(
+            app.world_mut(),
+            owner,
+            &second_chunk,
+            synthetic_attempt_token(),
+        );
+        queue_producer_packet(&mut app, owner, second_chunk);
+        app.update();
+        assert_eq!(
+            handle.shared.observation.read().generation,
+            generation_before_second_light + 1
+        );
+
+        {
+            let observation = handle.shared.observation.read();
+            assert_eq!(
+                observation.light_cache.context.as_ref().map(|context| (
+                    &context.dimension,
+                    context.scope_generation,
+                    context.has_skylight
+                )),
+                Some((
+                    &"minecraft:the_nether".to_owned(),
+                    handle.shared.entity_producer.lock().scope_generation,
+                    Some(true)
+                ))
+            );
+            assert_eq!(
+                observation
+                    .light_cache
+                    .chunks
+                    .get(&(0, 0))
+                    .and_then(|chunk| chunk.sky.get(1))
+                    .and_then(Option::as_ref)
+                    .map(|layer| layer[0]),
+                Some(9)
+            );
+            assert_eq!(
+                observation.light_cache.value_at(
+                    &Vec3Value {
+                        x: 0.25,
+                        y: -64.0,
+                        z: 0.25,
+                    },
+                    1,
+                    handle.shared.entity_producer.lock().scope_generation,
+                    "minecraft:the_nether",
+                ),
+                Some(9)
+            );
+        }
+
+        let second_world = empty_world();
+        assert!(handle.shared.set_world_if_running(second_world.clone()));
+        let mut second_snapshot = snapshot_at(1, 0.25, -64.0, 0.25);
+        second_snapshot.world.dimension = "minecraft:the_nether".to_owned();
+        install_viewport_observation(
+            &handle,
+            second_snapshot,
+            FactSource::ServerObserved,
+            Vec::new(),
+            second_world,
+        );
+        handle.shared.observation.write().snapshot_scope_generation =
+            handle.shared.entity_producer.lock().scope_generation;
+        let second_facts = handle
+            .capture_frame_facts()
+            .expect("respawned scope should have a snapshot");
+        assert_eq!(second_facts.light, Some(9));
+        assert_eq!(second_facts.armor, Some(7));
+    }
+
+    #[test]
+    fn production_raw_scope_order_resets_old_light_keeps_armor_and_forgets_chunks() {
+        let (handle, mut app, owner, shared_world, _source, _events) = producer_test_app();
+        assert!(handle
+            .shared
+            .reset_entity_scope_for_owner_at_epoch_with_dimension_and_light(
+                owner,
+                1,
+                Some("minecraft:overworld".to_owned()),
+                Some(true),
+            ));
+
+        let old_chunk = light_chunk_packet(
+            0,
+            0,
+            light_data_with_masks(
+                &[1],
+                &[1],
+                &[],
+                &[],
+                vec![packed_light_layer(&[(0, 5)])],
+                vec![packed_light_layer(&[(0, 2)])],
+            ),
+        );
+        let armor = attributes_packet(
+            99,
+            vec![armor_snapshot(
+                azalea::registry::builtin::Attribute::Armor,
+                8.0,
+            )],
+        );
+        install_dimension_registry(&shared_world, "minecraft:the_nether", Some(false));
+        let respawn = reducer_respawn_packet("minecraft:the_nether");
+        let new_chunk = light_chunk_packet(
+            1,
+            0,
+            light_data_with_masks(
+                &[1],
+                &[1],
+                &[],
+                &[],
+                vec![packed_light_layer(&[(0, 7)])],
+                vec![packed_light_layer(&[(0, 3)])],
+            ),
+        );
+        let partial_update = light_update_packet(
+            1,
+            0,
+            light_data_with_masks(
+                &[1],
+                &[1],
+                &[],
+                &[],
+                vec![packed_light_layer(&[(0, 12)])],
+                vec![packed_light_layer(&[(0, 12)])],
+            ),
+        );
+
+        for packet in [old_chunk, armor, respawn, new_chunk, partial_update] {
+            if let azalea::protocol::packets::game::ClientboundGamePacket::LevelChunkWithLight(_) =
+                &packet
+            {
+                azalea::packet::game::process_packet(
+                    app.world_mut(),
+                    owner,
+                    &packet,
+                    synthetic_attempt_token(),
+                );
+            }
+            queue_producer_packet(&mut app, owner, packet);
+        }
+        app.update();
+
+        let observation = handle.shared.observation.read();
+        let context = observation
+            .light_cache
+            .context
+            .as_ref()
+            .expect("post-respawn light context");
+        assert_eq!(context.dimension, "minecraft:the_nether");
+        assert_eq!(context.has_skylight, Some(false));
+        assert!(!observation.light_cache.chunks.contains_key(&(0, 0)));
+        assert_eq!(observation.armor, Some(8));
+        drop(observation);
+
+        let new_world = empty_world();
+        assert!(handle.shared.set_world_if_running(new_world.clone()));
+        let mut snapshot = snapshot_at(1, 16.25, -64.0, 0.25);
+        snapshot.world.dimension = "minecraft:the_nether".to_owned();
+        install_viewport_observation(
+            &handle,
+            snapshot,
+            FactSource::ServerObserved,
+            Vec::new(),
+            new_world,
+        );
+        let facts = handle
+            .capture_frame_facts()
+            .expect("new scope snapshot should capture");
+        assert_eq!(facts.light, Some(12));
+        assert_eq!(facts.armor, Some(8));
+
+        let forget = azalea::protocol::packets::game::ClientboundGamePacket::ForgetLevelChunk(
+            azalea::protocol::packets::game::ClientboundForgetLevelChunk {
+                pos: azalea::core::position::ChunkPos::new(1, 0),
+            },
+        );
+        azalea::packet::game::process_packet(
+            app.world_mut(),
+            owner,
+            &forget,
+            synthetic_attempt_token(),
+        );
+        queue_producer_packet(&mut app, owner, forget);
+        app.update();
+        assert!(handle
+            .shared
+            .observation
+            .read()
+            .light_cache
+            .chunks
+            .is_empty());
+        assert_eq!(
+            handle
+                .capture_frame_facts()
+                .expect("snapshot remains")
+                .light,
+            None
+        );
+
+        // A new connection epoch physically clears the frame cache and cannot
+        // expose either value from the old owner, even before a new snapshot.
+        assert!(handle.shared.begin_connection_attempt());
+        let observation = handle.shared.observation.read();
+        assert!(observation.light_cache.chunks.is_empty());
+        assert_eq!(observation.armor, None);
+        assert!(observation.snapshot.is_none());
+        drop(shared_world);
+    }
+
+    #[test]
+    fn light_cache_mutations_and_scope_resets_share_observation_generation() {
+        let (handle, mut app, owner, shared_world, _source, _events) =
+            producer_test_app_without_world();
+        assert!(handle
+            .shared
+            .reset_entity_scope_for_owner_at_epoch_with_dimension_and_light(
+                owner,
+                1,
+                Some("minecraft:overworld".to_owned()),
+                Some(true),
+            ));
+        let generation_after_login = handle.shared.observation.read().generation;
+
+        let full_chunk = light_chunk_packet(
+            0,
+            0,
+            light_data_with_masks(
+                &[1],
+                &[1],
+                &[],
+                &[],
+                vec![packed_light_layer(&[(0, 10)])],
+                vec![packed_light_layer(&[(0, 2)])],
+            ),
+        );
+        azalea::packet::game::process_packet(
+            app.world_mut(),
+            owner,
+            &full_chunk,
+            synthetic_attempt_token(),
+        );
+        queue_producer_packet(&mut app, owner, full_chunk);
+        app.update();
+        let generation_after_full_chunk = handle.shared.observation.read().generation;
+        assert_eq!(generation_after_full_chunk, generation_after_login + 1);
+
+        let partial = light_update_packet(
+            0,
+            0,
+            light_data_with_masks(
+                &[],
+                &[1],
+                &[],
+                &[],
+                Vec::new(),
+                vec![packed_light_layer(&[(0, 6)])],
+            ),
+        );
+        queue_producer_packet(&mut app, owner, partial);
+        app.update();
+        let generation_after_partial = handle.shared.observation.read().generation;
+        assert_eq!(generation_after_partial, generation_after_full_chunk + 1);
+
+        let forget = azalea::protocol::packets::game::ClientboundGamePacket::ForgetLevelChunk(
+            azalea::protocol::packets::game::ClientboundForgetLevelChunk {
+                pos: azalea::core::position::ChunkPos::new(0, 0),
+            },
+        );
+        queue_producer_packet(&mut app, owner, forget);
+        app.update();
+        let generation_after_forget = handle.shared.observation.read().generation;
+        assert_eq!(generation_after_forget, generation_after_partial + 1);
+
+        assert!(handle
+            .shared
+            .reset_entity_scope_for_owner_at_epoch_with_dimension_and_light(
+                owner,
+                1,
+                Some("minecraft:the_nether".to_owned()),
+                Some(false),
+            ));
+        assert_eq!(
+            handle.shared.observation.read().generation,
+            generation_after_forget + 1
+        );
+        drop(shared_world);
+    }
+
+    #[test]
+    fn frame_facts_capture_cannot_mix_with_an_epoch_reset_at_the_read_boundary() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        assert!(handle.shared.begin_connection_attempt());
+        let snapshot = snapshot_at(1, 0.25, -64.0, 0.25);
+        handle.test_install_frame_facts(snapshot.clone(), Some(9), Some(12));
+        let generation_before_capture = handle.shared.observation.read().generation;
+
+        let (start_reset, start_reset_received) = std_mpsc::channel();
+        let (about_to_reset, about_to_reset_received) = std_mpsc::channel();
+        let (write_boundary, write_boundary_received) = std_mpsc::channel();
+        let (reset_finished, reset_finished_received) = std_mpsc::channel();
+        let reset_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let write_gate = Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new()));
+        let hook_write_gate = write_gate.clone();
+        handle
+            .shared
+            .set_observation_write_boundary_hook(Some(Arc::new(move || {
+                write_boundary
+                    .send(())
+                    .expect("reset should reach the observation write boundary");
+                let (allowed, wake) = &*hook_write_gate;
+                let mut allowed = allowed.lock();
+                while !*allowed {
+                    wake.wait(&mut allowed);
+                }
+            })));
+
+        let reset_completed_by_thread = reset_completed.clone();
+        let shared = handle.shared.clone();
+        let reset = thread::spawn(move || {
+            start_reset_received
+                .recv()
+                .expect("reset must wait for an active capture read guard");
+            about_to_reset
+                .send(())
+                .expect("reset should report before entering reset/write");
+            let result = shared.begin_connection_attempt();
+            reset_completed_by_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+            reset_finished
+                .send(result)
+                .expect("epoch reset result should remain observable");
+        });
+
+        let probe_shared = handle.shared.clone();
+        let captured = handle
+            .shared
+            .capture_frame_facts_with_test_hooks(
+                || {
+                    start_reset
+                        .send(())
+                        .expect("capture must start reset after taking its read guard");
+                    about_to_reset_received
+                        .recv_timeout(StdDuration::from_secs(1))
+                        .expect("reset should report before entering reset/write");
+                    write_boundary_received
+                        .recv_timeout(StdDuration::from_secs(1))
+                        .expect("reset should reach the observation write boundary");
+                    assert!(
+                        !reset_completed.load(std::sync::atomic::Ordering::SeqCst),
+                        "reset cannot complete while the capture read guard is held"
+                    );
+                    let (allowed, wake) = &*write_gate;
+                    *allowed.lock() = true;
+                    wake.notify_one();
+                },
+                move || {
+                    assert!(
+                        probe_shared.observation.try_write().is_none(),
+                        "capture must retain its observation read guard through fact reads"
+                    );
+                },
+            )
+            .expect("the old frame should be captured coherently");
+
+        assert_eq!(captured.snapshot, snapshot);
+        assert_eq!(captured.armor, Some(9));
+        assert_eq!(captured.light, Some(12));
+        assert!(reset_finished_received
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("epoch reset should complete after capture"));
+        reset.join().expect("epoch reset thread");
+        assert!(handle.capture_frame_facts().is_none());
+        assert!(handle.shared.observation.read().generation > generation_before_capture);
+    }
+
+    #[test]
+    fn light_cache_decodes_nibbles_masks_retain_bad_layers_and_full_replace() {
+        let mut ecs_world = bevy_ecs::world::World::new();
+        let entity = ecs_world.spawn_empty().id();
+        let source = CanonicalSourceAdmission {
+            entity,
+            epoch: 1,
+            scope_generation: 4,
+            attempt_token: None,
+        };
+        let geometry = LightSectionGeometry {
+            min_light_section: -5,
+            light_section_count: 26,
+        };
+        let default_world = azalea::world::World::default();
+        assert_eq!(
+            LightSectionGeometry::from_world(&default_world),
+            Some(geometry)
+        );
+        let mut cache = LightCache::default();
+
+        let low_index = (3 << 8) | (2 << 4);
+        let high_index = low_index | 1;
+        let first = light_data_with_masks(
+            &[1],
+            &[1],
+            &[],
+            &[],
+            vec![packed_light_layer(&[(low_index, 2), (high_index, 13)])],
+            vec![packed_light_layer(&[(low_index, 7), (high_index, 4)])],
+        );
+        assert!(cache.apply_packet(
+            source,
+            "minecraft:overworld".to_owned(),
+            Some(true),
+            geometry,
+            0,
+            0,
+            &first,
+            true,
+        ));
+        assert_eq!(
+            cache.value_at(
+                &Vec3Value {
+                    x: 0.0,
+                    y: -61.0,
+                    z: 2.0,
+                },
+                1,
+                4,
+                "minecraft:overworld",
+            ),
+            Some(7)
+        );
+        assert_eq!(
+            cache.value_at(
+                &Vec3Value {
+                    x: 1.0,
+                    y: -61.0,
+                    z: 2.0,
+                },
+                1,
+                4,
+                "minecraft:overworld",
+            ),
+            Some(13)
+        );
+
+        let empty = light_data_with_masks(&[], &[], &[2], &[2], Vec::new(), Vec::new());
+        assert!(cache.apply_packet(
+            source,
+            "minecraft:overworld".to_owned(),
+            Some(true),
+            geometry,
+            0,
+            0,
+            &empty,
+            false,
+        ));
+        assert_eq!(cache.layer(0, 0, 2, true).map(|layer| layer[0]), Some(0));
+        assert_eq!(cache.layer(0, 0, 2, false).map(|layer| layer[0]), Some(0));
+
+        // Empty masks do not erase an ordinary layer; a data mask on the same
+        // bit wins over its empty counterpart.
+        let partial = light_data_with_masks(
+            &[2],
+            &[2],
+            &[2],
+            &[2],
+            vec![packed_light_layer(&[(0, 8)])],
+            vec![packed_light_layer(&[(0, 3)])],
+        );
+        assert!(cache.apply_packet(
+            source,
+            "minecraft:overworld".to_owned(),
+            Some(true),
+            geometry,
+            0,
+            0,
+            &partial,
+            false,
+        ));
+        assert_eq!(cache.layer(0, 0, 2, true).map(|layer| layer[0]), Some(8));
+        assert_eq!(cache.layer(0, 0, 2, false).map(|layer| layer[0]), Some(3));
+        assert_eq!(cache.layer(0, 0, 1, true).map(|layer| layer[0]), Some(0));
+
+        // A bad first array must not shift the valid second array onto the
+        // first bit. Missing arrays similarly make only their own layer unknown.
+        let bad_then_valid = light_data_with_masks(
+            &[1, 2],
+            &[],
+            &[],
+            &[],
+            vec![
+                vec![0; 2047].into_boxed_slice(),
+                packed_light_layer(&[(0, 9)]),
+            ],
+            Vec::new(),
+        );
+        assert!(cache.apply_packet(
+            source,
+            "minecraft:overworld".to_owned(),
+            Some(true),
+            geometry,
+            0,
+            0,
+            &bad_then_valid,
+            false,
+        ));
+        assert!(cache.layer(0, 0, 1, true).is_none());
+        assert_eq!(cache.layer(0, 0, 2, true).map(|layer| layer[0]), Some(9));
+
+        let missing_second = light_data_with_masks(
+            &[1, 2],
+            &[],
+            &[],
+            &[],
+            vec![packed_light_layer(&[(0, 6)])],
+            Vec::new(),
+        );
+        assert!(cache.apply_packet(
+            source,
+            "minecraft:overworld".to_owned(),
+            Some(true),
+            geometry,
+            0,
+            0,
+            &missing_second,
+            false,
+        ));
+        assert_eq!(cache.layer(0, 0, 1, true).map(|layer| layer[0]), Some(6));
+        assert!(cache.layer(0, 0, 2, true).is_none());
+
+        let out_of_range = light_data_with_masks(
+            &[30],
+            &[],
+            &[],
+            &[],
+            vec![packed_light_layer(&[(0, 15)])],
+            Vec::new(),
+        );
+        assert!(cache.apply_packet(
+            source,
+            "minecraft:overworld".to_owned(),
+            Some(true),
+            geometry,
+            0,
+            0,
+            &out_of_range,
+            false,
+        ));
+        assert!(cache.layer(0, 0, 30, true).is_none());
+
+        let retain = azalea::protocol::packets::game::c_light_update::ClientboundLightUpdatePacketData::default();
+        assert!(cache.apply_packet(
+            source,
+            "minecraft:overworld".to_owned(),
+            Some(true),
+            geometry,
+            0,
+            0,
+            &retain,
+            false,
+        ));
+        assert_eq!(cache.layer(0, 0, 1, true).map(|layer| layer[0]), Some(6));
+
+        let replace = light_data_with_masks(&[], &[], &[], &[], Vec::new(), Vec::new());
+        assert!(cache.apply_packet(
+            source,
+            "minecraft:overworld".to_owned(),
+            Some(true),
+            geometry,
+            0,
+            0,
+            &replace,
+            true,
+        ));
+        assert!(cache.layer(0, 0, 1, true).is_none());
+        assert!(cache.remove_chunk(source, "minecraft:overworld", 0, 0));
+        assert!(cache.chunks.is_empty());
+    }
+
+    #[test]
+    fn light_cache_unknown_max_skylight_false_and_floor_rules_are_fail_closed() {
+        let mut ecs_world = bevy_ecs::world::World::new();
+        let entity = ecs_world.spawn_empty().id();
+        let source = CanonicalSourceAdmission {
+            entity,
+            epoch: 1,
+            scope_generation: 1,
+            attempt_token: None,
+        };
+        let geometry = LightSectionGeometry {
+            min_light_section: -5,
+            light_section_count: 26,
+        };
+        let mut cache = LightCache::default();
+
+        let below_fifteen = light_data_with_masks(
+            &[1],
+            &[],
+            &[],
+            &[],
+            vec![packed_light_layer(&[(0, 14)])],
+            Vec::new(),
+        );
+        assert!(cache.apply_packet(
+            source,
+            "minecraft:overworld".to_owned(),
+            Some(true),
+            geometry,
+            0,
+            0,
+            &below_fifteen,
+            true,
+        ));
+        assert_eq!(
+            cache.value_at(
+                &Vec3Value {
+                    x: 0.0,
+                    y: -64.0,
+                    z: 0.0,
+                },
+                1,
+                1,
+                "minecraft:overworld",
+            ),
+            None
+        );
+
+        let fifteen = light_data_with_masks(
+            &[1],
+            &[],
+            &[],
+            &[],
+            vec![packed_light_layer(&[(0, 15)])],
+            Vec::new(),
+        );
+        assert!(cache.apply_packet(
+            source,
+            "minecraft:overworld".to_owned(),
+            Some(true),
+            geometry,
+            0,
+            0,
+            &fifteen,
+            true,
+        ));
+        assert_eq!(
+            cache.value_at(
+                &Vec3Value {
+                    x: 0.0,
+                    y: -64.0,
+                    z: 0.0,
+                },
+                1,
+                1,
+                "minecraft:overworld",
+            ),
+            Some(15)
+        );
+
+        cache.reset_scope(1, 2, Some("minecraft:nether".to_owned()), Some(false));
+        let no_sky = light_data_with_masks(
+            &[1],
+            &[1],
+            &[],
+            &[],
+            vec![vec![0; 2047].into_boxed_slice()],
+            vec![packed_light_layer(&[(0, 3)])],
+        );
+        let source = CanonicalSourceAdmission {
+            scope_generation: 2,
+            ..source
+        };
+        assert!(cache.apply_packet(
+            source,
+            "minecraft:nether".to_owned(),
+            Some(false),
+            geometry,
+            0,
+            0,
+            &no_sky,
+            true,
+        ));
+        assert_eq!(cache.layer(0, 0, 1, true).map(|layer| layer[0]), Some(0));
+        assert_eq!(
+            cache.value_at(
+                &Vec3Value {
+                    x: 0.0,
+                    y: -64.0,
+                    z: 0.0,
+                },
+                1,
+                2,
+                "minecraft:nether",
+            ),
+            Some(3)
+        );
+        assert_eq!(floor_block_coordinate(-0.1), Some(-1));
+        assert_eq!(floor_block_coordinate(15.9), Some(15));
+        assert_eq!(floor_block_coordinate(f64::NAN), None);
+        assert_eq!(floor_block_coordinate(f64::INFINITY), None);
+    }
+
+    fn reducer_common_spawn_info(
+        dimension: &str,
+    ) -> azalea::protocol::packets::common::CommonPlayerSpawnInfo {
+        use azalea::core::game_type::{GameMode, OptionalGameType};
+        use azalea::protocol::packets::common::CommonPlayerSpawnInfo;
+        use azalea::registry::data::DimensionKind;
+
+        CommonPlayerSpawnInfo {
+            dimension_type: <DimensionKind as azalea::registry::DataRegistry>::new_raw(0),
+            dimension: azalea::Identifier::from(dimension),
+            seed: 0,
+            game_type: GameMode::Survival,
+            previous_game_type: OptionalGameType(None),
+            is_debug: false,
+            is_flat: false,
+            last_death_location: None,
+            portal_cooldown: 0,
+            sea_level: 63,
+        }
+    }
+
+    fn reducer_respawn_packet(
+        dimension: &str,
+    ) -> azalea::protocol::packets::game::ClientboundGamePacket {
+        let common = reducer_common_spawn_info(dimension);
+        azalea::protocol::packets::game::ClientboundGamePacket::Respawn(
+            azalea::protocol::packets::game::ClientboundRespawn {
+                common,
+                data_to_keep: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn registry_dimension_extra_proves_login_respawn_skylight_semantics() {
+        let mut ecs_world = bevy_ecs::world::World::new();
+        let owner = ecs_world.spawn_empty().id();
+        let common = reducer_common_spawn_info("minecraft:overworld");
+
+        for (proof, expected) in [
+            (Some(true), Some(true)),
+            (Some(false), Some(false)),
+            (None, None),
+        ] {
+            let shared_world = empty_world();
+            install_dimension_registry(&shared_world, "minecraft:overworld", proof);
+            let holder = azalea::local_player::WorldHolder::new(owner, shared_world);
+            assert_eq!(prove_has_skylight(&common, &holder), expected);
+        }
+    }
+
+    fn sound_event_metadata(events: &mut RuntimeEventReceiver) -> Vec<(Option<String>, String)> {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| {
+                let dimension = event.dimension.clone();
+                match event.payload {
+                    BackendEventPayload::Sound(payload) => Some((dimension, payload.sound_name?)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn production_block_sound_raw_reducer_preserves_sound_scope_at_packet_position() {
+        let run = |packets: Vec<azalea::protocol::packets::game::ClientboundGamePacket>| {
+            let (_handle, mut app, owner, _shared_world, _source, mut events) = producer_test_app();
+            for packet in packets {
+                queue_producer_packet(&mut app, owner, packet);
+            }
+            app.update();
+            sound_event_metadata(&mut events)
+        };
+
+        assert_eq!(
+            run(vec![
+                sound_packet(
+                    azalea::registry::Holder::Direct(azalea::core::sound::CustomSound {
+                        sound_id: azalea::Identifier::from("custom:old"),
+                        range: None,
+                    }),
+                    1.0,
+                    1.0,
+                ),
+                reducer_respawn_packet("minecraft:the_nether"),
+                sound_packet(
+                    azalea::registry::Holder::Direct(azalea::core::sound::CustomSound {
+                        sound_id: azalea::Identifier::from("custom:new"),
+                        range: None,
+                    }),
+                    1.0,
+                    1.0,
+                ),
+            ]),
+            vec![
+                (None, "custom:old".to_owned()),
+                (
+                    Some("minecraft:the_nether".to_owned()),
+                    "custom:new".to_owned()
+                ),
+            ]
+        );
+        assert_eq!(
+            run(vec![
+                reducer_respawn_packet("minecraft:the_nether"),
+                sound_packet(
+                    azalea::registry::Holder::Direct(azalea::core::sound::CustomSound {
+                        sound_id: azalea::Identifier::from("custom:new-only"),
+                        range: None,
+                    }),
+                    1.0,
+                    1.0,
+                ),
+            ]),
+            vec![(
+                Some("minecraft:the_nether".to_owned()),
+                "custom:new-only".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn production_block_sound_raw_reducer_stamps_block_and_chunk_items_across_respawn() {
+        let (_handle, mut app, owner, shared_world, _source, mut events) = producer_test_app();
+        let old_chunk_pos = azalea::core::position::ChunkPos::new(-2, 1);
+        let new_chunk_pos = azalea::core::position::ChunkPos::new(1, -2);
+        let old_chunk = install_shared_chunk(&shared_world, old_chunk_pos);
+        let new_chunk = install_shared_chunk(&shared_world, new_chunk_pos);
+        let old_position = azalea::BlockPos {
+            x: -17,
+            y: -46,
+            z: 30,
+        };
+        let new_position = azalea::BlockPos {
+            x: 17,
+            y: -46,
+            z: -30,
+        };
+        let old_state = test_block_state(7);
+        let new_state = test_block_state(8);
+        let old_block = azalea::protocol::packets::game::ClientboundGamePacket::BlockUpdate(
+            azalea::protocol::packets::game::ClientboundBlockUpdate {
+                pos: old_position,
+                block_state: old_state,
+            },
+        );
+        let new_block = azalea::protocol::packets::game::ClientboundGamePacket::BlockUpdate(
+            azalea::protocol::packets::game::ClientboundBlockUpdate {
+                pos: new_position,
+                block_state: new_state,
+            },
+        );
+        let old_chunk_packet = empty_chunk_packet(old_chunk_pos.x, old_chunk_pos.z);
+        let new_chunk_packet = empty_chunk_packet(new_chunk_pos.x, new_chunk_pos.z);
+
+        azalea::packet::game::process_packet(
+            app.world_mut(),
+            owner,
+            &old_block,
+            synthetic_attempt_token(),
+        );
+        queue_producer_packet(&mut app, owner, old_block);
+        azalea::packet::game::process_packet(
+            app.world_mut(),
+            owner,
+            &old_chunk_packet,
+            synthetic_attempt_token(),
+        );
+        queue_producer_packet(&mut app, owner, old_chunk_packet);
+        queue_producer_packet(
+            &mut app,
+            owner,
+            reducer_respawn_packet("minecraft:the_nether"),
+        );
+        azalea::packet::game::process_packet(
+            app.world_mut(),
+            owner,
+            &new_chunk_packet,
+            synthetic_attempt_token(),
+        );
+        queue_producer_packet(&mut app, owner, new_chunk_packet);
+        azalea::packet::game::process_packet(
+            app.world_mut(),
+            owner,
+            &new_block,
+            synthetic_attempt_token(),
+        );
+        queue_producer_packet(&mut app, owner, new_block);
+        app.update();
+
+        let block_payloads = block_events(&mut events);
+        assert_eq!(
+            block_payloads
+                .iter()
+                .filter_map(|event| match event {
+                    ContractProtocolBlockEvent::Updated { new_block, .. } => {
+                        new_block.as_ref().map(|block| block.state_id)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![u32::from(new_state.id())]
+        );
+        assert_eq!(
+            block_payloads
+                .iter()
+                .filter_map(|event| match event {
+                    ContractProtocolBlockEvent::ChunkLoaded { chunk_x, chunk_z } => {
+                        Some((*chunk_x, *chunk_z))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![(new_chunk_pos.x, new_chunk_pos.z)]
+        );
+        assert_eq!(
+            shared_world.read().get_block_state(old_position),
+            Some(old_state)
+        );
+        assert_eq!(
+            shared_world.read().get_block_state(new_position),
+            Some(new_state)
+        );
+        drop(old_chunk);
+        drop(new_chunk);
+    }
+
+    #[test]
+    fn production_block_sound_named_direct_and_reference_are_canonical_and_invalid_is_dropped() {
+        let (_handle, mut app, owner, _shared_world, _source, mut events) = producer_test_app();
+        queue_producer_packet(
+            &mut app,
+            owner,
+            sound_packet(
+                azalea::registry::Holder::Direct(azalea::core::sound::CustomSound {
+                    sound_id: azalea::Identifier::from("custom:bell"),
+                    range: None,
+                }),
+                0.75,
+                1.25,
+            ),
+        );
+        queue_producer_packet(
+            &mut app,
+            owner,
+            sound_packet(
+                azalea::registry::Holder::Reference(
+                    azalea::registry::builtin::SoundEvent::AmbientCave,
+                ),
+                1.0,
+                0.5,
+            ),
+        );
+        for (volume, pitch) in [
+            (f32::NAN, 1.0),
+            (f32::INFINITY, 1.0),
+            (-1.0, 1.0),
+            (1.0, f32::NAN),
+            (1.0, f32::INFINITY),
+        ] {
+            queue_producer_packet(
+                &mut app,
+                owner,
+                sound_packet(
+                    azalea::registry::Holder::Reference(
+                        azalea::registry::builtin::SoundEvent::AmbientCave,
+                    ),
+                    volume,
+                    pitch,
+                ),
+            );
+        }
+        app.update();
+
+        let sounds = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event.payload {
+                BackendEventPayload::Sound(payload) => Some(payload),
+                _ => None,
+            })
+            .collect::<Vec<ContractProtocolSoundPayload>>();
+        assert_eq!(sounds.len(), 2);
+        assert_eq!(sounds[0].event_type, ContractHeardSoundType::Heard);
+        assert_eq!(sounds[0].sound_name.as_deref(), Some("custom:bell"));
+        assert_eq!(
+            sounds[1].sound_name.as_deref(),
+            Some("minecraft:ambient.cave")
+        );
+        for sound in &sounds {
+            assert!(sound.sound_id.is_none());
+            assert!(sound.category.is_none());
+            assert_eq!(
+                sound.protocol_source,
+                ContractProtocolSoundSource::NamedSoundEffect
+            );
+            assert!(!sound.sound_key.is_empty());
+            assert_eq!(
+                (
+                    sound.source_position.x,
+                    sound.source_position.y,
+                    sound.source_position.z
+                ),
+                (1.125, -1.0, 2.0)
+            );
+        }
+        assert_ne!(sounds[0].sound_key, sounds[1].sound_key);
+        assert_eq!((sounds[0].volume, sounds[0].pitch), (0.75, 1.25));
+        assert_eq!((sounds[1].volume, sounds[1].pitch), (1.0, 0.5));
+    }
+
+    #[test]
+    fn production_block_sound_chunk_loaded_and_unloaded_are_once_and_negative_coordinates_are_preserved(
+    ) {
+        let (handle, mut app, owner, shared_world, _source, mut events) = producer_test_app();
+        let chunk_pos = azalea::core::position::ChunkPos::new(-1, -2);
+        let chunk = install_shared_chunk(&shared_world, chunk_pos);
+        let chunk_packet = azalea::protocol::packets::game::ClientboundGamePacket::LevelChunkWithLight(
+            azalea::protocol::packets::game::ClientboundLevelChunkWithLight {
+                x: chunk_pos.x,
+                z: chunk_pos.z,
+                chunk_data: azalea::protocol::packets::game::c_level_chunk_with_light::ClientboundLevelChunkPacketData {
+                    heightmaps: Vec::new(),
+                    data: Arc::new(Vec::<u8>::new().into_boxed_slice()),
+                    block_entities: Vec::new(),
+                },
+                light_data: Default::default(),
+            },
+        );
+        azalea::packet::game::process_packet(
+            app.world_mut(),
+            owner,
+            &chunk_packet,
+            synthetic_attempt_token(),
+        );
+        queue_producer_packet(&mut app, owner, chunk_packet);
+        app.update();
+        assert!(matches!(
+            block_events(&mut events).as_slice(),
+            [ContractProtocolBlockEvent::ChunkLoaded {
+                chunk_x: -1,
+                chunk_z: -2
+            }]
+        ));
+        app.update();
+        assert!(block_events(&mut events).is_empty());
+        drop(chunk);
+
+        let forget = azalea::protocol::packets::game::ClientboundGamePacket::ForgetLevelChunk(
+            azalea::protocol::packets::game::ClientboundForgetLevelChunk { pos: chunk_pos },
+        );
+        azalea::packet::game::process_packet(
+            app.world_mut(),
+            owner,
+            &forget,
+            synthetic_attempt_token(),
+        );
+        queue_producer_packet(&mut app, owner, forget);
+        app.update();
+        assert!(matches!(
+            block_events(&mut events).as_slice(),
+            [ContractProtocolBlockEvent::ChunkUnloaded {
+                chunk_x: -1,
+                chunk_z: -2
+            }]
+        ));
+        assert_eq!(handle.connection_epoch(), 1);
+    }
+
+    #[test]
+    fn canonical_observation_late_scope_publication_is_fail_closed() {
+        let (handle, _app, owner, _shared_world, _source, mut events) = producer_test_app();
+        let source = handle
+            .shared
+            .admit_canonical_source(owner)
+            .expect("current owner admission");
+        assert!(handle
+            .shared
+            .reset_entity_scope_for_owner_at_epoch(owner, source.epoch));
+        assert!(!handle.shared.emit_canonical_observation_event(
+            source,
+            BackendEventPayload::Block(ContractProtocolBlockEvent::ChunkLoaded {
+                chunk_x: -1,
+                chunk_z: -2,
+            }),
+        ));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn transport_retry_schedule_matches_ts_oracle_boundaries() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-03T00:00:00Z")
+            .expect("fixed clock")
+            .with_timezone(&chrono::Utc);
+        let policy = ReconnectPolicy {
+            enabled: true,
+            initial_delay_ms: 100,
+            multiplier: 2.0,
+            max_delay_ms: 1_000,
+            jitter_ratio: 0.0,
+            stable_reset_ms: 60_000,
+        };
+        assert_eq!(
+            reconnect_schedule_at(&policy, 1, 0.5, now).delay,
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            reconnect_schedule_at(&policy, 2, 0.5, now).delay,
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            reconnect_schedule_at(&policy, 4, 0.5, now).delay,
+            Duration::from_millis(800)
+        );
+        let clamped = reconnect_schedule_at(&policy, 5, 0.5, now);
+        assert_eq!(clamped.delay, Duration::from_millis(1_000));
+        assert_eq!(
+            clamped
+                .retry_at
+                .signed_duration_since(now)
+                .num_milliseconds(),
+            1_000
+        );
+
+        let initial_larger_than_max = ReconnectPolicy {
+            initial_delay_ms: 5_000,
+            max_delay_ms: 1_000,
+            ..policy.clone()
+        };
+        assert_eq!(
+            reconnect_schedule_at(&initial_larger_than_max, 1, 0.5, now).delay,
+            Duration::from_millis(1_000)
+        );
+
+        let jitter = ReconnectPolicy {
+            initial_delay_ms: 100,
+            max_delay_ms: 1_000,
+            jitter_ratio: 0.2,
+            ..policy.clone()
+        };
+        assert_eq!(
+            reconnect_schedule_at(&jitter, 1, 0.0, now).delay,
+            Duration::from_millis(80)
+        );
+        assert_eq!(
+            reconnect_schedule_at(&jitter, 1, 0.5, now).delay,
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            reconnect_schedule_at(&jitter, 1, 0.999_999, now).delay,
+            Duration::from_millis(120)
+        );
+
+        let full_jitter = ReconnectPolicy {
+            initial_delay_ms: 1,
+            max_delay_ms: 10,
+            jitter_ratio: 1.0,
+            ..policy.clone()
+        };
+        assert_eq!(
+            reconnect_schedule_at(&full_jitter, 1, 0.0, now).delay,
+            Duration::ZERO
+        );
+        assert_eq!(
+            reconnect_schedule_at(&full_jitter, 1, 0.5, now).delay,
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            reconnect_schedule_at(&full_jitter, 1, 0.75, now).delay,
+            Duration::from_millis(2)
+        );
+
+        let huge = ReconnectPolicy {
+            initial_delay_ms: u64::MAX,
+            max_delay_ms: u64::MAX,
+            multiplier: f64::MAX,
+            jitter_ratio: 1.0,
+            ..policy
+        };
+        assert_eq!(
+            reconnect_schedule_at(&huge, u64::MAX, 1.0, now).delay,
+            Duration::from_millis(u64::MAX)
+        );
+        assert_eq!(
+            reconnect_schedule_at(&huge, u64::MAX, 1.0, now).retry_at,
+            chrono::DateTime::<chrono::Utc>::MAX_UTC
+        );
+    }
+
+    #[test]
+    fn transport_retry_ordinal_matches_scheduled_and_next_request_while_epoch_stays_monotonic() {
+        let mut config = RunConfig::default();
+        config.reconnect.jitter_ratio = 0.0;
+        let handle = RuntimeHandle::new(config);
+        let mut events = handle.subscribe();
+        assert!(handle.shared.begin_connection_attempt());
+        let first_request = events.try_recv().expect("first request");
+        assert_eq!(first_request.connection_epoch, 1);
+        assert_eq!(payload_json(&first_request)["attempt"], 1);
+
+        let close = handle.shared.mark_disconnected(None);
+        let _closed = events.try_recv().expect("first close");
+        assert_eq!(
+            handle.shared.emit_reconnect_scheduled(&close),
+            Some(Duration::from_millis(1_000))
+        );
+        let scheduled = events.try_recv().expect("reconnect schedule");
+        assert_eq!(scheduled.connection_epoch, 1);
+        assert_eq!(payload_json(&scheduled)["attempt"], 2);
+
+        assert!(handle.shared.begin_connection_attempt());
+        let second_request = events.try_recv().expect("second request");
+        assert_eq!(second_request.connection_epoch, 2);
+        assert_eq!(payload_json(&second_request)["attempt"], 2);
+        assert_eq!(handle.shared.retry_ordinal.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn stable_reset_requires_exact_ready_epoch_attempt_and_generation() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut world = bevy_ecs::world::World::new();
+        let owner = world.spawn_empty().id();
+        let owner_b = world.spawn_empty().id();
+        let mut events = handle.subscribe();
+
+        assert!(handle.shared.begin_connection_attempt());
+        let _request_a = events.try_recv().expect("request A");
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind(owner),
+            Some(1)
+        );
+        let _transport_a = events.try_recv().expect("transport A");
+        handle
+            .shared
+            .emit_logged_in("26.1.2", "minecraft:overworld".to_owned());
+        let _logged_in_a = events.try_recv().expect("login A");
+        handle.shared.emit_ready(1);
+        let _ready_a = events.try_recv().expect("ready A");
+        let stable_a = handle.shared.test_current_stable_token();
+
+        let _close_a = handle.shared.mark_disconnected(None);
+        let _closed_a = events.try_recv().expect("close A");
+        assert!(handle.shared.begin_connection_attempt());
+        let _request_b = events.try_recv().expect("request B");
+        assert_eq!(handle.shared.retry_ordinal.load(Ordering::Acquire), 2);
+        handle.shared.fire_stable_reset(stable_a);
+        assert_eq!(handle.shared.retry_ordinal.load(Ordering::Acquire), 2);
+
+        assert!(handle
+            .shared
+            .consume_attempt_for_transport_init_and_bind(owner_b)
+            .is_some());
+        let _transport_b = events.try_recv().expect("transport B");
+        handle
+            .shared
+            .emit_logged_in("26.1.2", "minecraft:overworld".to_owned());
+        let _logged_in_b = events.try_recv().expect("login B");
+        handle.shared.emit_ready(2);
+        let _ready_b = events.try_recv().expect("ready B");
+        let stable_b = handle.shared.test_current_stable_token();
+        handle.shared.fire_stable_reset(stable_b);
+        assert_eq!(handle.shared.retry_ordinal.load(Ordering::Acquire), 0);
+
+        handle
+            .shared
+            .emit_logged_in("26.1.2", "minecraft:overworld".to_owned());
+        let _logged_in_again = events.try_recv().expect("non-ready transition");
+        handle.shared.fire_stable_reset(stable_b);
+        assert_eq!(handle.shared.retry_ordinal.load(Ordering::Acquire), 0);
+
+        let stable_non_ready = handle.shared.test_current_stable_token();
+        handle.stop("stable-stop");
+        handle.shared.fire_stable_reset(stable_non_ready);
+        assert_eq!(handle.shared.retry_ordinal.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn phase_deadlines_have_distinct_codes_unique_close_and_disabled_fault_priority() {
+        for (phase, expected_code) in [
+            (TransportPhase::Connecting, "connection_timeout"),
+            (TransportPhase::LoggingIn, "login_timeout"),
+            (TransportPhase::Spawning, "spawn_timeout"),
+        ] {
+            let mut config = RunConfig::default();
+            config.reconnect.enabled = false;
+            let handle = RuntimeHandle::new(config);
+            let mut events = handle.subscribe();
+            let mut world = bevy_ecs::world::World::new();
+            let owner = world.spawn_empty().id();
+            assert!(handle.shared.begin_connection_attempt());
+            let _request = events.try_recv().expect("request");
+            if phase != TransportPhase::Connecting {
+                assert!(handle
+                    .shared
+                    .consume_attempt_for_transport_init_and_bind(owner)
+                    .is_some());
+                let _transport = events.try_recv().expect("transport");
+            }
+            if phase == TransportPhase::Spawning {
+                handle
+                    .shared
+                    .emit_logged_in("26.1.2", "minecraft:overworld".to_owned());
+                let _login = events.try_recv().expect("login");
+            }
+            let token = handle.shared.test_current_phase_token(phase);
+            handle.shared.fire_phase_deadline(token);
+            let closed = events.try_recv().expect("timeout close");
+            assert_eq!(payload_json(&closed)["close"]["code"], expected_code);
+            let faulted = events.try_recv().expect("disabled fault");
+            assert_eq!(payload_json(&faulted)["type"], "faulted");
+            assert_eq!(
+                payload_json(&faulted)["failure"]["code"],
+                "reconnect_disabled"
+            );
+            handle.shared.fire_phase_deadline(token);
+            assert!(events.try_recv().is_err(), "late timeout must be inert");
+        }
+    }
+
+    #[test]
+    fn late_phase_timeout_and_disconnect_stop_races_are_admission_gated() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        let mut world = bevy_ecs::world::World::new();
+        let owner_a = world.spawn_empty().id();
+        let owner_b = world.spawn_empty().id();
+
+        assert!(handle.shared.begin_connection_attempt());
+        let _request_a = events.try_recv().expect("request A");
+        assert!(handle
+            .shared
+            .consume_attempt_for_transport_init_and_bind(owner_a)
+            .is_some());
+        let _transport_a = events.try_recv().expect("transport A");
+        let timeout_a = handle
+            .shared
+            .test_current_phase_token(TransportPhase::LoggingIn);
+        assert!(handle.shared.begin_connection_attempt());
+        let _request_b = events.try_recv().expect("request B");
+        assert_eq!(handle.shared.connection_epoch(), 2);
+        handle.shared.fire_phase_deadline(timeout_a);
+        assert!(
+            events.try_recv().is_err(),
+            "late A timeout must not close B"
+        );
+
+        assert!(handle
+            .shared
+            .consume_attempt_for_transport_init_and_bind(owner_b)
+            .is_some());
+        let _transport_b = events.try_recv().expect("transport B");
+        let timeout_b = handle
+            .shared
+            .test_current_phase_token(TransportPhase::LoggingIn);
+        let close_b = handle.shared.mark_disconnected(None);
+        let closed_b = events.try_recv().expect("disconnect close B");
+        assert_eq!(payload_json(&closed_b)["close"]["code"], close_b.code);
+        handle.shared.fire_phase_deadline(timeout_b);
+        assert!(
+            events.try_recv().is_err(),
+            "late timeout after disconnect is inert"
+        );
+
+        let stop_handle = RuntimeHandle::new(RunConfig::default());
+        let mut stop_events = stop_handle.subscribe();
+        assert!(stop_handle.shared.begin_connection_attempt());
+        let _stop_request = stop_events.try_recv().expect("stop request");
+        assert!(stop_handle
+            .shared
+            .consume_attempt_for_transport_init_and_bind(owner_a)
+            .is_some());
+        let _stop_transport = stop_events.try_recv().expect("stop transport");
+        let timeout_before_stop = stop_handle
+            .shared
+            .test_current_phase_token(TransportPhase::LoggingIn);
+        stop_handle.stop("timeout-stop-race");
+        let _stop_close = stop_events.try_recv().expect("stop close");
+        let _stopped = stop_events.try_recv().expect("stopped");
+        stop_handle.shared.fire_phase_deadline(timeout_before_stop);
+        assert!(
+            stop_events.try_recv().is_err(),
+            "late timeout after stop is inert"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_shaped_timer_tasks_install_progress_and_cancel_on_phase_and_stop() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut config = RunConfig::default();
+                config.timeouts.login_ms = 1;
+                config.timeouts.spawn_ms = 1;
+                config.timeouts.stop_ms = 1;
+                config.reconnect.stable_reset_ms = 1_000;
+                let handle = RuntimeHandle::new(config);
+                handle.shared.timers_enabled.store(true, Ordering::Release);
+                let mut world = bevy_ecs::world::World::new();
+                let owner = world.spawn_empty().id();
+                let mut events = handle.subscribe();
+
+                assert!(handle.shared.begin_connection_attempt());
+                let _request = events.try_recv().expect("request");
+                assert!(handle
+                    .shared
+                    .consume_attempt_for_transport_init_and_bind(owner)
+                    .is_some());
+                let _transport = events.try_recv().expect("transport");
+                // The real login timer was installed; advancing to the next
+                // phase invalidates it before it can close the attempt.
+                handle
+                    .shared
+                    .emit_logged_in("26.1.2", "minecraft:overworld".to_owned());
+                let _logged_in = events.try_recv().expect("logged in");
+                handle.shared.emit_ready(1);
+                let _ready = events.try_recv().expect("ready");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                assert!(
+                    events.try_recv().is_err(),
+                    "cancelled login/spawn timers stay inert"
+                );
+
+                let watchdog_handle = RuntimeHandle::new(RunConfig {
+                    timeouts: BackendTimeouts {
+                        connect_ms: 1,
+                        login_ms: 1,
+                        spawn_ms: 1,
+                        stop_ms: 1,
+                    },
+                    ..RunConfig::default()
+                });
+                watchdog_handle
+                    .shared
+                    .timers_enabled
+                    .store(true, Ordering::Release);
+                let mut watchdog_events = watchdog_handle.subscribe();
+                assert!(watchdog_handle.shared.begin_connection_attempt());
+                let _watchdog_request = watchdog_events.try_recv().expect("watchdog request");
+                let (completion, state) = CommandCompletion::channel("runtime-watchdog".to_owned());
+                state.begin_active_release(Arc::new(Notify::new()));
+                *watchdog_handle.shared.active_movement_completion.lock() = Some(state);
+                *watchdog_handle.shared.active_movement_id.lock() =
+                    Some("runtime-watchdog".to_owned());
+                watchdog_handle
+                    .shared
+                    .active_movement
+                    .store(true, Ordering::Release);
+                watchdog_handle.stop("runtime-watchdog");
+                let _watchdog_close = watchdog_events.try_recv().expect("watchdog close");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                assert!(completion.wait().await.is_err());
+                let stopped = watchdog_events.try_recv().expect("watchdog stopped");
+                assert_eq!(payload_json(&stopped)["type"], "stopped");
+                assert!(watchdog_events.try_recv().is_err());
+            })
+            .await;
+    }
+
+    #[test]
+    fn normal_stop_invalidates_watchdog_and_publishes_stopped_once() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        assert!(handle.shared.begin_connection_attempt());
+        let _request = events.try_recv().expect("request");
+        handle.stop("normal-stop");
+        let _closed = events.try_recv().expect("close");
+        let stopped = events.try_recv().expect("stopped");
+        assert_eq!(payload_json(&stopped)["type"], "stopped");
+        let token = handle.shared.test_current_stop_watchdog_token();
+        handle.shared.fire_stop_watchdog(token);
+        assert!(
+            events.try_recv().is_err(),
+            "cancelled watchdog must not duplicate stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_stop_cancels_watchdog_task_before_large_stop_deadline() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut config = RunConfig::default();
+                config.timeouts.stop_ms = 60_000;
+                let handle = RuntimeHandle::new(config);
+                handle.shared.timers_enabled.store(true, Ordering::Release);
+                let (probe_sender, probe_receiver) = oneshot::channel();
+                *handle.shared.stop_watchdog_completion_probe.lock() = Some(probe_sender);
+                let weak_shared = Arc::downgrade(&handle.shared);
+                let mut events = handle.subscribe();
+
+                assert!(handle.shared.begin_connection_attempt());
+                let _request = events.try_recv().expect("request");
+                // initiate_stop spawns the watchdog and immediately completes
+                // normal cleanup in this case.  No yield occurs between those
+                // operations, so this also exercises Notify's pre-first-poll
+                // permit retention.
+                handle.stop("normal-stop-task");
+                let _closed = events.try_recv().expect("close");
+                let stopped = events.try_recv().expect("stopped");
+                assert_eq!(payload_json(&stopped)["type"], "stopped");
+                drop(events);
+                drop(handle);
+
+                tokio::time::timeout(Duration::from_secs(1), probe_receiver)
+                    .await
+                    .expect("normal cleanup must cancel the large watchdog without sleeping")
+                    .expect("watchdog completion probe");
+                assert!(
+                    weak_shared.upgrade().is_none(),
+                    "completed watchdog task must not retain RuntimeShared"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn stop_watchdog_forces_pending_movement_and_has_no_fault_or_reconnect() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        assert!(handle.shared.begin_connection_attempt());
+        let _request = events.try_recv().expect("request");
+        let (completion, state) = CommandCompletion::channel("watchdog-move".to_owned());
+        state.begin_active_release(Arc::new(Notify::new()));
+        *handle.shared.active_movement_completion.lock() = Some(state);
+        *handle.shared.active_movement_id.lock() = Some("watchdog-move".to_owned());
+        handle.shared.active_movement.store(true, Ordering::Release);
+
+        handle.stop("watchdog-stop");
+        let _closed = events.try_recv().expect("close");
+        let token = handle.shared.test_current_stop_watchdog_token();
+        assert!(
+            events.try_recv().is_err(),
+            "stopped waits for forced cleanup"
+        );
+        handle.shared.fire_stop_watchdog(token);
+        assert!(completion.wait().await.is_err());
+        let stopped = events.try_recv().expect("forced stopped");
+        assert_eq!(payload_json(&stopped)["type"], "stopped");
+        assert!(events.try_recv().is_err());
+        assert!(matches!(handle.state(), BackendState::Stopped { .. }));
+    }
+
+    // ================= NEW-13 V2: AttemptToken ↔ epoch binding =================
+
+    fn stamped_block_app() -> (
+        RuntimeHandle,
+        App,
+        bevy_ecs::entity::Entity,
+        RuntimeEventReceiver,
+    ) {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut app = App::new();
+        app.add_message::<azalea::packet::game::ReceiveGamePacketEvent>();
+        app.add_message::<azalea::chunks::ReceiveChunkEvent>();
+        let owner = app
+            .world_mut()
+            .spawn((LocalEntity, azalea::core::entity_id::MinecraftEntityId(99)))
+            .id();
+        app.world_mut().entity_mut(owner).insert((
+            azalea::local_player::WorldHolder::new(owner, empty_world()),
+            azalea::block_update::QueuedServerBlockUpdates::default(),
+            azalea::interact::BlockStatePredictionHandler::default(),
+            CanonicalPacketSourceMetadata::default(),
+        ));
+        app.insert_resource(SwarmState {
+            shared: handle.shared.clone(),
+        });
+        app.add_systems(azalea::app::PreUpdate, produce_entity_packet_events);
+        app.add_systems(
+            Update,
+            (
+                azalea::chunks::handle_receive_chunk_event,
+                azalea::block_update::handle_block_update_event,
+            ),
+        );
+        app.add_plugins(BlockSoundProducerPlugin);
+        let events = handle.subscribe();
+        (handle, app, owner, events)
+    }
+
+    fn bind_stamped_attempt(
+        handle: &RuntimeHandle,
+        app: &mut App,
+        owner: bevy_ecs::entity::Entity,
+        token: azalea::join::AttemptToken,
+    ) {
+        let epoch = handle.shared.connection_epoch();
+        assert!(handle
+            .shared
+            .admit_canonical_join_started_with_token(epoch, Some(token)));
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind_with_token(owner, Some(token)),
+            Some(epoch)
+        );
+        app.world_mut()
+            .insert_resource(super::entity_events_owner_tests::TestAttemptToken(token));
+    }
+
+    fn block_update_packet(
+        position: azalea::BlockPos,
+        state_id: u32,
+    ) -> azalea::protocol::packets::game::ClientboundGamePacket {
+        azalea::protocol::packets::game::ClientboundGamePacket::BlockUpdate(
+            azalea::protocol::packets::game::ClientboundBlockUpdate {
+                pos: position,
+                block_state: test_block_state(state_id),
+            },
+        )
+    }
+
+    fn drain_events(receiver: &mut RuntimeEventReceiver) -> Vec<BackendEventEnvelope> {
+        std::iter::from_fn(|| receiver.try_recv().ok()).collect()
+    }
+
+    #[test]
+    fn stamped_rebind_restores_production_and_late_a_packets_are_rejected() {
+        let (handle, mut app, owner, mut events) = stamped_block_app();
+        assert!(handle.shared.begin_connection_attempt());
+        let token_a = azalea::join::AttemptToken::mint();
+        bind_stamped_attempt(&handle, &mut app, owner, token_a);
+        let _ = drain_events(&mut events);
+
+        // A packet is admitted on epoch 1 through the stamped source path.
+        queue_production_block_packet(
+            &mut app,
+            owner,
+            azalea::BlockPos { x: 0, y: 0, z: 0 },
+            test_block_state(1),
+        );
+        app.update();
+        assert_eq!(block_events(&mut events).len(), 1);
+
+        assert!(handle
+            .shared
+            .admit_canonical_disconnected_with_token(owner, 1, None, Some(token_a))
+            .is_some());
+        let _ = drain_events(&mut events);
+
+        // B reuses the same entity. The legacy fence becomes ambiguous, but
+        // stamped B sources must still reach production.
+        assert!(handle.shared.begin_connection_attempt());
+        let token_b = azalea::join::AttemptToken::mint();
+        bind_stamped_attempt(&handle, &mut app, owner, token_b);
+        let _ = drain_events(&mut events);
+
+        queue_production_block_packet(
+            &mut app,
+            owner,
+            azalea::BlockPos { x: 1, y: 0, z: 0 },
+            test_block_state(2),
+        );
+        app.update();
+        assert_eq!(
+            block_events(&mut events).len(),
+            1,
+            "stamped B must be accepted even after same-entity reuse made the fence ambiguous"
+        );
+
+        // A late A packet is rejected at the source admission; even if a
+        // packet were queued, no envelope may be produced for it.
+        assert!(
+            handle
+                .shared
+                .admit_canonical_source_with_token(owner, Some(token_a))
+                .is_none(),
+            "a late A packet must be rejected at the stamped source admission"
+        );
+        app.world_mut()
+            .write_message(azalea::packet::game::ReceiveGamePacketEvent {
+                entity: owner,
+                packet: Arc::new(block_update_packet(
+                    azalea::BlockPos { x: 2, y: 0, z: 0 },
+                    3,
+                )),
+                attempt_token: token_a,
+            });
+        app.update();
+        assert!(
+            block_events(&mut events).is_empty(),
+            "a late A packet must not publish into B's epoch"
+        );
+    }
+
+    #[test]
+    fn late_a_lifecycle_sources_cannot_claim_b() {
+        let (handle, mut app, owner, mut events) = stamped_block_app();
+        assert!(handle.shared.begin_connection_attempt());
+        let token_a = azalea::join::AttemptToken::mint();
+        bind_stamped_attempt(&handle, &mut app, owner, token_a);
+        let _ = drain_events(&mut events);
+        assert!(handle
+            .shared
+            .admit_canonical_disconnected_with_token(owner, 1, None, Some(token_a))
+            .is_some());
+        let _ = drain_events(&mut events);
+
+        assert!(handle.shared.begin_connection_attempt());
+        let token_b = azalea::join::AttemptToken::mint();
+        bind_stamped_attempt(&handle, &mut app, owner, token_b);
+        let _ = drain_events(&mut events);
+        let epoch = handle.shared.connection_epoch();
+        assert_eq!(epoch, 2);
+
+        // Stamped packet admission: A rejected, B accepted.
+        assert!(handle
+            .shared
+            .admit_canonical_source_with_token(owner, Some(token_a))
+            .is_none());
+        let source_b = handle
+            .shared
+            .admit_canonical_source_with_token(owner, Some(token_b))
+            .expect("stamped B source must be admitted");
+        assert_eq!(source_b.attempt_token, Some(token_b));
+
+        // WorldLoaded boundary: A rejected, B accepted.
+        assert!(!handle
+            .shared
+            .observe_dimension_from_world_boundary_with_token(
+                owner,
+                "minecraft:the_nether",
+                Some(token_a),
+            ));
+        assert!(handle
+            .shared
+            .observe_dimension_from_world_boundary_with_token(
+                owner,
+                "minecraft:the_nether",
+                Some(token_b),
+            ));
+
+        // Disconnect: late A cannot close B; matching B closes normally.
+        assert!(handle
+            .shared
+            .admit_canonical_disconnected_with_token(owner, 2, None, Some(token_a))
+            .is_none());
+        assert!(handle
+            .shared
+            .admit_canonical_disconnected_with_token(owner, 2, None, Some(token_b))
+            .is_some());
+        let _ = drain_events(&mut events);
+
+        // ConnectionFailed: late A cannot close a fresh B.
+        assert!(handle.shared.begin_connection_attempt());
+        let token_b2 = azalea::join::AttemptToken::mint();
+        bind_stamped_attempt(&handle, &mut app, owner, token_b2);
+        let _ = drain_events(&mut events);
+        assert!(handle
+            .shared
+            .admit_canonical_connection_failed_with_token(
+                owner,
+                3,
+                "probe".to_owned(),
+                Some(token_a)
+            )
+            .is_none());
+        assert!(handle
+            .shared
+            .admit_canonical_connection_failed_with_token(
+                owner,
+                3,
+                "probe".to_owned(),
+                Some(token_b2),
+            )
+            .is_some());
+
+        // Init/Client binding: A's token cannot consume B's reservation.
+        assert!(handle.shared.begin_connection_attempt());
+        let token_b3 = azalea::join::AttemptToken::mint();
+        assert!(handle
+            .shared
+            .admit_canonical_join_started_with_token(4, Some(token_b3)));
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind_with_token(owner, Some(token_a)),
+            None
+        );
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind_with_token(owner, Some(token_b3)),
+            Some(4)
+        );
+
+        // Client token gate: late A client rejected, matching B accepted.
+        let empty_world = Arc::new(parking_lot::RwLock::new(bevy_ecs::world::World::new()));
+        let client_a = azalea::Client::new_with_attempt_token(owner, empty_world.clone(), token_a);
+        let client_b = azalea::Client::new_with_attempt_token(owner, empty_world, token_b3);
+        assert!(!handle.shared.client_is_current_owner(&client_a));
+        assert!(handle.shared.client_is_current_owner(&client_b));
+
+        // Swarm disconnect: late A cannot claim a reconnect for B.
+        assert!(!handle.shared.claim_reconnect_with_token(Some(token_a)));
+        assert!(handle
+            .shared
+            .admit_canonical_disconnected_with_token(owner, 4, None, Some(token_b3))
+            .is_some());
+        assert!(handle.shared.claim_reconnect_with_token(Some(token_b3)));
+    }
+
+    #[test]
+    fn source_token_bindings_are_one_to_one_and_idempotent() {
+        let mut bindings = SourceTokenBindings::default();
+        let a = azalea::join::AttemptToken::mint();
+        let b = azalea::join::AttemptToken::mint();
+        let c = azalea::join::AttemptToken::mint();
+
+        assert!(bindings.bind(a, 1));
+        assert!(
+            !bindings.bind(a, 2),
+            "A must never be re-registered on epoch 2"
+        );
+        assert!(bindings.bind(b, 2));
+        assert!(!bindings.bind(c, 2), "epoch 2 cannot switch to C");
+        assert!(bindings.bind(a, 1), "the same pair is idempotent");
+        assert!(bindings.matches(a, 1));
+        assert!(!bindings.matches(a, 2));
+    }
+
+    #[test]
+    fn historical_token_cannot_bind_to_a_later_epoch() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        assert!(handle.shared.begin_connection_attempt());
+        let token_a = azalea::join::AttemptToken::mint();
+        assert!(handle
+            .shared
+            .admit_canonical_join_started_with_token(1, Some(token_a)));
+        assert!(handle.shared.begin_connection_attempt());
+        assert!(
+            !handle
+                .shared
+                .admit_canonical_join_started_with_token(2, Some(token_a)),
+            "a historical token must not be re-registered on a later epoch"
+        );
+        let token_b = azalea::join::AttemptToken::mint();
+        assert!(handle
+            .shared
+            .admit_canonical_join_started_with_token(2, Some(token_b)));
+    }
+
+    #[test]
+    fn reconnect_return_client_token_must_match_start_join_token() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        let mut ecs_world = bevy_ecs::world::World::new();
+        let entity = ecs_world.spawn_empty().id();
+
+        assert!(handle.shared.begin_connection_attempt());
+        let token_a = azalea::join::AttemptToken::mint();
+        assert!(handle
+            .shared
+            .admit_canonical_join_started_with_token(1, Some(token_a)));
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind_with_token(entity, Some(token_a)),
+            Some(1)
+        );
+        assert!(handle
+            .shared
+            .admit_canonical_disconnected_with_token(entity, 1, None, Some(token_a))
+            .is_some());
+        let _ = drain_events(&mut events);
+
+        assert!(handle.shared.claim_reconnect_with_token(Some(token_a)));
+        let reconnect_token = handle
+            .shared
+            .admit_reconnect_attempt()
+            .expect("reconnect reservation");
+        let token_b = azalea::join::AttemptToken::mint();
+        assert!(handle
+            .shared
+            .admit_canonical_join_started_with_token(2, Some(token_b)));
+
+        // A different client token than the StartJoin token is rejected.
+        assert_eq!(
+            handle
+                .shared
+                .bind_reconnect_return_with_token(reconnect_token, entity, Some(token_a)),
+            None
+        );
+        // The matching token binds and installs the active client.
+        assert_eq!(
+            handle
+                .shared
+                .bind_reconnect_return_with_token(reconnect_token, entity, Some(token_b)),
+            Some(2)
+        );
+        let empty_world = Arc::new(parking_lot::RwLock::new(bevy_ecs::world::World::new()));
+        let client_b = azalea::Client::new_with_attempt_token(entity, empty_world, token_b);
+        assert!(handle.shared.set_active_client_if_current(&client_b));
+        handle.shared.finish_reconnect_attempt(reconnect_token);
+    }
+
+    #[test]
+    fn tokenless_fallback_first_connect_works_but_same_entity_rebind_fails_closed() {
+        let handle = RuntimeHandle::new(RunConfig::default());
+        let mut events = handle.subscribe();
+        let mut ecs_world = bevy_ecs::world::World::new();
+        let entity = ecs_world.spawn_empty().id();
+
+        // First, never-reused connect keeps the legacy tokenless behavior.
+        assert!(handle.shared.begin_connection_attempt());
+        assert!(handle.shared.admit_canonical_join_started(1));
+        assert_eq!(
+            handle
+                .shared
+                .consume_attempt_for_transport_init_and_bind(entity),
+            Some(1)
+        );
+        let _ = drain_events(&mut events);
+        assert!(handle.shared.admit_canonical_source(entity).is_some());
+
+        // Same-entity rebind without a token must stay fail closed; the
+        // current B token is never back-stamped onto A events.
+        assert!(handle
+            .shared
+            .admit_canonical_disconnected(entity, 1, None)
+            .is_some());
+        let _ = drain_events(&mut events);
+        assert!(handle.shared.begin_connection_attempt());
+        assert!(!handle.shared.admit_canonical_join_started(2));
+        assert!(handle.shared.admit_canonical_source(entity).is_none());
+    }
+
+    #[tokio::test]
+    async fn stamped_admission_publication_race_rejects_a_after_b_rebind() {
+        let (handle, mut app, owner, mut events) = stamped_block_app();
+        assert!(handle.shared.begin_connection_attempt());
+        let token_a = azalea::join::AttemptToken::mint();
+        bind_stamped_attempt(&handle, &mut app, owner, token_a);
+        let _ = drain_events(&mut events);
+        let source = handle
+            .shared
+            .admit_canonical_source_with_token(owner, Some(token_a))
+            .expect("A source must be admitted while A is current");
+
+        let (checked_tx, checked_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let release_rx = Arc::new(StdMutex::new(Some(release_rx)));
+        // The probe runs outside `command_admission`, so the main thread can
+        // rebind B while A's publication is suspended between source
+        // admission and the publication recheck.
+        handle
+            .shared
+            .set_canonical_publication_probe(Some(Arc::new({
+                let release_rx = release_rx.clone();
+                move || {
+                    checked_tx.send(()).expect("hook reached");
+                    release_rx
+                        .lock()
+                        .expect("release gate lock")
+                        .take()
+                        .expect("one publication owns the gate")
+                        .recv()
+                        .expect("publication release");
+                }
+            })));
+
+        let publish_shared = handle.shared.clone();
+        let publisher = thread::spawn(move || {
+            publish_shared.emit_canonical_observation_event(
+                source,
+                BackendEventPayload::Block(ContractProtocolBlockEvent::ChunkLoaded {
+                    chunk_x: 0,
+                    chunk_z: 0,
+                }),
+            )
+        });
+        checked_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("A publication must reach the admission hook");
+
+        // B rebinds the same entity while A's publication is suspended between
+        // admission and publication.
+        assert!(handle.shared.begin_connection_attempt());
+        let token_b = azalea::join::AttemptToken::mint();
+        bind_stamped_attempt(&handle, &mut app, owner, token_b);
+
+        release_tx.send(()).expect("release A publication");
+        assert!(
+            !publisher.join().expect("publisher must finish"),
+            "A publication must be rejected after B rebinds the same entity"
+        );
     }
 }

@@ -10,11 +10,12 @@ use std::{
 use mineintent_contracts::{
     agent::{
         fixtures, AgentError, AgentErrorCode, AgentHotbarV5, AgentItemStackV5, AgentRunRequest,
-        AgentRunner, AgentStatusV5, ContractFuture, ExecutionControl, JsonAgentDecisionContextV5,
-        ModelProvider, ModelRunResult, ModelUsage, ToolInvocation, WireToolDefinition,
+        AgentRunner, AgentStatusV5, ContractFuture, Deadline, ExecutionControl,
+        JsonAgentDecisionContextV5, ModelProvider, ModelRunResult, ModelUsage, RunId, ToolCallId,
+        ToolInvocation, WireToolDefinition,
     },
-    capability::ScopeGuard,
     capability::ToolCapabilityRegistry,
+    capability::{CapabilityExecutionContext, CapabilityInvocation, ExecutionResource, ScopeGuard},
     information::InformationOmission,
     minecraft::{
         BackendClose, BackendError, BackendEventEnvelope, BackendEventKind, BackendEventListener,
@@ -34,20 +35,20 @@ use mineintent_middle::{
     capability::{
         build_production_capability_registry, CapabilityActionIdSource, CapabilityJournal,
         CapabilityScopeAssembly, CapabilityUtcTimestampSource,
-        ExplicitCapabilityInvocationAssembler, MemoryStorePort, ProductionCapabilityServices,
-        RegistryToolDispatcher, SpeechSchedulerPort, ViewportReader,
+        ExplicitCapabilityInvocationAssembler, MemoryStorePort, ObservationAfterSource,
+        ProductionCapabilityServices, RegistryToolDispatcher, SpeechSchedulerPort, ViewportReader,
     },
     memory::MemoryError,
     participant::{
-        ParticipantAdmission, ParticipantAgentAssembly, ParticipantAgentFactory,
-        ParticipantAgentPort, ParticipantClock, ParticipantEvent, ParticipantFrameCapture,
-        ParticipantFrameSource, ParticipantInternalEvent, ParticipantMemorySource,
-        ParticipantRegistryBound, ParticipantRuntime, ParticipantRuntimeConfig,
-        ParticipantRuntimeError, ParticipantScope, ParticipantScopedAgentRunner,
-        ParticipantSourceError, ParticipantSpeechControl, WakeKind, WakeRegistry, WakeRule,
-        WakeRuleCondition,
+        ParticipantAdmission, ParticipantAdmissionObserver, ParticipantAgentAssembly,
+        ParticipantAgentFactory, ParticipantAgentPort, ParticipantClock, ParticipantEvent,
+        ParticipantFrameCapture, ParticipantFrameSource, ParticipantInternalEvent,
+        ParticipantMemorySource, ParticipantObservationAfterSource, ParticipantRegistryBound,
+        ParticipantRuntime, ParticipantRuntimeConfig, ParticipantRuntimeError, ParticipantScope,
+        ParticipantScopedAgentRunner, ParticipantSourceError, ParticipantSpeechControl, WakeKind,
+        WakeRegistry, WakeRule, WakeRuleCondition,
     },
-    speech::{ChatInputContext, SpeechRequest, SpeechScheduleError},
+    speech::{ChatInputContext, PlayerChatMessage, SpeechRequest, SpeechScheduleError},
     telemetry::DebugStateStore,
 };
 
@@ -121,6 +122,7 @@ impl ParticipantAgentPort for TestAgent {
     fn run<'a>(
         &'a self,
         _scope: ParticipantScope,
+        _generation: u64,
         _trigger_event_id: String,
         request: AgentRunRequest<JsonAgentDecisionContextV5>,
         control: ExecutionControl<'a>,
@@ -384,8 +386,24 @@ struct TestFrameSource {
     context: ChatInputContext,
     capture: Mutex<ParticipantFrameCapture>,
     chats: Mutex<Vec<AgentChatInputV5>>,
+    capture_calls: AtomicUsize,
+    capture_gate: Mutex<Option<Arc<CleanupGate>>>,
     missing_light: AtomicBool,
     fail_context: AtomicBool,
+    retain_calls: AtomicUsize,
+    release_calls: AtomicUsize,
+    release_all_calls: AtomicUsize,
+    retained_count: AtomicUsize,
+}
+
+struct TestAdmissionObserver {
+    gate: Arc<CleanupGate>,
+}
+
+impl ParticipantAdmissionObserver for TestAdmissionObserver {
+    fn after_work_admitted_before_fact(&self, _event_type: &str) {
+        self.gate.enter();
+    }
 }
 
 impl TestFrameSource {
@@ -419,14 +437,21 @@ impl TestFrameSource {
                     off_hand: None,
                 },
                 unread_chat: Vec::new(),
+                unread_chat_omitted: 0,
                 sound: None,
                 light: Some(7),
                 events: Vec::new(),
                 omissions: Vec::<InformationOmission>::new(),
             }),
             chats: Mutex::new(Vec::new()),
+            capture_calls: AtomicUsize::new(0),
+            capture_gate: Mutex::new(None),
             missing_light: AtomicBool::new(false),
             fail_context: AtomicBool::new(false),
+            retain_calls: AtomicUsize::new(0),
+            release_calls: AtomicUsize::new(0),
+            release_all_calls: AtomicUsize::new(0),
+            retained_count: AtomicUsize::new(0),
         })
     }
 
@@ -436,6 +461,32 @@ impl TestFrameSource {
 
     fn set_armor(&self, armor: Option<u8>) {
         self.capture.lock().unwrap().status.as_mut().unwrap().armor = armor;
+    }
+
+    fn gate_capture(&self) -> Arc<CleanupGate> {
+        let gate = CleanupGate::new();
+        *self.capture_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    fn capture_calls(&self) -> usize {
+        self.capture_calls.load(Ordering::SeqCst)
+    }
+
+    fn retain_calls(&self) -> usize {
+        self.retain_calls.load(Ordering::SeqCst)
+    }
+
+    fn release_calls(&self) -> usize {
+        self.release_calls.load(Ordering::SeqCst)
+    }
+
+    fn release_all_calls(&self) -> usize {
+        self.release_all_calls.load(Ordering::SeqCst)
+    }
+
+    fn retained_count(&self) -> usize {
+        self.retained_count.load(Ordering::SeqCst)
     }
 }
 
@@ -456,6 +507,10 @@ impl ParticipantFrameSource for TestFrameSource {
         &self,
         scope: &ParticipantScope,
     ) -> Result<ParticipantFrameCapture, ParticipantSourceError> {
+        self.capture_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = self.capture_gate.lock().unwrap().clone() {
+            gate.enter();
+        }
         let mut capture = self.capture.lock().unwrap().clone();
         capture.dimension = scope
             .dimension
@@ -466,6 +521,40 @@ impl ParticipantFrameSource for TestFrameSource {
             capture.light = None;
         }
         Ok(capture)
+    }
+
+    fn retain_trigger(
+        &self,
+        _scope: &ParticipantScope,
+        _trigger: &PlayerChatMessage,
+    ) -> Result<(), ParticipantSourceError> {
+        self.retain_calls.fetch_add(1, Ordering::SeqCst);
+        self.retained_count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn release_trigger(&self, _scope: &ParticipantScope, _trigger: &PlayerChatMessage) {
+        let mut current = self.retained_count.load(Ordering::SeqCst);
+        while current > 0 {
+            match self.retained_count.compare_exchange(
+                current,
+                current - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    self.release_calls.fetch_add(1, Ordering::SeqCst);
+                    break;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release_retained_triggers(&self) {
+        self.release_all_calls.fetch_add(1, Ordering::SeqCst);
+        let retained = self.retained_count.swap(0, Ordering::SeqCst);
+        self.release_calls.fetch_add(retained, Ordering::SeqCst);
     }
 }
 
@@ -522,6 +611,8 @@ impl Subscription for TestSubscription {
 
 struct TestBackend {
     motor: Arc<TestMotor>,
+    snapshot: Mutex<MinecraftSnapshotV1>,
+    snapshot_fail: AtomicBool,
     listener: Mutex<Option<Arc<dyn BackendEventListener>>>,
     subscription_closed: Arc<AtomicBool>,
     subscription_unsubscribes: Arc<AtomicUsize>,
@@ -533,6 +624,16 @@ impl TestBackend {
     fn new(motor: Arc<TestMotor>) -> Arc<Self> {
         Arc::new(Self {
             motor,
+            snapshot: Mutex::new({
+                let mut snapshot = mineintent_contracts::minecraft::fixture_snapshot();
+                snapshot.process_session_id = "process-test".to_owned();
+                snapshot.connection_epoch = 1;
+                snapshot.connection_attempt_id = "attempt-test".to_owned();
+                snapshot.world.world_id = "world-test".to_owned();
+                snapshot.world.dimension = "minecraft:overworld".to_owned();
+                snapshot
+            }),
+            snapshot_fail: AtomicBool::new(false),
             listener: Mutex::new(None),
             subscription_closed: Arc::new(AtomicBool::new(false)),
             subscription_unsubscribes: Arc::new(AtomicUsize::new(0)),
@@ -557,6 +658,10 @@ impl TestBackend {
 
     fn fail_subscribe(&self) {
         self.subscribe_fail.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_snapshot(&self) {
+        self.snapshot_fail.store(true, Ordering::SeqCst);
     }
 
     fn emit(&self, event: BackendEventEnvelope) {
@@ -591,9 +696,12 @@ impl MinecraftBackendApi for TestBackend {
     }
 
     fn snapshot(&self) -> Result<MinecraftSnapshotV1, BackendError> {
-        Err(BackendError::NotReady {
-            state: "test snapshot unused".to_owned(),
-        })
+        if self.snapshot_fail.load(Ordering::SeqCst) {
+            return Err(BackendError::NotReady {
+                state: "test snapshot failure".to_owned(),
+            });
+        }
+        Ok(self.snapshot.lock().unwrap().clone())
     }
 
     fn subscribe(
@@ -797,6 +905,16 @@ fn chat_timestamp(text: &str) -> String {
     format!("2026-08-03T00:01:{seconds:02}Z")
 }
 
+fn observation_invocation(id: &str) -> CapabilityInvocation {
+    CapabilityInvocation {
+        run_id: RunId::new(format!("observation-run-{id}")).unwrap(),
+        tool_call_id: ToolCallId::new(format!("observation-call-{id}")).unwrap(),
+        arguments: serde_json::Map::new(),
+        action_id: format!("observation-action-{id}"),
+        started_at: "2026-08-03T00:00:00Z".to_owned(),
+    }
+}
+
 fn internal_fact(
     id: &str,
     event_scope: &ParticipantScope,
@@ -990,6 +1108,70 @@ async fn startup_registry_and_addressing_are_explicit_and_symmetric() {
 }
 
 #[tokio::test]
+async fn startup_seeds_one_participant_started_without_calling_model() {
+    let agent = TestAgent::new(0);
+    let (runtime, source, _journal, _speech, _motor, _backend) = runtime_parts(Arc::clone(&agent));
+    runtime.start_worker().unwrap();
+    assert!(agent.requests.lock().unwrap().is_empty());
+    assert!(matches!(
+        runtime.start_worker(),
+        Err(ParticipantRuntimeError::AlreadyStarted)
+    ));
+    assert!(agent.requests.lock().unwrap().is_empty());
+
+    let trigger = chat_input(301, "Alice", "@Bot startup seed");
+    source.set_chats(vec![trigger]);
+    runtime
+        .ingest_backend_event(chat_event("startup-chat", 1, "Alice", "@Bot startup seed"))
+        .unwrap();
+    wait_for_request(&agent, 1).await;
+
+    let request = agent.requests.lock().unwrap()[0].clone();
+    let seed_events = request
+        .context
+        .frame
+        .events
+        .as_ref()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            mineintent_contracts::agent::AgentEventV5::Summary {
+                event_type,
+                summary,
+            } if event_type == "participant.started" => Some(summary.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(seed_events, vec!["AI 参与者已进入世界"]);
+    runtime.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn startup_snapshot_failure_rolls_back_without_worker_or_model_call() {
+    let agent = TestAgent::new(0);
+    let (runtime, source, _journal, _speech, _motor, backend) = runtime_parts(Arc::clone(&agent));
+    backend.fail_snapshot();
+
+    let error = runtime.start_worker().unwrap_err();
+    assert!(matches!(error, ParticipantRuntimeError::Backend(_)));
+    assert_eq!(
+        runtime.lifecycle(),
+        mineintent_middle::participant::ParticipantLifecycle::Faulted
+    );
+    assert!(runtime.current_scope().is_none());
+    assert!(agent.requests.lock().unwrap().is_empty());
+    assert_eq!(backend.subscription_unsubscribes(), 0);
+    assert_eq!(source.retained_count(), 0);
+    assert!(source.release_all_calls() >= 1);
+
+    runtime.stop().await.unwrap();
+    assert_eq!(
+        runtime.lifecycle(),
+        mineintent_middle::participant::ParticipantLifecycle::Stopped
+    );
+}
+
+#[tokio::test]
 async fn stop_finishes_while_subscribe_is_blocked_and_closes_late_handle() {
     let agent = TestAgent::new(0);
     let (runtime, _source, _journal, _speech, _motor, backend) = runtime_parts(Arc::clone(&agent));
@@ -1166,6 +1348,146 @@ async fn v5_frame_requires_light_deduplicates_trigger_and_preserves_armor() {
 }
 
 #[tokio::test]
+async fn production_observation_after_is_body_only_and_drains_facts_once() {
+    let agent = TestAgent::new(0);
+    let (runtime, source, _journal, _speech, _motor, _backend) = runtime_parts(Arc::clone(&agent));
+    runtime.start_worker().unwrap();
+
+    let opening = chat_input(401, "Alice", "@Bot observation");
+    source.set_chats(vec![opening]);
+    runtime
+        .ingest_backend_event(chat_event(
+            "observation-trigger",
+            1,
+            "Alice",
+            "@Bot observation",
+        ))
+        .unwrap();
+    wait_for_request(&agent, 1).await;
+
+    let run_scope = runtime
+        .current_scope()
+        .expect("startup scope remains active");
+    let generation = runtime.current_generation();
+    runtime
+        .emit_internal(internal_fact(&"body-fact", &run_scope, "self_hurt"))
+        .unwrap();
+
+    let frame_source: Arc<dyn ParticipantFrameSource> = source.clone();
+    let observation = ParticipantObservationAfterSource::new(
+        frame_source,
+        runtime.fact_owner(),
+        run_scope.clone(),
+        generation,
+        "body-trigger",
+    );
+    let checks = Arc::new(AtomicUsize::new(0));
+    let signal = NeverCancelled;
+    let guard = RealScopeGuard {
+        checks: Arc::clone(&checks),
+    };
+    let deadline = Deadline::after(std::time::Instant::now(), Duration::from_secs(1)).unwrap();
+    let first = observation
+        .observe_after(
+            observation_invocation("first"),
+            ExecutionResource::Body,
+            serde_json::json!({"status": "failed"}),
+            CapabilityExecutionContext::new(
+                &run_scope.world_id,
+                "body-trigger",
+                ExecutionControl::new(&signal, deadline),
+                &guard,
+            ),
+        )
+        .await
+        .unwrap()
+        .expect("body observation returns direct frame");
+    assert!(first.get("world").is_some());
+    assert!(first.get("viewport").is_none());
+    assert!(first.get("stable").is_none());
+    assert!(first["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| { event["type"] == "self_hurt" }));
+    assert!(first.get("triggerPlayer").is_none());
+
+    let signal = NeverCancelled;
+    let guard = RealScopeGuard {
+        checks: Arc::clone(&checks),
+    };
+    let deadline = Deadline::after(std::time::Instant::now(), Duration::from_secs(1)).unwrap();
+    let second = observation
+        .observe_after(
+            observation_invocation("second"),
+            ExecutionResource::Body,
+            serde_json::json!({"status": "completed"}),
+            CapabilityExecutionContext::new(
+                &run_scope.world_id,
+                "body-trigger",
+                ExecutionControl::new(&signal, deadline),
+                &guard,
+            ),
+        )
+        .await
+        .unwrap()
+        .expect("passive body facts remain sampleable");
+    assert!(second.get("events").is_none());
+    assert!(second.get("status").is_some());
+    assert_eq!(source.capture_calls(), 3, "opening plus two body samples");
+
+    for (resource, id) in [
+        (ExecutionResource::Viewport, "viewport"),
+        (ExecutionResource::Chat, "chat"),
+        (ExecutionResource::Memory, "memory"),
+    ] {
+        let signal = NeverCancelled;
+        let guard = RealScopeGuard {
+            checks: Arc::clone(&checks),
+        };
+        let deadline = Deadline::after(std::time::Instant::now(), Duration::from_secs(1)).unwrap();
+        let result = observation
+            .observe_after(
+                observation_invocation(id),
+                resource,
+                serde_json::json!({"status": "completed"}),
+                CapabilityExecutionContext::new(
+                    &run_scope.world_id,
+                    "body-trigger",
+                    ExecutionControl::new(&signal, deadline),
+                    &guard,
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_none(), "{resource:?} must not sample body facts");
+    }
+    assert_eq!(source.capture_calls(), 3);
+    assert!(checks.load(Ordering::SeqCst) >= 7);
+    runtime.stop().await.unwrap();
+    drop(runtime);
+
+    let signal = NeverCancelled;
+    let guard = RealScopeGuard { checks };
+    let deadline = Deadline::after(std::time::Instant::now(), Duration::from_secs(1)).unwrap();
+    let error = observation
+        .observe_after(
+            observation_invocation("after-runtime-drop"),
+            ExecutionResource::Body,
+            serde_json::json!({"status": "completed"}),
+            CapabilityExecutionContext::new(
+                &run_scope.world_id,
+                "body-trigger",
+                ExecutionControl::new(&signal, deadline),
+                &guard,
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, AgentErrorCode::ScopeInvalid);
+}
+
+#[tokio::test]
 async fn repeated_chat_text_uses_timestamp_and_sequence_identity() {
     let agent = TestAgent::new(0);
     let (runtime, source, _journal, _speech, _motor, _backend) = runtime_parts(Arc::clone(&agent));
@@ -1291,7 +1613,504 @@ async fn second_chat_queues_fifo_without_preempting_first_run() {
     agent.release();
     wait_for_request(&agent, 2).await;
     assert_eq!(agent.texts(), vec!["@Bot first", "@Bot second"]);
+    assert_eq!(source.retain_calls(), 2);
+    assert_eq!(source.retained_count(), 0);
+    assert_eq!(source.release_calls(), 2);
     runtime.stop().await.unwrap();
+    assert!(source.release_all_calls() >= 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fact_recorded_after_wake_admission_is_drained_at_opening_processing_boundary() {
+    let agent = TestAgent::new(1);
+    let (runtime, source, _journal, _speech, _motor, _backend) = runtime_parts(agent.clone());
+    runtime.start_worker().unwrap();
+
+    let first = chat_input(100, "Alice", "@Bot first boundary");
+    source.set_chats(vec![first.clone()]);
+    runtime
+        .ingest_backend_event(chat_event(
+            "boundary-first",
+            1,
+            "Alice",
+            "@Bot first boundary",
+        ))
+        .unwrap();
+    wait_for_request(&agent, 1).await;
+
+    let second = chat_input(101, "Bob", "@Bot second boundary");
+    source.set_chats(vec![first, second]);
+    let capture_gate = source.gate_capture();
+    let admission = runtime
+        .ingest_backend_event(chat_event(
+            "boundary-second",
+            1,
+            "Bob",
+            "@Bot second boundary",
+        ))
+        .unwrap();
+    assert!(matches!(admission, ParticipantAdmission::WakeQueued { .. }));
+
+    agent.release();
+    tokio::time::timeout(Duration::from_secs(2), capture_gate.wait_started())
+        .await
+        .expect("second opening capture should reach the controlled gate");
+
+    let admission_gate = CleanupGate::new();
+    runtime.install_admission_observer_for_test(Arc::new(TestAdmissionObserver {
+        gate: Arc::clone(&admission_gate),
+    }));
+    let fact_runtime = Arc::clone(&runtime);
+    let fact_scope = scope(1, "minecraft:overworld");
+    let fact_producer = tokio::task::spawn_blocking(move || {
+        fact_runtime.emit_internal(internal_fact(
+            "damage-after-admission",
+            &fact_scope,
+            "self_hurt",
+        ))
+    });
+    tokio::time::timeout(Duration::from_secs(2), admission_gate.wait_started())
+        .await
+        .expect("producer should stop after queue admission before record_fact");
+    capture_gate.release();
+    admission_gate.release();
+    fact_producer
+        .await
+        .expect("fact producer task should join")
+        .expect("fact admission should succeed");
+    wait_for_request(&agent, 2).await;
+
+    let requests = agent.requests.lock().unwrap();
+    let second_events = requests[1]
+        .context
+        .frame
+        .events
+        .as_ref()
+        .expect("second opening has trigger and fact");
+    assert!(second_events.iter().any(|event| {
+        matches!(
+            event,
+            mineintent_contracts::agent::AgentEventV5::Summary { event_type, .. }
+                if event_type == "self_hurt"
+        )
+    }));
+
+    runtime.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn active_run_body_drain_precedes_queued_opening_without_fact_replay() {
+    let agent = TestAgent::new(1);
+    let (runtime, source, _journal, _speech, _motor, _backend) = runtime_parts(Arc::clone(&agent));
+    runtime.start_worker().unwrap();
+
+    let first = chat_input_at(120, "Alice", "@Bot seam first", "2026-08-03T00:11:00Z");
+    source.set_chats(vec![first.clone()]);
+    runtime
+        .ingest_backend_event(scoped_chat_event_at(
+            "seam-first",
+            "process-test",
+            1,
+            "world-test",
+            "minecraft:overworld",
+            "Alice",
+            "@Bot seam first",
+            &first.message.at,
+        ))
+        .unwrap();
+    wait_for_request(&agent, 1).await;
+
+    let run_scope = runtime.current_scope().expect("first run scope is active");
+    let generation = runtime.current_generation();
+    runtime
+        .emit_internal(internal_fact(&"seam-damage", &run_scope, "self_hurt"))
+        .unwrap();
+
+    let second = chat_input_at(121, "Bob", "@Bot seam second", "2026-08-03T00:11:01Z");
+    source.set_chats(vec![first, second]);
+    let admission = runtime
+        .ingest_backend_event(scoped_chat_event_at(
+            "seam-second",
+            "process-test",
+            1,
+            "world-test",
+            "minecraft:overworld",
+            "Bob",
+            "@Bot seam second",
+            "2026-08-03T00:11:01Z",
+        ))
+        .unwrap();
+    assert!(matches!(admission, ParticipantAdmission::WakeQueued { .. }));
+    assert_eq!(agent.requests.lock().unwrap().len(), 1);
+
+    let frame_source: Arc<dyn ParticipantFrameSource> = source.clone();
+    let observation = ParticipantObservationAfterSource::new(
+        frame_source,
+        runtime.fact_owner(),
+        run_scope.clone(),
+        generation,
+        "seam-first",
+    );
+    let checks = Arc::new(AtomicUsize::new(0));
+    let signal = NeverCancelled;
+    let guard = RealScopeGuard {
+        checks: Arc::clone(&checks),
+    };
+    let deadline = Deadline::after(std::time::Instant::now(), Duration::from_secs(1)).unwrap();
+    let first_observation = observation
+        .observe_after(
+            observation_invocation("seam-body-failure"),
+            ExecutionResource::Body,
+            serde_json::json!({"status": "failed"}),
+            CapabilityExecutionContext::new(
+                &run_scope.world_id,
+                "seam-first",
+                ExecutionControl::new(&signal, deadline),
+                &guard,
+            ),
+        )
+        .await
+        .unwrap()
+        .expect("body ordinary failure still has observation");
+    assert!(first_observation["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| { event["type"] == "self_hurt" }));
+
+    let signal = NeverCancelled;
+    let guard = RealScopeGuard {
+        checks: Arc::clone(&checks),
+    };
+    let deadline = Deadline::after(std::time::Instant::now(), Duration::from_secs(1)).unwrap();
+    let second_observation = observation
+        .observe_after(
+            observation_invocation("seam-body-second"),
+            ExecutionResource::Body,
+            serde_json::json!({"status": "failed"}),
+            CapabilityExecutionContext::new(
+                &run_scope.world_id,
+                "seam-first",
+                ExecutionControl::new(&signal, deadline),
+                &guard,
+            ),
+        )
+        .await
+        .unwrap()
+        .expect("second body sample keeps passive frame facts");
+    assert!(second_observation.get("events").is_none());
+
+    agent.release();
+    wait_for_request(&agent, 2).await;
+    let requests = agent.requests.lock().unwrap();
+    let second_opening = requests[1]
+        .context
+        .frame
+        .events
+        .as_ref()
+        .expect("second opening keeps its trigger event");
+    assert!(!second_opening.iter().any(|event| {
+        matches!(
+            event,
+            mineintent_contracts::agent::AgentEventV5::Summary { event_type, .. }
+                if event_type == "self_hurt"
+        )
+    }));
+    drop(requests);
+    assert_eq!(agent.texts(), vec!["@Bot seam first", "@Bot seam second"]);
+    assert_eq!(runtime.current_scope(), Some(run_scope));
+    assert_eq!(runtime.current_generation(), generation);
+    assert_eq!(source.retained_count(), 0);
+    assert!(checks.load(Ordering::SeqCst) >= 6);
+    runtime.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn body_observation_progresses_while_full_control_admission_waits() {
+    let agent = TestAgent::new(1);
+    let (runtime, source, journal, _speech, _motor, _backend) = runtime_parts(Arc::clone(&agent));
+    runtime.start_worker().unwrap();
+
+    let first = chat_input_at(130, "Alice", "@Bot deadlock first", "2026-08-03T00:12:00Z");
+    source.set_chats(vec![first.clone()]);
+    runtime
+        .ingest_backend_event(scoped_chat_event_at(
+            "deadlock-first",
+            "process-test",
+            1,
+            "world-test",
+            "minecraft:overworld",
+            "Alice",
+            "@Bot deadlock first",
+            &first.message.at,
+        ))
+        .unwrap();
+    wait_for_request(&agent, 1).await;
+
+    let run_scope = runtime.current_scope().expect("first run scope is active");
+    let generation = runtime.current_generation();
+    let queued: Vec<_> = (0..TEST_CONTROL_CAPACITY)
+        .map(|index| {
+            chat_input_at(
+                131 + index as u64,
+                "Alice",
+                &format!("@Bot deadlock queued {index}"),
+                &format!("2026-08-03T00:12:{:02}Z", index + 1),
+            )
+        })
+        .collect();
+    let blocked_chat = chat_input_at(140, "Bob", "@Bot deadlock blocked", "2026-08-03T00:12:11Z");
+    let mut chats = vec![first.clone()];
+    chats.extend(queued.iter().cloned());
+    chats.push(blocked_chat.clone());
+    source.set_chats(chats);
+
+    runtime
+        .emit_internal(internal_fact("deadlock-body-fact", &run_scope, "self_hurt"))
+        .unwrap();
+    for (index, chat) in queued.iter().enumerate() {
+        runtime
+            .ingest_backend_event(scoped_chat_event_at(
+                &format!("deadlock-queued-{index}"),
+                "process-test",
+                1,
+                "world-test",
+                "minecraft:overworld",
+                &chat.message.username,
+                &chat.message.text,
+                &chat.message.at,
+            ))
+            .unwrap();
+    }
+    assert_eq!(runtime.queue_counts_for_test().1, TEST_CONTROL_CAPACITY);
+
+    let blocked_runtime = Arc::clone(&runtime);
+    let blocked_event = scoped_chat_event_at(
+        "deadlock-blocked",
+        "process-test",
+        1,
+        "world-test",
+        "minecraft:overworld",
+        &blocked_chat.message.username,
+        &blocked_chat.message.text,
+        &blocked_chat.message.at,
+    );
+    let blocked =
+        tokio::task::spawn_blocking(move || blocked_runtime.ingest_backend_event(blocked_event));
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        runtime.wait_for_queue_waiters_for_test(1),
+    )
+    .await
+    .expect("the next addressed admission must wait for control capacity");
+
+    let frame_source: Arc<dyn ParticipantFrameSource> = source.clone();
+    let observation = Arc::new(ParticipantObservationAfterSource::new(
+        frame_source,
+        runtime.fact_owner(),
+        run_scope.clone(),
+        generation,
+        "deadlock-first",
+    ));
+    let observation_handle = tokio::runtime::Handle::current();
+    let mut observation_task = tokio::task::spawn_blocking({
+        let observation = Arc::clone(&observation);
+        move || {
+            let signal = NeverCancelled;
+            let checks = Arc::new(AtomicUsize::new(0));
+            let guard = RealScopeGuard { checks };
+            let deadline =
+                Deadline::after(std::time::Instant::now(), Duration::from_secs(1)).unwrap();
+            observation_handle.block_on(observation.observe_after(
+                observation_invocation("deadlock-body"),
+                ExecutionResource::Body,
+                serde_json::json!({"status": "failed"}),
+                CapabilityExecutionContext::new(
+                    &run_scope.world_id,
+                    "deadlock-first",
+                    ExecutionControl::new(&signal, deadline),
+                    &guard,
+                ),
+            ))
+        }
+    });
+    let body_result = tokio::time::timeout(Duration::from_secs(2), &mut observation_task).await;
+    assert!(
+        !blocked.is_finished(),
+        "the full control lane must remain blocked while the active run is held"
+    );
+
+    agent.release();
+    let blocked_admission = tokio::time::timeout(Duration::from_secs(2), blocked)
+        .await
+        .expect("blocked admission must complete after the active run releases capacity")
+        .expect("blocked admission task must not panic")
+        .expect("blocked admission must retain its structured success boundary");
+    assert!(matches!(
+        blocked_admission,
+        ParticipantAdmission::WakeQueued { .. }
+    ));
+
+    let body = body_result
+        .expect("body observation must finish while the producer waits")
+        .expect("body observation task must not panic")
+        .expect("body observation must succeed")
+        .expect("body observation must return a direct frame");
+    assert!(body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["type"] == "self_hurt"));
+
+    wait_for_request(&agent, TEST_CONTROL_CAPACITY + 2).await;
+    let expected_texts = std::iter::once(first.message.text.clone())
+        .chain(queued.iter().map(|chat| chat.message.text.clone()))
+        .chain(std::iter::once(blocked_chat.message.text.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(agent.texts(), expected_texts);
+
+    let payloads = journal.payloads();
+    let wake_ids = (0..TEST_CONTROL_CAPACITY)
+        .map(|index| format!("deadlock-queued-{index}"))
+        .chain(std::iter::once("deadlock-blocked".to_owned()))
+        .collect::<Vec<_>>();
+    let wake_tickets = wake_ids
+        .iter()
+        .map(|id| {
+            payloads
+                .iter()
+                .find(|payload| payload.get("id").and_then(serde_json::Value::as_str) == Some(id))
+                .map(admission_ticket)
+                .expect("every queued wake must be journaled")
+        })
+        .collect::<Vec<_>>();
+    assert!(wake_tickets
+        .windows(2)
+        .all(|tickets| tickets[0] < tickets[1]));
+
+    runtime.stop().await.unwrap();
+    assert_eq!(
+        runtime.lifecycle(),
+        mineintent_middle::participant::ParticipantLifecycle::Stopped
+    );
+    assert_eq!(source.retained_count(), 0);
+    assert_eq!(source.retain_calls(), TEST_CONTROL_CAPACITY + 2);
+    assert_eq!(source.release_calls(), TEST_CONTROL_CAPACITY + 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn waiting_old_wake_is_ignored_after_scope_generation_changes() {
+    let agent = TestAgent::new(1);
+    let (runtime, source, _journal, _speech, _motor, _backend) = runtime_parts(Arc::clone(&agent));
+    runtime.start_worker().unwrap();
+
+    let first = chat_input(150, "Alice", "@Bot stale wait first");
+    source.set_chats(vec![first.clone()]);
+    runtime
+        .ingest_backend_event(scoped_chat_event_at(
+            "stale-wait-first",
+            "process-test",
+            1,
+            "world-test",
+            "minecraft:overworld",
+            "Alice",
+            &first.message.text,
+            &first.message.at,
+        ))
+        .unwrap();
+    wait_for_request(&agent, 1).await;
+
+    let queued: Vec<_> = (0..TEST_CONTROL_CAPACITY)
+        .map(|index| {
+            chat_input(
+                151 + index as u64,
+                "Alice",
+                &format!("@Bot stale wait {index}"),
+            )
+        })
+        .collect();
+    for (index, chat) in queued.iter().enumerate() {
+        runtime
+            .ingest_backend_event(scoped_chat_event_at(
+                &format!("stale-wait-queued-{index}"),
+                "process-test",
+                1,
+                "world-test",
+                "minecraft:overworld",
+                &chat.message.username,
+                &chat.message.text,
+                &chat.message.at,
+            ))
+            .unwrap();
+    }
+    assert_eq!(runtime.queue_counts_for_test().1, TEST_CONTROL_CAPACITY);
+
+    let old_runtime = Arc::clone(&runtime);
+    let old_chat = chat_input(160, "Bob", "@Bot stale wait blocked");
+    let old_event = scoped_chat_event_at(
+        "stale-wait-blocked",
+        "process-test",
+        1,
+        "world-test",
+        "minecraft:overworld",
+        &old_chat.message.username,
+        &old_chat.message.text,
+        &old_chat.message.at,
+    );
+    let old_producer =
+        tokio::task::spawn_blocking(move || old_runtime.ingest_backend_event(old_event));
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        runtime.wait_for_queue_waiters_for_test(1),
+    )
+    .await
+    .expect("old wake producer must reach the bounded queue wait");
+
+    let new_scope = scope(2, "minecraft:nether");
+    let generation = runtime.current_generation();
+    let scope_runtime = Arc::clone(&runtime);
+    let scope_event = ParticipantInternalEvent::ScopeChanged {
+        id: "stale-wait-scope-change".to_owned(),
+        occurred_at: "2026-08-03T00:13:00Z".to_owned(),
+        scope: new_scope.clone(),
+        reason: "scope changes while an old wake waits for capacity".to_owned(),
+    };
+    let scope_producer =
+        tokio::task::spawn_blocking(move || scope_runtime.emit_internal(scope_event));
+    // Deterministic synchronization: wait until the scope-change producer has
+    // published the invalidation (generation bump), which happens while it
+    // still holds the admission serial. The old wake cannot resolve before
+    // that serial is released, so this proves the scope/generation change was
+    // applied while the old admission was still pending. The previous
+    // `wait_for_queue_waiters_for_test(2)` assertion was a scheduling
+    // assumption: the worker may pop a stale control item and wake the old
+    // producer before the scope producer registers as the second queue
+    // waiter, so the transient "two waiters" count is not a protocol fact.
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        runtime.wait_for_generation_for_test(generation + 1),
+    )
+    .await
+    .expect("scope change must be published while the old wake waits for capacity");
+
+    let old_admission = tokio::time::timeout(Duration::from_secs(2), old_producer)
+        .await
+        .expect("old waiting producer must complete after scope cancellation")
+        .expect("old producer task must not panic")
+        .expect("old producer must keep the structured admission boundary");
+    assert!(matches!(old_admission, ParticipantAdmission::Ignored));
+
+    let scope_admission = tokio::time::timeout(Duration::from_secs(2), scope_producer)
+        .await
+        .expect("scope change producer must complete after the stale ticket is skipped")
+        .expect("scope producer task must not panic")
+        .expect("scope change admission must succeed");
+    assert!(matches!(scope_admission, ParticipantAdmission::Recorded));
+    assert_eq!(runtime.current_scope(), Some(new_scope));
+
+    runtime.stop().await.unwrap();
+    assert_eq!(source.retained_count(), 0);
+    assert_eq!(source.retain_calls(), TEST_CONTROL_CAPACITY + 2);
 }
 
 #[tokio::test]
@@ -1321,7 +2140,7 @@ async fn journal_gate_serializes_later_chat_before_model() {
 #[tokio::test]
 async fn request_stop_wakes_full_control_and_overflow_producer() {
     let agent = TestAgent::new(0);
-    let (runtime, _source, journal, _speech, _motor, backend) = runtime_parts(Arc::clone(&agent));
+    let (runtime, source, journal, _speech, _motor, backend) = runtime_parts(Arc::clone(&agent));
     runtime.start_worker().unwrap();
     let mut failures = runtime.subscribe_failures();
     let current = scope(1, "minecraft:overworld");
@@ -1404,6 +2223,9 @@ async fn request_stop_wakes_full_control_and_overflow_producer() {
         failures.try_recv(),
         Err(tokio::sync::broadcast::error::TryRecvError::Empty)
     ));
+    assert_eq!(source.retain_calls(), TEST_CONTROL_CAPACITY + 1);
+    assert_eq!(source.retained_count(), 0);
+    assert_eq!(source.release_calls(), TEST_CONTROL_CAPACITY + 1);
     assert_ne!(
         runtime.lifecycle(),
         mineintent_middle::participant::ParticipantLifecycle::Faulted
@@ -2047,6 +2869,9 @@ async fn scope_change_cancels_active_run_and_drops_old_queue() {
         .unwrap();
     wait_for_request(&agent, 2).await;
     assert_eq!(agent.texts(), vec!["@Bot old", "@Bot new scope"]);
+    assert_eq!(source.retain_calls(), 3);
+    assert_eq!(source.retained_count(), 0);
+    assert_eq!(source.release_calls(), 3);
     runtime.stop().await.unwrap();
 }
 
@@ -2128,6 +2953,54 @@ async fn backend_listener_surfaces_source_error_and_uses_injected_debug_clock() 
         runtime.lifecycle(),
         mineintent_middle::participant::ParticipantLifecycle::Faulted
     );
+    runtime.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn terminal_path_releases_queued_trigger_retention() {
+    let agent = TestAgent::new(1);
+    let (runtime, source, _journal, _speech, _motor, backend) = runtime_parts(Arc::clone(&agent));
+    runtime.start_worker().unwrap();
+
+    let first = chat_input(501, "Alice", "@Bot terminal first");
+    source.set_chats(vec![first.clone()]);
+    runtime
+        .ingest_backend_event(chat_event(
+            "terminal-first",
+            1,
+            "Alice",
+            "@Bot terminal first",
+        ))
+        .unwrap();
+    wait_for_request(&agent, 1).await;
+
+    let second = chat_input(502, "Bob", "@Bot terminal queued");
+    source.set_chats(vec![first, second]);
+    runtime
+        .ingest_backend_event(chat_event(
+            "terminal-queued",
+            1,
+            "Bob",
+            "@Bot terminal queued",
+        ))
+        .unwrap();
+    assert_eq!(source.retained_count(), 1);
+
+    backend.emit(lifecycle_event(
+        "terminal-release",
+        BackendLifecyclePayload::Stopped {
+            reason: "release queued trigger".to_owned(),
+        },
+    ));
+    wait_for_lifecycle(
+        &runtime,
+        mineintent_middle::participant::ParticipantLifecycle::Stopped,
+    )
+    .await;
+    assert_eq!(source.retained_count(), 0);
+    assert_eq!(source.retain_calls(), 2);
+    assert_eq!(source.release_calls(), 2);
+    assert!(source.release_all_calls() >= 1);
     runtime.stop().await.unwrap();
 }
 
@@ -2556,6 +3429,7 @@ async fn agent_assembly_rejects_tool_definition_drift() {
     let result = assembly
         .run(
             scope(1, "minecraft:overworld"),
+            0,
             "assembly-event".to_owned(),
             request,
             ExecutionControl::new(&signal, deadline),
@@ -2595,6 +3469,7 @@ async fn agent_factory_binds_each_wake_scope_and_trigger_identity() {
     assembly
         .run(
             scope_one.clone(),
+            1,
             "chat-one".to_owned(),
             AgentRunRequest {
                 run_id: mineintent_contracts::agent::RunId::new("factory-one").unwrap(),
@@ -2614,6 +3489,7 @@ async fn agent_factory_binds_each_wake_scope_and_trigger_identity() {
     assembly
         .run(
             scope_two.clone(),
+            2,
             "chat-two".to_owned(),
             AgentRunRequest {
                 run_id: mineintent_contracts::agent::RunId::new("factory-two").unwrap(),
@@ -2653,6 +3529,7 @@ async fn agent_assembly_rejects_runner_bound_to_foreign_registry() {
     let result = assembly
         .run(
             scope(1, "minecraft:overworld"),
+            1,
             "foreign-registry".to_owned(),
             AgentRunRequest {
                 run_id: mineintent_contracts::agent::RunId::new("foreign-registry").unwrap(),
@@ -2730,6 +3607,7 @@ async fn real_concrete_runner_uses_one_registry_and_rebinds_scope_per_wake() {
         assembly
             .run(
                 scope,
+                1,
                 trigger.to_owned(),
                 AgentRunRequest {
                     run_id: mineintent_contracts::agent::RunId::new(run_id).unwrap(),
@@ -2957,6 +3835,7 @@ impl ParticipantAgentFactory for ConcreteRegistryFactory {
     fn build(
         &self,
         scope: &ParticipantScope,
+        _generation: u64,
         trigger_event_id: &str,
     ) -> Result<Arc<dyn ParticipantScopedAgentRunner>, AgentError> {
         self.bindings
@@ -3004,6 +3883,7 @@ impl ParticipantAgentFactory for AssemblyFactory {
     fn build(
         &self,
         scope: &ParticipantScope,
+        _generation: u64,
         trigger_event_id: &str,
     ) -> Result<Arc<dyn ParticipantScopedAgentRunner>, AgentError> {
         self.bindings

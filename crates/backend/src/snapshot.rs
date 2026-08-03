@@ -1,7 +1,7 @@
 use azalea::{
     entity::inventory::Inventory,
     entity::{
-        dimensions::EntityDimensions, Dead, EntityKindComponent, EntityUuid, LocalEntity,
+        dimensions::EntityDimensions, Dead, EntityKindComponent, EntityUuid, LoadedBy, LocalEntity,
         LookDirection, Physics, Pose, Position,
     },
     local_player::LocalGameMode,
@@ -264,7 +264,18 @@ fn transparent_hint(name: &str, outline_shape: &azalea::physics::collision::Voxe
     named_transparent || !is_full_cube(outline_shape)
 }
 
-fn local_registry_name(name: &str) -> String {
+/// The protocol entity key shared by observations and incremental entity
+/// events.  The connection epoch is part of the identity because Azalea can
+/// reuse the same ECS entity on reconnect.
+pub(crate) fn protocol_entity_key(connection_epoch: u64, protocol_entity_id: i32) -> String {
+    format!("{connection_epoch}:{protocol_entity_id}")
+}
+
+/// Normalize an Azalea registry name at the backend boundary.  Both packet
+/// producers and ECS snapshots must use this exact helper; `Debug` output is
+/// not a registry name (for example, `DarkOakChestBoat` would lose its
+/// separators when lowercased).
+pub(crate) fn canonical_entity_type(name: &str) -> String {
     name.strip_prefix("minecraft:").unwrap_or(name).to_owned()
 }
 
@@ -392,7 +403,7 @@ fn capture_inventory(bot: &Client) -> InventorySnapshot {
                     } else {
                         Some(InventorySlotSnapshot {
                             slot,
-                            item_name: local_registry_name(&item.kind().to_string()),
+                            item_name: canonical_entity_type(&item.kind().to_string()),
                             count: item.count(),
                         })
                     }
@@ -448,11 +459,36 @@ fn capture_tracked_players(bot: &Client) -> Vec<TrackedPlayerSnapshot> {
 }
 
 /// 读取当前客户端已知、仍在 ECS 中的协议实体；未加载的实体不伪造为可见。
+/// Backwards-compatible capture entry point. The runtime uses the epoch-aware
+/// companion below so incremental packet observations share the same key;
+/// callers of this public helper retain the historical UUID/ECS fallback key.
 pub fn capture_tracked_entities(bot: &Client) -> Vec<ProtocolEntitySnapshot> {
+    capture_tracked_entities_impl(bot, None)
+}
+
+pub(crate) fn capture_tracked_entities_for_epoch(
+    bot: &Client,
+    connection_epoch: u64,
+) -> Vec<ProtocolEntitySnapshot> {
+    capture_tracked_entities_impl(bot, Some(connection_epoch))
+}
+
+fn capture_tracked_entities_impl(
+    bot: &Client,
+    connection_epoch: Option<u64>,
+) -> Vec<ProtocolEntitySnapshot> {
+    let owner_world = bot
+        .try_query_self::<&WorldName, _>(|world_name| world_name.clone())
+        .ok();
+    let Some(owner_world) = owner_world else {
+        return Vec::new();
+    };
     let mut ecs = bot.ecs.write();
     let mut query = ecs.query::<(
         azalea::ecs::entity::Entity,
         &azalea::core::entity_id::MinecraftEntityId,
+        &LoadedBy,
+        &WorldName,
         &Position,
         &Physics,
         &LookDirection,
@@ -470,6 +506,8 @@ pub fn capture_tracked_entities(bot: &Client) -> Vec<ProtocolEntitySnapshot> {
             |(
                 entity,
                 protocol_entity_id,
+                loaded_by,
+                world_name,
                 position,
                 physics,
                 look,
@@ -481,20 +519,26 @@ pub fn capture_tracked_entities(bot: &Client) -> Vec<ProtocolEntitySnapshot> {
                 dimensions,
                 pose,
             )| {
-                if local.is_some() {
+                if local.is_some()
+                    || !entity_belongs_to_owner(loaded_by, bot.entity, world_name, &owner_world)
+                {
                     // 与 MineIntent 的 `bot.entities` 语义一致：自身已经在
                     // MinecraftSnapshotV1.self 中，不重复作为附近实体返回。
                     return None;
                 }
                 let uuid = uuid.map(|value| (**value).to_string());
+                let entity_key = connection_epoch
+                    .map(|epoch| protocol_entity_key(epoch, **protocol_entity_id))
+                    .unwrap_or_else(|| {
+                        uuid.clone()
+                            .unwrap_or_else(|| format!("ecs-{}", entity.to_bits()))
+                    });
                 Some(ProtocolEntitySnapshot {
-                    entity_key: uuid
-                        .clone()
-                        .unwrap_or_else(|| format!("ecs-{}", entity.to_bits())),
+                    entity_key,
                     protocol_entity_id: **protocol_entity_id,
                     name: None,
                     entity_type: kind
-                        .map(|value| local_registry_name(&(**value).to_string()))
+                        .map(|value| canonical_entity_type(&(**value).to_string()))
                         .unwrap_or_else(|| "unknown".to_owned()),
                     username: profile.map(|value| value.name.clone()),
                     uuid,
@@ -516,6 +560,15 @@ pub fn capture_tracked_entities(bot: &Client) -> Vec<ProtocolEntitySnapshot> {
         .collect();
     entities.sort_by(|left, right| left.entity_key.cmp(&right.entity_key));
     entities
+}
+
+fn entity_belongs_to_owner(
+    loaded_by: &LoadedBy,
+    owner: azalea::ecs::entity::Entity,
+    entity_world: &WorldName,
+    owner_world: &WorldName,
+) -> bool {
+    loaded_by.contains(&owner) && entity_world == owner_world
 }
 
 #[cfg(test)]
@@ -596,7 +649,66 @@ mod tests {
 
     #[test]
     fn registry_names_match_mineintent_local_name_contract() {
-        assert_eq!(local_registry_name("minecraft:dirt"), "dirt");
-        assert_eq!(local_registry_name("stone"), "stone");
+        assert_eq!(canonical_entity_type("minecraft:dirt"), "dirt");
+        assert_eq!(canonical_entity_type("stone"), "stone");
+    }
+
+    #[test]
+    fn entity_key_and_type_normalization_match_the_packet_identity_contract() {
+        assert_eq!(protocol_entity_key(7, 42), "7:42");
+        assert_eq!(
+            canonical_entity_type(
+                &azalea::registry::builtin::EntityKind::DarkOakChestBoat.to_string()
+            ),
+            "dark_oak_chest_boat"
+        );
+    }
+
+    #[test]
+    fn capture_membership_excludes_deferred_remove_and_cross_client_entities() {
+        let mut ecs = azalea::ecs::world::World::new();
+        let owner = ecs.spawn_empty().id();
+        let other_client = ecs.spawn_empty().id();
+        let owner_world = WorldName::new("minecraft:overworld");
+        let other_world = WorldName::new("minecraft:the_nether");
+        let mut loaded_by = LoadedBy(std::collections::HashSet::from([owner]));
+
+        assert!(entity_belongs_to_owner(
+            &loaded_by,
+            owner,
+            &owner_world,
+            &owner_world,
+        ));
+
+        // RemoveEntities removes the owner from LoadedBy before deferred ECS
+        // despawn. The entity is still present, but a refresh must not revive
+        // it into this client's observation.
+        loaded_by.0.remove(&owner);
+        assert!(!entity_belongs_to_owner(
+            &loaded_by,
+            owner,
+            &owner_world,
+            &owner_world,
+        ));
+
+        loaded_by.0.insert(other_client);
+        assert!(!entity_belongs_to_owner(
+            &loaded_by,
+            owner,
+            &owner_world,
+            &owner_world,
+        ));
+        assert!(!entity_belongs_to_owner(
+            &loaded_by,
+            other_client,
+            &other_world,
+            &owner_world,
+        ));
+        assert!(entity_belongs_to_owner(
+            &loaded_by,
+            other_client,
+            &owner_world,
+            &owner_world,
+        ));
     }
 }

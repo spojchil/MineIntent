@@ -6,15 +6,18 @@
 //! light and armor).
 
 pub mod information_adapters;
+pub mod production;
 pub mod runtime;
 
 pub use information_adapters::{
     BackendInformationAdapterBundle, BackendInformationScopeSource, BackendInventoryPort,
     BackendPerceptionPort, BackendSelfVitalsPort, SoundHistory,
 };
+pub use production::{ParticipantObservationAfterSource, ProductionParticipantFrameSource};
 pub use runtime::{
-    ParticipantAdmission, ParticipantAgentAssembly, ParticipantAgentAssemblyError,
-    ParticipantAgentFactory, ParticipantAgentPort, ParticipantClock, ParticipantEvent,
+    ParticipantAdmission, ParticipantAdmissionObserver, ParticipantAgentAssembly,
+    ParticipantAgentAssemblyError, ParticipantAgentFactory, ParticipantAgentPort, ParticipantClock,
+    ParticipantEvent, ParticipantFact, ParticipantFactBatch, ParticipantFactOwner,
     ParticipantFailure, ParticipantFailureSource, ParticipantFrameCapture, ParticipantFrameSource,
     ParticipantInternalEvent, ParticipantLifecycle, ParticipantMemorySource,
     ParticipantRegistryBound, ParticipantRuntime, ParticipantRuntimeConfig,

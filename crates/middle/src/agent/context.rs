@@ -21,6 +21,8 @@ pub struct AgentContextV5Input {
     /// Unread chat in old-to-new order.  The assembler retains the newest
     /// eight entries and reports the number dropped before that window.
     pub unread_chat: Vec<AgentChatInputV5>,
+    /// Records evicted by the source's bounded history before this input.
+    pub unread_chat_omitted: u64,
     pub sound: Option<SoundValues>,
     pub light: u8,
     /// Cross-run/registered events, including an optional trigger chat.
@@ -108,6 +110,7 @@ impl AgentContextV5Assembler {
             status,
             hotbar,
             unread_chat,
+            unread_chat_omitted,
             sound,
             light,
             events,
@@ -193,7 +196,7 @@ impl AgentContextV5Assembler {
                 .collect();
             Some(AgentChatV5 {
                 items,
-                omitted: retained_start as u64,
+                omitted: unread_chat_omitted.saturating_add(retained_start as u64),
             })
         };
 

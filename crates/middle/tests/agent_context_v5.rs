@@ -213,6 +213,7 @@ fn input(
             off_hand: Some(AgentItemStackV5::new("shield", 1).unwrap()),
         },
         unread_chat,
+        unread_chat_omitted: 0,
         sound: Some(SoundValues {
             recent_sounds: Some(vec![SoundObservation {
                 sound_name: Some("block.note_block.harp".to_owned()),

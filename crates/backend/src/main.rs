@@ -52,9 +52,12 @@ fn parse_args() -> RunConfig {
                     Duration::from_secs(value().parse().expect("--duration-secs 必须是数字"));
             }
             "--reconnect-delay-secs" => {
-                config.reconnect_delay = Duration::from_secs(
+                config.reconnect.initial_delay_ms = Duration::from_secs(
                     value().parse().expect("--reconnect-delay-secs 必须是数字"),
-                );
+                )
+                .as_millis()
+                .try_into()
+                .expect("--reconnect-delay-secs 超出毫秒范围");
             }
             "--send-chat" => config.initial_chat = Some(value()),
             "--help" | "-h" => {

@@ -11,7 +11,7 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Condvar, Mutex, MutexGuard,
+        Arc, Condvar, Mutex, MutexGuard, Weak,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -26,7 +26,8 @@ use mineintent_contracts::{
     information::SoundValues,
     minecraft::{
         BackendEventEnvelope, BackendEventKind, BackendEventListener, BackendEventPayload,
-        BackendLifecyclePayload, MinecraftBackendApi, ProtocolChatEvent, Subscription,
+        BackendLifecyclePayload, MinecraftBackendApi, MinecraftFrameFacts, ProtocolChatEvent,
+        Subscription,
     },
 };
 use serde_json::json;
@@ -114,6 +115,9 @@ pub struct ParticipantFrameCapture {
     pub status: Option<AgentStatusV5>,
     pub hotbar: AgentHotbarV5,
     pub unread_chat: Vec<AgentChatInputV5>,
+    /// Number of chat records evicted before the bounded source window.
+    /// The assembler adds records retained before its newest-eight view.
+    pub unread_chat_omitted: u64,
     pub sound: Option<SoundValues>,
     pub light: Option<u8>,
     pub events: Vec<AgentContextV5EventInput>,
@@ -131,6 +135,34 @@ pub trait ParticipantFrameSource: Send + Sync {
         &self,
         scope: &ParticipantScope,
     ) -> Result<ParticipantFrameCapture, ParticipantSourceError>;
+
+    /// Retains an addressed trigger until the corresponding opening capture
+    /// has copied it. Production sources use this to make the bounded chat
+    /// history lossless for admitted wakes.
+    fn retain_trigger(
+        &self,
+        _scope: &ParticipantScope,
+        _trigger: &PlayerChatMessage,
+    ) -> Result<(), ParticipantSourceError> {
+        Ok(())
+    }
+
+    /// Releases the retention established for one admitted trigger. The
+    /// default is intentionally inert for test/fallback sources.
+    fn release_trigger(&self, _scope: &ParticipantScope, _trigger: &PlayerChatMessage) {}
+
+    /// Drops any source-side retained triggers during runtime teardown. A
+    /// production app may still call the concrete source's `dispose` to stop
+    /// backend listeners; this hook only prevents queued wakes from keeping
+    /// bounded chat records alive.
+    fn release_retained_triggers(&self) {}
+}
+
+/// Optional synchronous probe used by deterministic runtime-shaped tests to
+/// hold the admission point between queue publication and fact recording.
+/// Production assembly leaves this unset.
+pub trait ParticipantAdmissionObserver: Send + Sync {
+    fn after_work_admitted_before_fact(&self, event_type: &str);
 }
 
 /// Read-only memory seam used while assembling each opening frame.
@@ -228,6 +260,7 @@ pub trait ParticipantAgentFactory: Send + Sync {
     fn build(
         &self,
         scope: &ParticipantScope,
+        generation: u64,
         trigger_event_id: &str,
     ) -> Result<Arc<dyn ParticipantScopedAgentRunner>, AgentError>;
 }
@@ -246,6 +279,7 @@ pub trait ParticipantAgentPort: Send + Sync {
     fn run<'a>(
         &'a self,
         scope: ParticipantScope,
+        generation: u64,
         trigger_event_id: String,
         request: AgentRunRequest<JsonAgentDecisionContextV5>,
         control: ExecutionControl<'a>,
@@ -276,11 +310,12 @@ impl ParticipantAgentPort for ParticipantAgentAssembly {
     fn run<'a>(
         &'a self,
         scope: ParticipantScope,
+        generation: u64,
         trigger_event_id: String,
         request: AgentRunRequest<JsonAgentDecisionContextV5>,
         control: ExecutionControl<'a>,
     ) -> ContractFuture<'a, Result<mineintent_contracts::agent::ModelRunResult, AgentError>> {
-        let runner = match self.factory.build(&scope, &trigger_event_id) {
+        let runner = match self.factory.build(&scope, generation, &trigger_event_id) {
             Ok(runner) => runner,
             Err(error) => return Box::pin(async move { Err(error) }),
         };
@@ -394,6 +429,129 @@ pub struct ParticipantFact {
     pub scope: ParticipantScope,
     pub event_type: String,
     pub summary: String,
+}
+
+/// One atomic result of a body/opening fact drain. The owner is shared by the
+/// runtime opening path and a production `observationAfter` source; it is not
+/// a second event interpretation layer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParticipantFactBatch {
+    pub facts: Vec<ParticipantFact>,
+    pub omitted: u64,
+    pub omitted_types: Vec<String>,
+}
+
+struct ParticipantFactOwnerState {
+    generation: u64,
+    scope: Option<ParticipantScope>,
+    facts: VecDeque<ParticipantFact>,
+    omitted: u64,
+    omitted_types: Vec<String>,
+}
+
+/// Bounded, scope-owned facts shared by opening frames and body
+/// `observationAfter`. Producers hold the runtime's admission serial before
+/// recording; `drain` takes that same serial before inspecting the owner, so
+/// an enqueue-then-record gap cannot be observed as a false empty drain.
+pub struct ParticipantFactOwner {
+    admission_serial: Arc<Mutex<()>>,
+    state: Mutex<ParticipantFactOwnerState>,
+}
+
+impl ParticipantFactOwner {
+    fn new(admission_serial: Arc<Mutex<()>>) -> Arc<Self> {
+        Arc::new(Self {
+            admission_serial,
+            state: Mutex::new(ParticipantFactOwnerState {
+                generation: 0,
+                scope: None,
+                facts: VecDeque::new(),
+                omitted: 0,
+                omitted_types: Vec::new(),
+            }),
+        })
+    }
+
+    /// Returns the owner state at the same admission linearization boundary
+    /// used by runtime producers. `None` means the run scope is stale.
+    pub fn drain(&self, scope: &ParticipantScope, generation: u64) -> Option<ParticipantFactBatch> {
+        let _serial = lock(&self.admission_serial);
+        self.drain_locked(scope, generation)
+    }
+
+    fn drain_locked(
+        &self,
+        scope: &ParticipantScope,
+        generation: u64,
+    ) -> Option<ParticipantFactBatch> {
+        let mut state = lock(&self.state);
+        if state.generation != generation || state.scope.as_ref() != Some(scope) {
+            return None;
+        }
+        Some(ParticipantFactBatch {
+            facts: state.facts.drain(..).collect(),
+            omitted: std::mem::take(&mut state.omitted),
+            omitted_types: std::mem::take(&mut state.omitted_types),
+        })
+    }
+
+    /// Runtime-only scope binding. The caller already owns the admission
+    /// serial and therefore must not call this from an un-serialized producer.
+    fn bind_scope(&self, generation: u64, scope: Option<ParticipantScope>) {
+        let mut state = lock(&self.state);
+        if state.generation != generation || state.scope != scope {
+            state.facts.clear();
+            state.omitted = 0;
+            state.omitted_types.clear();
+            state.generation = generation;
+            state.scope = scope;
+        }
+    }
+
+    /// Runtime-only fact record. The caller already owns the admission serial.
+    fn record(&self, generation: u64, fact: ParticipantFact) {
+        let mut state = lock(&self.state);
+        if state.generation != generation || state.scope.as_ref() != Some(&fact.scope) {
+            return;
+        }
+        if state.facts.len() == MAX_PENDING_FACTS {
+            let dropped_type = state.facts.pop_front().map(|dropped| dropped.event_type);
+            state.omitted = state.omitted.saturating_add(1);
+            if let Some(dropped_type) = dropped_type {
+                add_pending_omitted_type(&mut state.omitted_types, &dropped_type);
+            }
+        }
+        state.facts.push_back(fact);
+    }
+
+    /// Runtime-only omission record. The caller already owns the admission
+    /// serial and has already decided that the fact belongs to this scope.
+    fn record_omission(&self, generation: u64, event_type: String) {
+        let mut state = lock(&self.state);
+        if state.generation != generation {
+            return;
+        }
+        state.omitted = state.omitted.saturating_add(1);
+        add_pending_omitted_type(&mut state.omitted_types, &event_type);
+    }
+}
+
+fn startup_scope(facts: &MinecraftFrameFacts) -> Result<ParticipantScope, &'static str> {
+    let snapshot = &facts.snapshot;
+    if snapshot.process_session_id.is_empty()
+        || snapshot.connection_attempt_id.is_empty()
+        || snapshot.world.world_id.is_empty()
+        || snapshot.world.dimension.is_empty()
+        || snapshot.captured_at.is_empty()
+    {
+        return Err("backend startup snapshot is missing scope identity");
+    }
+    Ok(ParticipantScope::new(
+        snapshot.process_session_id.clone(),
+        snapshot.connection_epoch,
+        snapshot.world.world_id.clone(),
+        Some(snapshot.world.dimension.clone()),
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -515,6 +673,8 @@ pub struct ParticipantFailure {
 pub enum ParticipantSourceError {
     #[error("opening frame light is unavailable")]
     MissingLight,
+    #[error("participant source scope is stale: {0}")]
+    StaleScope(String),
     #[error("opening frame source is invalid: {0}")]
     Invalid(String),
     #[error("opening frame source failed: {0}")]
@@ -570,9 +730,6 @@ struct RuntimeState {
     scope: Option<ParticipantScope>,
     generation: u64,
     next_ordinal: u64,
-    pending_facts: VecDeque<ParticipantFact>,
-    pending_omitted: u64,
-    pending_omitted_types: Vec<String>,
     active: Option<ActiveRun>,
     terminal_pending: bool,
     // There is no frozen backend seam which can prove that an evicted
@@ -601,9 +758,7 @@ struct WakeItem {
     scope: ParticipantScope,
     occurred_at: String,
     trigger: PlayerChatMessage,
-    facts: Vec<ParticipantFact>,
-    omitted: u64,
-    omitted_types: Vec<String>,
+    trigger_retained: bool,
 }
 
 struct WorkItem {
@@ -636,7 +791,35 @@ struct OverflowEntry {
 
 enum QueueAdmission {
     Accepted,
+    Ignored,
     OrdinaryDropped { event_type: String },
+}
+
+/// Admission normally holds the runtime serial for the complete synchronous
+/// admission transaction.  A bounded queue wait is the one exception: the
+/// producer must not pin this guard while waiting for the worker to make room,
+/// because body observationAfter needs the same serial to drain facts.
+struct AdmissionSerialGuard<'a> {
+    serial: &'a Mutex<()>,
+    guard: Option<MutexGuard<'a, ()>>,
+}
+
+impl<'a> AdmissionSerialGuard<'a> {
+    fn new(serial: &'a Mutex<()>) -> Self {
+        Self {
+            serial,
+            guard: Some(lock(serial)),
+        }
+    }
+
+    fn release(&mut self) {
+        drop(self.guard.take());
+    }
+
+    fn reacquire(&mut self) {
+        debug_assert!(self.guard.is_none());
+        self.guard = Some(lock(self.serial));
+    }
 }
 
 struct ParticipantEventQueue {
@@ -678,7 +861,12 @@ impl ParticipantEventQueue {
         })
     }
 
-    fn enqueue(&self, mut item: WorkItem) -> Result<QueueAdmission, ParticipantRuntimeError> {
+    fn enqueue(
+        &self,
+        mut item: WorkItem,
+        serial: &mut AdmissionSerialGuard<'_>,
+        mut is_current: impl FnMut(&WorkItem) -> bool,
+    ) -> Result<QueueAdmission, ParticipantRuntimeError> {
         let mut state = lock(&self.state);
         let ticket = state.next_ticket;
         state.next_ticket = state.next_ticket.saturating_add(1);
@@ -688,12 +876,16 @@ impl ParticipantEventQueue {
             while !state.closed && state.next_admission != ticket {
                 state.waiting_producers = state.waiting_producers.saturating_add(1);
                 self.waiter_notify.notify_waiters();
+                serial.release();
                 state = self
                     .wake
                     .wait(state)
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 state.waiting_producers = state.waiting_producers.saturating_sub(1);
                 self.waiter_notify.notify_waiters();
+                drop(state);
+                serial.reacquire();
+                state = lock(&self.state);
             }
             if state.closed {
                 if state.next_admission == ticket {
@@ -701,6 +893,29 @@ impl ParticipantEventQueue {
                     self.wake.notify_all();
                 }
                 return Err(ParticipantRuntimeError::QueueClosed);
+            }
+
+            // The queue lock is intentionally not held while checking runtime
+            // scope/generation.  At this point the admission serial has been
+            // reacquired after any wait, so a stale producer can cancel its
+            // reserved ticket before publishing an old item.
+            drop(state);
+            let current = is_current(&item);
+            state = lock(&self.state);
+            if state.closed {
+                if state.next_admission == ticket {
+                    state.next_admission = state.next_admission.saturating_add(1);
+                    self.wake.notify_all();
+                }
+                return Err(ParticipantRuntimeError::QueueClosed);
+            }
+            if state.next_admission != ticket {
+                continue;
+            }
+            if !current {
+                state.next_admission = state.next_admission.saturating_add(1);
+                self.wake.notify_all();
+                return Ok(QueueAdmission::Ignored);
             }
 
             if item.terminal {
@@ -765,12 +980,16 @@ impl ParticipantEventQueue {
 
             state.waiting_producers = state.waiting_producers.saturating_add(1);
             self.waiter_notify.notify_waiters();
+            serial.release();
             state = self
                 .wake
                 .wait(state)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.waiting_producers = state.waiting_producers.saturating_sub(1);
             self.waiter_notify.notify_waiters();
+            drop(state);
+            serial.reacquire();
+            state = lock(&self.state);
         }
     }
 
@@ -944,7 +1163,9 @@ where
     run_deadline: Duration,
     wake_registry: WakeRegistry,
     assembler: AgentContextV5Assembler,
-    admission_serial: Mutex<()>,
+    admission_serial: Arc<Mutex<()>>,
+    fact_owner: Arc<ParticipantFactOwner>,
+    admission_observer: Mutex<Option<Arc<dyn ParticipantAdmissionObserver>>>,
     event_queue: Arc<ParticipantEventQueue>,
     admission_cancelled: AtomicBool,
     state: Mutex<RuntimeState>,
@@ -996,6 +1217,8 @@ where
         let (lifecycle_signal, _) = watch::channel(ParticipantLifecycle::Created);
         let (generation, _) = watch::channel(0_u64);
         let (failures, _) = broadcast::channel(32);
+        let admission_serial = Arc::new(Mutex::new(()));
+        let fact_owner = ParticipantFactOwner::new(Arc::clone(&admission_serial));
         Ok(Arc::new(Self {
             backend: config.backend,
             agent: config.agent,
@@ -1009,7 +1232,9 @@ where
             run_deadline: config.run_deadline,
             wake_registry: config.wake_registry,
             assembler: AgentContextV5Assembler,
-            admission_serial: Mutex::new(()),
+            admission_serial,
+            fact_owner,
+            admission_observer: Mutex::new(None),
             event_queue: ParticipantEventQueue::new(),
             admission_cancelled: AtomicBool::new(false),
             state: Mutex::new(RuntimeState {
@@ -1017,9 +1242,6 @@ where
                 scope: None,
                 generation: 0,
                 next_ordinal: 0,
-                pending_facts: VecDeque::new(),
-                pending_omitted: 0,
-                pending_omitted_types: Vec::new(),
                 active: None,
                 terminal_pending: false,
                 retired_process_sessions: std::collections::HashSet::new(),
@@ -1048,6 +1270,18 @@ where
         lock(&self.state).scope.clone()
     }
 
+    /// Current runtime generation for per-wake production source assembly.
+    pub fn current_generation(&self) -> u64 {
+        lock(&self.state).generation
+    }
+
+    /// A weak fact-owner port for a per-wake body observation source. The
+    /// weak edge keeps an observation dispatcher from retaining a stopped
+    /// runtime.
+    pub fn fact_owner(&self) -> Weak<ParticipantFactOwner> {
+        Arc::downgrade(&self.fact_owner)
+    }
+
     pub fn wake_registry(&self) -> &WakeRegistry {
         &self.wake_registry
     }
@@ -1072,11 +1306,40 @@ where
         self.event_queue.counts()
     }
 
+    /// Installs the optional admission probe before a deterministic test
+    /// drives a producer. It does not participate in the production wiring or
+    /// the model-visible contract.
+    #[doc(hidden)]
+    pub fn install_admission_observer_for_test(
+        &self,
+        observer: Arc<dyn ParticipantAdmissionObserver>,
+    ) {
+        *lock(&self.admission_observer) = Some(observer);
+    }
+
     /// Deterministic saturation probe for tests that need to establish that a
     /// producer is blocked on ticket/capacity before exercising cancellation.
     #[doc(hidden)]
     pub async fn wait_for_queue_waiters_for_test(&self, expected: usize) {
         self.event_queue.wait_for_waiters(expected).await;
+    }
+
+    /// Deterministic test probe that waits until the published generation
+    /// reaches at least `expected`. Scope/generation invalidation is always
+    /// published while the admission serial is still held, so observing the
+    /// new generation deterministically proves that a pending older admission
+    /// cannot have resolved yet (it still needs the serial to re-check).
+    #[doc(hidden)]
+    pub async fn wait_for_generation_for_test(&self, expected: u64) {
+        let mut receiver = self.generation.subscribe();
+        loop {
+            if *receiver.borrow() >= expected {
+                return;
+            }
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     /// Starts the ordered worker and attaches the runtime to an already-owned
@@ -1085,7 +1348,7 @@ where
     /// `stop(reason, OperationControl)` after [`Self::stop`] returns. No model
     /// call is made here.
     pub fn start_worker(self: &Arc<Self>) -> Result<(), ParticipantRuntimeError> {
-        {
+        let startup_result: Result<(), ParticipantRuntimeError> = {
             let _serial = lock(&self.admission_serial);
             let mut state = lock(&self.state);
             match state.lifecycle {
@@ -1099,9 +1362,45 @@ where
                     return Err(ParticipantRuntimeError::AlreadyStarted)
                 }
             }
-            let runtime = Arc::clone(self);
-            let worker = tokio::spawn(async move { runtime.worker_loop().await });
-            *lock(&self.worker) = Some(worker);
+            match self.backend.capture_frame_facts() {
+                Err(error) => Err(ParticipantRuntimeError::Backend(error.to_string())),
+                Ok(facts) => match startup_scope(&facts) {
+                    Err(message) => Err(ParticipantRuntimeError::Backend(message.to_owned())),
+                    Ok(scope) => {
+                        state.scope = Some(scope.clone());
+                        state.active_connection_attempt_id =
+                            Some(facts.snapshot.connection_attempt_id.clone());
+                        state.closed_scope = None;
+                        state.closed_connection_attempt_id = None;
+                        self.fact_owner
+                            .bind_scope(state.generation, state.scope.clone());
+                        self.record_fact(
+                            state.generation,
+                            ParticipantFact {
+                                id: format!("participant-started-{}", self.run_id_instance_id),
+                                occurred_at: facts.snapshot.captured_at,
+                                scope,
+                                event_type: "participant.started".to_owned(),
+                                summary: "AI 参与者已进入世界".to_owned(),
+                            },
+                        );
+                        let runtime = Arc::clone(self);
+                        let worker = tokio::spawn(async move { runtime.worker_loop().await });
+                        *lock(&self.worker) = Some(worker);
+                        Ok(())
+                    }
+                },
+            }
+        };
+        if let Err(error) = startup_result {
+            self.fail_runtime_sync(
+                ParticipantFailureSource::Backend,
+                "backend_startup_snapshot_failed",
+                "backend startup snapshot failed",
+                None,
+            );
+            self.rollback_startup_failure(&error);
+            return Err(error);
         }
         self.debug.update(DebugStateUpdate {
             connection: Some(self.backend.state()),
@@ -1149,7 +1448,7 @@ where
         &self,
         event: BackendEventEnvelope,
     ) -> Result<ParticipantAdmission, ParticipantRuntimeError> {
-        let _serial = lock(&self.admission_serial);
+        let mut serial = AdmissionSerialGuard::new(&self.admission_serial);
         self.ensure_running()?;
         let scope = ParticipantScope::from_backend(&event);
         self.debug.update(DebugStateUpdate {
@@ -1180,16 +1479,6 @@ where
         let (event_type, wake_candidate) = self.evaluate_backend_wake(&event, &scope)?;
         let terminal_lifecycle = terminal.then(|| backend_terminal_lifecycle(&event));
 
-        let (facts, omitted, omitted_types) = if wake_candidate.is_some() {
-            let mut state = lock(&self.state);
-            let facts = state.pending_facts.drain(..).collect();
-            let omitted = std::mem::take(&mut state.pending_omitted);
-            let omitted_types = std::mem::take(&mut state.pending_omitted_types);
-            (facts, omitted, omitted_types)
-        } else {
-            (Vec::new(), 0, Vec::new())
-        };
-
         let pending_fact =
             (!terminal && record_fact && wake_candidate.is_none()).then(|| ParticipantFact {
                 id: event.id.clone(),
@@ -1199,37 +1488,66 @@ where
                 summary: backend_event_summary(&event),
             });
 
+        let retained_trigger = wake_candidate.clone();
+        let mut trigger_retained = false;
+        if let Some(trigger) = retained_trigger.as_ref() {
+            self.frame_source.retain_trigger(&scope, trigger)?;
+            trigger_retained = true;
+        }
         let wake = wake_candidate.map(|trigger| WakeItem {
             ordinal,
             scope: scope.clone(),
             occurred_at: event.occurred_at.clone(),
             trigger,
-            facts,
-            omitted,
-            omitted_types,
+            trigger_retained,
         });
         let has_wake = wake.is_some();
         let backend_control = backend_event_is_control(&event);
-        let queue_admission = self.enqueue_work(WorkItem {
-            ticket: 0,
-            ordinal,
-            generation,
-            scope,
-            occurred_at: event.occurred_at.clone(),
-            event_id: event.id,
-            event_type,
-            wake,
-            scope_control: scope_control || backend_control,
-            terminal,
-            terminal_lifecycle,
-            overflow: None,
-        })?;
-        if let Some(fact) = pending_fact {
-            match queue_admission {
-                QueueAdmission::Accepted => self.record_fact(fact),
-                QueueAdmission::OrdinaryDropped { event_type } => {
-                    self.record_pending_omission(event_type)
+        let queue_admission = match self.enqueue_work(
+            WorkItem {
+                ticket: 0,
+                ordinal,
+                generation,
+                scope: scope.clone(),
+                occurred_at: event.occurred_at.clone(),
+                event_id: event.id,
+                event_type,
+                wake,
+                scope_control: scope_control || backend_control,
+                terminal,
+                terminal_lifecycle,
+                overflow: None,
+            },
+            &mut serial,
+        ) {
+            Ok(admission) => admission,
+            Err(error) => {
+                if trigger_retained {
+                    if let Some(trigger) = retained_trigger.as_ref() {
+                        self.frame_source.release_trigger(&scope, trigger);
+                    }
                 }
+                return Err(error);
+            }
+        };
+        if matches!(&queue_admission, QueueAdmission::Ignored) {
+            if trigger_retained {
+                if let Some(trigger) = retained_trigger.as_ref() {
+                    self.frame_source.release_trigger(&scope, trigger);
+                }
+            }
+            return Ok(ParticipantAdmission::Ignored);
+        }
+        if let Some(fact) = pending_fact {
+            if matches!(&queue_admission, QueueAdmission::Accepted) {
+                self.notify_admission_observer(&fact.event_type);
+            }
+            match queue_admission {
+                QueueAdmission::Accepted => self.record_fact(generation, fact),
+                QueueAdmission::OrdinaryDropped { event_type } => {
+                    self.record_pending_omission(generation, event_type)
+                }
+                QueueAdmission::Ignored => unreachable!("ignored admission returned above"),
             }
         }
         Ok(match has_wake {
@@ -1242,7 +1560,7 @@ where
         &self,
         event: ParticipantInternalEvent,
     ) -> Result<ParticipantAdmission, ParticipantRuntimeError> {
-        let _serial = lock(&self.admission_serial);
+        let mut serial = AdmissionSerialGuard::new(&self.admission_serial);
         self.ensure_running()?;
         let (id, occurred_at, scope) = {
             let (id, occurred_at, scope) = event.metadata();
@@ -1312,26 +1630,36 @@ where
             event_type: event_type.clone(),
             summary: bounded_summary(summary),
         });
-        let queue_admission = self.enqueue_work(WorkItem {
-            ticket: 0,
-            ordinal,
-            generation,
-            scope,
-            occurred_at,
-            event_id: id,
-            event_type,
-            wake: None,
-            scope_control: internal_scope_control,
-            terminal,
-            terminal_lifecycle,
-            overflow: None,
-        })?;
+        let queue_admission = self.enqueue_work(
+            WorkItem {
+                ticket: 0,
+                ordinal,
+                generation,
+                scope,
+                occurred_at,
+                event_id: id,
+                event_type,
+                wake: None,
+                scope_control: internal_scope_control,
+                terminal,
+                terminal_lifecycle,
+                overflow: None,
+            },
+            &mut serial,
+        )?;
+        if matches!(&queue_admission, QueueAdmission::Ignored) {
+            return Ok(ParticipantAdmission::Ignored);
+        }
         if let Some(fact) = pending_fact {
+            if matches!(&queue_admission, QueueAdmission::Accepted) {
+                self.notify_admission_observer(&fact.event_type);
+            }
             match queue_admission {
-                QueueAdmission::Accepted => self.record_fact(fact),
+                QueueAdmission::Accepted => self.record_fact(generation, fact),
                 QueueAdmission::OrdinaryDropped { event_type } => {
-                    self.record_pending_omission(event_type)
+                    self.record_pending_omission(generation, event_type)
                 }
+                QueueAdmission::Ignored => unreachable!("ignored admission returned above"),
             }
         }
         Ok(ParticipantAdmission::Recorded)
@@ -1381,10 +1709,12 @@ where
             }
         };
         if !should_wait {
+            self.frame_source.release_retained_triggers();
             return Ok(false);
         }
 
         self.perform_cleanup(cleanup, "participant_stopped", AgentError::run_cancelled());
+        self.frame_source.release_retained_triggers();
         if let Some(mut subscription) = lock(&self.subscription).take() {
             subscription.unsubscribe();
         }
@@ -1447,11 +1777,10 @@ where
             merge_active_cleanup(&mut cleanup, take_cleanup(&mut state));
             state.generation = state.generation.saturating_add(1);
             state.scope = None;
-            state.pending_facts.clear();
-            state.pending_omitted = 0;
-            state.pending_omitted_types.clear();
             state.terminal_pending = false;
             self.publish_generation(state.generation);
+            self.fact_owner
+                .bind_scope(state.generation, state.scope.clone());
             cleanup
         };
         self.perform_cleanup(
@@ -1459,6 +1788,7 @@ where
             "participant_startup_failed",
             AgentError::new(AgentErrorCode::ScopeInvalid, handler_code(error)),
         );
+        self.frame_source.release_retained_triggers();
     }
 
     fn ensure_running(&self) -> Result<(), ParticipantRuntimeError> {
@@ -1502,13 +1832,12 @@ where
             merge_active_cleanup(&mut cleanup, take_cleanup(&mut state));
             state.generation = state.generation.saturating_add(1);
             state.scope = None;
-            state.pending_facts.clear();
-            state.pending_omitted = 0;
-            state.pending_omitted_types.clear();
             state.closed_scope = Some(scope.clone());
             state.closed_connection_attempt_id = Some(event.connection_attempt_id.clone());
             state.active_connection_attempt_id = None;
             self.publish_generation(state.generation);
+            self.fact_owner
+                .bind_scope(state.generation, state.scope.clone());
             state.next_ordinal = state.next_ordinal.saturating_add(1);
             return BackendAdmission::Accepted {
                 generation: state.generation,
@@ -1593,9 +1922,6 @@ where
             cleanup = Cleanup::required();
             merge_active_cleanup(&mut cleanup, take_cleanup(&mut state));
             state.generation = state.generation.saturating_add(1);
-            state.pending_facts.clear();
-            state.pending_omitted = 0;
-            state.pending_omitted_types.clear();
             self.publish_generation(state.generation);
         }
         if changed {
@@ -1625,15 +1951,14 @@ where
             merge_active_cleanup(&mut cleanup, take_cleanup(&mut state));
             state.generation = state.generation.saturating_add(1);
             state.scope = None;
-            state.pending_facts.clear();
-            state.pending_omitted = 0;
-            state.pending_omitted_types.clear();
             state.active_connection_attempt_id = None;
             self.publish_generation(state.generation);
             state.lifecycle = ParticipantLifecycle::Stopping;
             state.terminal_pending = true;
             self.publish_lifecycle(ParticipantLifecycle::Stopping);
         }
+        self.fact_owner
+            .bind_scope(state.generation, state.scope.clone());
         state.next_ordinal = state.next_ordinal.saturating_add(1);
         let ordinal = state.next_ordinal;
         BackendAdmission::Accepted {
@@ -1674,9 +1999,6 @@ where
             cleanup = Cleanup::required();
             merge_active_cleanup(&mut cleanup, take_cleanup(&mut state));
             state.generation = state.generation.saturating_add(1);
-            state.pending_facts.clear();
-            state.pending_omitted = 0;
-            state.pending_omitted_types.clear();
             self.publish_generation(state.generation);
         }
         state.scope = Some(scope.clone());
@@ -1685,13 +2007,12 @@ where
             merge_active_cleanup(&mut cleanup, take_cleanup(&mut state));
             state.generation = state.generation.saturating_add(1);
             state.scope = None;
-            state.pending_facts.clear();
-            state.pending_omitted = 0;
-            state.pending_omitted_types.clear();
             self.publish_generation(state.generation);
             state.lifecycle = ParticipantLifecycle::Stopping;
             state.terminal_pending = true;
             self.publish_lifecycle(ParticipantLifecycle::Stopping);
+            self.fact_owner
+                .bind_scope(state.generation, state.scope.clone());
             state.next_ordinal = state.next_ordinal.saturating_add(1);
             return ExplicitAdmission::Accepted {
                 generation: state.generation,
@@ -1700,6 +2021,8 @@ where
                 terminal_lifecycle: Some(terminal_lifecycle),
             };
         }
+        self.fact_owner
+            .bind_scope(state.generation, state.scope.clone());
         state.next_ordinal = state.next_ordinal.saturating_add(1);
         ExplicitAdmission::Accepted {
             generation: state.generation,
@@ -1732,29 +2055,49 @@ where
         }
     }
 
-    fn record_fact(&self, fact: ParticipantFact) {
-        let mut state = lock(&self.state);
-        if state.pending_facts.len() == MAX_PENDING_FACTS {
-            let dropped_type = state
-                .pending_facts
-                .pop_front()
-                .map(|dropped| dropped.event_type);
-            state.pending_omitted = state.pending_omitted.saturating_add(1);
-            if let Some(dropped_type) = dropped_type {
-                add_pending_omitted_type(&mut state.pending_omitted_types, &dropped_type);
-            }
+    fn record_fact(&self, generation: u64, fact: ParticipantFact) {
+        self.fact_owner.record(generation, fact);
+    }
+
+    fn record_pending_omission(&self, generation: u64, event_type: String) {
+        self.fact_owner.record_omission(generation, event_type);
+    }
+
+    fn notify_admission_observer(&self, event_type: &str) {
+        let observer = lock(&self.admission_observer).clone();
+        if let Some(observer) = observer {
+            observer.after_work_admitted_before_fact(event_type);
         }
-        state.pending_facts.push_back(fact);
     }
 
-    fn record_pending_omission(&self, event_type: String) {
-        let mut state = lock(&self.state);
-        state.pending_omitted = state.pending_omitted.saturating_add(1);
-        add_pending_omitted_type(&mut state.pending_omitted_types, &event_type);
+    /// Drains facts at the opening-frame processing boundary, rather than at
+    /// wake admission.  A queued wake therefore cannot claim facts which are
+    /// still observable by an active run's body observationAfter.
+    fn drain_pending_facts(
+        &self,
+        scope: &ParticipantScope,
+        generation: u64,
+    ) -> Option<(Vec<ParticipantFact>, u64, Vec<String>)> {
+        let _serial = lock(&self.admission_serial);
+        let state = lock(&self.state);
+        if state.generation != generation
+            || state.lifecycle != ParticipantLifecycle::Running
+            || state.scope.as_ref() != Some(scope)
+        {
+            return None;
+        }
+        drop(state);
+        let batch = self.fact_owner.drain_locked(scope, generation)?;
+        Some((batch.facts, batch.omitted, batch.omitted_types))
     }
 
-    fn enqueue_work(&self, item: WorkItem) -> Result<QueueAdmission, ParticipantRuntimeError> {
-        self.event_queue.enqueue(item)
+    fn enqueue_work(
+        &self,
+        item: WorkItem,
+        serial: &mut AdmissionSerialGuard<'_>,
+    ) -> Result<QueueAdmission, ParticipantRuntimeError> {
+        self.event_queue
+            .enqueue(item, serial, |item| self.admission_item_is_current(item))
     }
 
     fn invalidate_generation(&self) -> Cleanup {
@@ -1763,11 +2106,10 @@ where
         merge_active_cleanup(&mut cleanup, take_cleanup(&mut state));
         state.generation = state.generation.saturating_add(1);
         state.scope = None;
-        state.pending_facts.clear();
-        state.pending_omitted = 0;
-        state.pending_omitted_types.clear();
         state.terminal_pending = false;
         self.publish_generation(state.generation);
+        self.fact_owner
+            .bind_scope(state.generation, state.scope.clone());
         cleanup
     }
 
@@ -1911,10 +2253,15 @@ where
 
     async fn process_item(&self, item: WorkItem) -> Result<(), ParticipantRuntimeError> {
         if !self.item_is_current(&item) {
+            self.release_item_trigger(&item);
             return Ok(());
         }
-        self.append_event_journal(&item).await?;
+        if let Err(error) = self.append_event_journal(&item).await {
+            self.release_item_trigger(&item);
+            return Err(error);
+        }
         if !self.item_is_current(&item) {
+            self.release_item_trigger(&item);
             return Ok(());
         }
         if item.terminal {
@@ -1930,17 +2277,34 @@ where
         self.process_wake(item).await
     }
 
+    fn release_item_trigger(&self, item: &WorkItem) {
+        if let Some(wake) = item.wake.as_ref().filter(|wake| wake.trigger_retained) {
+            self.frame_source
+                .release_trigger(&wake.scope, &wake.trigger);
+        }
+    }
+
     async fn process_wake(&self, item: WorkItem) -> Result<(), ParticipantRuntimeError> {
         let wake = item
             .wake
             .as_ref()
             .ok_or_else(|| ParticipantRuntimeError::Handler("wake item missing".to_owned()))?;
-        let capture = self.frame_source.capture(&wake.scope)?;
+        let capture_result = self.frame_source.capture(&wake.scope);
+        if wake.trigger_retained {
+            self.frame_source
+                .release_trigger(&wake.scope, &wake.trigger);
+        }
+        let capture = capture_result?;
         let memory = self.read_memory(&item.generation).await?;
         if !self.generation_is_current(item.generation) {
             return Ok(());
         }
-        let context = self.assemble_frame(wake, capture, memory)?;
+        let Some((facts, omitted, omitted_types)) =
+            self.drain_pending_facts(&wake.scope, item.generation)
+        else {
+            return Ok(());
+        };
+        let context = self.assemble_frame(wake, capture, memory, facts, omitted, omitted_types)?;
         let run_id = RunId::new(format!(
             "p-{}-{}-{}-{}-{}",
             self.run_id_namespace_digest,
@@ -1975,6 +2339,7 @@ where
         let task_cancellation = Arc::clone(&cancellation);
         let task_start_gate = Arc::clone(&start_gate);
         let run_scope = wake.scope.clone();
+        let run_generation = item.generation;
         let trigger_event_id = item.event_id.clone();
         let task: JoinHandle<Result<mineintent_contracts::agent::ModelRunResult, AgentError>> =
             tokio::spawn(async move {
@@ -1991,7 +2356,13 @@ where
                 }
                 let control = ExecutionControl::new(task_cancellation.as_ref(), deadline);
                 agent
-                    .run(run_scope, trigger_event_id, request, control)
+                    .run(
+                        run_scope,
+                        run_generation,
+                        trigger_event_id,
+                        request,
+                        control,
+                    )
                     .await
             });
         let abort = task.abort_handle();
@@ -2115,6 +2486,9 @@ where
         wake: &WakeItem,
         mut capture: ParticipantFrameCapture,
         memory: String,
+        facts: Vec<ParticipantFact>,
+        omitted: u64,
+        omitted_types: Vec<String>,
     ) -> Result<JsonAgentDecisionContextV5, ParticipantRuntimeError> {
         if capture.light.is_none() {
             return Err(ParticipantSourceError::MissingLight.into());
@@ -2180,7 +2554,7 @@ where
             });
         }
         let mut events = capture.events;
-        for fact in &wake.facts {
+        for fact in &facts {
             if fact.scope != wake.scope {
                 continue;
             }
@@ -2189,15 +2563,15 @@ where
                 summary: fact.summary.clone(),
             });
         }
-        if wake.omitted > 0 {
-            let omitted_types = if wake.omitted_types.is_empty() {
+        if omitted > 0 {
+            let omitted_types = if omitted_types.is_empty() {
                 String::new()
             } else {
-                format!("; types={}", wake.omitted_types.join(","))
+                format!("; types={}", omitted_types.join(","))
             };
             events.push(AgentContextV5EventInput::Summary {
                 event_type: "participant_events_omitted".to_owned(),
-                summary: format!("{} pending events omitted{}", wake.omitted, omitted_types),
+                summary: format!("{} pending events omitted{}", omitted, omitted_types),
             });
         }
         self.assembler
@@ -2209,6 +2583,7 @@ where
                 status: capture.status,
                 hotbar: capture.hotbar,
                 unread_chat: capture.unread_chat,
+                unread_chat_omitted: capture.unread_chat_omitted,
                 sound: capture.sound,
                 light: capture.light.expect("light checked above"),
                 events,
@@ -2229,6 +2604,17 @@ where
                 && item.scope_control)
             || (state.generation == item.generation
                 && state.lifecycle == ParticipantLifecycle::Running
+                && state.scope.as_ref() == Some(&item.scope))
+    }
+
+    fn admission_item_is_current(&self, item: &WorkItem) -> bool {
+        let state = lock(&self.state);
+        item.terminal
+            || (state.lifecycle == ParticipantLifecycle::Running
+                && item.wake.is_none()
+                && item.scope_control)
+            || (state.lifecycle == ParticipantLifecycle::Running
+                && state.generation == item.generation
                 && state.scope.as_ref() == Some(&item.scope))
     }
 
@@ -2276,6 +2662,7 @@ where
         self.teardown_subscription();
         self.admission_cancelled.store(true, Ordering::Release);
         self.event_queue.close_admission();
+        self.frame_source.release_retained_triggers();
         let mut state = lock(&self.state);
         if state.lifecycle == ParticipantLifecycle::Stopping && state.terminal_pending {
             state.lifecycle = terminal_lifecycle;
@@ -2353,6 +2740,7 @@ where
         self.admission_cancelled.store(true, Ordering::Release);
         self.event_queue.close_admission();
         let cleanup = {
+            let _serial = lock(&self.admission_serial);
             let mut state = lock(&self.state);
             if state.lifecycle == ParticipantLifecycle::Stopping
                 || state.lifecycle == ParticipantLifecycle::Stopped
@@ -2365,11 +2753,10 @@ where
             merge_active_cleanup(&mut cleanup, take_cleanup(&mut state));
             state.generation = state.generation.saturating_add(1);
             state.scope = None;
-            state.pending_facts.clear();
-            state.pending_omitted = 0;
-            state.pending_omitted_types.clear();
             state.terminal_pending = false;
             self.publish_generation(state.generation);
+            self.fact_owner
+                .bind_scope(state.generation, state.scope.clone());
             cleanup
         };
         self.perform_cleanup(
@@ -2377,6 +2764,7 @@ where
             "participant_handler_failed",
             AgentError::new(AgentErrorCode::ScopeInvalid, "participant_handler_failed"),
         );
+        self.frame_source.release_retained_triggers();
     }
 }
 
@@ -2684,7 +3072,7 @@ fn backend_fact_type(event: &BackendEventEnvelope) -> &'static str {
     }
 }
 
-fn safe_fact_event_type(event_type: &str) -> String {
+pub(crate) fn safe_fact_event_type(event_type: &str) -> String {
     if event_type == "player_chat" {
         "player_chat_fact".to_owned()
     } else {

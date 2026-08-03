@@ -181,6 +181,25 @@ impl MinecraftSnapshotV1 {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixture_snapshot_wire_has_no_frame_fact_fields() {
+        let fixture = crate::minecraft::fixture_snapshot();
+        let value = serde_json::to_value(&fixture).expect("snapshot fixture should serialize");
+
+        assert_eq!(value["protocol"], "mineintent.minecraft.snapshot.v1");
+        assert!(value.get("armor").is_none());
+        assert!(value.get("light").is_none());
+        assert_eq!(
+            serde_json::from_value::<MinecraftSnapshotV1>(value).expect("fixture should roundtrip"),
+            fixture
+        );
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EntityEquipmentSnapshot {

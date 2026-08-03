@@ -21,17 +21,18 @@ use mineintent_contracts::minecraft::{
     BackendEventMetadata, BackendEventPayload, BackendFailure, BackendFailureCode,
     BackendLifecyclePayload, BackendOverflowPayload, BackendReady, BackendState, BlockPosition,
     BlockReadResult, BoxFuture, DirectedViewportError, DirectedViewportProjection, GameMode,
-    LookRelativeRequest, MinecraftBackendApi, MinecraftBackendConfig, MinecraftMotorDriverApi,
-    MinecraftSnapshotV1, MoveInputRequest, ObservationEventListener, OperationControl,
-    OverflowType, ProtocolEntitySnapshot, ProtocolObservationSource, SelfPose, Subscription,
-    ViewportRead,
+    LookRelativeRequest, MinecraftBackendApi, MinecraftBackendConfig, MinecraftFrameFacts,
+    MinecraftMotorDriverApi, MinecraftSnapshotV1, MoveInputRequest, ObservationEventListener,
+    OperationControl, OverflowType, ProtocolEntitySnapshot, ProtocolObservationSource, SelfPose,
+    Subscription, ViewportRead,
 };
 use tokio::{runtime::Builder, sync::Notify, task::LocalSet};
 
 use crate::{
     protocol::{BackendEventEnvelope as RuntimeEventEnvelope, MotorDirection},
     runtime::{
-        run_with_handle, CommandCompletion, RunConfig, RuntimeHandle, RuntimeObservationSource,
+        run_with_handle, CommandCompletion, RunConfig, RuntimeFrameFacts, RuntimeHandle,
+        RuntimeObservationSource,
     },
     snapshot as runtime_snapshot,
 };
@@ -376,6 +377,25 @@ impl MinecraftBackendApi for MinecraftBackendFacade {
                 state: "snapshot_unavailable".to_owned(),
             })?;
         convert_snapshot(raw)
+    }
+
+    fn capture_frame_facts(&self) -> Result<MinecraftFrameFacts, BackendError> {
+        let session = self.ensure_ready("capture_frame_facts")?;
+        #[cfg(test)]
+        if let Some(snapshot) = session.scripted_snapshot.lock().clone() {
+            return Ok(MinecraftFrameFacts {
+                snapshot,
+                armor: None,
+                light: None,
+            });
+        }
+        let raw = session
+            .handle
+            .capture_frame_facts()
+            .ok_or_else(|| BackendError::NotReady {
+                state: "frame_facts_unavailable".to_owned(),
+            })?;
+        Ok(convert_frame_facts(raw)?)
     }
 
     fn subscribe(
@@ -1659,8 +1679,8 @@ fn run_config(config: &MinecraftBackendConfig) -> RunConfig {
         // Production owns the lifecycle; the diagnostic duration must not
         // stop a facade session.  Keep the field valid for the runtime seam.
         duration: Duration::from_secs(86_400),
-        reconnect_delay: Duration::from_millis(config.reconnect.initial_delay_ms),
-        reconnect_enabled: config.reconnect.enabled,
+        timeouts: config.timeouts.clone(),
+        reconnect: config.reconnect.clone(),
         auto_stop: false,
         emit_stdout: false,
         initial_chat: None,
@@ -1898,6 +1918,14 @@ fn convert_snapshot(
     Ok(snapshot)
 }
 
+fn convert_frame_facts(raw: RuntimeFrameFacts) -> Result<MinecraftFrameFacts, BackendError> {
+    Ok(MinecraftFrameFacts {
+        snapshot: convert_snapshot(raw.snapshot)?,
+        armor: raw.armor,
+        light: raw.light,
+    })
+}
+
 #[cfg(test)]
 fn ready_from_contract_snapshot(
     event: &BackendEventEnvelope,
@@ -2093,6 +2121,8 @@ mod tests {
         let runtime = run_config(&test_config());
         assert!(!runtime.auto_stop);
         assert!(!runtime.emit_stdout);
+        assert_eq!(runtime.timeouts, test_config().timeouts);
+        assert_eq!(runtime.reconnect, test_config().reconnect);
     }
 
     fn test_snapshot() -> MinecraftSnapshotV1 {
@@ -2151,6 +2181,108 @@ mod tests {
         }
     }
 
+    fn runtime_snapshot_for_frame_facts(
+        snapshot: &MinecraftSnapshotV1,
+    ) -> runtime_snapshot::MinecraftSnapshotV1 {
+        let game_mode = match snapshot.world.game_mode {
+            GameMode::Survival => "survival",
+            GameMode::Creative => "creative",
+            GameMode::Adventure => "adventure",
+            GameMode::Spectator => "spectator",
+        };
+        let experience = snapshot
+            .self_snapshot
+            .experience
+            .as_ref()
+            .map(|value| runtime_snapshot::ExperienceSnapshot {
+                level: value.level,
+                progress: value.progress as f32,
+                total: value.total as u32,
+            })
+            .unwrap_or(runtime_snapshot::ExperienceSnapshot {
+                level: 0,
+                progress: 0.0,
+                total: 0,
+            });
+
+        runtime_snapshot::MinecraftSnapshotV1 {
+            protocol: runtime_snapshot::SNAPSHOT_PROTOCOL.to_owned(),
+            snapshot_revision: snapshot.snapshot_revision,
+            lifecycle_revision: snapshot.lifecycle_revision,
+            captured_at: snapshot
+                .captured_at
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .expect("test snapshot timestamp"),
+            process_session_id: snapshot.process_session_id.clone(),
+            connection_epoch: snapshot.connection_epoch,
+            connection_attempt_id: snapshot.connection_attempt_id.clone(),
+            world: runtime_snapshot::WorldSnapshot {
+                world_id: snapshot.world.world_id.clone(),
+                dimension: snapshot.world.dimension.clone(),
+                minecraft_version: snapshot.world.minecraft_version.clone(),
+                protocol_version: snapshot.world.protocol_version,
+                game_mode: game_mode.to_owned(),
+                min_y: snapshot.world.min_y,
+                height: snapshot.world.height,
+            },
+            self_snapshot: runtime_snapshot::SelfSnapshot {
+                entity_key: snapshot.self_snapshot.entity_key.clone(),
+                username: snapshot.self_snapshot.username.clone(),
+                position: runtime_snapshot::Vec3Value {
+                    x: snapshot.self_snapshot.position.x,
+                    y: snapshot.self_snapshot.position.y,
+                    z: snapshot.self_snapshot.position.z,
+                },
+                velocity: runtime_snapshot::Vec3Value {
+                    x: snapshot.self_snapshot.velocity.x,
+                    y: snapshot.self_snapshot.velocity.y,
+                    z: snapshot.self_snapshot.velocity.z,
+                },
+                yaw: snapshot.self_snapshot.yaw as f32,
+                pitch: snapshot.self_snapshot.pitch as f32,
+                on_ground: snapshot.self_snapshot.on_ground,
+                alive: snapshot.self_snapshot.alive,
+                health: snapshot.self_snapshot.health as f32,
+                food: snapshot.self_snapshot.food as u32,
+                food_saturation: snapshot.self_snapshot.food_saturation as f32,
+                experience,
+            },
+            inventory: runtime_snapshot::InventorySnapshot {
+                selected_hotbar_slot: snapshot.inventory.selected_hotbar_slot,
+                slots: snapshot
+                    .inventory
+                    .slots
+                    .iter()
+                    .map(|slot| runtime_snapshot::InventorySlotSnapshot {
+                        slot: slot.slot as usize,
+                        item_name: slot.item_name.clone(),
+                        count: slot.count as i32,
+                    })
+                    .collect(),
+            },
+            tracked_players: snapshot
+                .tracked_players
+                .iter()
+                .map(|player| runtime_snapshot::TrackedPlayerSnapshot {
+                    player_key: player.player_key.clone(),
+                    uuid: player.uuid.clone().unwrap_or_default(),
+                    username: player.username.clone(),
+                    listed: player.listed,
+                    entity_tracked: player.entity_tracked,
+                    position: player.position.as_ref().map(|position| {
+                        runtime_snapshot::Vec3Value {
+                            x: position.x,
+                            y: position.y,
+                            z: position.z,
+                        }
+                    }),
+                    yaw: player.yaw.map(|value| value as f32),
+                    pitch: player.pitch.map(|value| value as f32),
+                })
+                .collect(),
+        }
+    }
+
     async fn ready_facade() -> (MinecraftBackendFacade, ScriptedDriver) {
         let (facade, driver) = MinecraftBackendFacade::scripted(test_config());
         let start = facade.start(never_control());
@@ -2166,6 +2298,33 @@ mod tests {
             .expect("scripted ready must be bounded")
             .expect("scripted ready should succeed");
         (facade, driver)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn facade_capture_frame_facts_returns_runtime_atomic_values() {
+        let (facade, driver) = ready_facade().await;
+        let session = driver.session();
+        let snapshot = facade
+            .snapshot()
+            .expect("scripted snapshot should be ready");
+
+        // Force the override through RuntimeHandle rather than the scripted
+        // snapshot shortcut, then verify the public facade converts all three
+        // values from that one runtime capture.
+        *session.scripted_snapshot.lock() = None;
+        session.handle.test_install_frame_facts(
+            runtime_snapshot_for_frame_facts(&snapshot),
+            Some(17),
+            Some(13),
+        );
+
+        let facts = facade
+            .capture_frame_facts()
+            .expect("runtime frame facts should be ready");
+        assert_eq!(facts.snapshot.connection_epoch, snapshot.connection_epoch);
+        assert_eq!(facts.snapshot.world.dimension, snapshot.world.dimension);
+        assert_eq!(facts.armor, Some(17));
+        assert_eq!(facts.light, Some(13));
     }
 
     async fn settle_next_command(driver: &ScriptedDriver, result: Result<(), BackendError>) {
