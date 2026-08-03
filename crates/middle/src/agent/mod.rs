@@ -10,6 +10,8 @@ mod run;
 mod runner;
 mod transcript;
 mod viewport;
+mod viewport_mirror;
+mod viewport_reducer;
 
 pub use context::{
     AgentChatInputV5, AgentChatTriggerV5, AgentContextV5Assembler, AgentContextV5AssemblyError,
@@ -33,3 +35,8 @@ pub use viewport::{
     BackendRoundViewportSampler, FixedUtcTimestampSource, NoRoundViewportSampler,
     RoundViewportSampler, SystemUtcTimestampSource, UtcTimestampSource,
 };
+pub use viewport_mirror::{
+    block_fact_key, KeyframeReason, MirrorLimits, PendingViewportFrame, ViewportCommitError,
+    ViewportFrame, ViewportMirror, ViewportMirrorError, ViewportObservation, ViewportProposal,
+};
+pub use viewport_reducer::{ViewportIncrementalReducer, ViewportReducedState, ViewportReplayError};
