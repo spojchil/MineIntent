@@ -10,6 +10,7 @@ mod ids;
 mod runner;
 mod tool;
 mod viewport;
+mod viewport_incremental;
 
 pub use context::{
     AgentChatItemV5, AgentChatMessageV5, AgentChatMovedMarkerV5, AgentChatMovedV5, AgentChatV5,
@@ -39,4 +40,10 @@ pub use tool::{
 pub use viewport::{
     ViewportFrameMessage, ViewportFrameMessageV2, ViewportFrameProtocol, ViewportFrameProtocolV2,
     ViewportFrameV2WireError, ViewportFrameWireError,
+};
+pub use viewport_incremental::{
+    ViewportBaselineId, ViewportDeltaError, ViewportDeltaV1, ViewportIncrementalFrameError,
+    ViewportIncrementalFrameMessageV1, ViewportIncrementalFrameProtocol,
+    ViewportIncrementalPayloadV1, ViewportKeyframeError, ViewportKeyframeV1, ViewportScope,
+    ViewportScopeError, ViewportUnverifiedReason,
 };
