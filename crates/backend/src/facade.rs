@@ -429,6 +429,7 @@ impl MinecraftBackendApi for MinecraftBackendFacade {
 
     fn send_chat(&self, message: String) -> Result<(), BackendError> {
         let session = self.ensure_ready("send_chat")?;
+        let bound_epoch = session.handle.connection_epoch();
         if message.is_empty() || message.contains(['\r', '\n', '\0']) {
             return Err(BackendError::InvalidCommand {
                 field: "message".to_owned(),
@@ -437,7 +438,7 @@ impl MinecraftBackendApi for MinecraftBackendFacade {
         }
         session
             .handle
-            .send_chat(message)
+            .send_chat_for_epoch(bound_epoch, message)
             .map_err(|error| map_runtime_command_error(&session, "send_chat", error))
     }
 }
@@ -1439,7 +1440,7 @@ impl MinecraftMotorDriverApi for FacadeMotor {
             }
             let completion = session
                 .handle
-                .look_relative(yaw, pitch)
+                .look_relative_for_epoch(bound_epoch, yaw, pitch)
                 .map_err(|error| map_runtime_command_error(&session, "look_relative", error))?;
             await_command(completion, control, "look_relative").await
         })
@@ -1467,7 +1468,14 @@ impl MinecraftMotorDriverApi for FacadeMotor {
                 .collect();
             let completion = session
                 .handle
-                .move_input(directions, request.duration_ms, request.sprint, None, None)
+                .move_input_for_epoch(
+                    bound_epoch,
+                    directions,
+                    request.duration_ms,
+                    request.sprint,
+                    None,
+                    None,
+                )
                 .map_err(|error| map_runtime_command_error(&session, "move_input", error))?;
             await_command(completion, control, "move_input").await
         })
@@ -1478,7 +1486,7 @@ impl MinecraftMotorDriverApi for FacadeMotor {
         let completion = self
             .session
             .handle
-            .release_all()
+            .release_all_for_epoch(self.bound_epoch)
             .map_err(|error| map_runtime_command_error(&self.session, "release_all", error))?;
         completion.wait_blocking()
     }
