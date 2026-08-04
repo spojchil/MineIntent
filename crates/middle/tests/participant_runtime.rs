@@ -3948,3 +3948,41 @@ impl mineintent_contracts::agent::CancellationSignal for NeverCancelled {
         Box::pin(async { std::future::pending::<AgentError>().await })
     }
 }
+
+/// 实测抓到的移植偏差回归：模型 provider 一次失败曾把整个 runtime 打成
+/// Faulted，此后任何指名聊天都不再唤醒（同伴永久失聪）。oracle
+/// runtime.ts:311-314 只 catch 住记 model.decision_failed 并继续。
+/// 本回归钉住：失败后 runtime 仍 Running，且下一次唤醒照常进模型。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_provider_failure_ends_the_run_not_the_participant() {
+    let agent = TestAgent::new(0);
+    let (runtime, source, _journal, _speech, _motor, _backend) = runtime_parts(Arc::clone(&agent));
+    runtime.start_worker().unwrap();
+
+    agent.fail.store(true, Ordering::SeqCst);
+    let first = chat_input(10, "Alice", "@Bot first");
+    source.set_chats(vec![first.clone()]);
+    runtime
+        .ingest_backend_event(chat_event("41", 1, "Alice", "@Bot first"))
+        .unwrap();
+    wait_for_request(&agent, 1).await;
+    assert_eq!(
+        runtime.lifecycle(),
+        mineintent_middle::participant::ParticipantLifecycle::Running,
+        "模型失败不得让同伴进入 Faulted"
+    );
+
+    agent.fail.store(false, Ordering::SeqCst);
+    let second = chat_input(11, "Bob", "@Bot second");
+    source.set_chats(vec![first, second]);
+    runtime
+        .ingest_backend_event(chat_event("42", 1, "Bob", "@Bot second"))
+        .unwrap();
+    wait_for_request(&agent, 2).await;
+    assert_eq!(
+        agent.texts(),
+        vec!["@Bot first", "@Bot second"],
+        "失败之后的唤醒必须照常进入模型"
+    );
+    runtime.stop().await.unwrap();
+}

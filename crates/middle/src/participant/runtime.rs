@@ -2194,6 +2194,25 @@ where
         self.mark_faulted_after_handler();
     }
 
+    /// 单轮模型失败的落盘：与 runtime 级 participant.failure 分开，
+    /// 便于事后区分「这一轮没成」与「同伴已经不再响应」。
+    fn journal_model_failure_detached(&self, summary: &str) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let journal = Arc::clone(&self.journal);
+        let summary = bounded_summary(summary);
+        handle.spawn(async move {
+            let payload = json!({
+                "code": "decision_failed",
+                "summary": summary,
+            });
+            if let Some(payload) = payload.as_object().cloned() {
+                let _ = journal.append("model.failed".to_owned(), payload).await;
+            }
+        });
+    }
+
     fn journal_failure_detached(&self, error: &ParticipantRuntimeError) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
@@ -2434,10 +2453,18 @@ where
                     })),
                     ..DebugStateUpdate::default()
                 });
-                Err(ParticipantRuntimeError::Handler(format!(
-                    "agent runner returned {}",
-                    error.code
-                )))
+                // 模型侧失败终结的是这一轮，不是这个同伴（oracle
+                // runtime.ts:311-314 同形：catch 住、记 model.decision_failed、
+                // 继续接受下一次唤醒）。provider 的一次抖动不得让同伴永久失聪。
+                let summary = format!("{}: {}", error.code, error.summary);
+                self.fail_runtime_sync(
+                    ParticipantFailureSource::Model,
+                    "decision_failed",
+                    &summary,
+                    self.current_scope(),
+                );
+                self.journal_model_failure_detached(&summary);
+                Ok(())
             }
         }
     }
