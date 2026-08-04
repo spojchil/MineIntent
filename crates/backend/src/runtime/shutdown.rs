@@ -114,8 +114,7 @@ impl SharedRuntime {
     ) -> Result<T, BackendError> {
         let _admission = self.command_admission.lock();
         let operation = format!("command:{command_id}");
-        if let Some(error) =
-            self.client_command_error_locked(client, connection_epoch, &operation)
+        if let Some(error) = self.client_command_error_locked(client, connection_epoch, &operation)
         {
             return Err(error);
         }
@@ -369,13 +368,16 @@ impl SharedRuntime {
         let cancelled = owner.map_or_else(
             || !self.command_execution_allowed(),
             |(client, connection_epoch)| {
-                self.client_command_error(client, connection_epoch, &format!("command:{command_id}"))
-                    .is_some()
+                self.client_command_error(
+                    client,
+                    connection_epoch,
+                    &format!("command:{command_id}"),
+                )
+                .is_some()
             },
-        )
-            || completion
-                .as_ref()
-                .is_some_and(|completion| completion.cancelled.load(Ordering::Acquire));
+        ) || completion
+            .as_ref()
+            .is_some_and(|completion| completion.cancelled.load(Ordering::Acquire));
         if cancelled {
             if let Some(completion) = completion {
                 completion.cancel(format!("command:{command_id}"), true);

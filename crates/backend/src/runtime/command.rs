@@ -364,16 +364,16 @@ fn release_active_movement_and_finish_for_owner(
             ) {
                 // The old task still owns its bookkeeping, but it must not
                 // touch an entity that may now represent the next attempt.
-                error
+                Err(error)
             } else if release_inputs() {
                 result_if_released
             } else {
-                command_component_failure(failure_operation)
+                Err(command_component_failure(failure_operation))
             }
         } else if release_inputs() {
             result_if_released
         } else {
-            command_component_failure(failure_operation)
+            Err(command_component_failure(failure_operation))
         }
     };
     // Keep the active completion/id visible to stop until the physical release
@@ -392,6 +392,9 @@ fn release_active_movement_and_finish_for_owner(
 
 pub(super) fn handle_command(bot: &Client, shared: &Arc<SharedRuntime>, queued: QueuedCommand) {
     let QueuedCommand {
+        // 陈旧拒绝在入队时、所有权证明在出队时完成；epoch 戳随队列项保留，
+        // 执行点复检属后续切片，此处显式弃用。
+        connection_epoch: _,
         envelope,
         completion,
     } = queued;
