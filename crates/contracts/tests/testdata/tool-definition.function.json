@@ -1,0 +1,12 @@
+{
+  "type": "function",
+  "function": {
+    "name": "look_relative",
+    "description": "转头",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  }
+}

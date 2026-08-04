@@ -1,0 +1,32 @@
+[package]
+name = "mineintent-app"
+description = "MineIntent 组合根：装配 backend、Participant runtime 与模型 provider"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "mineintent"
+path = "src/main.rs"
+
+# 纵向验收用的确定性假人：以同一份 Azalea 进服发指名聊天。
+# 26.1.2（协议 775）下 mineflayer 假人无法进服，故不复用 TS 侧脚本。
+[[bin]]
+name = "fake_player"
+path = "src/bin/fake_player.rs"
+
+[dependencies]
+mineintent-backend.workspace = true
+mineintent-contracts.workspace = true
+mineintent-middle.workspace = true
+azalea.workspace = true
+parking_lot.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["full"] }
+uuid.workspace = true
+
+[lints]
+workspace = true

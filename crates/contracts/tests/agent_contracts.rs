@@ -1,0 +1,630 @@
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context as TaskContext, Poll, Wake, Waker},
+    time::{Duration, Instant},
+};
+
+use mineintent_contracts::agent::{
+    fixtures, AgentContextProtocol, AgentDecisionContext, AgentDecisionContextV3, AgentError,
+    AgentErrorCode, AgentRunRequest, AgentRunner, CancellationSignal, ContractFuture, Deadline,
+    ExecutionControl, JsonAgentDecisionContext, JsonAgentDecisionContextV4, ModelProvider,
+    ModelRunResult, ModelUsage, RequiredNullable, StableContext, StableContextV3, ToolCallKey,
+    ToolDefinitionName, ToolExecution, ToolInvocation, ToolName, WireToolDefinition,
+    MAX_AGENT_RUN_TOOLS,
+};
+use serde::de::DeserializeOwned;
+use serde_json::{json, Value};
+
+const AGENT_CONTEXT: &str = include_str!("testdata/agent-context.v3.json");
+const AGENT_CONTEXT_V4: &str = include_str!("testdata/agent-context.v4.json");
+const TOOL_DEFINITION: &str = include_str!("testdata/tool-definition.function.json");
+const TOOL_INVOCATION: &str = include_str!("testdata/tool-invocation.valid.json");
+const TOOL_EXECUTION: &str = include_str!("testdata/tool-execution.v2.json");
+const AGENT_RUN: &str = include_str!("testdata/agent-run.v1.json");
+
+#[test]
+fn deterministic_fixtures_match_the_frozen_wire_examples() {
+    let context: JsonAgentDecisionContext = parse(AGENT_CONTEXT);
+    let definition: WireToolDefinition = parse(TOOL_DEFINITION);
+    let invocation: ToolInvocation = parse(TOOL_INVOCATION);
+
+    assert_eq!(context, fixtures::agent_context());
+    let context_v4: JsonAgentDecisionContextV4 = parse(AGENT_CONTEXT_V4);
+    assert_eq!(context_v4, fixtures::agent_context_v4());
+    assert_eq!(definition, fixtures::tool_definition());
+    assert_eq!(invocation, fixtures::tool_invocation());
+    assert_eq!(fixtures::agent_frame(), fixtures::agent_frame());
+    assert_eq!(fixtures::agent_run_request().run_id.as_str(), "run-1");
+    assert_eq!(fixtures::model_run_result(), fixtures::model_run_result());
+}
+
+#[test]
+fn legacy_public_context_names_remain_explicit_v3_aliases() {
+    let legacy: AgentDecisionContext = fixtures::agent_context();
+    let explicit: AgentDecisionContextV3 = legacy.clone();
+    let legacy_stable: StableContext = legacy.stable.clone();
+    let explicit_stable: StableContextV3 = legacy_stable;
+
+    assert_eq!(explicit, fixtures::agent_context());
+    assert_eq!(explicit_stable, fixtures::agent_context().stable);
+    assert_eq!(
+        serde_json::to_value(legacy).unwrap()["protocol"],
+        "mineintent.agent-context.v3"
+    );
+}
+
+#[test]
+fn context_v3_round_trips_with_strict_outer_shapes() {
+    let context: JsonAgentDecisionContext = parse(AGENT_CONTEXT);
+    let encoded = serde_json::to_value(&context).expect("context serializes");
+    assert_eq!(encoded, fixture_value(AGENT_CONTEXT));
+    assert_eq!(context.protocol, AgentContextProtocol::V3);
+
+    let mut wrong_protocol = fixture_value(AGENT_CONTEXT);
+    wrong_protocol["protocol"] = json!("mineintent.agent-context.v2");
+    assert_rejected::<JsonAgentDecisionContext>(wrong_protocol);
+
+    let mut unknown_top_level = fixture_value(AGENT_CONTEXT);
+    insert_unknown(&mut unknown_top_level, "profile");
+    assert_rejected::<JsonAgentDecisionContext>(unknown_top_level);
+
+    let mut unknown_frame = fixture_value(AGENT_CONTEXT);
+    insert_unknown(&mut unknown_frame["frame"], "viewport");
+    assert_rejected::<JsonAgentDecisionContext>(unknown_frame);
+
+    let mut unknown_world = fixture_value(AGENT_CONTEXT);
+    insert_unknown(&mut unknown_world["frame"]["world"], "weather");
+    assert_rejected::<JsonAgentDecisionContext>(unknown_world);
+
+    let mut unknown_event = fixture_value(AGENT_CONTEXT);
+    unknown_event["frame"]["events"] = json!([{
+        "type": "damage",
+        "summary": "受到伤害",
+        "amount": 1
+    }]);
+    assert_rejected::<JsonAgentDecisionContext>(unknown_event);
+}
+
+#[test]
+fn context_v4_binds_the_discriminator_to_the_single_text_stable_shape() {
+    let context: JsonAgentDecisionContextV4 = parse(AGENT_CONTEXT_V4);
+    let encoded = serde_json::to_value(&context).expect("v4 context serializes");
+    assert_eq!(encoded, fixture_value(AGENT_CONTEXT_V4));
+    assert_eq!(context.protocol, AgentContextProtocol::V4);
+    assert_eq!(context.stable.memory, "玩家怕高");
+
+    let mut empty = fixture_value(AGENT_CONTEXT_V4);
+    empty["stable"]["memory"] = json!("");
+    let decoded: JsonAgentDecisionContextV4 =
+        serde_json::from_value(empty).expect("v4 memory may be empty");
+    assert_eq!(decoded.stable.memory, "");
+
+    let mut missing = fixture_value(AGENT_CONTEXT_V4);
+    missing["stable"].as_object_mut().unwrap().remove("memory");
+    assert_rejected::<JsonAgentDecisionContextV4>(missing);
+
+    let mut null_memory = fixture_value(AGENT_CONTEXT_V4);
+    null_memory["stable"]["memory"] = Value::Null;
+    assert_rejected::<JsonAgentDecisionContextV4>(null_memory);
+
+    let mut unknown_stable = fixture_value(AGENT_CONTEXT_V4);
+    insert_unknown(&mut unknown_stable["stable"], "memories");
+    assert_rejected::<JsonAgentDecisionContextV4>(unknown_stable);
+
+    let mut wrong_shape = fixture_value(AGENT_CONTEXT_V4);
+    wrong_shape["stable"] = json!({"memories": []});
+    assert_rejected::<JsonAgentDecisionContextV4>(wrong_shape);
+
+    let mut v3_discriminator = fixture_value(AGENT_CONTEXT);
+    v3_discriminator["protocol"] = json!("mineintent.agent-context.v4");
+    v3_discriminator["stable"] = json!({"memory": "玩家怕高"});
+    assert_rejected::<JsonAgentDecisionContext>(v3_discriminator);
+
+    let mut v4_discriminator = fixture_value(AGENT_CONTEXT_V4);
+    v4_discriminator["protocol"] = json!("mineintent.agent-context.v3");
+    v4_discriminator["stable"] = json!({"memories": []});
+    assert_rejected::<JsonAgentDecisionContextV4>(v4_discriminator);
+
+    let mut unknown_top_level = fixture_value(AGENT_CONTEXT_V4);
+    insert_unknown(&mut unknown_top_level, "profile");
+    assert_rejected::<JsonAgentDecisionContextV4>(unknown_top_level);
+
+    let mut unknown_frame = fixture_value(AGENT_CONTEXT_V4);
+    insert_unknown(&mut unknown_frame["frame"], "viewport");
+    assert_rejected::<JsonAgentDecisionContextV4>(unknown_frame);
+}
+
+#[test]
+fn v4_run_request_round_trips_without_reopening_the_v3_context_shape() {
+    let request = fixtures::agent_run_request_v4();
+    let encoded = serde_json::to_value(&request).expect("v4 request serializes");
+    assert_eq!(
+        encoded["context"]["protocol"],
+        "mineintent.agent-context.v4"
+    );
+    assert_eq!(encoded["context"]["stable"], json!({"memory": "玩家怕高"}));
+    let decoded: AgentRunRequest<JsonAgentDecisionContextV4> =
+        serde_json::from_value(encoded.clone()).expect("v4 request decodes");
+    assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+
+    let mut wrong_context = encoded;
+    wrong_context["context"]["protocol"] = json!("mineintent.agent-context.v3");
+    wrong_context["context"]["stable"] = json!({"memories": []});
+    assert_rejected::<AgentRunRequest<JsonAgentDecisionContextV4>>(wrong_context);
+}
+
+#[test]
+fn optional_frame_fields_reject_explicit_null_and_non_finite_output() {
+    for key in [
+        "player",
+        "self",
+        "status",
+        "inventory",
+        "sound",
+        "omittedEvents",
+    ] {
+        let mut value = fixture_value(AGENT_CONTEXT);
+        value["frame"][key] = Value::Null;
+        assert_rejected::<JsonAgentDecisionContext>(value);
+    }
+
+    let mut null_time = fixture_value(AGENT_CONTEXT);
+    null_time["frame"]["world"]["timeOfDay"] = Value::Null;
+    assert_rejected::<JsonAgentDecisionContext>(null_time);
+
+    let mut frame = fixtures::agent_frame();
+    frame
+        .self_state
+        .as_mut()
+        .expect("fixture has self observation")
+        .yaw_degrees = f64::NAN;
+    assert!(serde_json::to_value(frame).is_err());
+
+    let mut frame = fixtures::agent_frame();
+    frame.world.time_of_day = Some(f64::INFINITY);
+    assert!(serde_json::to_value(frame).is_err());
+}
+
+#[test]
+fn information_owned_payloads_remain_opaque_inside_strict_context_envelopes() {
+    let mut value = fixture_value(AGENT_CONTEXT);
+    value["stable"]["memories"][0]["futureMemoryField"] = json!({"from": "I01"});
+    value["frame"]["status"] = json!({"futureStatusField": [1, 2, 3]});
+
+    let decoded: JsonAgentDecisionContext =
+        serde_json::from_value(value.clone()).expect("A-owned payloads are opaque here");
+    assert_eq!(
+        decoded.stable.memories[0]["futureMemoryField"],
+        json!({"from": "I01"})
+    );
+    assert_eq!(
+        decoded.frame.status,
+        Some(json!({"futureStatusField": [1, 2, 3]}))
+    );
+}
+
+#[test]
+fn advertised_tool_definition_is_strict_and_provider_safe() {
+    let definition: WireToolDefinition = parse(TOOL_DEFINITION);
+    assert_eq!(
+        serde_json::to_value(definition).expect("definition serializes"),
+        fixture_value(TOOL_DEFINITION)
+    );
+
+    for name in ["", "has space", "看", &"a".repeat(65)] {
+        let mut value = fixture_value(TOOL_DEFINITION);
+        value["function"]["name"] = json!(name);
+        assert_rejected::<WireToolDefinition>(value);
+    }
+    assert!(ToolDefinitionName::new("say-2").is_ok());
+
+    let mut wrong_type = fixture_value(TOOL_DEFINITION);
+    wrong_type["type"] = json!("client_tool");
+    assert_rejected::<WireToolDefinition>(wrong_type);
+
+    let mut unknown_function_field = fixture_value(TOOL_DEFINITION);
+    insert_unknown(&mut unknown_function_field["function"], "strict");
+    assert_rejected::<WireToolDefinition>(unknown_function_field);
+
+    let mut non_object_parameters = fixture_value(TOOL_DEFINITION);
+    non_object_parameters["function"]["parameters"] = json!([]);
+    assert_rejected::<WireToolDefinition>(non_object_parameters);
+}
+
+#[test]
+fn invocation_preserves_open_tool_name_and_arguments_but_validates_keys() {
+    let invocation: ToolInvocation = parse(TOOL_INVOCATION);
+    assert_eq!(ToolCallKey::from(&invocation).run_id.as_str(), "run-1");
+
+    let complex_arguments = json!({
+        "nested": {"future": true},
+        "array": [null, 1, "two"],
+        "unicode": "羊"
+    });
+    let mut value = fixture_value(TOOL_INVOCATION);
+    value["name"] = json!("未来工具");
+    value["arguments"] = complex_arguments.clone();
+    let decoded: ToolInvocation = serde_json::from_value(value).expect("open name is accepted");
+    assert_eq!(decoded.name, ToolName::new("未来工具").unwrap());
+    assert_eq!(
+        decoded.arguments,
+        complex_arguments.as_object().unwrap().clone()
+    );
+
+    let mut finite_float = fixture_value(TOOL_INVOCATION);
+    finite_float["arguments"] = json!({"yaw_degrees": -30.5});
+    let decoded: ToolInvocation =
+        serde_json::from_value(finite_float).expect("finite float is accepted");
+    assert_eq!(decoded.arguments["yaw_degrees"], json!(-30.5));
+
+    for (field, invalid) in [
+        ("runId", String::new()),
+        ("runId", "r".repeat(129)),
+        ("toolCallId", String::new()),
+        ("toolCallId", "c".repeat(129)),
+        ("toolCallId", "包含空格".to_owned()),
+        ("toolCallId", "🐑".repeat(65)),
+        ("name", String::new()),
+        ("name", "n".repeat(65)),
+    ] {
+        let mut value = fixture_value(TOOL_INVOCATION);
+        value[field] = json!(invalid);
+        assert_rejected::<ToolInvocation>(value);
+    }
+
+    let mut unknown_round = fixture_value(TOOL_INVOCATION);
+    insert_unknown(&mut unknown_round, "round");
+    assert_rejected::<ToolInvocation>(unknown_round);
+
+    let mut non_object_arguments = fixture_value(TOOL_INVOCATION);
+    non_object_arguments["arguments"] = json!([]);
+    assert_rejected::<ToolInvocation>(non_object_arguments);
+
+    for invalid in ["NaN", "Infinity", "-Infinity"] {
+        let invalid_number = TOOL_INVOCATION.replace("10", invalid);
+        assert!(serde_json::from_str::<ToolInvocation>(&invalid_number).is_err());
+    }
+}
+
+#[test]
+fn tool_execution_v2_requires_nullable_observation_and_rejects_transport_legacy() {
+    let execution: ToolExecution = parse(TOOL_EXECUTION);
+    assert_eq!(execution.observation_after.as_ref(), None);
+
+    let mut with_observation = fixture_value(TOOL_EXECUTION);
+    with_observation["observationAfter"] =
+        serde_json::to_value(fixtures::agent_frame()).expect("fixture frame serializes");
+    let decoded: ToolExecution =
+        serde_json::from_value(with_observation).expect("frame observation is accepted");
+    assert!(decoded.observation_after.as_ref().is_some());
+
+    let mut missing_observation = fixture_value(TOOL_EXECUTION);
+    missing_observation
+        .as_object_mut()
+        .unwrap()
+        .remove("observationAfter");
+    assert_rejected::<ToolExecution>(missing_observation);
+
+    let mut wrong_protocol = fixture_value(TOOL_EXECUTION);
+    wrong_protocol["protocol"] = json!("mineintent.tool-response.v1");
+    assert_rejected::<ToolExecution>(wrong_protocol);
+
+    let mut legacy_round = fixture_value(TOOL_EXECUTION);
+    insert_unknown(&mut legacy_round, "roundId");
+    assert_rejected::<ToolExecution>(legacy_round);
+
+    let mut wrong_observation = fixture_value(TOOL_EXECUTION);
+    wrong_observation["observationAfter"] = json!([]);
+    assert_rejected::<ToolExecution>(wrong_observation);
+
+    let constructed: ToolExecution<Value> = ToolExecution::new(json!(null), None);
+    assert_eq!(constructed.observation_after, RequiredNullable::new(None));
+}
+
+#[test]
+fn run_request_uses_external_prompt_reference_and_excludes_transport_configuration() {
+    let request: AgentRunRequest<JsonAgentDecisionContext> = parse(AGENT_RUN);
+    let encoded = serde_json::to_value(&request).expect("run request serializes");
+    assert_eq!(
+        encoded["promptTemplate"],
+        json!({
+            "key": "participant-system",
+            "version": "v1"
+        })
+    );
+    assert!(encoded.get("prompt").is_none());
+
+    for legacy in [
+        "callbackUrl",
+        "callbackToken",
+        "toolCallbackUrl",
+        "serviceToken",
+    ] {
+        let mut value = fixture_value(AGENT_RUN);
+        insert_unknown(&mut value, legacy);
+        assert_rejected::<AgentRunRequest<JsonAgentDecisionContext>>(value);
+    }
+
+    let mut embedded_prompt = fixture_value(AGENT_RUN);
+    embedded_prompt["promptTemplate"]["text"] = json!("hard-coded prompt");
+    assert_rejected::<AgentRunRequest<JsonAgentDecisionContext>>(embedded_prompt);
+
+    let mut too_many_tools = fixture_value(AGENT_RUN);
+    too_many_tools["tools"] = Value::Array(vec![fixture_value(TOOL_DEFINITION); 33]);
+    assert_rejected::<AgentRunRequest<JsonAgentDecisionContext>>(too_many_tools);
+}
+
+#[test]
+fn run_request_tool_limit_is_shared_by_validation_and_both_serde_directions() {
+    let mut request = fixtures::agent_run_request();
+    request.tools = vec![fixtures::tool_definition(); MAX_AGENT_RUN_TOOLS];
+    assert!(request.validate().is_ok());
+
+    let encoded = serde_json::to_value(&request).expect("32-tool request serializes");
+    let decoded: AgentRunRequest<JsonAgentDecisionContext> =
+        serde_json::from_value(encoded.clone()).expect("32-tool request deserializes");
+    assert_eq!(
+        serde_json::to_value(decoded).expect("32-tool request round trips"),
+        encoded
+    );
+
+    let mut too_many = request;
+    too_many.tools.push(fixtures::tool_definition());
+    let error = too_many
+        .validate()
+        .expect_err("33 tools exceed the run limit");
+    assert_eq!(error.code, AgentErrorCode::LimitExceeded);
+    assert_eq!(error.summary, "agent_run_tool_limit_exceeded");
+    assert!(serde_json::to_value(&too_many).is_err());
+
+    let mut too_many_wire = encoded;
+    too_many_wire["tools"] = Value::Array(vec![fixture_value(TOOL_DEFINITION); 33]);
+    assert_rejected::<AgentRunRequest<JsonAgentDecisionContext>>(too_many_wire);
+}
+
+#[test]
+fn python_test_config_requires_an_independent_service_token_maps_to_strict_contract_rejection() {
+    for legacy in ["serviceToken", "modelApiKey"] {
+        assert_legacy_agent_run_field_rejected(legacy);
+    }
+}
+
+#[test]
+fn python_test_decide_authentication_happens_before_body_validation_maps_to_no_transport_phase() {
+    for legacy in [
+        "Authorization",
+        "authorization",
+        "callbackUrl",
+        "callbackToken",
+        "toolCallbackUrl",
+        "toolExecutorUrl",
+        "agentServiceUrl",
+        "body",
+        "rawBody",
+        "contentType",
+    ] {
+        assert_legacy_agent_run_field_rejected(legacy);
+    }
+
+    let encoded =
+        serde_json::to_value(fixtures::agent_run_request()).expect("in-process request serializes");
+    let fields = encoded.as_object().expect("request is an object");
+    assert_eq!(fields.len(), 4);
+    for field in ["runId", "context", "tools", "promptTemplate"] {
+        assert!(fields.contains_key(field));
+    }
+}
+
+#[test]
+fn model_result_usage_and_structured_errors_are_versioned_and_strict() {
+    let result = fixtures::model_run_result();
+    let value = serde_json::to_value(&result).expect("model result serializes");
+    let decoded: ModelRunResult =
+        serde_json::from_value(value.clone()).expect("model result round trips");
+    assert_eq!(decoded, result);
+
+    let mut wrong_protocol = value.clone();
+    wrong_protocol["protocol"] = json!("mineintent.agent-run.v0");
+    assert_rejected::<ModelRunResult>(wrong_protocol);
+
+    let mut negative_usage = value.clone();
+    negative_usage["usage"]["inputTokens"] = json!(-1);
+    assert_rejected::<ModelRunResult>(negative_usage);
+
+    let mut null_usage_field = value.clone();
+    null_usage_field["usage"]["outputTokens"] = Value::Null;
+    assert_rejected::<ModelRunResult>(null_usage_field);
+
+    let mut unknown_usage = value;
+    insert_unknown(&mut unknown_usage["usage"], "reasoningTokens");
+    assert_rejected::<ModelRunResult>(unknown_usage);
+
+    let error = AgentError::new(AgentErrorCode::UnknownTool, "unknown_tool:future");
+    let encoded = serde_json::to_value(&error).expect("error serializes");
+    assert_eq!(encoded["code"], "unknown_tool");
+    assert_eq!(error.to_string(), "unknown_tool: unknown_tool:future");
+
+    assert_rejected::<AgentError>(json!({"code": "future_error", "summary": "future"}));
+    assert_rejected::<AgentError>(json!({
+        "code": "unknown_tool",
+        "summary": "future",
+        "detail": "not frozen"
+    }));
+}
+
+#[test]
+fn cancellation_precedes_deadline_and_deadline_is_deterministic() {
+    let now = Instant::now();
+    let deadline =
+        Deadline::after(now, Duration::from_millis(10)).expect("short deadline is representable");
+    let active = FixedCancellation(None);
+    let active_control = ExecutionControl::new(&active, deadline);
+    assert_eq!(
+        active_control.deadline().expires_at(),
+        deadline.expires_at()
+    );
+    let mut active_notification = active_control.cancelled();
+    assert!(matches!(
+        poll_once(active_notification.as_mut()),
+        Poll::Pending
+    ));
+    assert!(active_control.check_at(now).is_ok());
+    assert_eq!(
+        active_control
+            .check_at(now + Duration::from_millis(10))
+            .unwrap_err()
+            .code,
+        AgentErrorCode::DeadlineExceeded
+    );
+
+    let cancelled = FixedCancellation(Some(AgentError::run_cancelled()));
+    let cancelled_control = ExecutionControl::new(&cancelled, Deadline::at(now));
+    let mut cancelled_notification = cancelled_control.cancelled();
+    assert!(matches!(
+        poll_once(cancelled_notification.as_mut()),
+        Poll::Ready(error) if error.code == AgentErrorCode::RunCancelled
+    ));
+    assert_eq!(
+        cancelled_control.check_at(now).unwrap_err().code,
+        AgentErrorCode::RunCancelled
+    );
+}
+
+#[test]
+fn public_agent_traits_are_object_safe_with_bound_associated_types() {
+    let now = Instant::now();
+    let active = FixedCancellation(None);
+    let control = ExecutionControl::new(
+        &active,
+        Deadline::after(now, Duration::from_secs(1)).expect("one-second deadline is representable"),
+    );
+
+    let runner_impl = StubAgentRunner;
+    let runner: &dyn AgentRunner<Context = JsonAgentDecisionContext> = &runner_impl;
+    let result = poll_ready(runner.run(fixtures::agent_run_request(), control))
+        .expect("stub runner completes");
+    assert_eq!(result, fixtures::model_run_result());
+
+    let provider_impl = StubModelProvider;
+    let provider: &dyn ModelProvider<Request = Value, Response = Value> = &provider_impl;
+    let response = poll_ready(provider.complete(json!({"request": true}), control))
+        .expect("stub provider completes");
+    assert_eq!(response, json!({"request": true}));
+}
+
+#[test]
+fn model_usage_defaults_to_absent_counters_without_accepting_null() {
+    let usage: ModelUsage = serde_json::from_value(json!({})).expect("empty usage is valid");
+    assert_eq!(usage, ModelUsage::default());
+    assert_rejected::<ModelUsage>(json!({"cacheReadTokens": null}));
+}
+
+#[test]
+fn deadline_rejects_an_unrepresentable_duration_as_a_structured_request_error() {
+    let error = Deadline::after(Instant::now(), Duration::MAX)
+        .expect_err("Duration::MAX must not panic or create an invalid deadline");
+    assert_eq!(error.code, AgentErrorCode::InvalidRequest);
+    assert_eq!(error.summary, "deadline_out_of_range");
+}
+
+struct FixedCancellation(Option<AgentError>);
+
+impl CancellationSignal for FixedCancellation {
+    fn cancellation_error(&self) -> Option<AgentError> {
+        self.0.clone()
+    }
+
+    fn cancelled(&self) -> Pin<Box<dyn Future<Output = AgentError> + Send + '_>> {
+        match self.0.clone() {
+            Some(error) => Box::pin(std::future::ready(error)),
+            None => Box::pin(std::future::pending()),
+        }
+    }
+}
+
+struct StubAgentRunner;
+
+impl AgentRunner for StubAgentRunner {
+    type Context = JsonAgentDecisionContext;
+
+    fn run<'a>(
+        &'a self,
+        _request: AgentRunRequest<Self::Context>,
+        control: ExecutionControl<'a>,
+    ) -> ContractFuture<'a, Result<ModelRunResult, AgentError>> {
+        Box::pin(async move {
+            control.check_at(Instant::now())?;
+            Ok(fixtures::model_run_result())
+        })
+    }
+}
+
+struct StubModelProvider;
+
+impl ModelProvider for StubModelProvider {
+    type Request = Value;
+    type Response = Value;
+
+    fn complete<'a>(
+        &'a self,
+        request: Self::Request,
+        control: ExecutionControl<'a>,
+    ) -> ContractFuture<'a, Result<Self::Response, AgentError>> {
+        Box::pin(async move {
+            control.check_at(Instant::now())?;
+            Ok(request)
+        })
+    }
+}
+
+struct NoopWake;
+
+impl Wake for NoopWake {
+    fn wake(self: Arc<Self>) {}
+}
+
+fn poll_once<F>(mut future: Pin<&mut F>) -> Poll<F::Output>
+where
+    F: Future + ?Sized,
+{
+    let waker = Waker::from(Arc::new(NoopWake));
+    let mut context = TaskContext::from_waker(&waker);
+    future.as_mut().poll(&mut context)
+}
+
+fn poll_ready<T>(mut future: ContractFuture<'_, T>) -> T {
+    match poll_once(future.as_mut()) {
+        Poll::Ready(value) => value,
+        Poll::Pending => panic!("contract test future unexpectedly yielded"),
+    }
+}
+
+fn parse<T: DeserializeOwned>(source: &str) -> T {
+    serde_json::from_str(source).expect("frozen fixture must decode")
+}
+
+fn fixture_value(source: &str) -> Value {
+    parse(source)
+}
+
+fn insert_unknown(value: &mut Value, key: &str) {
+    value
+        .as_object_mut()
+        .expect("test target is an object")
+        .insert(key.to_owned(), json!(true));
+}
+
+fn assert_legacy_agent_run_field_rejected(field: &str) {
+    let mut value = fixture_value(AGENT_RUN);
+    insert_unknown(&mut value, field);
+    assert_rejected::<AgentRunRequest<JsonAgentDecisionContext>>(value);
+}
+
+fn assert_rejected<T: DeserializeOwned>(value: Value) {
+    assert!(
+        serde_json::from_value::<T>(value).is_err(),
+        "invalid contract value was accepted"
+    );
+}

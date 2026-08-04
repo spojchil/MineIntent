@@ -1,0 +1,15 @@
+[package]
+name = "mineintent-contracts"
+description = "MineIntent Agent、capability、Information 与 Minecraft backend 进程内契约"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

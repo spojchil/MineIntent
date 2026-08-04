@@ -1,0 +1,22 @@
+{
+  "runId": "run-1",
+  "context": {
+    "protocol": "mineintent.agent-context.v3",
+    "stable": {
+      "memories": []
+    },
+    "frame": {
+      "at": "2026-07-25T00:00:00Z",
+      "world": {
+        "dimension": "overworld"
+      },
+      "events": [],
+      "omissions": []
+    }
+  },
+  "tools": [],
+  "promptTemplate": {
+    "key": "participant-system",
+    "version": "v1"
+  }
+}

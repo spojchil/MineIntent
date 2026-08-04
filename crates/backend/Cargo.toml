@@ -1,0 +1,22 @@
+[package]
+name = "mineintent-backend"
+description = "MineIntent 自有 Minecraft 协议后端（目标 26.1 / 协议号 775）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+mineintent-contracts.workspace = true
+# 直接在自有插件中读取 ReceiveGamePacketEvent，只筛选位置校正；不打开
+# Azalea 的 packet-event 高层转发，避免所有游戏包进入 unbounded Event 通道。
+azalea.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["full"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,5 @@
+[toolchain]
+# Azalea 0.16 及其 bevy 依赖需要 nightly 特性；跟随其 pin。
+channel = "nightly"
+# 显式声明组件，使 CI 与新克隆都自带 fmt/clippy，不必各自补装。
+components = ["rustfmt", "clippy"]

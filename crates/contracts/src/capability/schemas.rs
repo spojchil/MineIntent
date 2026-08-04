@@ -1,0 +1,562 @@
+use std::collections::HashSet;
+
+use crate::minecraft::INITIAL_VISIBLE_BLOCK_PROPERTY_NAMES;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{json, Map, Value};
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MoveDirection {
+    Forward,
+    Back,
+    Left,
+    Right,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LookRelativeArguments {
+    pub yaw_degrees: f64,
+    pub pitch_degrees: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLookRelativeArguments {
+    yaw_degrees: f64,
+    pitch_degrees: f64,
+}
+
+impl<'de> Deserialize<'de> for LookRelativeArguments {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawLookRelativeArguments::deserialize(deserializer)?;
+        for (field, value) in [
+            ("yaw_degrees", raw.yaw_degrees),
+            ("pitch_degrees", raw.pitch_degrees),
+        ] {
+            if !value.is_finite() || value.abs() > 90.0 {
+                return Err(serde::de::Error::custom(format!(
+                    "{field} must be finite and within -90..=90 degrees"
+                )));
+            }
+        }
+        Ok(Self {
+            yaw_degrees: raw.yaw_degrees,
+            pitch_degrees: raw.pitch_degrees,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RememberOperation {
+    Append,
+    Replace,
+    Rewrite,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RememberArguments {
+    pub operation: RememberOperation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(rename = "oldText", skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    #[serde(rename = "newText", skip_serializing_if = "Option::is_none")]
+    pub new_text: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RawRememberArguments {
+    operation: RememberOperation,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    text: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    old_text: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    new_text: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for RememberArguments {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawRememberArguments::deserialize(deserializer)?;
+        match raw.operation {
+            RememberOperation::Append
+                if raw.text.is_some() && raw.old_text.is_none() && raw.new_text.is_none() => {}
+            RememberOperation::Rewrite
+                if raw.text.is_some() && raw.old_text.is_none() && raw.new_text.is_none() => {}
+            RememberOperation::Replace
+                if raw.text.is_none()
+                    && raw
+                        .old_text
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty())
+                    && raw.new_text.is_some() => {}
+            RememberOperation::Append => {
+                return Err(serde::de::Error::custom(
+                    "append requires text and forbids oldText/newText",
+                ));
+            }
+            RememberOperation::Replace => {
+                return Err(serde::de::Error::custom(
+                    "replace requires non-empty oldText and newText, and forbids text",
+                ));
+            }
+            RememberOperation::Rewrite => {
+                return Err(serde::de::Error::custom(
+                    "rewrite requires text and forbids oldText/newText",
+                ));
+            }
+        }
+        Ok(Self {
+            operation: raw.operation,
+            text: raw.text,
+            old_text: raw.old_text,
+            new_text: raw.new_text,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MoveInputArguments {
+    pub directions: Vec<MoveDirection>,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sprint: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMoveInputArguments {
+    directions: Vec<MoveDirection>,
+    duration_ms: u64,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    sprint: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for MoveInputArguments {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawMoveInputArguments::deserialize(deserializer)?;
+        if !(1..=4).contains(&raw.directions.len()) {
+            return Err(serde::de::Error::custom(
+                "directions must contain 1..=4 movement keys",
+            ));
+        }
+        let mut unique = HashSet::with_capacity(raw.directions.len());
+        if !raw
+            .directions
+            .iter()
+            .copied()
+            .all(|direction| unique.insert(direction))
+        {
+            return Err(serde::de::Error::custom("movement keys must be unique"));
+        }
+        if !(50..=1_500).contains(&raw.duration_ms) {
+            return Err(serde::de::Error::custom(
+                "duration_ms must be an integer from 50 through 1500",
+            ));
+        }
+
+        Ok(Self {
+            directions: raw.directions,
+            duration_ms: raw.duration_ms,
+            sprint: raw.sprint,
+        })
+    }
+}
+
+/// 当前 wire 上允许的 view 模式。
+///
+/// 这是一个有意闭合的枚举：未来模式可以在这里增加专用分支和校验，但在增加之前
+/// 未知字符串必须在反序列化边界失败关闭。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ViewMode {
+    Full,
+    Directed,
+}
+
+/// Minecraft 方块体素的世界绝对坐标，不携带 backend/world 内部句柄。
+pub type ViewPosition = (i32, i32, i32);
+
+/// directed 输入的保守初始批量上限；它是可调的输入预算，不是永久产品裁定。
+pub use crate::minecraft::MAX_DIRECTED_VIEW_POSITIONS;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ViewArguments {
+    pub mode: ViewMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub positions: Option<Vec<ViewPosition>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawViewArguments {
+    mode: ViewMode,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
+    positions: Option<Vec<ViewPosition>>,
+}
+
+impl<'de> Deserialize<'de> for ViewArguments {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawViewArguments::deserialize(deserializer)?;
+        let positions = raw.positions;
+        match (raw.mode, positions.as_ref()) {
+            (ViewMode::Full, Some(_)) => {
+                return Err(serde::de::Error::custom(
+                    "full view does not accept positions",
+                ));
+            }
+            (ViewMode::Directed, None) => {
+                return Err(serde::de::Error::custom("directed view requires positions"));
+            }
+            (ViewMode::Directed, Some(positions)) if positions.is_empty() => {
+                return Err(serde::de::Error::custom(
+                    "directed view requires at least one position",
+                ));
+            }
+            (ViewMode::Full, None) | (ViewMode::Directed, Some(_)) => {}
+        }
+
+        if let Some(positions) = positions.as_deref() {
+            validate_directed_positions(positions).map_err(serde::de::Error::custom)?;
+        }
+
+        Ok(Self {
+            mode: raw.mode,
+            positions,
+        })
+    }
+}
+
+/// Validate the same directed input boundary used by runtime adapters.
+pub fn validate_directed_positions(positions: &[ViewPosition]) -> Result<(), String> {
+    if positions.is_empty() {
+        return Err("directed view requires at least one position".to_owned());
+    }
+    if positions.len() > MAX_DIRECTED_VIEW_POSITIONS {
+        return Err(format!(
+            "directed view accepts at most {MAX_DIRECTED_VIEW_POSITIONS} positions"
+        ));
+    }
+    let mut unique = HashSet::with_capacity(positions.len());
+    if positions
+        .iter()
+        .copied()
+        .all(|position| unique.insert(position))
+    {
+        Ok(())
+    } else {
+        Err("directed view positions must not contain duplicates".to_owned())
+    }
+}
+
+pub fn move_input_parameters_schema() -> Map<String, Value> {
+    object(json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "directions": {
+                "description": "同时按住的移动键，方向相对当前朝向；斜走时把两个键放在这里。",
+                "minItems": 1,
+                "maxItems": 4,
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["forward", "back", "left", "right"]
+                },
+                "uniqueItems": true
+            },
+            "duration_ms": {
+                "description": "整组移动键共同按住的时长，毫秒。步行大约每 250 毫秒走一格。",
+                "minimum": 50,
+                "maximum": 1500,
+                "type": "integer"
+            },
+            "sprint": {
+                "description": "是否同时按住疾跑；同样时长内走得更远。",
+                "type": "boolean"
+            }
+        },
+        "required": ["directions", "duration_ms"],
+        "additionalProperties": false
+    }))
+}
+
+pub fn look_relative_parameters_schema() -> Map<String, Value> {
+    object(json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "yaw_degrees": {
+                "description": "相对当前视线的水平转角，度。正值向右，负值向左。",
+                "type": "number",
+                "minimum": -90,
+                "maximum": 90
+            },
+            "pitch_degrees": {
+                "description": "相对当前视线的垂直转角，度。正值向下，负值向上。",
+                "type": "number",
+                "minimum": -90,
+                "maximum": 90
+            }
+        },
+        "required": ["yaw_degrees", "pitch_degrees"],
+        "additionalProperties": false
+    }))
+}
+
+pub fn remember_parameters_schema() -> Map<String, Value> {
+    object(json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "明确选择一种单文本记忆编辑：append 追加，replace 用唯一锚点替换（newText 可为空以删除），rewrite 重写全文。不同操作的字段不能混用。",
+        "type": "object",
+        "properties": {
+            "operation": {
+                "description": "记忆编辑操作。",
+                "type": "string",
+                "enum": ["append", "replace", "rewrite"]
+            },
+            "text": {
+                "description": "append 要追加的文本，或 rewrite 的完整文本；可为空。",
+                "type": "string"
+            },
+            "oldText": {
+                "description": "replace 的非空唯一原文锚点；必须在当前记忆中恰好出现一次。",
+                "type": "string",
+                "minLength": 1
+            },
+            "newText": {
+                "description": "replace 的替换文本；允许空字符串，表示删除 oldText。",
+                "type": "string"
+            }
+        },
+        "additionalProperties": false,
+        "oneOf": [
+            {
+                "required": ["operation", "text"],
+                "properties": {"operation": {"const": "append"}},
+                "not": {"anyOf": [{"required": ["oldText"]}, {"required": ["newText"]}]}
+            },
+            {
+                "required": ["operation", "oldText", "newText"],
+                "properties": {"operation": {"const": "replace"}},
+                "not": {"required": ["text"]}
+            },
+            {
+                "required": ["operation", "text"],
+                "properties": {"operation": {"const": "rewrite"}},
+                "not": {"anyOf": [{"required": ["oldText"]}, {"required": ["newText"]}]}
+            }
+        ]
+    }))
+}
+
+pub fn view_parameters_schema() -> Map<String, Value> {
+    object(json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "按 mode 读取视觉事实。full 只给出本次读取确认的正面证据；directed 只核对给定的方块体素坐标。",
+        "type": "object",
+        "properties": {
+            "mode": {
+                "description": "full 只给出本次读取确认的正面可见证据，结果可能因预算而截断；未列出不表示不可见或不存在。想核对未列出的坐标时使用 directed。directed 对 positions 逐坐标给出可见事实或不可见原因；不可见时绝不返回目标方块的身份或状态。",
+                "type": "string",
+                "enum": ["full", "directed"]
+            },
+            "positions": {
+                "description": "仅 directed 使用；每项是 Minecraft 方块体素世界绝对坐标的整数三元组 [x, y, z]，不是内部句柄。directed 必须至少给一个坐标；full 不得提供 positions。",
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_DIRECTED_VIEW_POSITIONS,
+                "uniqueItems": true,
+                "items": {
+                    "description": "一个 Minecraft 方块体素坐标 [x, y, z]；每个分量都是 i32 范围内的整数。",
+                    "type": "array",
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "items": {
+                        "type": "integer",
+                        "minimum": i32::MIN,
+                        "maximum": i32::MAX
+                    }
+                }
+            }
+        },
+        "required": ["mode"],
+        "additionalProperties": false
+    }))
+}
+
+/// Strict model-visible wire description for the frozen directed result.
+///
+/// The conditional clauses mirror `DirectedUnseenBlock::validate`: the schema accepts
+/// optional combinations of reasons but keeps conditional fields attached to their reason.
+pub fn directed_view_result_schema() -> Map<String, Value> {
+    let block_info = block_info_schema();
+    let why = directed_why_schema();
+    let mut value = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["seen", "unseen"],
+        "additionalProperties": false,
+        "properties": {
+            "seen": {
+                "type": "array",
+                "maxItems": MAX_DIRECTED_VIEW_POSITIONS,
+                "items": {
+                    "type": "object",
+                    "required": ["at", "block"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "at": position_schema(),
+                        "block": block_info
+                    }
+                }
+            },
+            "unseen": {
+                "type": "array",
+                "maxItems": MAX_DIRECTED_VIEW_POSITIONS,
+                "items": {
+                    "type": "object",
+                    "required": ["at", "why"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "at": position_schema(),
+                        "why": why,
+                        "distance": {"type": "number"},
+                        "max": {"type": "number"},
+                        "by": {
+                            "type": "object",
+                            "required": ["at", "block"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "at": position_schema(),
+                                "block": block_info
+                            }
+                        }
+                    },
+                    "allOf": [
+                        {
+                            "if": {"properties": {"why": {"contains": {"const": "too_far"}}}},
+                            "then": {"required": ["distance", "max"]},
+                            "else": {"not": {"anyOf": [{"required": ["distance"]}, {"required": ["max"]}]}}
+                        },
+                        {
+                            "if": {"properties": {"why": {"contains": {"const": "occluded"}}}},
+                            "then": {},
+                            "else": {"not": {"required": ["by"]}}
+                        },
+                        {
+                            "if": {"properties": {"why": {"contains": {"const": "out_of_world"}}}},
+                            "then": {"not": {"required": ["by"]}}
+                        }
+                    ]
+                }
+            }
+        }
+    });
+    value["properties"]["seen"]["items"]["properties"]["block"] = block_info_schema();
+    value["properties"]["unseen"]["items"]["properties"]["by"]["properties"]["block"] =
+        block_info_schema();
+    object(value)
+}
+
+fn position_schema() -> Value {
+    json!({
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 3,
+        "items": {
+            "type": "integer",
+            "minimum": i32::MIN,
+            "maximum": i32::MAX
+        }
+    })
+}
+
+fn directed_why_schema() -> Value {
+    let reasons = [
+        "outside_fov",
+        "too_far",
+        "occluded",
+        "chunk_not_loaded",
+        "out_of_world",
+    ];
+    let canonical_choices = (1u8..(1u8 << reasons.len()))
+        .map(|mask| {
+            let why = reasons
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| mask & (1u8 << index) != 0)
+                .map(|(_, reason)| Value::String((*reason).to_owned()))
+                .collect::<Vec<_>>();
+            json!({"const": why})
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "description": "why uses the closed reason set in canonical order: outside_fov, too_far, occluded, chunk_not_loaded, out_of_world; any non-empty subset is allowed",
+        "type": "array",
+        "minItems": 1,
+        "maxItems": reasons.len(),
+        "uniqueItems": true,
+        "items": {
+            "type": "string",
+            "enum": reasons
+        },
+        "oneOf": canonical_choices
+    })
+}
+
+fn block_info_schema() -> Value {
+    let mut properties = Map::new();
+    properties.insert("name".to_owned(), json!({"type": "string", "minLength": 1}));
+    for property in INITIAL_VISIBLE_BLOCK_PROPERTY_NAMES {
+        properties.insert(
+            (*property).to_owned(),
+            json!({"type": ["string", "boolean", "integer", "number"]}),
+        );
+    }
+    json!({
+        "description": "无视觉属性时为方块名称字符串；有属性时为 name 加全部白名单属性的扁平对象。",
+        "oneOf": [
+            {"type": "string", "minLength": 1},
+            {
+                "type": "object",
+                "required": ["name"],
+                "properties": properties,
+                "minProperties": 2,
+                "additionalProperties": false
+            }
+        ]
+    })
+}
+
+fn deserialize_optional_non_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)?.map_or_else(
+        || Err(serde::de::Error::custom("explicit null is not allowed")),
+        |value| Ok(Some(value)),
+    )
+}
+
+fn object(value: Value) -> Map<String, Value> {
+    value
+        .as_object()
+        .cloned()
+        .expect("frozen JSON schema is an object")
+}

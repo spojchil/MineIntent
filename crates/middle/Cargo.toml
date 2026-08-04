@@ -1,0 +1,31 @@
+[package]
+name = "mineintent-middle"
+description = "MineIntent 进程内事件、执行、信息与语音协调层"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+mineintent-contracts.workspace = true
+ryu.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "sync",
+    "time",
+] }
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["fs", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

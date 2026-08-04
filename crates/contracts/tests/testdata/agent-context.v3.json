@@ -1,0 +1,29 @@
+{
+  "protocol": "mineintent.agent-context.v3",
+  "stable": {
+    "memories": [
+      {
+        "kind": "note",
+        "summary": "玩家怕高",
+        "createdAt": "2026-07-01T00:00:00Z"
+      }
+    ]
+  },
+  "frame": {
+    "at": "2026-07-25T00:00:00Z",
+    "player": {
+      "username": "Alex",
+      "text": "看看羊"
+    },
+    "world": {
+      "dimension": "overworld"
+    },
+    "self": {
+      "position": [0.0, 64.0, 0.0],
+      "yawDegrees": 0.0,
+      "pitchDegrees": 0.0
+    },
+    "events": [],
+    "omissions": []
+  }
+}
