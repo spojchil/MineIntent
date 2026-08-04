@@ -45,3 +45,5 @@ target/
 # 施工期供应品与实服运行产物：客户端 jar、反编译源、世界存档与运行日志一律不入库
 supplies/
 server-run/
+# Rust 应用的本地配置（含密钥路径等本机事实）
+mineintent.toml

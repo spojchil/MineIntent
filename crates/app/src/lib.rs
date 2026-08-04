@@ -7,7 +7,6 @@
 //! 聚合首个错误，与 oracle closeBestEffort 同义）。
 
 mod config;
-mod deepseek;
 mod devlog;
 mod factory;
 mod model;
@@ -134,25 +133,23 @@ impl MineIntentApp {
                 AppModelChoice::Scripted(default_vertical_script()),
                 "scripted-vertical".to_owned(),
             ),
-            config::ModelChoiceConfig::DeepSeek { endpoint, model } => {
-                let api_key = std::env::var("DEEPSEEK_API_KEY")
-                    .ok()
-                    .map(|value| value.trim().to_owned())
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| {
-                        AppError::Assembly(
-                            "MINEINTENT_MODEL=deepseek 需要环境变量 DEEPSEEK_API_KEY".to_owned(),
-                        )
-                    })?;
-                println!("[app] 模型：deepseek（{model} @ {endpoint}）");
+            config::ModelChoiceConfig::Responses {
+                endpoint,
+                model,
+                reasoning_effort,
+                api_key,
+            } => {
+                println!(
+                    "[app] 模型：responses（{model} @ {endpoint}，effort={reasoning_effort}）"
+                );
                 (
-                    AppModelChoice::DeepSeek {
-                        config: crate::deepseek::DeepSeekConfig {
+                    AppModelChoice::Responses {
+                        config: model::ResponsesConfig {
                             endpoint: endpoint.clone(),
                             model: model.clone(),
-                            scratch_dir: config.data_directory.clone(),
+                            reasoning_effort: reasoning_effort.clone(),
                         },
-                        api_key,
+                        api_key: api_key.clone(),
                     },
                     model.clone(),
                 )

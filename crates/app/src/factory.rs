@@ -18,14 +18,14 @@ use mineintent_middle::participant::{ParticipantClock, SystemUtcClock};
 
 use mineintent_middle::capability::ViewportReader;
 
-use crate::deepseek::{DeepSeekConfig, DeepSeekModelProvider};
 use crate::model::{JsonObject, ScriptedModelProvider};
+use crate::model::{ResponsesConfig, ResponsesModelProvider};
 
 /// 工厂侧模型选择（key 已在装配时校验注入）。
 pub enum AppModelChoice {
     Scripted(Vec<JsonObject>),
-    DeepSeek {
-        config: DeepSeekConfig,
+    Responses {
+        config: ResponsesConfig,
         api_key: String,
     },
 }
@@ -150,9 +150,10 @@ impl ParticipantAgentFactory for AppAgentFactory {
                     sampler,
                 ))
             }
-            AppModelChoice::DeepSeek { config, api_key } => {
+            AppModelChoice::Responses { config, api_key } => {
                 Arc::new(ConcreteAgentRunner::with_viewport_sampler(
-                    DeepSeekModelProvider::new(config.clone(), api_key.clone()),
+                    ResponsesModelProvider::new(config.clone(), api_key.clone())
+                        .map_err(|error| AgentError::new(AgentErrorCode::ProviderFailed, error))?,
                     dispatcher,
                     self.model_name.clone(),
                     sampler,

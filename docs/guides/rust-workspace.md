@@ -16,42 +16,61 @@ cargo build --workspace
 cargo test --workspace --all-targets
 ```
 
-启动一个同伴（离线模式服务器）：
+## 配置
 
-```bash
-MINEINTENT_MC_HOST=127.0.0.1 \
-MINEINTENT_MC_PORT=25565 \
-MINEINTENT_MC_USERNAME=MineIntentBot \
-MINEINTENT_MODEL=deepseek \
-DEEPSEEK_API_KEY=... \
-cargo run -p mineintent-app --bin mineintent
+优先级从高到低：**环境变量 → `.env` → `mineintent.toml` → 内置默认**。
+形状参考生态惯例（如 atuin：TOML 文件叠加带前缀的环境变量）。
+
+`mineintent.toml`（工作目录下，或用 `MINEINTENT_CONFIG` 指定路径）：
+
+```toml
+[minecraft]
+host = "127.0.0.1"
+port = 25565
+username = "MineIntentBot"
+world_id = "local-world"
+
+[model]
+provider = "responses"          # scripted = 确定性假模型
+# 密钥只放路径，不放密钥本身
+api_key_file = "/path/to/api-key"
+# endpoint = "https://api.deepseek.com/responses"
+# model = "deepseek-v4-flash"
+# reasoning_effort = "none"     # none | low | medium | high
 ```
 
-| 环境变量 | 默认 | 说明 |
+对应的环境变量（覆盖文件值）：
+
+| 变量 | 默认 | 说明 |
 |---|---|---|
 | `MINEINTENT_MC_HOST` / `MINEINTENT_MC_PORT` | `127.0.0.1` / `25565` | 目标服务器 |
 | `MINEINTENT_MC_USERNAME` | `MineIntentBot` | 离线身份（本版本只支持 offline） |
 | `MINEINTENT_WORLD_ID` | `local-world` | 世界标识，进入 scope 与 journal |
 | `MINEINTENT_DATA_DIR` | `.mineintent` | 记忆、journal 与调试产物目录 |
-| `MINEINTENT_MODEL` | `scripted` | `scripted` = 确定性假模型；`deepseek` = 真实模型 |
+| `MINEINTENT_MODEL` | `scripted` | `scripted` 或 `responses` |
+| `MINEINTENT_MODEL_API_KEY` / `_FILE` | 无 | 密钥本身，或密钥文件路径 |
+| `MINEINTENT_MODEL_ENDPOINT` / `_NAME` / `_REASONING_EFFORT` | 见上 | 覆盖模型接入参数 |
+| `MINEINTENT_CONFIG` | `./mineintent.toml` | 配置文件路径 |
 | `MINEINTENT_DEBUG` | 关 | 见下节 |
 | `MINEINTENT_MAX_RUNTIME_SECS` | 无 | 到时按正常停机路径退出，供无人值守验收 |
 
-## 发版构建
+**密钥只从环境变量或文件路径读，不从配置文件读**——配置文件是要进版本库的。
+
+启动：
 
 ```bash
-cargo build --release -p mineintent-app --bin mineintent
+cargo run -p mineintent-app --bin mineintent
 ```
 
-`[profile.release]` 开了整体 LTO、单编译单元与符号剥离：实测单文件
-**47.2 MB（debug）→ 23.8 MB（release）**。两处刻意不做：
+## 模型接入
 
-- **不设 `panic = "abort"`**：工具与模型 provider 的 panic 由 `catch_unwind`
-  捕获并转成结构化失败，这是产品行为；abort 会让一次工具 panic 杀掉整个同伴进程。
-- **不用 `opt-level = "z"`**：ECS 每秒 20 tick 的热路径对吞吐敏感，
-  拿运行时性能换几 MB 体积不划算。
+provider 按**协议形状**分层，不按供应商：`crates/app/src/model/responses.rs`
+对接 OpenAI 系的 `/responses` 协议，DeepSeek 只是当前用这个形状的一家，
+换供应商改配置即可。chat/completions 形状已随 `deepseek-chat` 退役一并移除。
 
-排障需要栈回溯时用 debug 构建复现，不依赖发版二进制里的符号。
+provider 内部把 Responses 的 `instructions + input[]` / `output[]` 与
+Agent 状态机认的 `message { content, tool_calls }` 互转，
+因此新增供应商不会波及上层。
 
 ## 开发者模式
 
