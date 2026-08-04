@@ -6,6 +6,18 @@
 > `(Entity, token)` 精确取消 `CreateConnectionTask`。backend epoch 绑定与
 > connect deadline 接线不在本切片内。
 
+## 持久归宿（2026-08-04，维护者授权 fork 直改直推）
+
+补丁已重建为 fork 分支上的源码提交，vendor 目录与之一一对应：
+
+- 仓库：`https://github.com/spojchil/azalea`
+- 基座钉：分支 `mineintent-pin-0.16.0-mc26.1` = `a253702e`（0.16.0 发布提交）
+- 补丁分支：`mineintent/attempt-identity-0.16` = **`d0cc847`**
+  （单提交含全部 16 个源文件改动 + attempt_identity 集成测试；
+  `.cargo-checksum.json` 是 vendor 打包物，不属仓库内容，不在其中）
+
+后续 vendor 改动一律：先改 fork 分支提交推送，再同步 vendor 并更新本清单。
+
 ## 核心类型
 
 - `azalea_client::join::AttemptToken`：`u64` newtype，`Copy + Clone + Debug +
