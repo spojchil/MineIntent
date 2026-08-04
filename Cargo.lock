@@ -1774,6 +1774,7 @@ checksum = "d60a6352e005f1f86008644a9fe336a66f74c94428182162cc69eb8c6fff458d"
 name = "mineintent-app"
 version = "0.0.1"
 dependencies = [
+ "azalea",
  "mineintent-backend",
  "mineintent-contracts",
  "mineintent-middle",

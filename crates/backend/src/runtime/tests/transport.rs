@@ -547,3 +547,14 @@ fn pre_init_reconnect_claim_is_a_finite_barrier() {
         "claim while stopping must be refused"
     );
 }
+
+/// 纵向实测回归：公开 stop 可以从任意调用方运行时发起——watchdog 的
+/// 生成不得依赖 LocalSet 上下文（曾以 spawn_local 在 app 主线程 panic）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initiate_stop_spawns_watchdog_from_send_context_without_panicking() {
+    let handle = RuntimeHandle::new(RunConfig::default());
+    handle.shared.timers_enabled.store(true, Ordering::Release);
+    handle.shared.begin_connection_attempt();
+    handle.shared.initiate_stop("vertical-stop");
+    assert!(handle.shared.stopping.load(Ordering::Acquire));
+}

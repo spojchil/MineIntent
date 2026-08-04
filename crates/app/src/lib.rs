@@ -7,6 +7,7 @@
 //! 聚合首个错误，与 oracle closeBestEffort 同义）。
 
 mod config;
+mod deepseek;
 mod factory;
 mod model;
 
@@ -34,7 +35,7 @@ use mineintent_middle::participant::{
 use mineintent_middle::speech::{SpeechScheduler, SpeechSchedulerOptions, SpeechTransport};
 use mineintent_middle::telemetry::DebugStateStore;
 
-use factory::AppAgentFactory;
+use factory::{AppAgentFactory, AppModelChoice};
 use model::default_vertical_script;
 
 /// oracle 的 run 期限由模型服务边界承担；进程内形态下由 runtime 统一持有。
@@ -112,18 +113,48 @@ impl MineIntentApp {
         let viewport_reader = Arc::new(ViewportReader::new(Arc::clone(&backend)));
         let registry = build_production_capability_registry(ProductionCapabilityServices::new(
             Arc::clone(&backend),
-            viewport_reader,
+            Arc::clone(&viewport_reader),
             journal.clone(),
             speech.clone(),
             memory.clone(),
         ))
         .map_err(|error| AppError::Assembly(format!("capability registry 构建失败：{error}")))?;
 
+        let (choice, model_label) = match &config.model {
+            config::ModelChoiceConfig::Scripted => (
+                AppModelChoice::Scripted(default_vertical_script()),
+                "scripted-vertical".to_owned(),
+            ),
+            config::ModelChoiceConfig::DeepSeek { endpoint, model } => {
+                let api_key = std::env::var("DEEPSEEK_API_KEY")
+                    .ok()
+                    .map(|value| value.trim().to_owned())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        AppError::Assembly(
+                            "MINEINTENT_MODEL=deepseek 需要环境变量 DEEPSEEK_API_KEY".to_owned(),
+                        )
+                    })?;
+                println!("[app] 模型：deepseek（{model} @ {endpoint}）");
+                (
+                    AppModelChoice::DeepSeek {
+                        config: crate::deepseek::DeepSeekConfig {
+                            endpoint: endpoint.clone(),
+                            model: model.clone(),
+                            scratch_dir: config.data_directory.clone(),
+                        },
+                        api_key,
+                    },
+                    model.clone(),
+                )
+            }
+        };
         let factory = Arc::new(AppAgentFactory::new(
             registry,
-            default_vertical_script(),
-            ModelName::new("scripted-vertical")
+            choice,
+            ModelName::new(&model_label)
                 .map_err(|error| AppError::Assembly(format!("模型名无效：{error}")))?,
+            Arc::clone(&viewport_reader),
         ));
         let assembly = Arc::new(ParticipantAgentAssembly::new(Arc::clone(&factory)
             as Arc<dyn mineintent_middle::participant::ParticipantAgentFactory>));

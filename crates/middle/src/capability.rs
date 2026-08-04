@@ -709,6 +709,7 @@ pub fn build_production_capability_registry(
             Arc::clone(&services.journal),
         ),
         create_move_input_capability(Arc::clone(&services.backend), Arc::clone(&services.journal)),
+        create_respawn_capability(Arc::clone(&services.backend), Arc::clone(&services.journal)),
         create_view_capability(Arc::clone(&services.viewport_reader)),
         create_say_capability(
             Arc::clone(&services.speech),
@@ -724,6 +725,7 @@ const LOOK_RELATIVE_CAPABILITY_NAME: &str = "look_relative";
 const MOVE_INPUT_CAPABILITY_NAME: &str = "move_input";
 const SAY_CAPABILITY_NAME: &str = "say";
 const REMEMBER_CAPABILITY_NAME: &str = "remember";
+const RESPAWN_CAPABILITY_NAME: &str = "respawn";
 const LOOK_EFFECT_EPSILON_DEGREES: f64 = 0.01;
 const MOVE_EFFECT_EPSILON: f64 = 0.01;
 
@@ -733,6 +735,8 @@ const MOVE_INPUT_CAPABILITY_DESCRIPTION: &str =
     "想往一个方向挪一点、或斜着靠近已经看见的东西时，短暂按住一组真实移动键再一起松开，随后返回实际移动效果。前后键或左右键同时按会互相抵消，对应轴不会移动。没有寻路也不会跳跃：一次最多走几格，障碍不会被自动绕开，返回时身体可能仍在滑行或下落。";
 const SAY_CAPABILITY_DESCRIPTION: &str =
     "把一句话交给聊天发送队列。返回只表示已排队，不表示玩家已经看到：长句会被切成几条依次发出，发送有间隔，离开当前世界会取消未发出的部分。想说话时调用；不需要说、或想保持沉默时，不调用即可。动作要花时间，行动前先简短说一句往往更自然。";
+const RESPAWN_CAPABILITY_DESCRIPTION: &str =
+    "死亡后请求回到世界。返回只表示请求已发出，不表示已经站起来：复活位置由服务端决定，随后的观察才是事实。只有确实死了才需要调用；活着时调用会失败。";
 const REMEMBER_CAPABILITY_DESCRIPTION: &str =
     "编辑持久的单文本记忆，供以后回忆。明确选择 append 追加、replace 用唯一原文锚点替换（newText 可为空以删除），或 rewrite 重写全文；不同操作的字段不能混用。";
 
@@ -1332,6 +1336,125 @@ impl ToolCapability for RememberCapability {
             }))
         })
     }
+}
+
+pub struct RespawnCapability {
+    definition: mineintent_contracts::agent::WireToolDefinition,
+    backend: Arc<dyn MinecraftBackendApi>,
+    journal: Arc<dyn CapabilityJournal>,
+}
+
+impl RespawnCapability {
+    pub fn new(backend: Arc<dyn MinecraftBackendApi>, journal: Arc<dyn CapabilityJournal>) -> Self {
+        Self {
+            definition: function_definition(
+                RESPAWN_CAPABILITY_NAME,
+                RESPAWN_CAPABILITY_DESCRIPTION,
+                respawn_parameters_schema(),
+            ),
+            backend,
+            journal,
+        }
+    }
+}
+
+pub fn create_respawn_capability(
+    backend: Arc<dyn MinecraftBackendApi>,
+    journal: Arc<dyn CapabilityJournal>,
+) -> Arc<dyn ToolCapability> {
+    Arc::new(RespawnCapability::new(backend, journal))
+}
+
+impl ToolCapability for RespawnCapability {
+    fn definition(&self) -> &mineintent_contracts::agent::WireToolDefinition {
+        &self.definition
+    }
+
+    fn resource(&self) -> Option<ExecutionResource> {
+        // 重生占用身体：它与转向/移动互斥，且完成后旧的运动意图不再成立。
+        Some(ExecutionResource::Body)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        invocation: CapabilityInvocation,
+        context: CapabilityExecutionContext<'a>,
+    ) -> ContractFuture<'a, Result<Value, AgentError>> {
+        let backend = Arc::clone(&self.backend);
+        let journal = Arc::clone(&self.journal);
+        Box::pin(async move {
+            context.check_at(Instant::now())?;
+            let motor = match backend.motor() {
+                Ok(motor) => motor,
+                Err(error) => {
+                    return body_failed_result(
+                        journal.as_ref(),
+                        &invocation,
+                        RESPAWN_CAPABILITY_NAME,
+                        context,
+                        map_motor_backend_error(error),
+                    )
+                    .await;
+                }
+            };
+            context.check_at(Instant::now())?;
+            let bridge = BackendControlBridge::new();
+            bridge
+                .control
+                .preflight(RESPAWN_CAPABILITY_NAME)
+                .map_err(map_motor_backend_error)?;
+            match await_backend_future(
+                motor.respawn(bridge.control.clone()),
+                context.control(),
+                &bridge,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(AwaitBackendError::Control(error)) => return Err(error),
+                Err(AwaitBackendError::Backend(error)) => {
+                    return body_failed_result(
+                        journal.as_ref(),
+                        &invocation,
+                        RESPAWN_CAPABILITY_NAME,
+                        context,
+                        map_motor_backend_error(error),
+                    )
+                    .await;
+                }
+            };
+            context.check_at(Instant::now())?;
+            // 诚实边界：请求已派发不等于已经复活；复活是随后的生命周期事实。
+            let result = completed_body_result(json!({"requested": true}));
+            let journal_result = journal_event(
+                journal.as_ref(),
+                "body_tool.completed",
+                body_journal_payload(
+                    &invocation,
+                    RESPAWN_CAPABILITY_NAME,
+                    json!({"requested": true}),
+                ),
+                context.control(),
+            )
+            .await;
+            if let Err(error) = journal_result {
+                if is_structured_control_error(error.code) {
+                    return Err(error);
+                }
+            }
+            context.check_at(Instant::now())?;
+            Ok(result)
+        })
+    }
+}
+
+fn respawn_parameters_schema() -> Map<String, Value> {
+    object(json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    }))
 }
 
 fn say_parameters_schema() -> Map<String, Value> {

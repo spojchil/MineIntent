@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use mineintent_contracts::agent::{AgentError, AgentErrorCode, ModelName, ToolInvocation};
 use mineintent_contracts::capability::{ScopeGuard, ToolCapabilityRegistry};
-use mineintent_middle::agent::ConcreteAgentRunner;
+use mineintent_middle::agent::{BackendRoundViewportSampler, ConcreteAgentRunner};
 use mineintent_middle::capability::{
     CapabilityActionIdSource, CapabilityScopeAssembly, CapabilityUtcTimestampSource,
     ExplicitCapabilityInvocationAssembler, RegistryToolDispatcher,
@@ -16,7 +16,19 @@ use mineintent_middle::participant::{
 };
 use mineintent_middle::participant::{ParticipantClock, SystemUtcClock};
 
+use mineintent_middle::capability::ViewportReader;
+
+use crate::deepseek::{DeepSeekConfig, DeepSeekModelProvider};
 use crate::model::{JsonObject, ScriptedModelProvider};
+
+/// 工厂侧模型选择（key 已在装配时校验注入）。
+pub enum AppModelChoice {
+    Scripted(Vec<JsonObject>),
+    DeepSeek {
+        config: DeepSeekConfig,
+        api_key: String,
+    },
+}
 
 type AppRuntime = ParticipantRuntime<ParticipantAgentAssembly>;
 
@@ -69,21 +81,24 @@ impl ScopeGuard for RuntimeScopeGuard {
 
 pub struct AppAgentFactory {
     registry: Arc<ToolCapabilityRegistry>,
-    script: Vec<JsonObject>,
+    choice: AppModelChoice,
     model_name: ModelName,
+    viewport_reader: Arc<ViewportReader>,
     runtime: OnceLock<Weak<AppRuntime>>,
 }
 
 impl AppAgentFactory {
     pub fn new(
         registry: Arc<ToolCapabilityRegistry>,
-        script: Vec<JsonObject>,
+        choice: AppModelChoice,
         model_name: ModelName,
+        viewport_reader: Arc<ViewportReader>,
     ) -> Self {
         Self {
             registry,
-            script,
+            choice,
             model_name,
+            viewport_reader,
             runtime: OnceLock::new(),
         }
     }
@@ -124,10 +139,26 @@ impl ParticipantAgentFactory for AppAgentFactory {
                 scope_guard,
             )),
         );
-        Ok(Arc::new(ConcreteAgentRunner::new(
-            ScriptedModelProvider::new(self.script.clone()),
-            dispatcher,
-            self.model_name.clone(),
-        )))
+        // 轮末一帧（更新-05/06）：真实 sampler 与 view capability 共用同一 reader。
+        let sampler = BackendRoundViewportSampler::new(Arc::clone(&self.viewport_reader));
+        let runner: Arc<dyn ParticipantScopedAgentRunner> = match &self.choice {
+            AppModelChoice::Scripted(script) => {
+                Arc::new(ConcreteAgentRunner::with_viewport_sampler(
+                    ScriptedModelProvider::new(script.clone()),
+                    dispatcher,
+                    self.model_name.clone(),
+                    sampler,
+                ))
+            }
+            AppModelChoice::DeepSeek { config, api_key } => {
+                Arc::new(ConcreteAgentRunner::with_viewport_sampler(
+                    DeepSeekModelProvider::new(config.clone(), api_key.clone()),
+                    dispatcher,
+                    self.model_name.clone(),
+                    sampler,
+                ))
+            }
+        };
+        Ok(runner)
     }
 }

@@ -1446,6 +1446,22 @@ impl MinecraftMotorDriverApi for FacadeMotor {
         })
     }
 
+    fn respawn(&self, control: OperationControl) -> BoxFuture<'_, Result<(), BackendError>> {
+        let inner = self.inner.clone();
+        let session = self.session.clone();
+        let bound_epoch = self.bound_epoch;
+        Box::pin(async move {
+            let inner = inner.upgrade().ok_or_else(|| dropped_facade_error())?;
+            inner.ensure_bound_ready(&session, bound_epoch, "respawn")?;
+            control.preflight("respawn")?;
+            let completion = session
+                .handle
+                .respawn_for_epoch(bound_epoch)
+                .map_err(|error| map_runtime_command_error(&session, "respawn", error))?;
+            await_command(completion, control, "respawn").await
+        })
+    }
+
     fn move_input(
         &self,
         request: MoveInputRequest,

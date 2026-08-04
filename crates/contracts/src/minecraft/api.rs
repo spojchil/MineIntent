@@ -237,6 +237,9 @@ pub trait MinecraftMotorDriverApi: Send + Sync {
     ) -> BoxFuture<'_, Result<(), BackendError>>;
     /// Synchronous, idempotent and generation-safe release of all held controls.
     fn release_all(&self) -> Result<(), BackendError>;
+    /// 请求服务端执行重生。完成表示请求已派发，不表示已经站起来——
+    /// 复活的事实由 `respawned` 生命周期事件与随后的观察给出。
+    fn respawn(&self, control: OperationControl) -> BoxFuture<'_, Result<(), BackendError>>;
 }
 
 pub trait MinecraftBackendApi: Send + Sync {

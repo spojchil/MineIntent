@@ -35,6 +35,14 @@ fn default_reconnect() -> ReconnectPolicy {
 pub struct AppConfig {
     pub minecraft: MinecraftBackendConfig,
     pub data_directory: PathBuf,
+    pub model: ModelChoiceConfig,
+}
+
+/// 模型选择：scripted = gate b 确定性假模型；deepseek = 真模型加分项。
+#[derive(Clone, Debug)]
+pub enum ModelChoiceConfig {
+    Scripted,
+    DeepSeek { endpoint: String, model: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -85,6 +93,21 @@ pub fn load_app_config(cwd: &Path) -> Result<AppConfig, ConfigError> {
     }
     let data_dir = env_trimmed("MINEINTENT_DATA_DIR").unwrap_or_else(|| ".mineintent".to_owned());
 
+    let model = match env_trimmed("MINEINTENT_MODEL").as_deref() {
+        None | Some("scripted") => ModelChoiceConfig::Scripted,
+        Some("deepseek") => ModelChoiceConfig::DeepSeek {
+            endpoint: env_trimmed("MINEINTENT_DEEPSEEK_URL")
+                .unwrap_or_else(|| "https://api.deepseek.com/chat/completions".to_owned()),
+            model: env_trimmed("MINEINTENT_DEEPSEEK_MODEL")
+                .unwrap_or_else(|| "deepseek-chat".to_owned()),
+        },
+        Some(other) => {
+            return Err(ConfigError::Invalid {
+                name: "MINEINTENT_MODEL",
+                reason: format!("未知模型选择 {other}（可用：scripted | deepseek）"),
+            })
+        }
+    };
     Ok(AppConfig {
         minecraft: MinecraftBackendConfig {
             world_id,
@@ -102,5 +125,6 @@ pub fn load_app_config(cwd: &Path) -> Result<AppConfig, ConfigError> {
             reconnect: default_reconnect(),
         },
         data_directory: cwd.join(data_dir),
+        model,
     })
 }

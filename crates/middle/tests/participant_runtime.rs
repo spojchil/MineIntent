@@ -560,12 +560,14 @@ impl ParticipantFrameSource for TestFrameSource {
 
 struct TestMotor {
     releases: AtomicUsize,
+    respawn_calls: AtomicUsize,
 }
 
 impl TestMotor {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             releases: AtomicUsize::new(0),
+            respawn_calls: AtomicUsize::new(0),
         })
     }
 }
@@ -584,6 +586,14 @@ impl MinecraftMotorDriverApi for TestMotor {
         _request: MoveInputRequest,
         _control: OperationControl,
     ) -> mineintent_contracts::minecraft::BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn respawn(
+        &self,
+        _control: mineintent_contracts::minecraft::OperationControl,
+    ) -> mineintent_contracts::minecraft::BoxFuture<'_, Result<(), BackendError>> {
+        self.respawn_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(()) })
     }
 
@@ -3566,7 +3576,14 @@ async fn real_concrete_runner_uses_one_registry_and_rebinds_scope_per_wake() {
         .collect();
     assert_eq!(
         names,
-        vec!["look_relative", "move_input", "view", "say", "remember"]
+        vec![
+            "look_relative",
+            "move_input",
+            "respawn",
+            "view",
+            "say",
+            "remember"
+        ]
     );
 
     let bindings = Arc::new(Mutex::new(Vec::new()));

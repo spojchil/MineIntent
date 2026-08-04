@@ -296,6 +296,17 @@ impl RuntimeHandle {
         self.send_command(self.next_command(BackendCommand::Respawn))
     }
 
+    /// 绑定世代的重生：与其余马达命令同一条准入链，陈旧世代拒于入队。
+    pub(crate) fn respawn_for_epoch(
+        &self,
+        expected_epoch: u64,
+    ) -> Result<CommandCompletion, String> {
+        self.send_command_with_completion_for_optional_epoch(
+            BackendCommand::Respawn,
+            Some(expected_epoch),
+        )
+    }
+
     /// 主动结束运行时；停止动作本身会写入 `commanded` 事件。
     pub fn stop(&self, reason: &str) {
         self.shared.initiate_stop(reason);

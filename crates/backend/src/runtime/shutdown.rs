@@ -438,7 +438,9 @@ impl SharedRuntime {
         let duration = Duration::from_millis(self.config.timeouts.stop_ms);
         #[cfg(test)]
         let completion_probe = self.stop_watchdog_completion_probe.lock().take();
-        tokio::task::spawn_local(async move {
+        // watchdog future 的全部捕获均为 Send；用 tokio::spawn 使公开 stop 可以
+        // 从任意调用方运行时发起（纵向实测抓到的跨线程 spawn_local panic）。
+        tokio::spawn(async move {
             tokio::select! {
                 _ = tokio::time::sleep(duration) => shared.fire_stop_watchdog(token),
                 _ = cancel.notified() => {}

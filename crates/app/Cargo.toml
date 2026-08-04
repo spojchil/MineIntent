@@ -10,6 +10,8 @@ name = "mineintent"
 path = "src/main.rs"
 
 [dependencies]
+# 纵向假人 bin 直用 Azalea（与 backend 同一 pin）；产品路径不直接触协议。
+azalea = { version = "=0.16.0", default-features = false, features = ["log"] }
 mineintent-backend = { path = "../backend" }
 mineintent-contracts = { path = "../contracts" }
 mineintent-middle = { path = "../middle" }

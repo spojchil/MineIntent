@@ -32,9 +32,31 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    println!("已就绪；Ctrl-C 停机。");
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        eprintln!("信号监听失败：{error}");
+    // 有界运行：MINEINTENT_MAX_RUNTIME_SECS 供纵向实测等无人值守场景，
+    // 到时视同 Ctrl-C，走同一条正常停机路径（不是 kill）。
+    let max_runtime = std::env::var("MINEINTENT_MAX_RUNTIME_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    match max_runtime {
+        Some(secs) => {
+            println!("已就绪；Ctrl-C 或 {secs}s 后停机。");
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => {
+                    if let Err(error) = result {
+                        eprintln!("信号监听失败：{error}");
+                    }
+                }
+                () = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {
+                    println!("达到 MINEINTENT_MAX_RUNTIME_SECS={secs}，按计划停机。");
+                }
+            }
+        }
+        None => {
+            println!("已就绪；Ctrl-C 停机。");
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                eprintln!("信号监听失败：{error}");
+            }
+        }
     }
     println!("停机中……");
     match app.stop("app_stopped").await {

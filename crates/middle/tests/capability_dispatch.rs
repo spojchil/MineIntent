@@ -277,6 +277,7 @@ struct FakeMotor {
     move_fail: AtomicBool,
     release_fail: AtomicBool,
     release_calls: AtomicUsize,
+    respawn_calls: AtomicUsize,
     calls: AtomicUsize,
     started: Arc<Notify>,
     blocked: AtomicBool,
@@ -291,6 +292,7 @@ impl FakeMotor {
             move_fail: AtomicBool::new(false),
             release_fail: AtomicBool::new(false),
             release_calls: AtomicUsize::new(0),
+            respawn_calls: AtomicUsize::new(0),
             calls: AtomicUsize::new(0),
             started: Arc::new(Notify::new()),
             blocked: AtomicBool::new(false),
@@ -320,6 +322,9 @@ impl FakeMotor {
 
     fn release_calls(&self) -> usize {
         self.release_calls.load(Ordering::SeqCst)
+    }
+    fn respawn_calls(&self) -> usize {
+        self.respawn_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -390,6 +395,14 @@ impl MinecraftMotorDriverApi for FakeMotor {
             }
             Ok(())
         })
+    }
+
+    fn respawn(
+        &self,
+        _control: mineintent_contracts::minecraft::OperationControl,
+    ) -> mineintent_contracts::minecraft::BoxFuture<'_, Result<(), BackendError>> {
+        self.respawn_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
     }
 
     fn release_all(&self) -> Result<(), BackendError> {
@@ -640,7 +653,14 @@ async fn production_registry_definitions_and_dispatch_share_ordered_registry() {
         .collect();
     assert_eq!(
         names,
-        ["look_relative", "move_input", "view", "say", "remember"]
+        [
+            "look_relative",
+            "move_input",
+            "respawn",
+            "view",
+            "say",
+            "remember"
+        ]
     );
     for name in names {
         let invocation = tool_invocation(name.as_str(), json!({}));
@@ -652,7 +672,7 @@ async fn production_registry_definitions_and_dispatch_share_ordered_registry() {
         assert_eq!(
             harness.dispatcher.resource(&invocation),
             match name.as_str() {
-                "look_relative" | "move_input" => Some(ExecutionResource::Body),
+                "look_relative" | "move_input" | "respawn" => Some(ExecutionResource::Body),
                 "view" => Some(ExecutionResource::Viewport),
                 "say" => Some(ExecutionResource::Chat),
                 "remember" => Some(ExecutionResource::Memory),
@@ -1115,4 +1135,29 @@ async fn unknown_cancelled_deadline_and_invalid_scope_remain_structured_dispatch
         .expect_err("invalid scope dispatch");
     assert_eq!(scope.code, AgentErrorCode::ScopeInvalid);
     assert_eq!(harness.backend.motor_calls(), 0);
+}
+
+/// 产品裁定（2026-08-04 维护者，方案 1）：重生是同伴对自身处境的处置权，
+/// 由它自己决定何时调用。本回归钉住三件事：工具在生产 registry 里、
+/// 占身体资源（与转向/移动互斥）、完成语义只是「请求已派发」。
+#[tokio::test]
+async fn respawn_is_a_body_tool_that_reports_request_dispatched_only() {
+    let harness = harness();
+    let cancellation = TestCancellation::new();
+    let invocation = tool_invocation("respawn", json!({}));
+    assert_eq!(
+        harness.dispatcher.resource(&invocation),
+        Some(ExecutionResource::Body),
+        "重生与转向/移动共用身体资源，必须互斥"
+    );
+
+    let execution = dispatch(&harness.dispatcher, &cancellation, "respawn", json!({}))
+        .await
+        .expect("respawn dispatches");
+    assert_eq!(execution.result["status"], "completed");
+    assert_eq!(
+        execution.result["effect"]["requested"], true,
+        "完成只表示请求已派发，复活是随后的生命周期事实"
+    );
+    assert_eq!(harness.backend.motor.respawn_calls(), 1);
 }
