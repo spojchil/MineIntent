@@ -12,6 +12,9 @@ use mineintent_contracts::agent::{
     AgentError, AgentErrorCode, ContractFuture, ExecutionControl, ModelProvider, ModelUsage,
 };
 use mineintent_middle::agent::{AgentModelRequest, ModelCompletion};
+
+use crate::devlog;
+
 use serde_json::{json, Map, Value};
 
 #[derive(Clone, Debug)]
@@ -27,7 +30,9 @@ pub struct DeepSeekModelProvider {
 }
 
 fn provider_error(message: impl Into<String>) -> AgentError {
-    AgentError::new(AgentErrorCode::ProviderFailed, message.into())
+    let message = message.into();
+    devlog::log("model", format!("provider 失败：{message}"));
+    AgentError::new(AgentErrorCode::ProviderFailed, message)
 }
 
 impl DeepSeekModelProvider {
@@ -62,7 +67,21 @@ impl ModelProvider for DeepSeekModelProvider {
     ) -> ContractFuture<'a, Result<Self::Response, AgentError>> {
         Box::pin(async move {
             let payload = self.build_payload(&request)?;
-            let stamp = uuid::Uuid::new_v4().simple().to_string();
+            let stamp = format!(
+                "{}-{}",
+                request.run_id.as_str().replace(['/', '\\'], "_"),
+                uuid::Uuid::new_v4().simple()
+            );
+            devlog::log(
+                "model",
+                format!(
+                    "请求 run={} 消息数={} 工具数={}",
+                    request.run_id.as_str(),
+                    request.messages.len(),
+                    request.tools.len()
+                ),
+            );
+            devlog::dump_model_io(&stamp, "req", &payload.to_string());
             let io_dir = self.config.scratch_dir.join("model-io");
             tokio::fs::create_dir_all(&io_dir)
                 .await
@@ -91,6 +110,10 @@ impl ModelProvider for DeepSeekModelProvider {
                 .arg(&config_path)
                 .output()
                 .await;
+            // 配置文件含 key，任何模式下都必须删；请求正文在 dev 模式下
+            // 已另存一份可读副本，这里删的是 curl 的临时输入。
+            // 配置文件含 key，任何模式下都必须删；请求正文在 dev 模式下
+            // 已另存一份可读副本，这里删的是 curl 的临时输入。
             let _ = tokio::fs::remove_file(&config_path).await;
             let _ = tokio::fs::remove_file(&payload_path).await;
             let output =
@@ -103,6 +126,8 @@ impl ModelProvider for DeepSeekModelProvider {
                     stderr.chars().take(300).collect::<String>()
                 )));
             }
+            devlog::dump_model_io(&stamp, "res", &String::from_utf8_lossy(&output.stdout));
+            devlog::dump_model_io(&stamp, "res", &String::from_utf8_lossy(&output.stdout));
             let body: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
                 provider_error(format!(
                     "响应非 JSON：{error}；前 200 字节：{}",
@@ -130,6 +155,68 @@ impl ModelProvider for DeepSeekModelProvider {
                     .map(ToString::to_string)
                     .unwrap_or_else(|| "?".to_owned()),
                 body.get("usage").cloned().unwrap_or(Value::Null),
+            );
+            let tool_names: Vec<String> = message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .filter_map(|call| {
+                            call.pointer("/function/name")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            devlog::log(
+                "model",
+                format!(
+                    "响应 run={} finish={} 工具={:?} content={}",
+                    request.run_id.as_str(),
+                    finish_reason
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "?".to_owned()),
+                    tool_names,
+                    message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(|text| text.chars().take(120).collect::<String>())
+                        .unwrap_or_default()
+                ),
+            );
+            let tool_names: Vec<String> = message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .filter_map(|call| {
+                            call.pointer("/function/name")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            devlog::log(
+                "model",
+                format!(
+                    "响应 run={} finish={} 工具={:?} content={}",
+                    request.run_id.as_str(),
+                    finish_reason
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "?".to_owned()),
+                    tool_names,
+                    message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(|text| text.chars().take(120).collect::<String>())
+                        .unwrap_or_default()
+                ),
             );
             Ok(ModelCompletion {
                 message: Some(as_object(message)),

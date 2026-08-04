@@ -2183,10 +2183,12 @@ where
         });
     }
 
+    /// 事件入队路径的失败。与 worker 路径分开命名：前者会打死整个 runtime，
+    /// 后者按 is_recoverable_wake_error 分类，排障时必须一眼可辨。
     fn report_admission_error(&self, error: ParticipantRuntimeError) {
         self.fail_runtime_sync(
             failure_source(&error),
-            handler_code(&error),
+            &format!("ingest:{}", handler_code(&error)),
             &handler_summary(&error),
             self.current_scope(),
         );
@@ -2801,9 +2803,23 @@ where
 {
     fn on_event(&self, event: BackendEventEnvelope) {
         if let Err(error) = self.ingest_backend_event(event) {
-            if !self.is_normal_admission_race(&error) {
-                self.report_admission_error(error);
+            if self.is_normal_admission_race(&error) {
+                return;
             }
+            // 「什么算致命」必须只有一条规则：worker 路径按
+            // is_recoverable_wake_error 分类，入队路径过去却把同一种瞬时错误
+            // （如死亡期间的 source 读取失败）当致命，一次死亡就永久打死同伴。
+            // 两处各判一套，与 oracle 注释点名的 sameScope 缺陷同型。
+            if is_recoverable_wake_error(&error) {
+                self.fail_runtime_sync(
+                    failure_source(&error),
+                    &format!("ingest:{}", handler_code(&error)),
+                    &handler_summary(&error),
+                    self.current_scope(),
+                );
+                return;
+            }
+            self.report_admission_error(error);
         }
     }
 }
@@ -3211,6 +3227,9 @@ fn utc_now() -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
+/// 摘要保持与错误种类一一对应，**不携带内层文本**：内层可能嵌入私聊内容，
+/// 而失败摘要会进 journal 与 debug 面（既有隐私回归钉住了这条）。
+/// 排障所需的「为什么」由开发者模式在进程侧补齐，不放进持久记录。
 fn handler_summary(error: &ParticipantRuntimeError) -> String {
     match error {
         ParticipantRuntimeError::InvalidConfig(_) => {

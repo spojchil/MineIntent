@@ -334,6 +334,10 @@ impl MinecraftBackendFacade {
     fn ensure_ready(&self, operation: &str) -> Result<Arc<RuntimeSession>, BackendError> {
         self.inner.ensure_ready(operation)
     }
+
+    fn ensure_observable(&self, operation: &str) -> Result<Arc<RuntimeSession>, BackendError> {
+        self.inner.ensure_observable(operation)
+    }
 }
 
 impl MinecraftBackendApi for MinecraftBackendFacade {
@@ -365,7 +369,7 @@ impl MinecraftBackendApi for MinecraftBackendFacade {
     }
 
     fn snapshot(&self) -> Result<MinecraftSnapshotV1, BackendError> {
-        let session = self.ensure_ready("snapshot")?;
+        let session = self.ensure_observable("snapshot")?;
         #[cfg(test)]
         if let Some(snapshot) = session.scripted_snapshot.lock().clone() {
             return Ok(snapshot);
@@ -380,7 +384,7 @@ impl MinecraftBackendApi for MinecraftBackendFacade {
     }
 
     fn capture_frame_facts(&self) -> Result<MinecraftFrameFacts, BackendError> {
-        let session = self.ensure_ready("capture_frame_facts")?;
+        let session = self.ensure_observable("capture_frame_facts")?;
         #[cfg(test)]
         if let Some(snapshot) = session.scripted_snapshot.lock().clone() {
             return Ok(MinecraftFrameFacts {
@@ -406,7 +410,7 @@ impl MinecraftBackendApi for MinecraftBackendFacade {
     }
 
     fn observation_source(&self) -> Result<Arc<dyn ProtocolObservationSource>, BackendError> {
-        let session = self.ensure_ready("observation_source")?;
+        let session = self.ensure_observable("observation_source")?;
         let source = session.handle.observation_source();
         let bound_epoch = source.epoch();
         let facade_source = FacadeObservationSource {
@@ -503,6 +507,22 @@ impl FacadeInner {
     }
 
     fn ensure_ready(&self, operation: &str) -> Result<Arc<RuntimeSession>, BackendError> {
+        self.ensure_admitted(operation, false)
+    }
+
+    /// 观察面（snapshot / frame facts / observation source）在 `dead` 下同样可读：
+    /// 死亡是要如实上报的事实，不是拒绝读取的理由。oracle
+    /// minecraft-backend.ts:192,211 用的就是 `['ready','dead']` 允许集；
+    /// 动作面（motor / send_chat）仍只认 Ready。
+    fn ensure_observable(&self, operation: &str) -> Result<Arc<RuntimeSession>, BackendError> {
+        self.ensure_admitted(operation, true)
+    }
+
+    fn ensure_admitted(
+        &self,
+        operation: &str,
+        allow_dead: bool,
+    ) -> Result<Arc<RuntimeSession>, BackendError> {
         let session = self
             .session
             .lock()
@@ -511,7 +531,9 @@ impl FacadeInner {
                 state: "idle".to_owned(),
             })?;
         let state = session.handle.state();
-        if !matches!(state, BackendState::Ready { .. }) {
+        let admitted = matches!(state, BackendState::Ready { .. })
+            || (allow_dead && matches!(state, BackendState::Dead { .. }));
+        if !admitted {
             return Err(session_error_for(&session, operation));
         }
         if !session.has_snapshot() {

@@ -2954,14 +2954,20 @@ async fn backend_listener_surfaces_source_error_and_uses_injected_debug_clock() 
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(failure.code, "opening_frame_source_failed");
+    // 入队路径的失败带 ingest: 前缀，与 worker 路径可辨（两条路径的致命判据
+    // 相同，但排障时必须知道是谁先报的）。
+    assert_eq!(failure.code, "ingest:opening_frame_source_failed");
     assert!(!failure.summary.contains("secret"));
     let debug = runtime.debug_snapshot();
     assert_eq!(debug.recent_failures[0].at, "2026-08-03T00:00:00Z");
     assert!(!serde_json::to_string(&*debug).unwrap().contains("secret"));
+    // 曾断言 Faulted，实测证伪：同伴在游戏里死一次，入队侧的 source 读取即
+    // 失败，按旧行为整个同伴永久失聪。oracle 的 #recordFailure 只落盘不改
+    // 生命周期（runtime.ts:552-557），worker 路径也把 Source 归为可恢复；
+    // 本断言随致命判据统一而改为 Running。
     assert_eq!(
         runtime.lifecycle(),
-        mineintent_middle::participant::ParticipantLifecycle::Faulted
+        mineintent_middle::participant::ParticipantLifecycle::Running
     );
     runtime.stop().await.unwrap();
 }
@@ -3983,6 +3989,41 @@ async fn model_provider_failure_ends_the_run_not_the_participant() {
         agent.texts(),
         vec!["@Bot first", "@Bot second"],
         "失败之后的唤醒必须照常进入模型"
+    );
+    runtime.stop().await.unwrap();
+}
+
+/// 实测抓到的第二处移植偏差回归：入队路径把瞬时 source 错误当致命，
+/// 同伴在游戏里死一次就永久 Faulted。致命判据必须与 worker 路径同一条规则。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transient_source_failure_during_ingest_does_not_fault_the_participant() {
+    let agent = TestAgent::new(0);
+    let (runtime, source, _journal, _speech, _motor, _backend) = runtime_parts(Arc::clone(&agent));
+    runtime.start_worker().unwrap();
+
+    source.fail_context.store(true, Ordering::SeqCst);
+    // 走监听器路径：致命判定发生在 on_event，不在公开的 ingest 返回值上。
+    mineintent_contracts::minecraft::BackendEventListener::on_event(
+        runtime.as_ref(),
+        chat_event("51", 1, "Alice", "@Bot while dead"),
+    );
+    assert_eq!(
+        runtime.lifecycle(),
+        mineintent_middle::participant::ParticipantLifecycle::Running,
+        "瞬时 source 失败不得打死同伴"
+    );
+
+    source.fail_context.store(false, Ordering::SeqCst);
+    let recovered = chat_input(12, "Bob", "@Bot after recovery");
+    source.set_chats(vec![recovered]);
+    runtime
+        .ingest_backend_event(chat_event("52", 1, "Bob", "@Bot after recovery"))
+        .unwrap();
+    wait_for_request(&agent, 1).await;
+    assert_eq!(
+        agent.texts(),
+        vec!["@Bot after recovery"],
+        "恢复后必须照常唤醒"
     );
     runtime.stop().await.unwrap();
 }

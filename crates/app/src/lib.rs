@@ -8,6 +8,7 @@
 
 mod config;
 mod deepseek;
+mod devlog;
 mod factory;
 mod model;
 
@@ -82,6 +83,14 @@ pub enum AppError {
 
 impl MineIntentApp {
     pub async fn start(config: AppConfig) -> Result<Self, AppError> {
+        devlog::init(&config.data_directory);
+        devlog::log(
+            "app",
+            format!(
+                "装配开始 server={}:{}",
+                config.minecraft.server.host, config.minecraft.server.port
+            ),
+        );
         std::fs::create_dir_all(&config.data_directory)
             .map_err(|error| AppError::Assembly(format!("数据目录不可用：{error}")))?;
 
@@ -189,6 +198,43 @@ impl MineIntentApp {
         runtime
             .start_worker()
             .map_err(|error| AppError::Assembly(format!("runtime 启动失败：{error}")))?;
+
+        if devlog::enabled() {
+            // 失败流是 runtime 唯一的对外故障口径：dev 模式下逐条落盘，
+            // 避免再出现「同伴不响应但日志什么都没有」。
+            let mut failures = runtime.subscribe_failures();
+            tokio::spawn(async move {
+                while let Ok(failure) = failures.recv().await {
+                    devlog::log(
+                        "failure",
+                        format!(
+                            "source={:?} code={} summary={}",
+                            failure.source, failure.code, failure.summary
+                        ),
+                    );
+                }
+            });
+            // 生命周期心跳：卡住时能立刻区分「还在 Running」与「已 Faulted」。
+            let watched = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                let mut last = None;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    let snapshot = watched.debug_snapshot();
+                    let lifecycle = watched.lifecycle();
+                    let line = format!(
+                        "lifecycle={:?} scope={:?} decision={:?}",
+                        lifecycle,
+                        watched.current_scope().map(|scope| scope.connection_epoch),
+                        snapshot.decision.as_ref().map(|decision| decision.status),
+                    );
+                    if last.as_deref() != Some(line.as_str()) {
+                        devlog::log("state", &line);
+                        last = Some(line);
+                    }
+                }
+            });
+        }
 
         // BackendReady 的连接细节由 backend 生命周期事件承载；入口只需成功信号。
         drop(ready);
