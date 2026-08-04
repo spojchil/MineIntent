@@ -447,3 +447,62 @@ fn not_ready_command_head_cannot_be_overtaken_by_a_later_enqueue() {
     handle.shared.requeue_front(first_queued);
     handle.shared.cancel_pending_commands();
 }
+
+/// epoch 切片执行点复检：同代放行，重连推进一代后旧戳被拒且错误携带双方世代。
+/// 所有权半边需要真实 Client，由出队门既有回归与 Paper 纵向覆盖。
+#[test]
+fn execution_point_epoch_recheck_rejects_stale_stamp_and_passes_current() {
+    let handle = RuntimeHandle::new(RunConfig::default());
+    handle.shared.begin_connection_attempt();
+    let bound_epoch = handle.shared.writer.lock().connection_epoch;
+    assert!(
+        handle
+            .shared
+            .stale_epoch_error_locked(bound_epoch)
+            .is_none(),
+        "同代戳必须放行"
+    );
+    handle.shared.begin_connection_attempt();
+    match handle.shared.stale_epoch_error_locked(bound_epoch) {
+        Some(BackendError::StaleEpoch {
+            bound_epoch: bound,
+            current_epoch,
+        }) => {
+            assert_eq!(bound, bound_epoch);
+            assert_eq!(current_epoch, bound_epoch + 1);
+        }
+        other => panic!("旧戳必须被拒，实得 {other:?}"),
+    }
+}
+
+/// epoch 切片入队门：期望世代不匹配的命令拒于入队，不进队列；
+/// 匹配的入队项携带入队时刻的 epoch 戳供执行点复检。
+#[test]
+fn enqueue_rejects_mismatched_expected_epoch_and_stamps_queue_items() {
+    let handle = RuntimeHandle::new(RunConfig::default());
+    handle.shared.begin_connection_attempt();
+    let epoch = handle.shared.writer.lock().connection_epoch;
+    let envelope = |id: &str| BackendCommandEnvelope {
+        protocol: "mineintent.backend-command.v1".to_owned(),
+        id: id.to_owned(),
+        issued_at: chrono::Utc::now(),
+        command: BackendCommand::SendChat {
+            message: "hi".to_owned(),
+        },
+    };
+    let error = handle
+        .shared
+        .enqueue_command_if_running(envelope("stale"), Some(epoch + 1))
+        .expect_err("期望世代不匹配必须拒于入队");
+    assert!(
+        error.contains("stale command epoch"),
+        "拒绝理由必须点名世代陈旧，实得 {error}"
+    );
+    assert!(handle.shared.pop_command().is_none(), "被拒命令不得入队");
+    handle
+        .shared
+        .enqueue_command_if_running(envelope("current"), Some(epoch))
+        .expect("同代命令正常入队");
+    let queued = handle.shared.pop_command().expect("入队项存在");
+    assert_eq!(queued.connection_epoch, epoch, "队列项携带入队时刻的世代戳");
+}

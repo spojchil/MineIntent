@@ -19,18 +19,28 @@ impl SharedRuntime {
         Ok(actuator())
     }
 
-    pub(super) fn client_command_error_locked(
-        &self,
-        client: &Client,
-        connection_epoch: u64,
-        operation: &str,
-    ) -> Option<BackendError> {
+    /// 世代复检的无 Client 半边：入队时盖的 epoch 与当前不符即 StaleEpoch。
+    /// 单独成函数是为了让执行点复检语义可以在无法构造真实 Client 的单测里
+    /// 直接验证；所有权半边仍归 `client_command_error_locked`。
+    pub(super) fn stale_epoch_error_locked(&self, connection_epoch: u64) -> Option<BackendError> {
         let current_epoch = self.writer.lock().connection_epoch;
         if current_epoch != connection_epoch {
             return Some(BackendError::StaleEpoch {
                 bound_epoch: connection_epoch,
                 current_epoch,
             });
+        }
+        None
+    }
+
+    pub(super) fn client_command_error_locked(
+        &self,
+        client: &Client,
+        connection_epoch: u64,
+        operation: &str,
+    ) -> Option<BackendError> {
+        if let Some(error) = self.stale_epoch_error_locked(connection_epoch) {
+            return Some(error);
         }
         if !self.command_execution_allowed_without_lock()
             || !self.client_is_current_owner_locked(client)
@@ -83,6 +93,8 @@ impl SharedRuntime {
         Ok(actuator())
     }
 
+    /// 无主准入：仅供单测；生产路径走 `with_client_active_movement_admission`。
+    #[cfg(test)]
     pub(super) fn with_active_movement_admission<T>(
         &self,
         command_id: &str,
@@ -286,6 +298,8 @@ impl SharedRuntime {
     /// registration window as live.  The rest of the registration is allowed
     /// to run without that lock so cancellation never waits on a callback or
     /// a bot operation.
+    /// 无主注册：仅供单测；生产路径走 `register_active_movement_for_client`。
+    #[cfg(test)]
     pub(super) fn register_active_movement(
         &self,
         command_id: &str,

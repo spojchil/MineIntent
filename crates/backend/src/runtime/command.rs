@@ -295,6 +295,9 @@ pub(super) fn command_component_failure(operation: &str) -> BackendError {
 /// release attempt and the shared active-state cleanup have both completed.
 /// The actuator is injected so the ordering seam is testable without creating
 /// an Azalea client; production supplies the real walk/flag release closure.
+/// 无主释放：仅供无法构造真实 Client 的单测驱动状态机半边；
+/// 生产路径一律走 `release_client_active_movement_and_finish`。
+#[cfg(test)]
 pub(super) fn release_active_movement_and_finish(
     shared: &Arc<SharedRuntime>,
     command_id: &str,
@@ -392,9 +395,10 @@ fn release_active_movement_and_finish_for_owner(
 
 pub(super) fn handle_command(bot: &Client, shared: &Arc<SharedRuntime>, queued: QueuedCommand) {
     let QueuedCommand {
-        // 陈旧拒绝在入队时、所有权证明在出队时完成；epoch 戳随队列项保留，
-        // 执行点复检属后续切片，此处显式弃用。
-        connection_epoch: _,
+        // 三重门：入队拒陈旧、出队证所有权、执行点用队列项的 epoch 戳与
+        // Client 一起复检——重连可以发生在出队与马达调用之间，最后一道门
+        // 与同步马达共享同一 admission 点。
+        connection_epoch,
         envelope,
         completion,
     } = queued;
@@ -410,37 +414,36 @@ pub(super) fn handle_command(bot: &Client, shared: &Arc<SharedRuntime>, queued: 
     }
     match envelope.command {
         BackendCommand::SendChat { message } => {
-            match shared.with_command_admission(|| bot.chat(message)) {
+            let result = shared.with_client_command_admission(
+                bot,
+                connection_epoch,
+                &format!("command:{command_id}"),
+                || bot.chat(message),
+            );
+            match result {
                 Ok(()) => finish_command(&completion, Ok(())),
-                Err(()) => {
-                    finish_command(
-                        &completion,
-                        Err(BackendError::Cancelled {
-                            operation: format!("command:{command_id}"),
-                        }),
-                    );
-                }
+                Err(error) => finish_command(&completion, Err(error)),
             }
         }
         BackendCommand::LookRelative {
             yaw_degrees,
             pitch_degrees,
         } => {
-            let result = shared.with_command_admission(|| {
-                let direction = bot.direction();
-                bot.set_direction(
-                    direction.y_rot() - yaw_degrees,
-                    (direction.x_rot() - pitch_degrees).clamp(-90.0, 90.0),
-                );
-            });
+            let result = shared.with_client_command_admission(
+                bot,
+                connection_epoch,
+                &format!("command:{command_id}"),
+                || {
+                    let direction = bot.direction();
+                    bot.set_direction(
+                        direction.y_rot() - yaw_degrees,
+                        (direction.x_rot() - pitch_degrees).clamp(-90.0, 90.0),
+                    );
+                },
+            );
             match result {
                 Ok(()) => finish_command(&completion, Ok(())),
-                Err(()) => finish_command(
-                    &completion,
-                    Err(BackendError::Cancelled {
-                        operation: format!("command:{command_id}"),
-                    }),
-                ),
+                Err(error) => finish_command(&completion, Err(error)),
             }
         }
         BackendCommand::Move {
@@ -453,8 +456,14 @@ pub(super) fn handle_command(bot: &Client, shared: &Arc<SharedRuntime>, queued: 
             shared.cancel_active_movement(false);
             let direction = direction_for(&directions);
             let generation = shared.movement_generation.fetch_add(1, Ordering::AcqRel) + 1;
-            let registration =
-                shared.register_active_movement(&command_id, generation, duration_ms, &completion);
+            let registration = shared.register_active_movement_for_client(
+                bot,
+                connection_epoch,
+                &command_id,
+                generation,
+                duration_ms,
+                &completion,
+            );
             let ActiveMovementRegistration::Started { cancel_signal } = registration else {
                 return;
             };
@@ -463,8 +472,13 @@ pub(super) fn handle_command(bot: &Client, shared: &Arc<SharedRuntime>, queued: 
             // share one admission point. A cancellation that wins cannot
             // touch the bot; an actuator that wins leaves the same generation
             // for the release task to clean up.
-            let actuator_result =
-                shared.with_active_movement_admission(&command_id, generation, &completion, || {
+            let actuator_result = shared.with_client_active_movement_admission(
+                bot,
+                connection_epoch,
+                &command_id,
+                generation,
+                &completion,
+                || {
                     if sprint.unwrap_or(false) {
                         if let Some(sprint_direction) = sprint_direction(direction) {
                             bot.sprint(sprint_direction);
@@ -483,10 +497,13 @@ pub(super) fn handle_command(bot: &Client, shared: &Arc<SharedRuntime>, queued: 
                         bot.walk(WalkDirection::None);
                     }
                     true
-                });
+                },
+            );
             let started = match actuator_result {
                 Ok(started) => started,
-                Err(()) => {
+                // 无论输在取消竞速还是世代复检，completion 的结清形状都归
+                // cancel_registered_active_movement，保持既有取消语义不变。
+                Err(_) => {
                     shared.cancel_registered_active_movement(
                         &command_id,
                         generation,
@@ -533,8 +550,10 @@ pub(super) fn handle_command(bot: &Client, shared: &Arc<SharedRuntime>, queued: 
                                 .as_ref()
                                 .is_some_and(|completion| completion.cancelled.load(Ordering::Acquire))
                                 || task_shared.stopping.load(Ordering::Acquire);
-                            release_active_movement_and_finish(
+                            release_client_active_movement_and_finish(
                                 &task_shared,
+                                &bot_to_stop,
+                                connection_epoch,
                                 &command_id,
                                 generation,
                                 &completion_for_task,
@@ -554,8 +573,10 @@ pub(super) fn handle_command(bot: &Client, shared: &Arc<SharedRuntime>, queued: 
                             );
                         }
                         _ = cancel_signal.notified() => {
-                            release_active_movement_and_finish(
+                            release_client_active_movement_and_finish(
                                 &task_shared,
+                                &bot_to_stop,
+                                connection_epoch,
                                 &command_id,
                                 generation,
                                 &completion_for_task,
@@ -583,8 +604,10 @@ pub(super) fn handle_command(bot: &Client, shared: &Arc<SharedRuntime>, queued: 
                 .map(Some)
                 .unwrap_or(None);
             if let Some(previous_id) = previous_id {
-                release_active_movement_and_finish(
+                release_client_active_movement_and_finish(
                     shared,
+                    bot,
+                    connection_epoch,
                     &previous_id,
                     previous_generation,
                     &previous_completion,

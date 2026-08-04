@@ -328,7 +328,7 @@ pub(super) struct SharedRuntime {
     pub(super) connection_cancels:
         parking_lot::Mutex<Vec<(azalea::ecs::entity::Entity, azalea::join::AttemptToken)>>,
     /// NEW-15：pre-Init 超时自主重连所需账号，run 启动时登记一次。
-    pub(super) rejoin_account: parking_lot::Mutex<Option<azalea::Account>>,
+    pub(super) rejoin_account: parking_lot::Mutex<Option<azalea::account::Account>>,
     pub(super) shutdown: Arc<Notify>,
     pub(super) reconnect_cancel: Arc<Notify>,
     pub(super) shutdown_requested: AtomicBool,
