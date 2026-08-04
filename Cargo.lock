@@ -1771,6 +1771,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d60a6352e005f1f86008644a9fe336a66f74c94428182162cc69eb8c6fff458d"
 
 [[package]]
+name = "mineintent-app"
+version = "0.0.1"
+dependencies = [
+ "mineintent-backend",
+ "mineintent-contracts",
+ "mineintent-middle",
+ "parking_lot",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "mineintent-backend"
 version = "0.0.1"
 dependencies = [
