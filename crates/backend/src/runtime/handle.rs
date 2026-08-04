@@ -49,6 +49,13 @@ impl RuntimeHandle {
         self.shared.capture_frame_facts()
     }
 
+    /// 测试专用：直接落一个生命周期状态。脚本驱动只投事件不跑真实 reducer，
+    /// facade 侧的状态相关准入需要一个确定性的造态点。
+    #[cfg(test)]
+    pub(crate) fn test_set_backend_state(&self, state: BackendState) {
+        self.shared.set_backend_state(state);
+    }
+
     #[cfg(test)]
     pub(crate) fn test_install_frame_facts(
         &self,

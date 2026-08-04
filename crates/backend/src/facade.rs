@@ -423,7 +423,7 @@ impl MinecraftBackendApi for MinecraftBackendFacade {
     }
 
     fn motor(&self) -> Result<Arc<dyn MinecraftMotorDriverApi>, BackendError> {
-        let session = self.ensure_ready("motor")?;
+        let session = self.ensure_observable("motor")?;
         Ok(Arc::new(FacadeMotor {
             inner: Arc::downgrade(&self.inner),
             bound_epoch: session.handle.connection_epoch(),
@@ -1474,7 +1474,7 @@ impl MinecraftMotorDriverApi for FacadeMotor {
         let bound_epoch = self.bound_epoch;
         Box::pin(async move {
             let inner = inner.upgrade().ok_or_else(|| dropped_facade_error())?;
-            inner.ensure_bound_ready(&session, bound_epoch, "respawn")?;
+            inner.ensure_bound_respawnable(&session, bound_epoch, "respawn")?;
             control.preflight("respawn")?;
             let completion = session
                 .handle
@@ -1713,6 +1713,28 @@ impl FacadeInner {
             return Err(session_error_for(session, operation));
         }
         Ok(())
+    }
+
+    /// 重生是死亡状态下唯一有意义的动作：它的准入必须接受 Dead，
+    /// 否则「死了可以自己回来」在构造上不成立（实测中模型连调重生失败，
+    /// 只能眼睁睁躺着）。其余马达动作仍只认 Ready。
+    fn ensure_bound_respawnable(
+        &self,
+        session: &Arc<RuntimeSession>,
+        bound_epoch: u64,
+        operation: &str,
+    ) -> Result<(), BackendError> {
+        match self.ensure_bound_ready(session, bound_epoch, operation) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if matches!(session.handle.state(), BackendState::Dead { .. })
+                    && !matches!(error, BackendError::StaleEpoch { .. })
+                {
+                    return Ok(());
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -2371,6 +2393,64 @@ mod tests {
         assert_eq!(facts.snapshot.world.dimension, snapshot.world.dimension);
         assert_eq!(facts.armor, Some(17));
         assert_eq!(facts.light, Some(13));
+    }
+
+    /// 实测回归：同伴死亡后，观察面必须仍可读、重生必须仍可发，其余动作
+    /// 仍被拒。oracle minecraft-backend.ts:192,211 的允许集就是 [ready, dead]；
+    /// 移植时收窄成只认 ready，导致「死了就永远躺着且再也不响应」。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dead_backend_still_observes_and_admits_respawn_only() {
+        let (facade, driver) = ready_facade().await;
+        driver
+            .session()
+            .handle
+            .test_set_backend_state(BackendState::Dead {
+                epoch: 0,
+                attempt_id: "attempt-0".to_owned(),
+                died_at: "2026-08-04T16:00:00+00:00".to_owned(),
+            });
+        assert!(
+            matches!(facade.state(), BackendState::Dead { .. }),
+            "死亡事件后 backend 状态应为 Dead，实得 {:?}",
+            facade.state()
+        );
+
+        facade.snapshot().expect("死亡期间快照必须可读");
+        facade
+            .capture_frame_facts()
+            .expect("死亡期间帧事实必须可读");
+        facade.observation_source().expect("死亡期间观察源必须可取");
+        let motor = facade.motor().expect("死亡期间马达句柄必须可取");
+
+        let respawn_motor = motor.clone();
+        let respawn = tokio::spawn(async move { respawn_motor.respawn(never_control()).await });
+        tokio::task::yield_now().await;
+        settle_next_command(&driver, Ok(())).await;
+        tokio::time::timeout(Duration::from_secs(1), respawn)
+            .await
+            .expect("重生请求必须有界完成")
+            .expect("重生任务不得 panic")
+            .expect("死亡期间重生必须被准入");
+
+        let look = motor.look_relative(
+            LookRelativeRequest {
+                yaw_degrees: 10.0,
+                pitch_degrees: 0.0,
+            },
+            never_control(),
+        );
+        let error = tokio::time::timeout(Duration::from_secs(1), look)
+            .await
+            .expect("转向拒绝必须有界")
+            .expect_err("死亡期间转向必须仍被拒");
+        assert!(
+            matches!(error, BackendError::NotReady { .. }),
+            "拒绝理由应为未就绪，实得 {error:?}"
+        );
+
+        facade
+            .send_chat("hi".to_owned())
+            .expect_err("死亡期间发言必须仍被拒");
     }
 
     async fn settle_next_command(driver: &ScriptedDriver, result: Result<(), BackendError>) {
