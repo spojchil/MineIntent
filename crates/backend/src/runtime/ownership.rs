@@ -665,6 +665,55 @@ impl SharedRuntime {
         self.claim_reconnect_with_token(None)
     }
 
+    /// NEW-15：登记当前 pre-Init 连接尝试身份（ECS 捕获系统在
+    /// `Added<CreateConnectionTask>` 时调用）。覆盖式写入：同一时刻至多
+    /// 一个在途 join 任务，新登记天然取代旧的。
+    pub(super) fn record_pending_connection(
+        &self,
+        entity: azalea::ecs::entity::Entity,
+        attempt_token: azalea::join::AttemptToken,
+    ) {
+        let _admission = self.command_admission.lock();
+        let epoch = self.writer.lock().connection_epoch;
+        let ordinal = self.retry_ordinal.load(Ordering::Acquire);
+        *self.pending_connection.lock() = Some(PendingConnectionAttempt {
+            entity,
+            attempt_token,
+            epoch,
+            ordinal,
+        });
+    }
+
+    /// NEW-15：Connecting 超时下取走仍匹配 (epoch, ordinal) 的尝试身份。
+    /// 调用方必须持有 `command_admission`；身份不匹配时不动登记（陈旧
+    /// deadline 不得取消新尝试）。
+    pub(super) fn take_pending_connection_locked(
+        &self,
+        epoch: u64,
+        ordinal: u64,
+    ) -> Option<(azalea::ecs::entity::Entity, azalea::join::AttemptToken)> {
+        let mut pending = self.pending_connection.lock();
+        match *pending {
+            Some(attempt) if attempt.epoch == epoch && attempt.ordinal == ordinal => {
+                *pending = None;
+                Some((attempt.entity, attempt.attempt_token))
+            }
+            _ => None,
+        }
+    }
+
+    /// NEW-15：pre-Init 超时的重连宣占。与 SwarmEvent::Disconnect 兜底共享
+    /// 同一个 `reconnect_pending` 有限屏障：先到者调度，后到者拒绝，
+    /// 双重调度在构造上排除。
+    pub(super) fn claim_pre_init_reconnect(&self) -> bool {
+        let _admission = self.command_admission.lock();
+        if self.stopping.load(Ordering::Acquire) || self.reconnect_pending.load(Ordering::Acquire) {
+            return false;
+        }
+        self.reconnect_pending.store(true, Ordering::Release);
+        true
+    }
+
     pub(super) fn claim_reconnect_with_token(
         &self,
         attempt_token: Option<azalea::join::AttemptToken>,

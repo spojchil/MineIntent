@@ -127,13 +127,10 @@ impl SharedRuntime {
     }
 
     pub(super) fn spawn_phase_deadline(self: &Arc<Self>, token: PhaseDeadlineToken) {
-        // The pre-Init connect phase is deliberately not scheduled here:
-        // Azalea 0.16 does not expose a safe cancellation handle for its
-        // already-polled add/start future.  Login and spawn begin only after
-        // a Client/Init identity exists and are production-safe to cancel via
-        // the active Client path.
-        if token.phase == TransportPhase::Connecting || !self.timers_enabled.load(Ordering::Acquire)
-        {
+        // NEW-15：Connecting 现在同样排期。vendor seam 提供按 (entity, token)
+        // 精确取消 CreateConnectionTask 的句柄，fire 路径取走登记身份入取消
+        // 队列并自主走同一条重连链；黑洞 socket 不再能无限挂起 pre-Init。
+        if !self.timers_enabled.load(Ordering::Acquire) {
             return;
         }
         let shared = self.clone();
@@ -186,19 +183,31 @@ impl SharedRuntime {
         }
     }
 
-    pub(super) fn fire_phase_deadline(&self, token: PhaseDeadlineToken) {
-        let (close, should_drain, duplicate_cleanup, client) = {
+    pub(super) fn fire_phase_deadline(self: &Arc<Self>, token: PhaseDeadlineToken) {
+        let (close, should_drain, duplicate_cleanup, client, pre_init_cancel) = {
             let _admission = self.command_admission.lock();
             if !self.phase_deadline_matches_locked(token) {
                 return;
             }
             self.invalidate_phase_locked();
             let client = self.active_client.lock().clone();
+            // NEW-15：Connecting 超时下取走仍匹配本 deadline 世代的在途
+            // 连接任务身份；login/spawn 阶段已有 Client，不走此路。
+            let pre_init_cancel = if token.phase == TransportPhase::Connecting {
+                self.take_pending_connection_locked(token.epoch, token.attempt)
+            } else {
+                None
+            };
             let result = self
                 .mark_disconnected_evidence_locked(Self::timeout_close_evidence(token.phase), None);
-            (result.0, result.1, result.2, client)
+            (result.0, result.1, result.2, client, pre_init_cancel)
         };
         self.phase_cancel.notify_waiters();
+        if let Some((entity, attempt_token)) = pre_init_cancel {
+            // 锁外投递：vendor 的取消系统按三重身份匹配后 drop 任务，
+            // 旧 socket 不再可能迟到绑定。
+            self.connection_cancels.lock().push((entity, attempt_token));
+        }
         if duplicate_cleanup {
             self.cancel_active_movement(true);
             self.cancel_pending_commands();
@@ -215,6 +224,13 @@ impl SharedRuntime {
         // the one reconnect policy; this avoids a second lifecycle reducer.
         if let Some(client) = client {
             client.disconnect();
+        } else if token.phase == TransportPhase::Connecting
+            && close.retryable
+            && self.config.reconnect.enabled
+        {
+            // NEW-15：pre-Init 没有 Client，SwarmEvent 兜底不会到来；
+            // 超时路径自己走同一条重连链（宣占与 swarm 副本互斥）。
+            self.schedule_pre_init_reconnect(&close);
         }
         if !self.config.reconnect.enabled {
             self.emit_faulted(self.failure_for_close(&close));

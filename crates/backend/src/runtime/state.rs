@@ -306,11 +306,29 @@ impl EntityProducerRuntimeState {
     }
 }
 
+/// NEW-15：一次 pre-Init 连接尝试的完整身份。epoch/ordinal 把 (entity, token)
+/// 绑到登记时刻的世代，Connecting 超时只取走仍匹配的身份，陈旧登记不伤新尝试。
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PendingConnectionAttempt {
+    pub(super) entity: azalea::ecs::entity::Entity,
+    pub(super) attempt_token: azalea::join::AttemptToken,
+    pub(super) epoch: u64,
+    pub(super) ordinal: u64,
+}
+
 pub(super) struct SharedRuntime {
     pub(super) writer: parking_lot::Mutex<EventWriter>,
     pub(super) event_dispatch: parking_lot::Mutex<EventDispatchState>,
     pub(super) event_dispatch_wake: parking_lot::Condvar,
     pub(super) swarm: parking_lot::Mutex<Option<Swarm>>,
+    /// NEW-15：当前 pre-Init 连接尝试身份；ECS 捕获系统在任务出现时登记。
+    pub(super) pending_connection: parking_lot::Mutex<Option<PendingConnectionAttempt>>,
+    /// NEW-15：待投递的 CreateConnectionTask 取消请求；由泵系统在 Azalea
+    /// schedule 内转成 CancelConnectionTaskEvent，避免跨任务直写消息的竞争。
+    pub(super) connection_cancels:
+        parking_lot::Mutex<Vec<(azalea::ecs::entity::Entity, azalea::join::AttemptToken)>>,
+    /// NEW-15：pre-Init 超时自主重连所需账号，run 启动时登记一次。
+    pub(super) rejoin_account: parking_lot::Mutex<Option<azalea::Account>>,
     pub(super) shutdown: Arc<Notify>,
     pub(super) reconnect_cancel: Arc<Notify>,
     pub(super) shutdown_requested: AtomicBool,
@@ -412,6 +430,9 @@ impl SharedRuntime {
             event_dispatch: parking_lot::Mutex::new(EventDispatchState::default()),
             event_dispatch_wake: parking_lot::Condvar::new(),
             swarm: parking_lot::Mutex::new(None),
+            pending_connection: parking_lot::Mutex::new(None),
+            connection_cancels: parking_lot::Mutex::new(Vec::new()),
+            rejoin_account: parking_lot::Mutex::new(None),
             shutdown: Arc::new(Notify::new()),
             reconnect_cancel: Arc::new(Notify::new()),
             shutdown_requested: AtomicBool::new(false),

@@ -2,6 +2,9 @@
 
 use super::*;
 
+use azalea::ecs::prelude::{Added, Entity};
+use azalea::JoinOpts;
+
 #[derive(Clone, Component)]
 struct BotState {
     shared: Arc<SharedRuntime>,
@@ -35,9 +38,41 @@ struct RuntimeShutdownPlugin;
 impl Plugin for RuntimeShutdownPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Update, emit_app_exit_when_stopping);
+        // NEW-15：连接尝试身份捕获与取消投递都在 Azalea 自己的 schedule 内，
+        // 与消息双缓冲不竞争。捕获在 vendor 的 join 系统链之后看到新任务。
+        app.add_systems(
+            Update,
+            (record_started_connection_attempts, pump_connection_cancels),
+        );
         // 死亡后冻结本地物理状态必须在 Azalea 的常规 Update 查询完成后执行，
         // 否则会与更新碰撞盒、准星命中结果的系统产生无序写入警告。
         app.add_systems(PostUpdate, freeze_dead_local_player);
+    }
+}
+
+/// NEW-15：`CreateConnectionTask` 出现即登记 (entity, token) 到 runtime，
+/// Connecting 超时据此精确取消。Added 过滤器保证每次尝试恰登记一次。
+fn record_started_connection_attempts(
+    state: Res<SwarmState>,
+    query: Query<(Entity, &azalea::join::AttemptToken), Added<azalea::join::CreateConnectionTask>>,
+) {
+    for (entity, token) in &query {
+        state.shared.record_pending_connection(entity, *token);
+    }
+}
+
+/// NEW-15：把 runtime 侧排队的取消请求转成 ECS 消息；vendor 的取消系统
+/// 按 (entity, 当前 token, 任务 token) 三重匹配后 drop 任务。
+fn pump_connection_cancels(
+    state: Res<SwarmState>,
+    mut writer: MessageWriter<azalea::join::CancelConnectionTaskEvent>,
+) {
+    let cancels: Vec<_> = state.shared.connection_cancels.lock().drain(..).collect();
+    for (entity, attempt_token) in cancels {
+        writer.write(azalea::join::CancelConnectionTaskEvent {
+            entity,
+            attempt_token,
+        });
     }
 }
 
@@ -311,45 +346,87 @@ async fn handle_swarm(swarm: Swarm, event: SwarmEvent, state: SwarmState) {
             shared.finish_reconnect_attempt(0);
             return;
         };
-        let reconnect_cancel = shared.reconnect_cancel.clone();
-        tokio::task::spawn_local(async move {
-            tokio::select! {
-                _ = tokio::time::sleep(delay) => {}
-                _ = reconnect_cancel.notified() => {
-                    shared.finish_reconnect_attempt(0);
-                    return;
-                }
-            }
-            let Some(token) = shared.admit_reconnect_attempt() else {
+        spawn_rejoin(shared.clone(), swarm, account, join_opts, delay);
+    }
+}
+
+/// 退避到期后的单次重连尝试。SwarmEvent 兜底与 NEW-15 的 pre-Init 超时
+/// 路径共用同一实现：admit/allowed/bind/finish 的 token 纪律只有一份。
+fn spawn_rejoin(
+    shared: Arc<SharedRuntime>,
+    swarm: Swarm,
+    account: Box<Account>,
+    join_opts: Box<JoinOpts>,
+    delay: Duration,
+) {
+    let reconnect_cancel = shared.reconnect_cancel.clone();
+    tokio::task::spawn_local(async move {
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = reconnect_cancel.notified() => {
                 shared.finish_reconnect_attempt(0);
                 return;
-            };
-            if !shared.reconnect_add_is_allowed(token) {
-                shared.finish_reconnect_attempt(token);
-                return;
             }
-            let state = BotState {
-                shared: shared.clone(),
-            };
-            // Do not drop add_with_opts after its first poll: it may already
-            // have started Client::start_client. Stop invalidates the token
-            // and exits the swarm; once this future returns, an invalid token
-            // explicitly disconnects the returned client as the final guard.
-            let client = swarm.add_with_opts(&account, state, &join_opts).await;
-            // Bind while the reservation/token/stop admission is held by the
-            // backend.  Do not perform a separate read-then-bind check: a
-            // stop or token transition between those reads must invalidate
-            // the returned client instead of installing its owner.
-            let bound = shared
-                .bind_reconnect_return_with_token(token, client.entity, client.attempt_token())
-                .is_some();
-            if !bound {
-                client.disconnect();
-            } else {
-                let _ = shared.set_active_client_if_current(&client);
-            }
+        }
+        let Some(token) = shared.admit_reconnect_attempt() else {
+            shared.finish_reconnect_attempt(0);
+            return;
+        };
+        if !shared.reconnect_add_is_allowed(token) {
             shared.finish_reconnect_attempt(token);
-        });
+            return;
+        }
+        let state = BotState {
+            shared: shared.clone(),
+        };
+        // Do not drop add_with_opts after its first poll: it may already
+        // have started Client::start_client. Stop invalidates the token
+        // and exits the swarm; once this future returns, an invalid token
+        // explicitly disconnects the returned client as the final guard.
+        let client = swarm.add_with_opts(&account, state, &join_opts).await;
+        // Bind while the reservation/token/stop admission is held by the
+        // backend.  Do not perform a separate read-then-bind check: a
+        // stop or token transition between those reads must invalidate
+        // the returned client instead of installing its owner.
+        let bound = shared
+            .bind_reconnect_return_with_token(token, client.entity, client.attempt_token())
+            .is_some();
+        if !bound {
+            client.disconnect();
+        } else {
+            let _ = shared.set_active_client_if_current(&client);
+        }
+        shared.finish_reconnect_attempt(token);
+    });
+}
+
+impl SharedRuntime {
+    /// NEW-15：Connecting 超时的自主重连。pre-Init 没有 Client 可 disconnect，
+    /// SwarmEvent::Disconnect 兜底不会到来，由超时路径自己走同一条重连链。
+    /// 宣占失败（已有调度在途/停机）即无事返回；缺 swarm/account 时回滚宣占。
+    pub(super) fn schedule_pre_init_reconnect(self: &Arc<Self>, close: &BackendClose) {
+        if !self.claim_pre_init_reconnect() {
+            return;
+        }
+        let swarm = self.swarm.lock().clone();
+        let account = self.rejoin_account.lock().clone();
+        let (Some(swarm), Some(account)) = (swarm, account) else {
+            // 启动极早期（swarm 尚未 Init）拿不到重连材料；释放宣占，
+            // 让后续 ConnectionFailed/SwarmEvent 路径接手，不静默吞掉。
+            self.reconnect_pending.store(false, Ordering::Release);
+            return;
+        };
+        let Some(delay) = self.emit_reconnect_scheduled(close) else {
+            self.finish_reconnect_attempt(0);
+            return;
+        };
+        spawn_rejoin(
+            self.clone(),
+            swarm,
+            Box::new(account),
+            Box::new(JoinOpts::default()),
+            delay,
+        );
     }
 }
 
@@ -372,6 +449,8 @@ pub async fn run_with_handle(
         return Ok(());
     }
     let account = Account::offline(&config.username);
+    // NEW-15：pre-Init 超时自主重连需要账号材料；swarm 句柄由 Init 事件登记。
+    *shared.rejoin_account.lock() = Some(account.clone());
     let socket: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     let address = ResolvedAddr {
         server: ServerAddr::from(socket),

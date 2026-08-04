@@ -453,3 +453,97 @@ async fn stop_watchdog_forces_pending_movement_and_has_no_fault_or_reconnect() {
 }
 
 // ================= NEW-13 V2: AttemptToken ↔ epoch binding =================
+
+// ================= NEW-15: pre-Init connect deadline =================
+
+/// Connecting 超时必须取走在途连接任务身份并入取消队列；无 swarm 材料时
+/// 重连宣占回滚，不留死 pending 位阻塞后续路径。
+#[test]
+fn connecting_timeout_queues_precise_cancel_and_rolls_back_claim_without_swarm() {
+    let handle = RuntimeHandle::new(RunConfig::default());
+    let mut events = handle.subscribe();
+    let mut world = bevy_ecs::world::World::new();
+    let attempt_entity = world.spawn_empty().id();
+    let attempt_token = azalea::join::AttemptToken::mint();
+
+    assert!(handle.shared.begin_connection_attempt());
+    let _request = events.try_recv().expect("request");
+    handle
+        .shared
+        .record_pending_connection(attempt_entity, attempt_token);
+
+    let token = handle
+        .shared
+        .test_current_phase_token(TransportPhase::Connecting);
+    handle.shared.fire_phase_deadline(token);
+
+    let closed = events.try_recv().expect("timeout close");
+    assert_eq!(payload_json(&closed)["close"]["code"], "connection_timeout");
+    let cancels: Vec<_> = handle.shared.connection_cancels.lock().drain(..).collect();
+    assert_eq!(cancels, vec![(attempt_entity, attempt_token)]);
+    // 测试环境没有 swarm/Init：宣占必须已回滚，后续真实路径仍可宣占。
+    assert!(!handle.shared.reconnect_pending.load(Ordering::Acquire));
+    assert!(handle.shared.claim_pre_init_reconnect());
+}
+
+/// 陈旧登记（旧 epoch/ordinal）不得被新一代 Connecting 超时取消：
+/// 身份不匹配时取消队列保持为空，pending 位也不被清掉。
+#[test]
+fn stale_pending_connection_is_not_cancelled_by_new_generation_deadline() {
+    let handle = RuntimeHandle::new(RunConfig::default());
+    let mut events = handle.subscribe();
+    let mut world = bevy_ecs::world::World::new();
+    let stale_entity = world.spawn_empty().id();
+    let stale_token = azalea::join::AttemptToken::mint();
+
+    assert!(handle.shared.begin_connection_attempt());
+    let _request_a = events.try_recv().expect("request A");
+    handle
+        .shared
+        .record_pending_connection(stale_entity, stale_token);
+    // 第二次连接尝试推进 epoch；旧登记随之过期。
+    assert!(handle.shared.begin_connection_attempt());
+    let _request_b = events.try_recv().expect("request B");
+    assert_eq!(handle.shared.connection_epoch(), 2);
+    // 手动过期登记（epoch 1），当前 deadline 是 epoch 2。
+    let token_b = handle
+        .shared
+        .test_current_phase_token(TransportPhase::Connecting);
+    // 直接检验取走判定：身份不匹配必须返回 None 且不动登记。
+    {
+        let _admission = handle.shared.command_admission.lock();
+        assert!(handle
+            .shared
+            .take_pending_connection_locked(token_b.epoch, token_b.attempt)
+            .is_none());
+    }
+    assert!(handle.shared.pending_connection.lock().is_some());
+    handle.shared.fire_phase_deadline(token_b);
+    let closed = events.try_recv().expect("timeout close B");
+    assert_eq!(payload_json(&closed)["close"]["code"], "connection_timeout");
+    assert!(
+        handle.shared.connection_cancels.lock().is_empty(),
+        "stale identity must not be cancelled by a new-generation deadline"
+    );
+}
+
+/// 双重调度在构造上排除：宣占是有限屏障，先到者成功，后到者拒绝；
+/// 停机中一律拒绝。
+#[test]
+fn pre_init_reconnect_claim_is_a_finite_barrier() {
+    let handle = RuntimeHandle::new(RunConfig::default());
+    assert!(handle.shared.claim_pre_init_reconnect());
+    assert!(
+        !handle.shared.claim_pre_init_reconnect(),
+        "second claim while pending must be refused"
+    );
+    handle
+        .shared
+        .reconnect_pending
+        .store(false, Ordering::Release);
+    handle.shared.stopping.store(true, Ordering::Release);
+    assert!(
+        !handle.shared.claim_pre_init_reconnect(),
+        "claim while stopping must be refused"
+    );
+}
