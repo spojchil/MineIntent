@@ -1,6 +1,7 @@
 # 当前实现结构
 
-> 实现快照：本分支相对 `main@e2d1f89` 的当前实现
+> 实现快照：本分支相对 `main@e2d1f89` 的当前实现（TypeScript 栈）；
+> Rust 移植的实现快照见下方第 9 节，绑定 `crates/` 当前内容
 >
 > 本页只描述当前代码事实，没有产品权威。产品判断与候选架构见[《产品》](./产品.md)；两者不一致时，
 > 应把这里记录为实现偏差，不能用既成实现反向解释产品。
@@ -155,6 +156,36 @@ fake backend、fake model/provider 和临时文件，不启动 Minecraft 或真�
 和背包行为。挖掘场景不表示当前 Agent 已拥有挖掘工具。具体命令和破坏性边界见[验证指南](./guides/validation.md)。
 
 当前没有可重复的“Paper + MineIntent Runtime + Python Agent Service + 真实模型”端到端验收。
+
+## 9. Rust 移植（进行中，尚未接管运行）
+
+仓库同时存在两套实现。**当前可运行、被验证指南覆盖的仍是上面的 TypeScript 栈**；
+`crates/` 是全 Rust 单进程移植，已完成主体但未完成验收，因此不是"当前实现"，
+也还没有替代任何一层。
+
+```text
+Minecraft Java 26.1.2（Paper，协议 775）
+        ↕ Azalea（自有 fork，见 crates/backend/README.md）
+Rust 单进程
+  crates/backend   连接生命周期、命令、观察、视口投影
+  crates/middle    Agent 循环、capability 派发、Information、记忆、语音、Participant runtime
+  crates/contracts 三层之间的严格进程内契约
+  crates/app       组合根与模型 provider
+        ↕ OpenAI-compatible /chat/completions
+模型供应商
+```
+
+与 TS 栈的**结构性差异**（均已有裁定，不是实现偏差）：
+
+- Python agent-service 与 loopback HTTP 工具桥不再存在，Agent 循环内联为进程内 `AgentRunner`；
+- 目标服务端版本从 1.21.1 升到 26.1.2，协议执行层从 Mineflayer 换成自有 fork 的 Azalea；
+- 模型可见工具从五个增为六个（新增 `respawn`）；
+- 观察面：`view` 工具支持 `full` / `directed` 两种模式，轮末追加一帧视口。
+
+TS 栈在移植期的地位是**行为 oracle**：137 个行为测试是可执行的行为规范，
+逐条对应关系见[历史索引](./history/index.md)中的迁移证据。
+
+运行方式与开发者模式见[Rust workspace 指南](./guides/rust-workspace.md)。
 
 ## 已知实现偏差
 

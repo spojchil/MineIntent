@@ -39,3 +39,9 @@ TEMP_*.md
 # 本地私有文件与临时目录：*.local.* 罩单个文件（如 notes.local.md），tmp/ 罩整个目录
 *.local.*
 tmp/
+
+# Rust workspace
+target/
+# 施工期供应品与实服运行产物：客户端 jar、反编译源、世界存档与运行日志一律不入库
+supplies/
+server-run/

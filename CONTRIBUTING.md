@@ -27,6 +27,18 @@
 - 人工观察或真实服务器证据；
 - 尚未验证的推断。
 
+改动 `crates/` 时另跑 Rust 工作区的三件套（与 CI 相同）：
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets
+cargo test --workspace --all-targets --locked
+```
+
+工具链由 `rust-toolchain.toml` 钉住（nightly，随 Azalea 的要求），
+`rustfmt`/`clippy` 已在其中声明，无需另行安装。
+运行方式与环境变量见 [Rust workspace 指南](./docs/guides/rust-workspace.md)。
+
 ## 5. Pull Request
 
 - 使用简体中文填写人工创建的 Issue、Pull Request 和审查交流；代码标识与 Conventional Commit 类型可以使用英文。

@@ -132,3 +132,4 @@
 | `src/companion/` | [`src/participant/`](../../src/participant/) | [`e2d1f89` 原路径](https://github.com/spojchil/MineIntent/tree/e2d1f89/src/companion) |
 | `产品.md`（仓库根） | [`docs/产品.md`](../产品.md) | [`e37ffe7` 原路径](https://github.com/spojchil/MineIntent/blob/e37ffe7/产品.md) |
 | `产品待澄清问题.md` | 已移出仓库（转维护者本地 `*.local.*` 文件；2026-07-31 基线整体确认后仅余历史价值） | [`e37ffe7` 原文](https://github.com/spojchil/MineIntent/blob/e37ffe7/产品待澄清问题.md) |
+| 施工仓库 `MineIntent-backend-rs`（本地） | [`crates/`](../../crates/) | 完整施工历史（含 60+ 份施工过程文档、逐切片进度日志、决策台账与中期更新）保留在本仓库的 [`archive/rust-port-wip`](https://github.com/spojchil/MineIntent/tree/archive/rust-port-wip) 分支；该分支与 `main` 无共同祖先，只作证据查阅，不合并 |
