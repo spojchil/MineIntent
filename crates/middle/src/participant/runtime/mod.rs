@@ -1498,6 +1498,9 @@ where
         }
     }
 
+    /// 装配一轮决策的开场帧。**每次唤醒调用一次**，不是每进程一次——
+    /// 调用点就在 `process_wake` 里。误读成「只在最初装配一次」会得出
+    /// 「装配失败只影响启动」的错误结论；实际上它决定每一次唤醒能否成事。
     fn assemble_frame(
         &self,
         wake: &WakeItem,
@@ -1507,9 +1510,16 @@ where
         omitted: u64,
         omitted_types: Vec<String>,
     ) -> Result<JsonAgentDecisionContextV5, ParticipantRuntimeError> {
-        if capture.light.is_none() {
-            return Err(ParticipantSourceError::MissingLight.into());
-        }
+        // 纪律：可观察量缺席不构成装配失败。
+        //
+        // 这里曾经对 light 做 fail-closed，代价是同伴一死就永久失能——死后
+        // 服务端收回全部区块，光照必然读不到，于是唤醒到得了、准入过得了，
+        // 却卡在一个死亡期间本就不可能存在的事实上，而唯一的自救动作
+        // （respawn）只能由模型发起，模型又永远等不到这一帧。
+        //
+        // 下面保留的三项都不是「观察缺席」：维度为空和维度与作用域不符是
+        // 帧本身无效，触发聊天不在未读窗口内是唤醒的前提不成立。二者与
+        // 「这一轮没看到某个量」是不同性质的问题，仍然必须失败。
         if capture.dimension.is_empty() {
             return Err(ParticipantSourceError::Invalid(
                 "frame dimension must not be empty".to_owned(),
@@ -1602,7 +1612,7 @@ where
                 unread_chat: capture.unread_chat,
                 unread_chat_omitted: capture.unread_chat_omitted,
                 sound: capture.sound,
-                light: capture.light.expect("light checked above"),
+                light: capture.light,
                 events,
                 omissions: capture.omissions,
                 trigger_chat: Some(AgentChatTriggerV5 {

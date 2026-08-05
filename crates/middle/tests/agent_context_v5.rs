@@ -225,7 +225,7 @@ fn input(
                 observed_at: "2026-08-01T00:00:20Z".to_owned(),
             }]),
         }),
-        light: 12,
+        light: Some(12),
         events,
         omissions: vec![],
         trigger_chat,

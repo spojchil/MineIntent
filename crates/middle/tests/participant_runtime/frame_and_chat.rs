@@ -39,6 +39,12 @@ async fn v5_frame_requires_light_deduplicates_trigger_and_preserves_armor() {
     let request = agent.requests.lock().unwrap().remove(0);
     assert_eq!(request.context.frame.status.unwrap().armor, Some(6));
 
+    // 光照读不到时，帧照常装配并送到模型手里，只是 light 字段缺席。
+    //
+    // 这一条钉的是「可观察量缺席不构成装配失败」。它曾经的断言正好相反
+    // （期待 opening_frame_light_missing），而那个行为在实盘上的后果是：
+    // 同伴死后服务端收回全部区块，光照必然读不到，于是它永远拿不到帧、
+    // 永远调不出唯一能自救的 respawn。
     source.missing_light.store(true, Ordering::SeqCst);
     let missing = chat_input(7, "Alice", "@Bot no light");
     source.set_chats(vec![missing]);
@@ -46,11 +52,19 @@ async fn v5_frame_requires_light_deduplicates_trigger_and_preserves_armor() {
     runtime
         .ingest_backend_event(chat_event("23", 1, "Alice", "@Bot no light"))
         .unwrap();
-    let failure = tokio::time::timeout(Duration::from_secs(2), failures.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(failure.code, "opening_frame_light_missing");
+    wait_for_request(&agent, 3).await;
+    let request = agent.requests.lock().unwrap().remove(0);
+    assert_eq!(request.context.frame.light, None);
+    let wire = serde_json::to_value(&request.context).unwrap();
+    // 缺席只能写成「没有这个键」，不能写成 null，更不能拿 0 顶替。
+    assert!(wire["frame"].get("light").is_none());
+    assert!(!wire.to_string().contains("\"light\""));
+    // 一个可观察量缺席不得产生失败流事件。
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), failures.recv())
+            .await
+            .is_err()
+    );
     assert_eq!(
         runtime.lifecycle(),
         mineintent_middle::participant::ParticipantLifecycle::Running

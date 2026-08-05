@@ -85,6 +85,29 @@ fn v5_rejects_unknown_fields_nulls_empty_segments_and_ranges() {
     negative_light["frame"]["light"] = json!(-1);
     assert_rejected::<JsonAgentDecisionContextV5>(negative_light);
 
+    // 光照的三种情形必须彼此分开：缺席（这一轮没观察到）合法；显式 null 与
+    // 越界都不合法。缺席之所以要合法，是因为服务端会真的收走区块视野
+    // （实测：死亡后一秒全量 ForgetLevelChunk），此时没有任何可信值可填；
+    // 而 0 是「此处全黑」这个真实观察，不能拿来顶替「没看到」。
+    let mut null_light = fixture_value();
+    null_light["frame"]["light"] = Value::Null;
+    assert_rejected::<JsonAgentDecisionContextV5>(null_light);
+
+    let mut absent_light = fixture_value();
+    absent_light["frame"]
+        .as_object_mut()
+        .expect("frame is an object")
+        .remove("light");
+    let parsed: JsonAgentDecisionContextV5 =
+        serde_json::from_value(absent_light.clone()).expect("光照缺席是合法帧");
+    assert_eq!(parsed.frame.light, None);
+    // 缺席只能写成「没有这个键」，往返之后不得冒出 light。
+    assert_eq!(
+        serde_json::to_value(&parsed).expect("往返"),
+        absent_light,
+        "缺席的光照不得在序列化时被补回来"
+    );
+
     let mut invalid_slot = fixture_value();
     invalid_slot["frame"]["hotbar"]["slots"]["9"] = json!(["stone", 1]);
     assert_rejected::<JsonAgentDecisionContextV5>(invalid_slot);

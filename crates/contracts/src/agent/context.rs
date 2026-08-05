@@ -835,6 +835,12 @@ impl<'de> Deserialize<'de> for AgentEventV5 {
 
 /// Strict v5 opening frame.  No `player`, `self`, `inventory`, `timeOfDay`,
 /// `effects`, or viewport field exists in this type.
+///
+/// 「开场」指开启**这一轮决策**，不是整个会话只有一次：每次唤醒装配一份新的
+/// 本类型值，一轮里的多次模型请求共用同一份、只追加工具结果。整个会话真正
+/// 只有一份的是 [`StableContextV5`]，而它只装 memory、不含任何世界观察。
+/// 这一句写在这里，是因为「开场」二字按字面读会得到相反的结论，而两种读法
+/// 对「死亡后同伴为什么恢复不了」会导出完全不同的判断。
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AgentFrameV5 {
@@ -865,11 +871,22 @@ pub struct AgentFrameV5 {
         skip_serializing_if = "Option::is_none"
     )]
     pub sound: Option<SoundValues>,
+    /// 缺席表示「本轮没有观察到光照」，与 status/chat/sound 同一约定。
+    ///
+    /// 光照是本帧唯一从区块光照缓存重建、而不是直接取自快照的事实，所以它
+    /// 有别的字段没有的缺席途径：区块还没送达，或服务端把该玩家的区块视野
+    /// 收了回去（实测：同伴死亡后一秒，Paper 26.1.2 会 ForgetLevelChunk 掉
+    /// 它的全部区块，直到重生都不恢复）。
+    ///
+    /// 缺席绝不能用 0 顶替：0 是「此处全黑」这个真实观察，与「没看到」是
+    /// 两件事，混同就是替世界撒谎。
     #[serde(
-        deserialize_with = "deserialize_light",
-        serialize_with = "serialize_light"
+        default,
+        deserialize_with = "deserialize_optional_light",
+        serialize_with = "serialize_optional_light",
+        skip_serializing_if = "Option::is_none"
     )]
-    pub light: u8,
+    pub light: Option<u8>,
     #[serde(
         default,
         deserialize_with = "deserialize_optional_non_empty_vec",
@@ -1059,29 +1076,34 @@ fn parse_hotbar_slot(value: &str) -> Result<u8, String> {
         .map_err(|_| "hotbar slot key is not a valid slot".to_owned())
 }
 
-fn serialize_light<S>(value: &u8, serializer: S) -> Result<S::Ok, S::Error>
+/// 缺席与越界是两件事：缺席合法（没观察到），越界不合法（观察本身是坏的）。
+/// 显式 null 也不接受，理由与其余可选字段一致——省略才是缺席的唯一写法。
+fn serialize_optional_light<S>(value: &Option<u8>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    if *value > 15 {
-        return Err(S::Error::custom(
+    match value {
+        None => serializer.serialize_none(),
+        Some(value) if *value > 15 => Err(S::Error::custom(
             "light must be an integer between 0 and 15",
-        ));
+        )),
+        Some(value) => serializer.serialize_u8(*value),
     }
-    serializer.serialize_u8(*value)
 }
 
-fn deserialize_light<'de, D>(deserializer: D) -> Result<u8, D::Error>
+fn deserialize_optional_light<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let value = u8::deserialize(deserializer)?;
+    let Some(value) = Option::<u8>::deserialize(deserializer)? else {
+        return Err(D::Error::custom("explicit null is not allowed"));
+    };
     if value > 15 {
         return Err(D::Error::custom(
             "light must be an integer between 0 and 15",
         ));
     }
-    Ok(value)
+    Ok(Some(value))
 }
 
 fn value_contains_null(value: &Value) -> bool {

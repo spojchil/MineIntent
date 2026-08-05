@@ -366,9 +366,6 @@ pub(super) fn handler_code(error: &ParticipantRuntimeError) -> &'static str {
     match error {
         ParticipantRuntimeError::InvalidConfig(_) => "invalid_runtime_configuration",
         ParticipantRuntimeError::Frame(_) => "frame_assembly_failed",
-        ParticipantRuntimeError::Source(ParticipantSourceError::MissingLight) => {
-            "opening_frame_light_missing"
-        }
         ParticipantRuntimeError::Source(_) => "opening_frame_source_failed",
         ParticipantRuntimeError::Memory(_) => "memory_read_failed",
         ParticipantRuntimeError::Handler(_) => "participant_handler_failed",

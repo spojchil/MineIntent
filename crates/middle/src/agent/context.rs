@@ -24,7 +24,9 @@ pub struct AgentContextV5Input {
     /// Records evicted by the source's bounded history before this input.
     pub unread_chat_omitted: u64,
     pub sound: Option<SoundValues>,
-    pub light: u8,
+    /// `None` 直接透传为字段缺席。装配器不替光照做任何补偿，因为它没有
+    /// 任何比「没观察到」更可信的值可用。
+    pub light: Option<u8>,
     /// Cross-run/registered events, including an optional trigger chat.
     pub events: Vec<AgentContextV5EventInput>,
     pub omissions: Vec<InformationOmission>,

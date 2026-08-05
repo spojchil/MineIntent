@@ -375,24 +375,31 @@ if [ "$DEATH_SCENARIO" != "off" ]; then
       FAKE_SECONDS=90 FAKE_MESSAGE="$BOT_NAME 你还好吗" \
       "$FAKE_BIN" > "$DEATH_DIR/fake-stdout.log" 2>&1 ) & FAKE_PID=$!
 
-  # 没死成就不能判「死后重生」：respawn 在活着时是无害操作，后面那句话
-  # 照样说得出来，据此判过是假阳性。前置不成立时如实标注未取证。
+  # 没死成就不能判「死后重生」：respawn 在活着时是服务端的空操作
+  # （handleClientCommand 里 getHealth() > 0 直接 return），据此判过是假阳性。
+  # 前置不成立时如实标注未取证。
   if [ "$DIED" -ne 0 ]; then
     note "未致死，跳过重生判定（此前提不成立时该判定无意义）"
   else
-    if wait_for "$SERVER_DIR/logs/latest.log" "<$BOT_NAME> 我又活过来了" 90; then
-      assert "死后被唤醒并自行重生" "服务端 log（重生后才说得出话）" 0 "我又活过来了"
-    else
-      assert "死后被唤醒并自行重生" "服务端 log（重生后才说得出话）" 1 "90s 内未见重生后发言"
-    fi
-
-    console "data get entity $BOT_NAME Health" 2
-    if srvlog | grep 'entity data' | tail -1 | grep -qE ' (20|19|18|17|16)\.[0-9]+f'; then
-      assert "重生后生命值恢复" "服务端 data get Health" 0 \
+    # 判据是服务端的 Health 由 0.0f 回到满值，不是公屏上那句话。
+    #
+    # 原本想用「say 排在 respawn 之后，公屏出现即证明重生生效」做间接证明，
+    # 实测不成立：重生会把作用域推到下一代，而 say 是在重生完成之前入队的
+    # （实测相差 145ms），于是它作为旧作用域的遗留被正确拦掉，永远不会到
+    # 公屏。拦截本身没错，错的是拿一个必然失败的现象当判据。
+    RESPAWNED=1
+    for _ in $(seq 1 30); do
+      console "data get entity $BOT_NAME Health" 1
+      if srvlog | grep 'entity data' | tail -1 | grep -qE ' (20|19|18|17|16)\.[0-9]+f'; then
+        RESPAWNED=0; break
+      fi
+    done
+    if [ "$RESPAWNED" -eq 0 ]; then
+      assert "死后被唤醒并自行重生（生命值由 0 恢复）" "服务端 data get Health" 0 \
         "$(srvlog | grep 'entity data' | tail -1 | grep -oE '[0-9.]+f')"
     else
-      assert "重生后生命值恢复" "服务端 data get Health" 1 \
-        "$(srvlog | grep 'entity data' | tail -1)"
+      assert "死后被唤醒并自行重生（生命值由 0 恢复）" "服务端 data get Health" 1 \
+        "30 次轮询仍未回满：$(srvlog | grep 'entity data' | tail -1)"
     fi
   fi
 

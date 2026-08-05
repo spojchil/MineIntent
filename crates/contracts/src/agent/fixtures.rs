@@ -135,7 +135,7 @@ pub fn agent_context_v5() -> JsonAgentDecisionContextV5 {
                     observed_at: "2026-08-01T00:00:20Z".to_owned(),
                 }]),
             }),
-            light: 12,
+            light: Some(12),
             events: Some(vec![AgentEventV5::player_chat(alice)]),
             omissions: None,
         },

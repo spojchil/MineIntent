@@ -792,11 +792,8 @@ fn assemble_direct_frame(
     omitted: u64,
     omitted_types: Vec<String>,
 ) -> Result<AgentFrameV5, crate::agent::AgentContextV5AssemblyError> {
-    let Some(light) = capture.light else {
-        return Err(crate::agent::AgentContextV5AssemblyError::InvalidInput(
-            "opening frame light is unavailable".to_owned(),
-        ));
-    };
+    // 与 runtime 的装配同一纪律：光照读不到就缺席，不让整帧失败。
+    // 这条路径供轮末视野帧使用，它同样会在死亡期间被取用。
     if let Some(status) = capture.status.as_mut() {
         if status.armor == Some(0) {
             status.armor = None;
@@ -831,7 +828,7 @@ fn assemble_direct_frame(
             unread_chat: capture.unread_chat,
             unread_chat_omitted: capture.unread_chat_omitted,
             sound: capture.sound,
-            light,
+            light: capture.light,
             events,
             omissions: capture.omissions,
             trigger_chat: None,

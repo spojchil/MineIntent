@@ -119,8 +119,9 @@ pub struct ParticipantFailure {
 
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
 pub enum ParticipantSourceError {
-    #[error("opening frame light is unavailable")]
-    MissingLight,
+    // 这里曾有一个 MissingLight：光照读不到就让整帧失败。它已被删除，因为
+    // 「某个可观察量这一轮没读到」不是错误，是帧要如实表达的内容——留着它
+    // 就等于允许任何一个可缺席的量把同伴打成失能。见 AgentFrameV5::light。
     #[error("participant source scope is stale: {0}")]
     StaleScope(String),
     #[error("opening frame source is invalid: {0}")]
