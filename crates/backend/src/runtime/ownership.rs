@@ -255,6 +255,18 @@ impl SharedRuntime {
                     observation.armor = None;
                     observation.armor_epoch = None;
                 }
+                // 这一步会清空光照区块缓存。缓存要靠后续的区块/光照包重新填满，
+                // 在填满之前任何取帧都读不到光照——所以边界发生的时刻必须留痕，
+                // 否则事后只能看到「读不到」，看不到「什么时候被清的」。
+                let dropped = observation.light_cache.chunks.len();
+                tracing::info!(
+                    target: "mineintent_backend",
+                    epoch = expected_epoch,
+                    scope_generation,
+                    dimension = ?dimension,
+                    dropped_light_chunks = dropped,
+                    "作用域边界：重置观察面并清空光照缓存"
+                );
                 observation.clear_light_for_scope(
                     expected_epoch,
                     scope_generation,

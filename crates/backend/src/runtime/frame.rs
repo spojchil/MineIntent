@@ -51,6 +51,40 @@ pub(super) struct LightCache {
     pub(super) chunks: HashMap<(i32, i32), CachedLightChunk>,
 }
 
+/// 光照读不到的七种成因。全都是「本次读不到」，没有一种是「这里没有光」——
+/// 后者只会以 0 出现。区分它们是为了让上层能说人话，也为了排障不用猜。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LightUnavailable {
+    /// 还没见过 Login/Respawn 边界，作用域未建立。
+    NoScope,
+    /// 缓存属于另一个 epoch/作用域代/维度，按纪律不得跨用。
+    ScopeMismatch,
+    /// 位置不是可落格的有限值。
+    BadPosition,
+    /// 上游没能证明世界高度，光照分段几何未知。
+    NoGeometry,
+    /// 位置落在光照列之外（世界上下边界外）。
+    OutOfLightColumn,
+    /// 所在区块的光照数据还没收到或已被卸载。
+    ChunkNotCached,
+    /// 区块在缓存里，但该分段的天光/块光层缺失。
+    LayerMissing,
+}
+
+impl LightUnavailable {
+    pub(super) fn code(self) -> &'static str {
+        match self {
+            Self::NoScope => "no_scope",
+            Self::ScopeMismatch => "scope_mismatch",
+            Self::BadPosition => "bad_position",
+            Self::NoGeometry => "no_geometry",
+            Self::OutOfLightColumn => "out_of_light_column",
+            Self::ChunkNotCached => "chunk_not_cached",
+            Self::LayerMissing => "layer_missing",
+        }
+    }
+}
+
 impl LightCache {
     pub(super) fn clear(&mut self) {
         self.context = None;
@@ -186,42 +220,78 @@ impl LightCache {
         scope_generation: u64,
         dimension: &str,
     ) -> Option<u8> {
-        let context = self.context.as_ref()?;
+        self.explain_at(position, epoch, scope_generation, dimension)
+            .ok()
+    }
+
+    /// 与 `value_at` 同一判定，但把「读不到」的具体理由带出来。
+    ///
+    /// 光照是唯一一个从缓存重建、而非直接来自快照的帧事实，它缺席的成因有七种，
+    /// 彼此的处置完全不同（作用域还没建立是暂态、区块没缓存是可等待、几何未证
+    /// 是上游没给）。只回 `None` 的话，调用方无法区分，排障时也只能猜。
+    pub(super) fn explain_at(
+        &self,
+        position: &Vec3Value,
+        epoch: u64,
+        scope_generation: u64,
+        dimension: &str,
+    ) -> Result<u8, LightUnavailable> {
+        let Some(context) = self.context.as_ref() else {
+            return Err(LightUnavailable::NoScope);
+        };
         if context.epoch != epoch
             || context.scope_generation != scope_generation
             || context.dimension != dimension
         {
-            return None;
+            return Err(LightUnavailable::ScopeMismatch);
         }
-        let x = floor_block_coordinate(position.x)?;
-        let y = floor_block_coordinate(position.y)?;
-        let z = floor_block_coordinate(position.z)?;
+        let (Some(x), Some(y), Some(z)) = (
+            floor_block_coordinate(position.x),
+            floor_block_coordinate(position.y),
+            floor_block_coordinate(position.z),
+        ) else {
+            return Err(LightUnavailable::BadPosition);
+        };
         let section_y = y.div_euclid(16);
-        let section_index = context.geometry?.index_for_section_y(section_y)?;
+        let Some(geometry) = context.geometry else {
+            return Err(LightUnavailable::NoGeometry);
+        };
+        let Some(section_index) = geometry.index_for_section_y(section_y) else {
+            return Err(LightUnavailable::OutOfLightColumn);
+        };
         let chunk_x = x.div_euclid(16);
         let chunk_z = z.div_euclid(16);
-        let local_x = usize::try_from(x.rem_euclid(16)).ok()?;
-        let local_y = usize::try_from(y.rem_euclid(16)).ok()?;
-        let local_z = usize::try_from(z.rem_euclid(16)).ok()?;
+        let (Ok(local_x), Ok(local_y), Ok(local_z)) = (
+            usize::try_from(x.rem_euclid(16)),
+            usize::try_from(y.rem_euclid(16)),
+            usize::try_from(z.rem_euclid(16)),
+        ) else {
+            return Err(LightUnavailable::BadPosition);
+        };
         let layer_index = (local_y << 8) | (local_z << 4) | local_x;
-        let chunk = self.chunks.get(&(chunk_x, chunk_z));
+        let Some(chunk) = self.chunks.get(&(chunk_x, chunk_z)) else {
+            return Err(LightUnavailable::ChunkNotCached);
+        };
         let sky = if context.has_skylight == Some(false) {
             Some(0)
         } else {
             chunk
-                .and_then(|chunk| chunk.sky.get(section_index))
+                .sky
+                .get(section_index)
                 .and_then(|layer| layer.as_ref())
                 .and_then(|layer| layer.get(layer_index).copied())
         };
         let block = chunk
-            .and_then(|chunk| chunk.block.get(section_index))
+            .block
+            .get(section_index)
             .and_then(|layer| layer.as_ref())
             .and_then(|layer| layer.get(layer_index).copied());
 
         match (sky, block) {
-            (Some(sky), Some(block)) => Some(sky.max(block)),
-            (Some(15), None) | (None, Some(15)) => Some(15),
-            _ => None,
+            (Some(sky), Some(block)) => Ok(sky.max(block)),
+            // 单边满值已经能定上界：另一层无论多少都不会更亮。
+            (Some(15), None) | (None, Some(15)) => Ok(15),
+            _ => Err(LightUnavailable::LayerMissing),
         }
     }
 
@@ -485,6 +555,14 @@ impl SharedRuntime {
             data,
             replace_chunk,
         ) {
+            // 被拒的光照包是「缓存为什么填不满」的另一半答案：
+            // 卸载看得见，拒收看不见，两者都要留痕才能对上账。
+            tracing::debug!(
+                target: "mineintent_backend",
+                chunk = ?(chunk_x, chunk_z),
+                cached_chunks = observation.light_cache.chunks.len(),
+                "光照包被作用域校验拒收"
+            );
             return false;
         }
         observation.bump_generation();
@@ -513,6 +591,12 @@ impl SharedRuntime {
         {
             return false;
         }
+        tracing::debug!(
+            target: "mineintent_backend",
+            chunk = ?(chunk_x, chunk_z),
+            cached_chunks = observation.light_cache.chunks.len(),
+            "光照区块随服务端卸载移出缓存"
+        );
         observation.bump_generation();
         true
     }
@@ -666,12 +750,47 @@ impl SharedRuntime {
         let armor = (observation.armor_epoch == Some(snapshot.connection_epoch))
             .then_some(observation.armor)
             .flatten();
-        let light = observation.light_cache.value_at(
-            &snapshot.self_snapshot.position,
+        let position = &snapshot.self_snapshot.position;
+        let chunk = (
+            floor_block_coordinate(position.x).map(|x| x.div_euclid(16)),
+            floor_block_coordinate(position.z).map(|z| z.div_euclid(16)),
+        );
+        let light = match observation.light_cache.explain_at(
+            position,
             snapshot.connection_epoch,
             observation.snapshot_scope_generation,
             &snapshot.world.dimension,
-        );
+        ) {
+            Ok(light) => {
+                tracing::debug!(
+                    target: "mineintent_backend",
+                    light,
+                    chunk = ?chunk,
+                    cached_chunks = observation.light_cache.chunks.len(),
+                    alive = snapshot.self_snapshot.alive,
+                    scope_generation = observation.snapshot_scope_generation,
+                    "本帧光照可用"
+                );
+                Some(light)
+            }
+            Err(reason) => {
+                // 帧装配对 light 是 fail-closed 的，所以这条是「同伴突然不响应」
+                // 唯一的现场：不留下成因，事后只能靠复现去猜是哪一种。
+                tracing::warn!(
+                    target: "mineintent_backend",
+                    reason = reason.code(),
+                    alive = snapshot.self_snapshot.alive,
+                    position = ?position,
+                    chunk = ?chunk,
+                    cached_chunks = observation.light_cache.chunks.len(),
+                    epoch = snapshot.connection_epoch,
+                    scope_generation = observation.snapshot_scope_generation,
+                    dimension = %snapshot.world.dimension,
+                    "本帧光照不可用"
+                );
+                None
+            }
+        };
         Some(RuntimeFrameFacts {
             snapshot,
             armor,
