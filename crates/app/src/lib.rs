@@ -36,7 +36,7 @@ use mineintent_middle::speech::{SpeechScheduler, SpeechSchedulerOptions, SpeechT
 use mineintent_middle::telemetry::DebugStateStore;
 
 use factory::{AppAgentFactory, AppModelChoice};
-use model::default_vertical_script;
+use model::script_from_env;
 
 /// oracle 的 run 期限由模型服务边界承担；进程内形态下由 runtime 统一持有。
 /// 值与 TS 假模型集成测试的上限一致，Paper 纵向实测时按需登记调整。
@@ -131,7 +131,7 @@ impl MineIntentApp {
 
         let (choice, model_label) = match &config.model {
             config::ModelChoiceConfig::Scripted => (
-                AppModelChoice::Scripted(default_vertical_script()),
+                AppModelChoice::Scripted(script_from_env()),
                 "scripted-vertical".to_owned(),
             ),
             config::ModelChoiceConfig::Responses {

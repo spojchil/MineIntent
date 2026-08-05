@@ -12,4 +12,4 @@ pub mod responses;
 pub mod scripted;
 
 pub use responses::{ResponsesConfig, ResponsesModelProvider};
-pub use scripted::{default_vertical_script, JsonObject, ScriptedModelProvider};
+pub use scripted::{script_from_env, JsonObject, ScriptedModelProvider};

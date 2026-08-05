@@ -21,6 +21,7 @@ JAVA_BIN="${JAVA_BIN:-$REPO_ROOT/supplies/tools/jdk-25/Contents/Home/bin/java}"
 BASE="${BASE:-$REPO_ROOT/server-run/gate-b}"
 SERVER_DIR="$BASE/server"
 RUN_DIR="$BASE/run"
+DEATH_DIR="$BASE/death"
 DATA_DIR="$RUN_DIR/.mineintent"
 REPORT="$BASE/report.md"
 
@@ -31,6 +32,8 @@ MODEL="${MODEL:-scripted}"
 KEY_FILE="${KEY_FILE:-}"
 RUN_SECS="${RUN_SECS:-100}"
 PORT="${PORT:-25565}"
+# 死亡恢复场景：plain=怪物致死后自行重生；off=跳过。
+DEATH_SCENARIO="${DEATH_SCENARIO:-plain}"
 
 PHASE="(未开始)"
 COMPLETED=0
@@ -314,6 +317,90 @@ else
   else
     assert "停机走正常路径而非崩溃" "同伴退出输出（交叉印证）" 1 "未见正常停机标记"
   fi
+fi
+
+# ------------------------------------------------- 死亡恢复（第六个工具）
+# 默认纵向脚本只走五个工具，respawn 覆盖不到；而 respawn 恰是最近两次实盘
+# 修复（1298912 死后失聪、628836e 死亡期间准许重生）的主题。这里用怪物打死
+# 同伴而不是 /kill：伤害→掉血→死亡整条观察链都要真实经过。
+if [ "$DEATH_SCENARIO" != "off" ]; then
+  phase "死亡恢复"
+  rm -rf "$DEATH_DIR"; mkdir -p "$DEATH_DIR"
+  ( cd "$DEATH_DIR" && exec env MINEINTENT_MC_HOST=127.0.0.1 MINEINTENT_MC_PORT="$PORT" \
+      MINEINTENT_MC_USERNAME="$BOT_NAME" MINEINTENT_WORLD_ID=paper-gate-b \
+      MINEINTENT_DATA_DIR="$DEATH_DIR/.mineintent" MINEINTENT_DEBUG=1 \
+      MINEINTENT_SCRIPT=death MINEINTENT_MAX_RUNTIME_SECS=150 "${MODEL_ENV[@]}" \
+      "$APP_BIN" > "$DEATH_DIR/companion-stdout.log" 2>&1 ) & APP_PID=$!
+
+  if wait_for "$SERVER_DIR/logs/latest.log" "$BOT_NAME joined the game" 90; then
+    note "同伴重新进入世界，准备致死"
+  else
+    assert "死亡场景：同伴进入世界" "服务端 log" 1 "90s 内未见 joined"; exit 1
+  fi
+
+  # 夜间 + 困难：僵尸白天自燃会先死在半路，easy 难度伤害不足以在窗口内致死。
+  console "difficulty hard" 1
+  console "time set midnight" 1
+
+  # 持续补怪而不是一次性召唤：僵尸可能卡住、掉下去或被环境弄死，
+  # 一次性召唤的成功率靠运气。四个方位各来一只，每轮补一次。
+  DIED=1
+  for round in $(seq 1 12); do
+    for off in "~1 ~ ~" "~-1 ~ ~" "~ ~ ~1" "~ ~ ~-1"; do
+      console "execute at $BOT_NAME run summon minecraft:zombie $off" 0
+    done
+    if wait_for "$SERVER_DIR/logs/latest.log" "$BOT_NAME (was slain|was killed|died)" 10; then
+      DIED=0; break
+    fi
+  done
+  if [ "$DIED" -eq 0 ]; then
+    assert "同伴被怪物真实杀死" "服务端 log" 0 \
+      "$(srvlog | grep -oE "$BOT_NAME (was slain|was killed|died)[^\"]*" | tail -1)"
+  else
+    assert "同伴被怪物真实杀死" "服务端 log" 1 "补怪 12 轮仍未致死"
+  fi
+  console "kill @e[type=minecraft:zombie]" 1
+
+  console "data get entity $BOT_NAME Health" 2
+  if srvlog | grep 'entity data' | tail -1 | grep -q ' 0.0f'; then
+    assert "死亡态在服务端可见（Health=0）" "服务端 data get Health" 0 "0.0f"
+  else
+    assert "死亡态在服务端可见（Health=0）" "服务端 data get Health" 1 \
+      "$(srvlog | grep 'entity data' | tail -1)"
+  fi
+
+  # 唤醒它。死亡期间动作面只放行 respawn，所以只要公屏上出现这句话，
+  # 就同时证明了「死后仍可被唤醒」和「重生真的生效」——而不只是请求已派发。
+  ( cd "$DEATH_DIR" && exec env FAKE_HOST=127.0.0.1 FAKE_PORT="$PORT" FAKE_USERNAME="$FAKE_NAME" \
+      FAKE_SECONDS=90 FAKE_MESSAGE="$BOT_NAME 你还好吗" \
+      "$FAKE_BIN" > "$DEATH_DIR/fake-stdout.log" 2>&1 ) & FAKE_PID=$!
+
+  # 没死成就不能判「死后重生」：respawn 在活着时是无害操作，后面那句话
+  # 照样说得出来，据此判过是假阳性。前置不成立时如实标注未取证。
+  if [ "$DIED" -ne 0 ]; then
+    note "未致死，跳过重生判定（此前提不成立时该判定无意义）"
+  else
+    if wait_for "$SERVER_DIR/logs/latest.log" "<$BOT_NAME> 我又活过来了" 90; then
+      assert "死后被唤醒并自行重生" "服务端 log（重生后才说得出话）" 0 "我又活过来了"
+    else
+      assert "死后被唤醒并自行重生" "服务端 log（重生后才说得出话）" 1 "90s 内未见重生后发言"
+    fi
+
+    console "data get entity $BOT_NAME Health" 2
+    if srvlog | grep 'entity data' | tail -1 | grep -qE ' (20|19|18|17|16)\.[0-9]+f'; then
+      assert "重生后生命值恢复" "服务端 data get Health" 0 \
+        "$(srvlog | grep 'entity data' | tail -1 | grep -oE '[0-9.]+f')"
+    else
+      assert "重生后生命值恢复" "服务端 data get Health" 1 \
+        "$(srvlog | grep 'entity data' | tail -1)"
+    fi
+  fi
+
+  console "difficulty easy" 1
+  console "time set day" 1
+  kill -TERM "$FAKE_PID" 2>/dev/null; FAKE_PID=""
+  i=0; while [ "$i" -lt 200 ] && kill -0 "$APP_PID" 2>/dev/null; do sleep 2; i=$((i+2)); done
+  kill -TERM "$APP_PID" 2>/dev/null; APP_PID=""
 fi
 
 if [ "$TEMPLATE_USED" -eq 1 ]; then
