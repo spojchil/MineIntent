@@ -1537,14 +1537,25 @@ impl MinecraftMotorDriverApi for FacadeMotor {
         })
     }
 
+    /// 投递即返回，不等后端结算。
+    ///
+    /// 这个方法唯一的调用点在 `Drop` 里（中间层的 `ReleaseAllOnDrop`），
+    /// 而 `Drop` 不能 await。曾经的写法是在这里 condvar 阻塞等后端答复，
+    /// 于是产生过一个四节点死锁：析构发生在 tokio worker 上 → 阻塞等后端
+    /// 运行时线程 → 后端线程正卡在事件桥入队 → 桥等派发线程腾位 → 派发线程
+    /// 等的队列消费者，正是被阻塞住的那个 worker。2026-08-05 实盘挂死取证。
+    ///
+    /// 回到 TS 原型的代价模型：`motor-driver.ts:65` 的 `releaseAll()` 是
+    /// `bot.clearControlStates()`，单线程、纳秒返回、不等任何人。签名当初迁对了，
+    /// 代价模型迁反了。返回 `Ok` 表示命令已入队且世代有效，不表示按键已松开——
+    /// 松开的事实由随后的观察给出。
     fn release_all(&self) -> Result<(), BackendError> {
         self.ensure("release_all")?;
-        let completion = self
-            .session
+        self.session
             .handle
             .release_all_for_epoch(self.bound_epoch)
-            .map_err(|error| map_runtime_command_error(&self.session, "release_all", error))?;
-        completion.wait_blocking()
+            .map(|_completion| ())
+            .map_err(|error| map_runtime_command_error(&self.session, "release_all", error))
     }
 }
 
@@ -3709,13 +3720,9 @@ mod tests {
             .expect("new generation task")
             .expect("new move should complete");
 
-        let release_motor = motor.clone();
-        let release = tokio::task::spawn_blocking(move || release_motor.release_all());
+        // 投递即返回：不需要另起线程，也不需要后端先结算。返回 Ok 只表示
+        // 命令按当前世代入了队，随后的 settle 证明它确实到了队列里。
+        motor.release_all().expect("release_all should post");
         settle_next_command(&driver, Ok(())).await;
-        tokio::time::timeout(Duration::from_secs(1), release)
-            .await
-            .expect("release_all should be bounded")
-            .expect("release task")
-            .expect("release_all should complete");
     }
 }

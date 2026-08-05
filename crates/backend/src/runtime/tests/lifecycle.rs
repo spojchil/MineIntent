@@ -862,16 +862,21 @@ fn command_completion_settled_signal_waits_for_release_and_result_publication() 
                 CommandCompletionCancellation(waiter_state.clone())
                     .wait_settled()
                     .await;
+                // settled 是收尾事务里最后一次发布。观察到它的这个线程，
+                // 必须已经能看到结果——零超时只给一次轮询机会，所以这里
+                // 断言的是「已经在那儿」，不是「等一会儿会到」。
+                assert_eq!(
+                    tokio::time::timeout(Duration::ZERO, completion.wait()).await,
+                    Ok(Ok(()))
+                );
             });
             assert!(!observed_state.active_release.load(Ordering::Acquire));
-            assert!(observed_state.settled_result.lock().is_some());
         });
         barrier.wait();
         state.finish(Ok(()));
         waiter
             .join()
             .expect("settlement waiter should not race early");
-        assert_eq!(completion.wait_blocking(), Ok(()));
     }
 }
 

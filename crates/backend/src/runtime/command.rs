@@ -51,11 +51,9 @@ pub(super) fn validate_command(command: &BackendCommand) -> Result<(), String> {
 
 pub(super) struct CommandCompletionState {
     pub(super) sender: parking_lot::Mutex<Option<oneshot::Sender<Result<(), BackendError>>>>,
-    pub(super) settled_result: parking_lot::Mutex<Option<Result<(), BackendError>>>,
-    pub(super) settled_cv: parking_lot::Condvar,
     /// Owns the single finishing transition. `settled` is published only
-    /// after result, physical-release bookkeeping, and the oneshot have all
-    /// been published under this ownership.
+    /// after physical-release bookkeeping and the oneshot have both been
+    /// published under this ownership.
     pub(super) finish_lock: parking_lot::Mutex<()>,
     pub(super) cancelled: AtomicBool,
     pub(super) active_release: AtomicBool,
@@ -71,7 +69,6 @@ impl CommandCompletionState {
         if self.settled.load(Ordering::Acquire) {
             return;
         }
-        *self.settled_result.lock() = Some(result.clone());
         self.active_release.store(false, Ordering::Release);
         if let Some(sender) = self.sender.lock().take() {
             let _ = sender.send(result);
@@ -80,7 +77,6 @@ impl CommandCompletionState {
         // transition. Waiters that observe `settled` therefore also observe
         // the result and the completed physical-release bookkeeping.
         self.settled.store(true, Ordering::Release);
-        self.settled_cv.notify_all();
         self.settled_signal.notify_one();
     }
 
@@ -137,8 +133,6 @@ impl CommandCompletion {
         let (sender, receiver) = oneshot::channel();
         let state = Arc::new(CommandCompletionState {
             sender: parking_lot::Mutex::new(Some(sender)),
-            settled_result: parking_lot::Mutex::new(None),
-            settled_cv: parking_lot::Condvar::new(),
             finish_lock: parking_lot::Mutex::new(()),
             cancelled: AtomicBool::new(false),
             active_release: AtomicBool::new(false),
@@ -173,19 +167,6 @@ impl CommandCompletion {
                 operation: format!("command:{}", self.command_id),
             }),
         }
-    }
-
-    /// Synchronous companion used by the frozen `release_all` facade method.
-    /// The condition variable is independent of Tokio, so this remains safe
-    /// to call from a caller that happens to be inside another async runtime.
-    pub(crate) fn wait_blocking(self) -> Result<(), BackendError> {
-        let mut result = self.state.settled_result.lock();
-        while result.is_none() {
-            self.state.settled_cv.wait(&mut result);
-        }
-        result
-            .take()
-            .expect("settled result exists after completion wait")
     }
 
     pub(crate) fn cancellation_handle(&self) -> CommandCompletionCancellation {
