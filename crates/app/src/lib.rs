@@ -82,6 +82,7 @@ pub enum AppError {
 
 impl MineIntentApp {
     pub async fn start(config: AppConfig) -> Result<Self, AppError> {
+        devlog::init_tracing();
         devlog::init(&config.data_directory);
         devlog::log(
             "app",
@@ -245,6 +246,13 @@ impl MineIntentApp {
     /// 停机顺序照 oracle：runtime 先收束（内部取消 run/speech、释放身体），
     /// 再 dispose frame source（退订 backend），最后停 backend。
     pub async fn stop(&self, reason: &str) -> Result<(), AppError> {
+        // 未落盘的可重建事实在这里给一次总账：它们不进 journal，但「这次
+        // 运行到底摄入了多少、什么类型」是排障要看的量，只出现一次。
+        if let Some(summary) = self.runtime.ingest_counters().summary_line() {
+            tracing::info!(target: "mineintent_app", counts = %summary, "本次运行摄入的可重建事实计数");
+            devlog::log("ingest", &summary);
+        }
+        tracing::info!(target: "mineintent_app", reason, "开始停机");
         let mut first_error: Option<AppError> = None;
         if let Err(error) = self.runtime.stop().await {
             first_error.get_or_insert(AppError::Assembly(format!("runtime 停止失败：{error}")));

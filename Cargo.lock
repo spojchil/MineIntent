@@ -1872,6 +1872,8 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "toml",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -1907,6 +1909,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.19",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

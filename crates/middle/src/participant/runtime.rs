@@ -532,6 +532,16 @@ impl ParticipantFactOwner {
             return;
         }
         state.omitted = state.omitted.saturating_add(1);
+        // 丢弃意味着模型这一轮少看见了东西，值得留痕；但正是它高频，
+        // 所以只在第一条和之后每 100 条各说一次，其余靠计数。
+        if state.omitted == 1 || state.omitted % 100 == 0 {
+            tracing::warn!(
+                target: "mineintent_middle",
+                omitted = state.omitted,
+                event_type = %event_type,
+                "可重建事实被丢弃（队列饱和）；模型本轮会看到 omission 标记"
+            );
+        }
         add_pending_omitted_type(&mut state.omitted_types, &event_type);
     }
 }
@@ -1179,6 +1189,165 @@ where
     failures: broadcast::Sender<ParticipantFailure>,
     run_id_namespace_digest: String,
     run_id_instance_id: String,
+    ingest_counters: IngestCounters,
+    worker_gate: WorkerGate,
+}
+
+/// 可重建普通事实的按类型计数。
+///
+/// 它们不进 journal（见 `journal_type_for`），但「摄入了多少、什么类型」仍是
+/// 排障要看的量。计数在 worker 线程上串行更新，用一把小锁即可，不引入
+/// 额外依赖；读取方是 debug 快照与停机汇总。
+#[derive(Debug, Default)]
+pub struct IngestCounters {
+    counts: Mutex<std::collections::BTreeMap<String, u64>>,
+}
+
+impl IngestCounters {
+    fn record(&self, event_type: &str) {
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = counts.get_mut(event_type) {
+            *existing = existing.saturating_add(1);
+            return;
+        }
+        // 事件类型来自后端枚举与内部事实，是有界集合；仍然设一个上限，
+        // 避免将来有人把可变字符串塞进 event_type 时这里无声长成内存泄漏。
+        if counts.len() < 64 {
+            counts.insert(event_type.to_owned(), 1);
+        } else {
+            *counts.entry("other".to_owned()).or_insert(0) += 1;
+        }
+    }
+
+    /// 当前计数快照，按类型名有序。
+    pub fn snapshot(&self) -> std::collections::BTreeMap<String, u64> {
+        self.counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// `entity=32579,block=1243` 形式的单行摘要；无摄入时返回 None。
+    pub fn summary_line(&self) -> Option<String> {
+        let counts = self.snapshot();
+        if counts.is_empty() {
+            return None;
+        }
+        Some(
+            counts
+                .iter()
+                .map(|(name, count)| format!("{name}={count}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    }
+}
+
+/// worker 的单步闸门（测试用准入 seam，生产恒为放行）。
+///
+/// 饱和测试要的是「让 worker 恰好再处理一条」以腾出一个队列槽位。原先这是
+/// 靠「每条事件都要等一次 journal 落盘」间接得到的副作用；journal 收窄后
+/// 普通事实不再落盘，那个副作用消失。与其把磁盘写回热路径来喂测试，不如
+/// 给出一个直说的闸门——那些测试本来测的就是队列准入语义，不是落盘时机。
+///
+/// 未 `limit()` 时 `pass()` 只做一次原子读即返回，生产路径无额外开销。
+#[derive(Debug)]
+pub struct WorkerGate {
+    limited: AtomicBool,
+    permits: tokio::sync::Semaphore,
+    entered: std::sync::atomic::AtomicU64,
+    entered_signal: tokio::sync::Notify,
+}
+
+impl Default for WorkerGate {
+    fn default() -> Self {
+        Self {
+            limited: AtomicBool::new(false),
+            permits: tokio::sync::Semaphore::new(0),
+            entered: std::sync::atomic::AtomicU64::new(0),
+            entered_signal: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+impl WorkerGate {
+    /// 开始限流：此后每条 item 都要消耗一个 `allow` 发放的许可。
+    pub fn limit(&self) {
+        self.limited.store(true, Ordering::Release);
+    }
+
+    /// 再放行 n 条。
+    pub fn allow(&self, n: usize) {
+        self.permits.add_permits(n);
+    }
+
+    /// 解除限流并唤醒所有等待者，避免测试收尾时 worker 卡在闸门上。
+    pub fn release_all(&self) {
+        self.limited.store(false, Ordering::Release);
+        self.permits.add_permits(Self::RELEASE_PERMITS);
+    }
+
+    const RELEASE_PERMITS: usize = 1024;
+
+    /// worker 到达闸门的累计次数。
+    pub fn entered(&self) -> u64 {
+        self.entered.load(Ordering::Acquire)
+    }
+
+    /// 等到 worker 至少到达闸门 n 次（即已经停在那里）。
+    pub async fn wait_entered(&self, n: u64) {
+        loop {
+            if self.entered() >= n {
+                return;
+            }
+            let signal = self.entered_signal.notified();
+            if self.entered() >= n {
+                return;
+            }
+            signal.await;
+        }
+    }
+
+    async fn pass(&self) {
+        if !self.limited.load(Ordering::Acquire) {
+            return;
+        }
+        self.entered.fetch_add(1, Ordering::AcqRel);
+        self.entered_signal.notify_waiters();
+        if let Ok(permit) = self.permits.acquire().await {
+            permit.forget();
+        }
+    }
+}
+
+/// 这条 WorkItem 该不该进 journal，以及以什么类型进。
+///
+/// journal 是产品事实的持久记录，读者是事后翻看的人；它没有读取 API，
+/// 全部价值就是信噪比。把每条摄入事件都写进去会把真正的产品事实淹掉
+/// （实测 100 秒 36,764 条信封对 4 条事实，且信封 payload 不含事实内容）。
+///
+/// oracle 对照：TS 侧 12 个 journal 写入点全是产品事实
+/// （runtime.ts:152/166/247/303 与各 capability），从来没有「每条摄入事件
+/// 记一笔」。可重建的普通事实（实体/方块/名单增量、遗漏标记）改为计数。
+fn journal_type_for(item: &WorkItem) -> Option<&'static str> {
+    if item.wake.is_some() {
+        // 被指名叫醒是产品事实，且是模型这一轮的起因。
+        return Some("player.chat.received");
+    }
+    if item.terminal || item.scope_control || item.overflow.is_some() {
+        // scope 迁移、终态与丢弃标记都保留落盘。
+        //
+        // 丢弃标记（overflow）本身把 scope_control 置了 true，本可以顺手一起
+        // 收窄——实测一次 100 秒运行有 2,928 条，仍是本文件最大的单一来源。
+        // 但 NEW-11 裁定 A 明确要求「可重建事实可丢并在原 loss position 形成
+        // omission/overflow 事实」，且有具名回归钉住它与 scope 迁移的 ticket
+        // 次序。那是已裁定的产品语义，不在本次收窄的授权范围内，留给维护者。
+        return Some("participant.event");
+    }
+    None
 }
 
 impl<R> ParticipantRuntime<R>
@@ -1259,6 +1428,8 @@ where
             failures,
             run_id_namespace_digest,
             run_id_instance_id,
+            ingest_counters: IngestCounters::default(),
+            worker_gate: WorkerGate::default(),
         }))
     }
 
@@ -1288,6 +1459,16 @@ where
 
     pub fn tool_definitions(&self) -> Vec<mineintent_contracts::agent::WireToolDefinition> {
         self.agent.definitions()
+    }
+
+    /// 未进 journal 的可重建普通事实的按类型计数。排障与停机汇总用。
+    pub fn ingest_counters(&self) -> &IngestCounters {
+        &self.ingest_counters
+    }
+
+    /// worker 单步闸门；仅饱和类测试使用，生产不调用即恒放行。
+    pub fn worker_gate(&self) -> &WorkerGate {
+        &self.worker_gate
     }
 
     pub fn subscribe_failures(&self) -> broadcast::Receiver<ParticipantFailure> {
@@ -2198,6 +2379,18 @@ where
 
     /// 单轮模型失败的落盘：与 runtime 级 participant.failure 分开，
     /// 便于事后区分「这一轮没成」与「同伴已经不再响应」。
+    /// 记「这一轮的决定已经完成」。与 `model.failed` 成对，事后可区分
+    /// 「这一轮做完了」「这一轮没成」「同伴不再响应」三种情况。
+    async fn journal_decision_completed(&self, run_id: &RunId) {
+        let payload = json!({ "runId": run_id.to_string() });
+        if let Some(payload) = payload.as_object().cloned() {
+            let _ = self
+                .journal
+                .append("model.decision.completed".to_owned(), payload)
+                .await;
+        }
+    }
+
     fn journal_model_failure_detached(&self, summary: &str) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
@@ -2277,6 +2470,9 @@ where
             self.release_item_trigger(&item);
             return Ok(());
         }
+        // 闸门放在原来 journal await 的位置：那里曾是 worker 唯一的逐条
+        // 停顿点，饱和测试依赖的就是这个位置。
+        self.worker_gate.pass().await;
         if let Err(error) = self.append_event_journal(&item).await {
             self.release_item_trigger(&item);
             return Err(error);
@@ -2432,6 +2628,10 @@ where
                     decision: Some(Some(DebugDecision::idle())),
                     ..DebugStateUpdate::default()
                 });
+                // 「这一轮做完了决定」是产品事实，oracle runtime.ts:303 有、
+                // Rust 侧一直缺。落盘失败不能把这一轮判失败——决定已经做出
+                // 并且副作用已经发生，记账失败只该记账。
+                self.journal_decision_completed(&run_id).await;
                 Ok(())
             }
             Err(error) if is_normal_agent_error(&error) => {
@@ -2457,6 +2657,14 @@ where
                 // runtime.ts:311-314 同形：catch 住、记 model.decision_failed、
                 // 继续接受下一次唤醒）。provider 的一次抖动不得让同伴永久失聪。
                 let summary = format!("{}: {}", error.code, error.summary);
+                // 终结的是这一轮，不是这个同伴——warn 而非 error，并把话说明白，
+                // 免得读日志的人以为同伴已经死了。
+                tracing::warn!(
+                    target: "mineintent_middle",
+                    code = %error.code,
+                    summary = %error.summary,
+                    "模型这一轮失败；本轮结束，同伴继续接受下一次唤醒"
+                );
                 self.fail_runtime_sync(
                     ParticipantFailureSource::Model,
                     "decision_failed",
@@ -2470,8 +2678,15 @@ where
     }
 
     async fn append_event_journal(&self, item: &WorkItem) -> Result<(), ParticipantRuntimeError> {
+        let Some(journal_type) = journal_type_for(item) else {
+            // 可重建普通事实只计数。注意这里同时去掉了它们的 await：
+            // 原实现每条摄入事件都要等一次 journal 落盘，这是 NEW-11
+            // 有界 admission 设计中「journal 长期阻塞」那条假设的来源。
+            self.ingest_counters.record(&item.event_type);
+            return Ok(());
+        };
         let payload = event_payload(item);
-        let future = self.journal.append("participant.event".to_owned(), payload);
+        let future = self.journal.append(journal_type.to_owned(), payload);
         tokio::pin!(future);
         if item.wake.is_none() && item.scope_control {
             return future

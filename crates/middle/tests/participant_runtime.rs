@@ -950,20 +950,27 @@ const TEST_ORDINARY_CAPACITY: usize = 16;
 const TEST_CONTROL_CAPACITY: usize = 8;
 const TEST_OVERFLOW_CAPACITY: usize = 4;
 
+/// 把 worker 停在第二条 item 上。
+///
+/// 原实现靠 journal 写入阻塞间接达成；journal 收窄后普通事实不再落盘，
+/// 改用 runtime 的单步闸门直说同一件事。`journal` 参数保留是为了让调用方
+/// 的签名不变，同时明确它已不再是 worker 的刹车。
 async fn hold_worker_on_second_journal(
     runtime: &ParticipantRuntime<TestAgent>,
-    journal: &TestJournal,
+    _journal: &TestJournal,
     event_scope: &ParticipantScope,
 ) {
-    journal.block_after(1);
+    runtime.worker_gate().limit();
+    runtime.worker_gate().allow(1);
     runtime
         .emit_internal(internal_fact("seed-fact", event_scope, "seed_fact"))
         .unwrap();
-    journal.wait_for_entries(1).await;
+    runtime.worker_gate().wait_entered(1).await;
     runtime
         .emit_internal(internal_fact("held-fact", event_scope, "held_fact"))
         .unwrap();
-    journal.wait_for_entries(2).await;
+    // 第二条到达闸门但没有许可，worker 就停在这里。
+    runtime.worker_gate().wait_entered(2).await;
 }
 
 fn fill_ordinary_lane(
@@ -2123,6 +2130,72 @@ async fn waiting_old_wake_is_ignored_after_scope_generation_changes() {
     assert_eq!(source.retain_calls(), TEST_CONTROL_CAPACITY + 2);
 }
 
+/// journal 只收产品事实：可重建的普通事实只计数不落盘，被指名叫醒照记。
+///
+/// 实测背景：收窄前 100 秒实跑写了 36,764 条 `participant.event` 信封，
+/// 对应的产品事实只有 4 条，且信封 payload 不含事实内容。oracle
+/// （TS runtime.ts 的 12 个写入点）从来没有「每条摄入事件记一笔」。
+#[tokio::test]
+async fn ordinary_facts_are_counted_not_journalled_while_wake_is_recorded() {
+    let agent = TestAgent::new(0);
+    let (runtime, source, journal, _speech, _motor, backend) = runtime_parts(Arc::clone(&agent));
+    runtime.start_worker().unwrap();
+    let current = scope(1, "minecraft:overworld");
+
+    // 保持在 ordinary lane 容量内：超出部分会按 NEW-11 被丢弃并留下遗漏
+    // 标记，那是另一条已裁定的语义，不该混进本用例。
+    for index in 0..8 {
+        runtime
+            .emit_internal(internal_fact(
+                &format!("ordinary-{index}"),
+                &current,
+                "entity",
+            ))
+            .unwrap();
+    }
+    for index in 0..3 {
+        runtime
+            .emit_internal(internal_fact(&format!("block-{index}"), &current, "block"))
+            .unwrap();
+    }
+
+    source.set_chats(vec![chat_input(20, "Alice", "@Bot 你好")]);
+    backend.emit(chat_event("wake-1", 1, "Alice", "@Bot 你好"));
+    wait_for_request(&agent, 1).await;
+
+    let types = journal.entries.lock().unwrap().clone();
+    // participant.event 不为零是对的：scope 迁移这类结构事实仍然要落盘。
+    // 关键是它不再与摄入量成正比——27 条普通事实没有换来 27 条记录。
+    let structural = types
+        .iter()
+        .filter(|entry| *entry == "participant.event")
+        .count();
+    assert!(
+        structural <= 2,
+        "结构事实应稀疏；27 条普通事实后 participant.event 写了 {structural} 条：{types:?}"
+    );
+    assert!(
+        types.iter().any(|entry| entry == "player.chat.received"),
+        "被指名叫醒是产品事实，必须进 journal，实际写入：{types:?}"
+    );
+    assert!(
+        types
+            .iter()
+            .any(|entry| entry == "model.decision.completed"),
+        "做完决定是产品事实（oracle runtime.ts:303），必须进 journal：{types:?}"
+    );
+
+    let counts = runtime.ingest_counters().snapshot();
+    assert_eq!(counts.get("entity").copied(), Some(8));
+    assert_eq!(counts.get("block").copied(), Some(3));
+    assert!(
+        !counts.contains_key("player_chat"),
+        "进了 journal 的事实不该再计入未落盘计数：{counts:?}"
+    );
+
+    runtime.stop().await.unwrap();
+}
+
 #[tokio::test]
 async fn journal_gate_serializes_later_chat_before_model() {
     let agent = TestAgent::new(0);
@@ -2177,9 +2250,13 @@ async fn request_stop_wakes_full_control_and_overflow_producer() {
         let (_, _, overflow, _, _) = runtime.queue_counts_for_test();
         assert_eq!(overflow, marker_index + 1);
         if marker_index + 1 < TEST_OVERFLOW_CAPACITY {
-            let release_entry = 2 + marker_index;
-            journal.release_through(release_entry);
-            journal.wait_for_entries(release_entry + 1).await;
+            // 放行一条，并等 worker 真的消化掉它、重新停在闸门上：
+            // hold 后闸门计数为 2，每放行一条就再 +1。
+            runtime.worker_gate().allow(1);
+            runtime
+                .worker_gate()
+                .wait_entered(3 + marker_index as u64)
+                .await;
         }
     }
 
@@ -2241,7 +2318,7 @@ async fn request_stop_wakes_full_control_and_overflow_producer() {
         mineintent_middle::participant::ParticipantLifecycle::Faulted
     );
 
-    journal.release_through(usize::MAX);
+    runtime.worker_gate().release_all();
     journal.set_gate(false);
     runtime.stop().await.unwrap();
     assert_eq!(
@@ -2277,7 +2354,7 @@ async fn old_scope_omission_marker_keeps_ticket_and_cannot_cross_generation() {
         })
         .unwrap();
     assert_eq!(runtime.queue_counts_for_test().2, 1);
-    journal.release_through(usize::MAX);
+    runtime.worker_gate().release_all();
     tokio::time::timeout(
         Duration::from_secs(2),
         journal.wait_for_payload_ids(&["participant-overflow-19", "scope-to-nether"]),
@@ -2301,7 +2378,7 @@ async fn old_scope_omission_marker_keeps_ticket_and_cannot_cross_generation() {
         .expect("the scope transition remains journal-visible");
     assert!(admission_ticket(marker) < admission_ticket(transition));
 
-    journal.release_through(usize::MAX);
+    runtime.worker_gate().release_all();
     journal.set_gate(false);
     let current_chat = chat_input(700, "Alice", "@Bot after marker");
     source.set_chats(vec![current_chat.clone()]);
@@ -2399,7 +2476,7 @@ async fn lifecycle_controls_keep_ticket_fifo_when_ordinary_lane_is_full() {
     assert_eq!(terminal, 0);
     assert_eq!(waiting, 0);
 
-    journal.release_through(usize::MAX);
+    runtime.worker_gate().release_all();
     journal.set_gate(false);
     tokio::time::timeout(
         Duration::from_secs(2),

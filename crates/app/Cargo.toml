@@ -28,6 +28,8 @@ serde = { workspace = true }
 toml = "0.9"
 serde_json.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["full"] }
 uuid.workspace = true
 

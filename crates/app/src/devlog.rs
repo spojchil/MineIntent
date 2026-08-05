@@ -18,6 +18,34 @@ struct DevLog {
 
 static DEV_LOG: OnceLock<Option<DevLog>> = OnceLock::new();
 
+/// 装配分级日志（`tracing`）。进程内只应调用一次。
+///
+/// 过滤器优先取 `MINEINTENT_LOG`，其次 `RUST_LOG`，都没有时给一个安静的
+/// 默认：本项目自己的 crate 到 info，其余到 warn——azalea/bevy 在 debug
+/// 级别每 tick 都有输出，默认打开会淹掉真正要看的东西。
+///
+/// 语法是标准 EnvFilter，例如
+/// `MINEINTENT_LOG="warn,mineintent_middle=debug,mineintent_backend=trace"`。
+///
+/// 这条通道与 journal 是两件事：这里按 severity 分级、可丢弃、格式不承诺
+/// 稳定；journal 按事实类型定名、有 schema、要迁移。
+pub fn init_tracing() {
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+    let filter = std::env::var("MINEINTENT_LOG")
+        .ok()
+        .or_else(|| std::env::var("RUST_LOG").ok())
+        .unwrap_or_else(|| {
+            "warn,mineintent_app=info,mineintent_middle=info,mineintent_backend=info".to_owned()
+        });
+    let filter = EnvFilter::try_new(&filter).unwrap_or_else(|_| EnvFilter::new("warn"));
+    // 已经装过就不再装（测试进程里可能重复调用），失败不影响运行。
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_target(true).with_writer(std::io::stderr))
+        .try_init();
+}
+
 /// 是否开启：`MINEINTENT_DEBUG` 为 1/true/on 即开。
 pub fn enabled() -> bool {
     matches!(

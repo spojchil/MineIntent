@@ -52,6 +52,7 @@ api_key_file = "/path/to/api-key"
 | `MINEINTENT_MODEL_ENDPOINT` / `_NAME` / `_REASONING_EFFORT` | 见上 | 覆盖模型接入参数 |
 | `MINEINTENT_CONFIG` | `./mineintent.toml` | 配置文件路径 |
 | `MINEINTENT_DEBUG` | 关 | 见下节 |
+| `MINEINTENT_LOG` / `RUST_LOG` | 见下节 | 分级日志过滤器（EnvFilter 语法） |
 | `MINEINTENT_MAX_RUNTIME_SECS` | 无 | 到时按正常停机路径退出，供无人值守验收 |
 
 **密钥只从环境变量或文件路径读，不从配置文件读**——配置文件是要进版本库的。
@@ -81,6 +82,23 @@ Agent 状态机认的 `message { content, tool_calls }` 互转，
 
 它与 journal 分工不同：journal 是产品事实的持久记录（有 schema、要迁移），
 dev.log 是排障用的过程记录，不承诺格式稳定，默认关闭。排障先看它。
+
+## 分级日志
+
+排障输出走 `tracing`，写 stderr，用 `MINEINTENT_LOG`（其次 `RUST_LOG`）过滤，
+标准 EnvFilter 语法：
+
+```bash
+MINEINTENT_LOG="warn,mineintent_middle=debug" cargo run -p mineintent-app
+```
+
+默认 `warn` 加本项目三个 crate 到 `info`——azalea/bevy 在 debug 级别每 tick
+都有输出，默认放开会淹掉要看的东西。
+
+**它和 journal 是两条不同的通道**：日志按 severity 分级、可丢弃、格式不承诺
+稳定；journal 按事实类型定名、有 schema、要迁移（OTel OTEP-0202 对 events 与
+logs 的区分同理）。所以高频的队列摄入量不进 journal，只按类型计数，停机时
+在日志里出一条总账。
 
 ## 事实来源边界
 
