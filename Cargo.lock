@@ -1910,6 +1910,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.19",
  "tokio",
+ "toolloop",
  "tracing",
  "uuid",
 ]
@@ -3097,6 +3098,15 @@ name = "toml_writer"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
+
+[[package]]
+name = "toolloop"
+version = "0.0.1"
+dependencies = [
+ "mineintent-contracts",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "tower"

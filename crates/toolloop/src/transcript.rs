@@ -297,7 +297,7 @@ fn rotated_path(path: &Path) -> PathBuf {
 
 /// Shared second-precision UTC timestamp source for transcript and agent
 /// viewport-frame fallbacks.
-pub(crate) fn utc_timestamp_now() -> String {
+pub fn utc_timestamp_now() -> String {
     utc_timestamp(SystemTime::now())
 }
 

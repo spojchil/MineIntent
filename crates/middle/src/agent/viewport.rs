@@ -3,7 +3,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
 
-use super::transcript::utc_timestamp_now;
+use toolloop::utc_timestamp_now;
 use crate::capability::ViewportReader;
 
 /// The assembly seam for a post-body round viewport read.

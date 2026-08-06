@@ -1,0 +1,18 @@
+[package]
+name = "toolloop"
+description = "领域无关的模型—工具循环：可步进的运行状态、调用上限、tool-call 一次性 claim 与严格结果配对"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# 这个 crate 不认识 Minecraft。依赖表就是它的验收标准：
+# 只要这里不出现 mineintent-backend / azalea，编译器就替我们守住了通用性。
+[dependencies]
+mineintent-contracts.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -16,7 +16,7 @@ use mineintent_contracts::{
 use serde::Serialize;
 use serde_json::json;
 
-use super::transcript::utc_timestamp_now;
+use toolloop::utc_timestamp_now;
 use super::{
     AgentRun, AgentRunStep, AgentToolResult, ModelCompletion, NoRoundViewportSampler,
     PlannedToolCall, RoundViewportSampler,

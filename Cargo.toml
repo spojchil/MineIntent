@@ -4,6 +4,7 @@ members = [
     "crates/backend",
     "crates/contracts",
     "crates/middle",
+    "crates/toolloop",
 ]
 resolver = "2"
 
@@ -18,6 +19,8 @@ publish = false
 mineintent-backend = { path = "crates/backend" }
 mineintent-contracts = { path = "crates/contracts" }
 mineintent-middle = { path = "crates/middle" }
+# 领域无关的模型—工具循环。名字不带 mineintent 是有意的：它不该知道自己在哪个项目里。
+toolloop = { path = "crates/toolloop" }
 
 # 自有 fork：为每次 join 尝试铸不可变 AttemptToken 并支持 pre-Init 精确取消。
 # 补丁内容与理由见 crates/backend/README.md；rev 钉死，升级须同时更新该说明。

@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 mineintent-contracts.workspace = true
+toolloop.workspace = true
 ryu.workspace = true
 serde.workspace = true
 serde_json.workspace = true
