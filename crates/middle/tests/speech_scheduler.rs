@@ -267,9 +267,12 @@ async fn additional_transport_panic_becomes_failed_and_worker_continues_fifo() {
                 request_id: "good".to_owned(),
                 segments: 1,
             },
+            // transport panic 与「后端拒绝了这条聊天」必须可区分：前者是缺陷，
+            // 后者是世界的回答。reason 因此带 speech_transport_panicked 前缀，
+            // 并同时以 tracing::error! 出声。
             SpeechEvent::Failed {
                 request_id: "panic".to_owned(),
-                reason: "scripted transport panic".to_owned(),
+                reason: "speech_transport_panicked: scripted transport panic".to_owned(),
             },
             SpeechEvent::Sent {
                 request_id: "good".to_owned(),

@@ -387,7 +387,15 @@ impl SoundHistory {
 
         let subscription = lock_recover(&self.subscription).take();
         if let Some(mut subscription) = subscription {
-            let _ = catch_unwind(AssertUnwindSafe(|| subscription.unsubscribe()));
+            // 不得不 catch 的理由：`dispose` 由 `Drop for SoundHistory` 调用，
+            // 因此 unwind 途中可达。那时 unsubscribe 再 panic 就是 double panic
+            // → `abort()`，进程无声消失。语言约束。
+            if let Err(_payload) = catch_unwind(AssertUnwindSafe(|| subscription.unsubscribe())) {
+                tracing::error!(
+                    target: "mineintent_middle",
+                    "退订声音事件时 panic：已隔离以避免 double panic 中止进程；这是缺陷"
+                );
+            }
         }
     }
 

@@ -861,15 +861,24 @@ impl SharedRuntime {
                 continue;
             }
             let callback_guard = ObservationCallbackGuard::enter(&delivery.state);
+            // 不得不 catch 的理由：本函数跑在 backend 的专属 OS 线程上（azalea
+            // 的 LocalSet 逼出来的那根，见 facade.rs 的 launch）。那根线程同时
+            // 跑着 azalea 的 App 与 read_packets，没有任何监督者——panic 逃出去
+            // 就是线程死亡、世界停摆、KeepAlive 超时掉线，而重连逻辑要用的也正是
+            // 这根线程。
+            //
+            // 这不是「panic 不算 bug」，是「这里没有别人能接住它」。等这根线程有
+            // 了监督者（观察 join、报告、按 A11 交外部重启），这处就该撤掉。
             let callback_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 delivery.listener.on_event(observation_event.clone());
             }));
             drop(callback_guard);
             delivery.state.finish_callback();
             if callback_result.is_err() {
-                eprintln!(
-                    "observation listener panic isolated: subscription_id={}; other listeners continue",
-                    delivery.id
+                tracing::error!(
+                    target: "mineintent_backend",
+                    subscription_id = delivery.id,
+                    "观察订阅者回调 panic：已隔离，其余订阅者继续；这是缺陷，不是世界事实"
                 );
             }
         }

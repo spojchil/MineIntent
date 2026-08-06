@@ -1,8 +1,4 @@
-use std::{
-    panic::{catch_unwind, AssertUnwindSafe},
-    sync::Arc,
-    time::Instant,
-};
+use std::{sync::Arc, time::Instant};
 
 use mineintent_contracts::{
     agent::{
@@ -193,11 +189,13 @@ impl<Model, Tools, Sampler> ConcreteAgentRunner<Model, Tools, Sampler> {
             error,
         );
 
-        // Transcript diagnostics are deliberately fail-open. This catches
-        // both an ordinary sink error (ignored below) and a custom sink panic.
-        let _ = catch_unwind(AssertUnwindSafe(|| {
-            let _ = sink.append_record(&record);
-        }));
+        // 转录是 fail-open 的：sink 写不进去不该让这一轮失败，所以结果被丢弃。
+        //
+        // 但 fail-open 只覆盖「写入失败」，不覆盖 panic——那是 sink 的缺陷，
+        // 不是一次写入的结果。这里跑在 process_wake 里被 await 的那个任务内，
+        // tokio 会把 panic 接成 JoinError 并保留原始消息；我们再包一层只会把
+        // 它变成一次静默的、连转录都没有的消失。
+        let _ = sink.append_record(&record);
     }
 }
 

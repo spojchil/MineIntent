@@ -436,31 +436,52 @@ async fn provider_failure_is_recorded_without_replacing_the_original_error() {
     assert!(error_summary.chars().count() <= 300);
 }
 
+/// 转录 sink **写入失败**是 fail-open 的：它不该改变这一轮的业务结果。
 #[tokio::test]
-async fn transcript_sink_errors_and_panics_are_fail_open() {
-    for sink in [
+async fn transcript_sink_errors_are_fail_open() {
+    let runner = ConcreteAgentRunner::with_shared_transcript_sink(
+        RecordingProvider::new(vec![completion(
+            json!({"role": "assistant", "content": "ok"}),
+            ModelUsage::default(),
+        )]),
+        RecordingDispatcher::default(),
+        mineintent_contracts::agent::ModelName::new("explicit-model").unwrap(),
         Arc::new(FailingTranscriptSink) as Arc<dyn TranscriptSink>,
+    );
+    let signal = NeverCancelled;
+    let deadline = Deadline::after(Instant::now(), Duration::from_secs(5)).unwrap();
+    let result = runner
+        .run(v5_request(), ExecutionControl::new(&signal, deadline))
+        .await;
+    assert!(
+        result.is_ok(),
+        "diagnostic sink must not alter business result"
+    );
+}
+
+/// 但 sink **panic** 不在 fail-open 的范围内。
+///
+/// fail-open 说的是「写不进去不算这一轮失败」，那是对 `Result::Err` 的处置。
+/// panic 是 sink 自己的缺陷，不是一次写入的结果——把它一并吞掉，等于让一个坏掉
+/// 的排障通道连自己坏了都不说。这里跑在 `process_wake` 被 await 的任务内，
+/// tokio 会接住并保留原始消息。
+#[tokio::test]
+#[should_panic(expected = "diagnostic sink panic fixture")]
+async fn transcript_sink_panic_propagates() {
+    let runner = ConcreteAgentRunner::with_shared_transcript_sink(
+        RecordingProvider::new(vec![completion(
+            json!({"role": "assistant", "content": "ok"}),
+            ModelUsage::default(),
+        )]),
+        RecordingDispatcher::default(),
+        mineintent_contracts::agent::ModelName::new("explicit-model").unwrap(),
         Arc::new(PanickingTranscriptSink) as Arc<dyn TranscriptSink>,
-    ] {
-        let runner = ConcreteAgentRunner::with_shared_transcript_sink(
-            RecordingProvider::new(vec![completion(
-                json!({"role": "assistant", "content": "ok"}),
-                ModelUsage::default(),
-            )]),
-            RecordingDispatcher::default(),
-            mineintent_contracts::agent::ModelName::new("explicit-model").unwrap(),
-            sink,
-        );
-        let signal = NeverCancelled;
-        let deadline = Deadline::after(Instant::now(), Duration::from_secs(5)).unwrap();
-        let result = runner
-            .run(v5_request(), ExecutionControl::new(&signal, deadline))
-            .await;
-        assert!(
-            result.is_ok(),
-            "diagnostic sink must not alter business result"
-        );
-    }
+    );
+    let signal = NeverCancelled;
+    let deadline = Deadline::after(Instant::now(), Duration::from_secs(5)).unwrap();
+    let _ = runner
+        .run(v5_request(), ExecutionControl::new(&signal, deadline))
+        .await;
 }
 
 #[tokio::test]

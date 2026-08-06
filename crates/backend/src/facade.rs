@@ -641,14 +641,22 @@ impl FacadeInner {
             if !delivery.state.begin() {
                 continue;
             }
+            // 不得不 catch 的理由：本函数跑在 dispatcher 线程上，而那根线程没有
+            // 监督者。panic 逃出去就是线程死亡 → EventBridge 再也不被排空 →
+            // 上游生产者依次卡在各自的背压点上 → 整条事实流永久停摆。
+            //
+            // 需要如实记一笔：这根线程本身**没有独立理由**——它是推送式事实流的
+            // 产物，不像 backend runtime 线程那样被 azalea 的 LocalSet 逼出来。
+            // 事实流改成拉取式之后，这根线程和这处 catch 应当一起消失。
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 delivery.listener.on_event(event.clone());
             }));
             delivery.state.finish();
             if result.is_err() {
-                eprintln!(
-                    "backend facade listener panic isolated: subscription_id={}",
-                    delivery.id
+                tracing::error!(
+                    target: "mineintent_backend",
+                    subscription_id = delivery.id,
+                    "事件订阅者回调 panic：已隔离；这是缺陷，不是世界事实"
                 );
             }
         }
