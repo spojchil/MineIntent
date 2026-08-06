@@ -253,6 +253,29 @@ impl ParticipantEventQueue {
                     self.commit_admission(&mut state);
                     return Ok(QueueAdmission::OrdinaryDropped { event_type });
                 }
+                // 标记位也满了：并进最新的那条标记，**不阻塞**。
+                //
+                // 这里原来是掉出 if 去走下面的等待。后果是一条**可丢**的普通事实
+                // 反而把生产者钉住了：2026-08-05 实盘的四节点死锁里，被钉住的正是
+                // 后端派发线程（ordinary 16/16、control 4/8、overflow 4/4）；
+                // 2026-08-06 那次「停机走完了进程不退出」也是同一条路。
+                //
+                // 临时决定（2026-08-06，维护者不在场）：并进最新标记。丢的是这一段
+                // 丢失的**位置精度**——模型仍然知道丢了多少条、什么类型，只是位置
+                // 被归到上一条标记处。NEW-11 裁定 A 在意的正是位置，所以这条要走
+                // G06 确认；但在「位置粗一点」和「同伴卡死被服务端踢下线」之间，
+                // 先取前者。三个候选里的第三种（丢标记本身、事后报粗账）更差：
+                // 那会让丢失彻底不出声。
+                if let Some(newest) = state.overflow.back_mut() {
+                    newest.dropped_count = newest.dropped_count.saturating_add(1);
+                    add_overflow_type(&mut newest.dropped_types, &event_type);
+                    let segment = newest.ticket;
+                    // 认下这条标记为当前丢失段，后续丢弃就走上面的快路，
+                    // 不必每次都重新走一遍「lane 满不满」。
+                    state.open_loss_segment = Some(segment);
+                    self.commit_admission(&mut state);
+                    return Ok(QueueAdmission::OrdinaryDropped { event_type });
+                }
             }
 
             state.waiting_producers = state.waiting_producers.saturating_add(1);

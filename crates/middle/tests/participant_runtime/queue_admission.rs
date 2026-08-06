@@ -814,3 +814,80 @@ async fn lifecycle_controls_keep_ticket_fifo_when_ordinary_lane_is_full() {
     assert_eq!(runtime.current_scope(), Some(scope(1, "minecraft:nether")));
     runtime.stop().await.unwrap();
 }
+
+/// 标记位耗尽之后，一条**可丢**的普通事实曾经会把生产者钉住——它落到有界队列
+/// 的等待路径上，而它本来是允许被丢掉的。2026-08-05 实盘的四节点死锁里被钉住的
+/// 正是后端派发线程；2026-08-06 那次「停机走完了进程不退出」也是同一条路。
+///
+/// 现在的语义：并进最新的那条标记。丢的是这一段丢失的位置精度，不是丢失本身。
+#[tokio::test]
+async fn a_droppable_fact_never_blocks_the_producer_once_markers_are_exhausted() {
+    let agent = TestAgent::new(0);
+    let (runtime, _source, journal, _speech, _motor, _backend) = runtime_parts(Arc::clone(&agent));
+    runtime.start_worker().unwrap();
+    let current = scope(1, "minecraft:overworld");
+    hold_worker_on_second_journal(&runtime, &journal, &current).await;
+
+    // 把 ordinary lane 与全部标记位都占满：每开一个新标记，都要先让 worker
+    // 放行一条、使得下一次丢弃不能并进上一个标记。
+    fill_ordinary_lane(&runtime, &current, "exhaust");
+    for marker_index in 0..TEST_OVERFLOW_CAPACITY {
+        while runtime.queue_counts_for_test().0 < TEST_ORDINARY_CAPACITY {
+            runtime
+                .emit_internal(internal_fact(
+                    &format!("exhaust-fill-{marker_index}"),
+                    &current,
+                    "ordinary_fact",
+                ))
+                .unwrap();
+        }
+        runtime
+            .emit_internal(internal_fact(
+                &format!("exhaust-loss-{marker_index}"),
+                &current,
+                "ordinary_loss_candidate",
+            ))
+            .unwrap();
+        assert_eq!(runtime.queue_counts_for_test().2, marker_index + 1);
+        if marker_index + 1 < TEST_OVERFLOW_CAPACITY {
+            runtime.worker_gate().allow(1);
+            runtime
+                .worker_gate()
+                .wait_entered(3 + marker_index as u64)
+                .await;
+        }
+    }
+
+    while runtime.queue_counts_for_test().0 < TEST_ORDINARY_CAPACITY {
+        runtime
+            .emit_internal(internal_fact("exhaust-tail", &current, "ordinary_fact"))
+            .unwrap();
+    }
+    let (_, _, overflow, _, _) = runtime.queue_counts_for_test();
+    assert_eq!(overflow, TEST_OVERFLOW_CAPACITY, "标记位应当已经耗尽");
+
+    // 再来一条可丢事实。它必须立刻返回；钉住生产者就是缺陷。
+    let emitter = Arc::clone(&runtime);
+    let emit_scope = current.clone();
+    let admitted = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || {
+            emitter.emit_internal(internal_fact(
+                "beyond-markers",
+                &emit_scope,
+                "ordinary_loss_candidate",
+            ))
+        }),
+    )
+    .await
+    .expect("标记位耗尽后，可丢事实把生产者钉住了")
+    .expect("emit 任务应当正常结束");
+    assert!(admitted.is_ok());
+
+    let (_, _, overflow, _, waiting) = runtime.queue_counts_for_test();
+    assert_eq!(overflow, TEST_OVERFLOW_CAPACITY, "不该凭空多出标记");
+    assert_eq!(waiting, 0, "不该有生产者卡在准入上");
+
+    runtime.worker_gate().release_all();
+    runtime.stop().await.unwrap();
+}
