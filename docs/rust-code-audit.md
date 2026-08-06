@@ -847,6 +847,54 @@ for event in packets.read() {
    读下来是好的：每层都是 `let x = { …lock… };` 块作用域，**锁在 `.await` 之前释放**。
    深度来自块作用域，不是控制流。扫描器的数字在这里会误导。
 
+### 8.5 值得记的正面事实
+
+审查里有几处度量是**好的**，一并记下来，免得这份文档读起来像只有问题：
+
+- **零 `TODO` / `FIXME` / `XXX` / `HACK` / `todo!()` / `unimplemented!()`**。
+  全库（含测试）检索，一个都没有。
+- **自声明欠账只有 4 处**，而且每一处都写明了理由与归宿：
+  | 位置 | 内容 |
+  |---|---|
+  | `app/src/lib.rs:4` | 「未迁（DebugStateStore 保留，HTTP 面与 W08 系列同期另议）」 |
+  | `backend/src/facade.rs:650` | 「事实流改成拉取式之后，这根线程和这处 catch 应当一起消失」 |
+  | `contracts/src/capability/contracts.rs:11` | 「临时决定（2026-08-06，无人可问）：这个枚举已经名不副实，暂留」 |
+  | `middle/src/participant/runtime/queue.rs:263` | 「临时决定（2026-08-06，维护者不在场）：并进最新标记」 |
+- **生产码里可 panic 的调用只有 55 处**（`unwrap()` / `expect(` / `panic!` / `unreachable!`，
+  去掉 `#[cfg(test)]` 尾部与测试文件后），分布在 17 个文件。对 46 153 行生产码来说很低。
+- **依赖表零冗余**（§9.4）。
+- **`unsafe_code = "deny"`**（workspace lint），全库无 unsafe 豁免。
+
+panic 面的分布里有一处值得单独看——**处数最多的文件正是 §4.1 那个**：
+
+| 处数 | 文件 | 种类 |
+|---:|---|---|
+| 8 | `middle/src/participant/information_adapters.rs` | `panic!` ×8 |
+| 7 | `backend/src/runtime/events.rs` | `expect(` ×7 |
+| 7 | `backend/src/main.rs` | `expect(` ×5、`panic!` ×2 |
+| 6 | `middle/src/capability.rs` | `expect(` ×6 |
+| 6 | `contracts/src/minecraft/event.rs` | `expect(` ×3、`unreachable!` ×3 |
+
+`information_adapters.rs` 那 8 处 `panic!` 是**有意抛出、等人接**的
+（模块文档写明「expected to be caught by the Information runtime/provider boundary」），
+而那个 boundary 不在生产路径上。这两条发现在这里对上了。
+
+### 8.6 调试 HTTP 面也是休眠的
+
+`middle/src/telemetry/debug_server.rs`（307 行）的 `LocalDebugServer`
+只出现在自己文件、`telemetry/mod.rs` 的再导出、和 `middle/tests/telemetry.rs` 里。
+`app/src/lib.rs:4` 的模块注释已经写明：「未迁（DebugStateStore 保留，HTTP 面……同期另议）」。
+
+顺带核对了两件事，结论都是**没问题**：
+
+- **A11 无冲突**：该服务器只接受 `GET`（`debug_server.rs:259` 拒绝其他方法）、
+  只有 `/v1/state` 一条路由（`:265`）、只绑 `127.0.0.1`（`:13,102`）。
+  它不提供任何停止或控制接口。
+- **代价没有白付**：`DebugStateStore::update`（`debug_state.rs:46-54`）是廉价的
+  （赋值 + 版本号自增），昂贵的 `snapshot()`（深克隆 + 脱敏，`:69-76`）只在
+  `app/src/lib.rs:219-236` 的 5 秒心跳里调用，而那整段在 `if devlog::enabled()` 之内。
+  非调试模式下不付这份钱。
+
 ---
 
 ## 9. 死代码与不在生产路径上的代码：汇总
@@ -896,13 +944,14 @@ for event in packets.read() {
 | Information 控制面（§4） | 5 110 | ~7 875 | **编译实验**：摘掉后 `mineintent-app --bins` 仍通过 |
 | 增量视口（休眠模块） | 1 560 | 984 | 生产装配只用 `ViewportReader` + `BackendRoundViewportSampler`；`ViewportMirror` / `ViewportIncrementalReducer` 无构造点 |
 | agent-context v3/v4（§1） | ~153（`context.rs`）+ fixtures | ~630（`tests/agent_contracts.rs`） | `crates/contracts` 之外零引用 |
+| 调试 HTTP 面（§8.6） | 307 | 部分（`tests/telemetry.rs` 475 行的一部分） | `LocalDebugServer` 只在自身、再导出与测试中出现 |
 
 增量视口这块**是有意休眠的**（文档分支 commit `ac07d57`「合并：增量视口内核入库为休眠模块」），
 不是疏漏。记在这里有两个理由：一是它计入总量；
 二是 `middle/src/agent/mod.rs:33-39` 那段再导出把它按原名转出，
 读 `mineintent_middle::agent::ViewportMirror` 的人看不出它是休眠的。
 
-**合计约 6 800 行生产码 + 9 500 行测试**（约占全库 80 564 行的 **20%**）
+**合计约 7 100 行生产码 + 9 500 行测试**（约占全库 80 564 行的 **20%**）
 当前不在 `mineintent` 二进制的执行路径上。
 
 ### 9.4 一条负面结果（如实记）
