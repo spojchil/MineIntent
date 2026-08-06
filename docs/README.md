@@ -25,7 +25,7 @@
 | [`docs/minecraft-client-capability-panorama.md`](./minecraft-client-capability-panorama.md) | 原版客户端能力调研基线（26.1.2/775），P04 的参考材料 | 无 |
 | [`README.md`](../README.md) | 项目导航和最短启动 | 无 |
 | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | 人类贡献工作流 | 无 |
-| [`CLAUDE.md`](../CLAUDE.md) | 开发代理工作规则 | 无 |
+| [`AGENTS.md`](../AGENTS.md) | AI 编码助手工作规则的唯一真相源（`CLAUDE.md` 内容为 `@AGENTS.md`） | 无 |
 | 组件目录中的 README | 对应组件的局部使用说明 | 无 |
 | 代码、类型、测试和运行结果 | 当前实现的产生方与证据 | 不产生产品权威 |
 
