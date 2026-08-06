@@ -861,14 +861,25 @@ impl SharedRuntime {
                 continue;
             }
             let callback_guard = ObservationCallbackGuard::enter(&delivery.state);
-            // 不得不 catch 的理由：本函数跑在 backend 的专属 OS 线程上（azalea
-            // 的 LocalSet 逼出来的那根，见 facade.rs 的 launch）。那根线程同时
-            // 跑着 azalea 的 App 与 read_packets，没有任何监督者——panic 逃出去
-            // 就是线程死亡、世界停摆、KeepAlive 超时掉线，而重连逻辑要用的也正是
-            // 这根线程。
+            // 不得不 catch 的两条理由。
             //
-            // 这不是「panic 不算 bug」，是「这里没有别人能接住它」。等这根线程有
-            // 了监督者（观察 join、报告、按 A11 交外部重启），这处就该撤掉。
+            // 一、存在无监督的到达路径。`drain_events` 有十个调用点，线程各不
+            // 相同：ECS 生产者、命令完成与生命周期归约跑在 backend 的专属 OS
+            // 线程上（azalea 的 LocalSet 逼出来的那根，见 facade.rs 的 launch）；
+            // 公开 `stop()` 与 stop watchdog 则可能来自任意调用方线程，而
+            // `drain_events` 排空的是整条队列，所以停机时压在队里的
+            // Entity/Block/Sound 事件会在那条线程上回调。
+            //
+            // 其中专属线程那条没有任何监督者：它同时跑着 azalea 的 App 与
+            // read_packets，panic 逃出去就是线程死亡、世界停摆、KeepAlive 超时
+            // 掉线，而重连逻辑要用的也正是这根线程。
+            //
+            // 二、扇出隔离。这个循环要投递给多个订阅者，一个订阅者的缺陷不该让
+            // 其余订阅者收不到已经发生的事实。这条与线程无关，即使将来每条路径
+            // 都有了监督者，它仍然成立。
+            //
+            // 两条都不是「panic 不算 bug」——panic 照常记为 error，只是不允许它
+            // 顺手带走一根没人重建的线程或其余订阅者。
             let callback_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 delivery.listener.on_event(observation_event.clone());
             }));
