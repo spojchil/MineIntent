@@ -29,7 +29,7 @@ use mineintent_middle::capability::{
 use mineintent_middle::events::JsonlEventJournal;
 use mineintent_middle::memory::MemoryStore;
 use mineintent_middle::participant::{
-    ParticipantAgentAssembly, ParticipantRuntime, ParticipantRuntimeConfig,
+    ParticipantAgentAssembly, ParticipantFrameSource, ParticipantRuntime, ParticipantRuntimeConfig,
     ProductionParticipantFrameSource, SystemUtcClock, WakeRegistry,
 };
 use mineintent_middle::speech::{SpeechScheduler, SpeechSchedulerOptions, SpeechTransport};
@@ -156,19 +156,21 @@ impl MineIntentApp {
                 )
             }
         };
+        // frame source 先于工厂构造：工厂要拿它装配每轮的 observationAfter 源。
+        let frame_source = Arc::new(
+            ProductionParticipantFrameSource::new(Arc::clone(&backend))
+                .map_err(|error| AppError::Assembly(format!("frame source 初始化失败：{error}")))?,
+        );
         let factory = Arc::new(AppAgentFactory::new(
             registry,
             choice,
             ModelName::new(&model_label)
                 .map_err(|error| AppError::Assembly(format!("模型名无效：{error}")))?,
             Arc::clone(&viewport_reader),
+            Arc::clone(&frame_source) as Arc<dyn ParticipantFrameSource>,
         ));
         let assembly = Arc::new(ParticipantAgentAssembly::new(Arc::clone(&factory)
             as Arc<dyn mineintent_middle::participant::ParticipantAgentFactory>));
-        let frame_source = Arc::new(
-            ProductionParticipantFrameSource::new(Arc::clone(&backend))
-                .map_err(|error| AppError::Assembly(format!("frame source 初始化失败：{error}")))?,
-        );
 
         let runtime = ParticipantRuntime::try_new(ParticipantRuntimeConfig {
             backend: Arc::clone(&backend),

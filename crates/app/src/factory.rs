@@ -11,7 +11,8 @@ use mineintent_middle::capability::{
     ExplicitCapabilityInvocationAssembler, RegistryToolDispatcher,
 };
 use mineintent_middle::participant::{
-    ParticipantAgentAssembly, ParticipantAgentFactory, ParticipantRuntime, ParticipantScope,
+    ParticipantAgentAssembly, ParticipantAgentFactory, ParticipantFrameSource,
+    ParticipantObservationAfterSource, ParticipantRuntime, ParticipantScope,
     ParticipantScopedAgentRunner,
 };
 use mineintent_middle::participant::{ParticipantClock, SystemUtcClock};
@@ -84,6 +85,7 @@ pub struct AppAgentFactory {
     choice: AppModelChoice,
     model_name: ModelName,
     viewport_reader: Arc<ViewportReader>,
+    frame_source: Arc<dyn ParticipantFrameSource>,
     runtime: OnceLock<Weak<AppRuntime>>,
 }
 
@@ -93,12 +95,14 @@ impl AppAgentFactory {
         choice: AppModelChoice,
         model_name: ModelName,
         viewport_reader: Arc<ViewportReader>,
+        frame_source: Arc<dyn ParticipantFrameSource>,
     ) -> Self {
         Self {
             registry,
             choice,
             model_name,
             viewport_reader,
+            frame_source,
             runtime: OnceLock::new(),
         }
     }
@@ -121,6 +125,7 @@ impl ParticipantAgentFactory for AppAgentFactory {
         trigger_event_id: &str,
     ) -> Result<Arc<dyn ParticipantScopedAgentRunner>, AgentError> {
         let runtime = self.runtime.get().cloned().ok_or_else(scope_invalid)?;
+        let fact_owner = runtime.upgrade().ok_or_else(scope_invalid)?.fact_owner();
         let scope_guard: Arc<dyn ScopeGuard> = Arc::new(RuntimeScopeGuard {
             runtime,
             scope: scope.clone(),
@@ -137,7 +142,18 @@ impl ParticipantAgentFactory for AppAgentFactory {
                 trigger_event_id.to_owned(),
                 scope_guard,
             )),
-        );
+        )
+        // 不接这一句，生产侧就一直用 NullObservationAfter，每个工具结果的
+        // observationAfter 恒为 null——2026-08-05 与 08-06 两次实盘都是这样，
+        // 模型把它读成「视野捕获后端暂时不可用」。这个源一直存在、也有测试，
+        // 只是从来没有被装配进来过。
+        .with_observation_after(Arc::new(ParticipantObservationAfterSource::new(
+            Arc::clone(&self.frame_source),
+            fact_owner,
+            scope.clone(),
+            generation,
+            trigger_event_id,
+        )));
         // 轮末一帧（更新-05/06）：真实 sampler 与 view capability 共用同一 reader。
         let sampler = BackendRoundViewportSampler::new(Arc::clone(&self.viewport_reader));
         let runner: Arc<dyn ParticipantScopedAgentRunner> = match &self.choice {
