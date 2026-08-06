@@ -76,11 +76,13 @@ struct ProductionChatListener {
 
 impl BackendEventListener for ProductionChatListener {
     fn on_event(&self, event: BackendEventEnvelope) {
-        let _ = catch_unwind(AssertUnwindSafe(|| {
-            if let Some(inner) = self.inner.upgrade() {
-                inner.record_chat_event(event);
-            }
-        }));
+        // 这里不再 catch：backend 的 dispatcher 已经把整个 on_event 包住并报告
+        // （facade.rs 的 "listener panic isolated"）。在里面再包一层，只会让
+        // 我们自己代码里的 panic 被吞掉、那句报告永远不触发——一条聊天因为
+        // 我们的缺陷消失，日志里一个字都没有。
+        if let Some(inner) = self.inner.upgrade() {
+            inner.record_chat_event(event);
+        }
     }
 }
 

@@ -528,14 +528,13 @@ async fn multiple_body_calls_sample_once_after_all_tool_messages() {
 }
 
 #[tokio::test]
-async fn body_failure_busy_and_panic_still_sample_once() {
+async fn body_failure_and_busy_still_sample_once() {
     let provider = ScriptedProvider::new(vec![
         completion(json!({
             "role": "assistant",
             "tool_calls": [
                 tool_call("failed", "body_failed"),
                 tool_call("busy", "body_busy"),
-                tool_call("panic", "body_panic"),
             ],
         })),
         completion(json!({"role": "assistant", "content": "done"})),
@@ -544,12 +543,10 @@ async fn body_failure_busy_and_panic_still_sample_once() {
         [
             ("body_failed", ExecutionResource::Body),
             ("body_busy", ExecutionResource::Body),
-            ("body_panic", ExecutionResource::Body),
         ],
         [
             ("body_failed", DispatchBehavior::Failure),
             ("body_busy", DispatchBehavior::Busy),
-            ("body_panic", DispatchBehavior::Panic),
         ],
     );
     let sampler = RecordingSampler::success(json!({"after": "failures"}));
@@ -565,16 +562,13 @@ async fn body_failure_busy_and_panic_still_sample_once() {
     let replay = &requests[1].messages;
     assert_eq!(replay[2]["role"], "tool");
     assert_eq!(replay[3]["role"], "tool");
-    assert_eq!(replay[4]["role"], "tool");
     let first: Value = serde_json::from_str(replay[2]["content"].as_str().unwrap()).unwrap();
     let second: Value = serde_json::from_str(replay[3]["content"].as_str().unwrap()).unwrap();
-    let third: Value = serde_json::from_str(replay[4]["content"].as_str().unwrap()).unwrap();
     assert_eq!(first["result"]["summary"], "body_read_failed");
     assert_eq!(second["result"]["summary"], "body_held_by_other");
-    assert_eq!(third["result"]["summary"], "tool_dispatch_panicked");
-    assert_eq!(replay[5]["role"], "user");
+    assert_eq!(replay[4]["role"], "user");
     assert_eq!(
-        frame_content(&replay[5])["viewport"]["visibleEntities"]["items"][0]["player"],
+        frame_content(&replay[4])["viewport"]["visibleEntities"]["items"][0]["player"],
         "failures"
     );
     assert_eq!(driver.viewport_sampler().calls.load(Ordering::SeqCst), 1);
@@ -718,15 +712,14 @@ async fn missing_sampler_uses_real_utc_for_explicit_unavailable_frame() {
     assert_ne!(at, "1970-01-01T00:00:00Z");
 }
 
+/// 分类器 panic 照常传播，不再被压成一条配对的工具失败。
 #[tokio::test]
-async fn resource_classifier_panic_is_paired_without_dispatch_or_frame() {
-    let provider = ScriptedProvider::new(vec![
-        completion(json!({
-            "role": "assistant",
-            "tool_calls": [tool_call("unknown", "resource_panics")],
-        })),
-        completion(json!({"role": "assistant", "content": "done"})),
-    ]);
+#[should_panic(expected = "resource classifier panic fixture")]
+async fn resource_classifier_panic_propagates() {
+    let provider = ScriptedProvider::new(vec![completion(json!({
+        "role": "assistant",
+        "tool_calls": [tool_call("unknown", "resource_panics")],
+    }))]);
     let dispatcher = ResourcePanicDispatcher {
         dispatch_calls: AtomicUsize::new(0),
     };
@@ -734,19 +727,7 @@ async fn resource_classifier_panic_is_paired_without_dispatch_or_frame() {
     let driver = AgentLoopDriver::new_with_viewport_sampler(provider, dispatcher, sampler);
     let signal = NeverCancelled;
     let mut run = initial_run();
-    driver
-        .drive(&mut run, &[], active_control(&signal))
-        .await
-        .expect("resource panic is paired and contained");
-
-    let requests = driver.model().requests.lock().expect("request lock");
-    let replay = &requests[1].messages;
-    assert_eq!(replay.len(), 3);
-    let result: Value = serde_json::from_str(replay[2]["content"].as_str().unwrap()).unwrap();
-    assert_eq!(result["result"]["summary"], "tool_dispatch_panicked");
-    assert!(replay[2].get("tool_call_id").is_some());
-    assert_eq!(driver.tools().dispatch_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(driver.viewport_sampler().calls.load(Ordering::SeqCst), 0);
+    let _ = driver.drive(&mut run, &[], active_control(&signal)).await;
 }
 
 #[tokio::test]
@@ -774,40 +755,34 @@ async fn sampler_read_failure_is_an_explicit_unavailable_frame() {
     assert_eq!(frame["unavailable"], "viewport_read_failed");
 }
 
+/// 采样器 panic 照常传播。
+///
+/// 「读不到视口」与「采样器有缺陷」是两件事：前者是世界事实，应当变成
+/// `unavailable` 帧告诉模型（见上一个测试）；后者是我们的 bug，不该被伪装成
+/// 一次读不到。
 #[tokio::test]
-async fn sampler_panic_is_isolated_into_an_unavailable_frame() {
-    let provider = ScriptedProvider::new(vec![
-        completion(json!({
-            "role": "assistant",
-            "tool_calls": [tool_call("body", "body_tool")],
-        })),
-        completion(json!({"role": "assistant", "content": "done"})),
-    ]);
+#[should_panic(expected = "sampler panic fixture")]
+async fn sampler_panic_propagates() {
+    let provider = ScriptedProvider::new(vec![completion(json!({
+        "role": "assistant",
+        "tool_calls": [tool_call("body", "body_tool")],
+    }))]);
     let dispatcher = ClassifiedDispatcher::new([("body_tool", ExecutionResource::Body)], []);
     let sampler = RecordingSampler::with_behavior(SampleBehavior::Panic);
     let driver = AgentLoopDriver::new_with_viewport_sampler(provider, dispatcher, sampler);
     let signal = NeverCancelled;
     let mut run = initial_run();
-    driver
-        .drive(&mut run, &[], active_control(&signal))
-        .await
-        .expect("sampler panic is contained");
-
-    let requests = driver.model().requests.lock().expect("request lock");
-    let frame = frame_content(&requests[1].messages[3]);
-    assert_eq!(frame["viewport"], Value::Null);
-    assert_eq!(frame["unavailable"], "viewport_sampler_panicked");
+    let _ = driver.drive(&mut run, &[], active_control(&signal)).await;
 }
 
+/// 时间源 panic 照常传播。
 #[tokio::test]
-async fn sampler_timestamp_panic_is_isolated_with_a_real_utc_frame_at() {
-    let provider = ScriptedProvider::new(vec![
-        completion(json!({
-            "role": "assistant",
-            "tool_calls": [tool_call("body", "body_tool")],
-        })),
-        completion(json!({"role": "assistant", "content": "done"})),
-    ]);
+#[should_panic(expected = "timestamp panic fixture")]
+async fn sampler_timestamp_panic_propagates() {
+    let provider = ScriptedProvider::new(vec![completion(json!({
+        "role": "assistant",
+        "tool_calls": [tool_call("body", "body_tool")],
+    }))]);
     let dispatcher = ClassifiedDispatcher::new([("body_tool", ExecutionResource::Body)], []);
     let sampler = TimestampPanicSampler {
         sample_calls: AtomicUsize::new(0),
@@ -815,26 +790,7 @@ async fn sampler_timestamp_panic_is_isolated_with_a_real_utc_frame_at() {
     let driver = AgentLoopDriver::new_with_viewport_sampler(provider, dispatcher, sampler);
     let signal = NeverCancelled;
     let mut run = initial_run();
-    driver
-        .drive(&mut run, &[], active_control(&signal))
-        .await
-        .expect("timestamp panic is contained");
-
-    let requests = driver.model().requests.lock().expect("request lock");
-    let frame = frame_content(&requests[1].messages[3]);
-    assert_eq!(frame["protocol"], "mineintent.viewport-frame.v2");
-    assert_eq!(frame["viewport"], Value::Null);
-    assert_eq!(frame["unavailable"], "viewport_sampler_panicked");
-    let at = frame["at"].as_str().expect("fallback UTC at string");
-    assert!(looks_like_utc_second_timestamp(at));
-    assert_ne!(at, "1970-01-01T00:00:00Z");
-    assert_eq!(
-        driver
-            .viewport_sampler()
-            .sample_calls
-            .load(Ordering::SeqCst),
-        0
-    );
+    let _ = driver.drive(&mut run, &[], active_control(&signal)).await;
 }
 
 #[tokio::test]

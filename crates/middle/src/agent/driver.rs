@@ -1,15 +1,9 @@
-use std::{
-    future::Future,
-    panic::{catch_unwind, AssertUnwindSafe},
-    pin::Pin,
-    task::{Context, Poll},
-    time::Instant,
-};
+use std::time::Instant;
 
 use mineintent_contracts::{
     agent::{
         AgentError, AgentErrorCode, ExecutionControl, JsonObject, ModelProvider, ModelUsage, RunId,
-        ToolCallId, ViewportFrameMessageV2, WireToolDefinition,
+        ViewportFrameMessageV2, WireToolDefinition,
     },
     capability::{ExecutionResource, ToolDispatcher},
 };
@@ -20,7 +14,7 @@ use super::{
     AgentRun, AgentRunStep, AgentToolResult, ModelCompletion, NoRoundViewportSampler,
     PlannedToolCall, RoundViewportSampler,
 };
-use toolloop::utc_timestamp_now;
+use toolloop::{await_with_control, is_run_control_error, utc_timestamp_now};
 
 /// 一轮 OpenAI-compatible completion 所需的 provider 无关输入。
 #[derive(Clone, Debug, PartialEq)]
@@ -105,23 +99,8 @@ where
                         messages,
                         tools: definitions.to_vec(),
                     };
-                    let provider_future =
-                        catch_unwind(AssertUnwindSafe(|| self.model.complete(request, control)))
-                            .map_err(|_| {
-                                AgentError::new(
-                                    AgentErrorCode::ProviderFailed,
-                                    "model_provider_panicked",
-                                )
-                            })?;
-                    let completion = await_with_control(
-                        catch_future_panic(
-                            provider_future,
-                            AgentErrorCode::ProviderFailed,
-                            "model_provider_panicked",
-                        ),
-                        control,
-                    )
-                    .await?;
+                    let provider_future = self.model.complete(request, control);
+                    let completion = await_with_control(provider_future, control).await?;
                     run.model_response(completion)?;
                 }
                 AgentRunStep::CallTools { calls } => {
@@ -153,42 +132,15 @@ where
                 PlannedToolCall::LocalResult(result) => results.push(result),
                 PlannedToolCall::Dispatch(invocation) => {
                     let tool_call_id = invocation.tool_call_id.clone();
-                    let resource =
-                        match catch_unwind(AssertUnwindSafe(|| self.tools.resource(&invocation))) {
-                            Ok(resource) => resource,
-                            Err(_) => {
-                                // Classification is part of the tool boundary. A
-                                // panic leaves the resource unknown, so pair the
-                                // call as a dispatch failure without dispatching
-                                // or counting it as a body action.
-                                results.push(tool_panic_result(tool_call_id));
-                                continue;
-                            }
-                        };
+                    let resource = self.tools.resource(&invocation);
                     if resource == Some(ExecutionResource::Body) {
                         // Count before entering the dispatch future so ordinary
-                        // failures, resource busy, and both panic paths still
-                        // trigger exactly one post-batch sample.
+                        // failures and resource busy still trigger exactly one
+                        // post-batch sample.
                         body_dispatched = true;
                     }
-                    let dispatch_future = match catch_unwind(AssertUnwindSafe(|| {
-                        self.tools.dispatch(invocation, control)
-                    })) {
-                        Ok(future) => future,
-                        Err(_) => {
-                            results.push(tool_panic_result(tool_call_id));
-                            continue;
-                        }
-                    };
-                    let execution = await_with_control(
-                        catch_future_panic(
-                            dispatch_future,
-                            AgentErrorCode::ToolFailed,
-                            "tool_dispatch_panicked",
-                        ),
-                        control,
-                    )
-                    .await;
+                    let dispatch_future = self.tools.dispatch(invocation, control);
+                    let execution = await_with_control(dispatch_future, control).await;
                     match execution {
                         Ok(execution) => {
                             results.push(AgentToolResult::from_execution(tool_call_id, execution)?);
@@ -209,13 +161,7 @@ where
         control: ExecutionControl<'_>,
     ) -> Result<JsonObject, AgentError> {
         control.check_at(Instant::now())?;
-        let at = match catch_unwind(AssertUnwindSafe(|| self.viewport_sampler.timestamp())) {
-            Ok(at) => at,
-            Err(_) => {
-                control.check_at(Instant::now())?;
-                return unavailable_frame_message(utc_timestamp_now(), "viewport_sampler_panicked");
-            }
-        };
+        let at = self.viewport_sampler.timestamp();
         control.check_at(Instant::now())?;
         if ViewportFrameMessageV2::validate_at(&at).is_err() {
             return unavailable_frame_message(
@@ -223,30 +169,14 @@ where
                 "viewport_frame_timestamp_invalid",
             );
         }
-        let sample_future =
-            match catch_unwind(AssertUnwindSafe(|| self.viewport_sampler.sample(control))) {
-                Ok(future) => future,
-                Err(_) => {
-                    control.check_at(Instant::now())?;
-                    return unavailable_frame_message(at, "viewport_sampler_panicked");
-                }
-            };
-        let sampled = await_with_control(
-            catch_future_panic(
-                sample_future,
-                AgentErrorCode::ToolFailed,
-                "viewport_sampler_panicked",
-            ),
-            control,
-        )
-        .await;
+        let sample_future = self.viewport_sampler.sample(control);
+        let sampled = await_with_control(sample_future, control).await;
 
         match sampled {
             Ok(viewport) => {
                 control.check_at(Instant::now())?;
-                let serialized = catch_unwind(AssertUnwindSafe(|| serde_json::to_value(viewport)));
-                match serialized {
-                    Ok(Ok(value)) if !value.is_null() => {
+                match serde_json::to_value(viewport) {
+                    Ok(value) if !value.is_null() => {
                         let frame = match ViewportFrameMessageV2::success(at.clone(), value) {
                             Ok(frame) => frame,
                             Err(_) => {
@@ -264,11 +194,11 @@ where
                             }
                         }
                     }
-                    Ok(Ok(_)) => {
+                    Ok(_) => {
                         control.check_at(Instant::now())?;
                         unavailable_frame_message(at, "viewport_frame_null_payload")
                     }
-                    Ok(Err(_)) | Err(_) => {
+                    Err(_) => {
                         control.check_at(Instant::now())?;
                         unavailable_frame_message(at, "viewport_frame_serialization_failed")
                     }
@@ -320,94 +250,5 @@ fn viewport_error_reason(error: &AgentError) -> String {
         error.code.to_string()
     } else {
         reason
-    }
-}
-
-fn tool_panic_result(tool_call_id: ToolCallId) -> AgentToolResult {
-    AgentToolResult::failed(tool_call_id, "tool_dispatch_panicked")
-}
-
-fn is_run_control_error(code: AgentErrorCode) -> bool {
-    matches!(
-        code,
-        AgentErrorCode::RunCancelled
-            | AgentErrorCode::DeadlineExceeded
-            | AgentErrorCode::ScopeInvalid
-    )
-}
-
-async fn await_with_control<F, Output>(
-    future: F,
-    control: ExecutionControl<'_>,
-) -> Result<Output, AgentError>
-where
-    F: Future<Output = Result<Output, AgentError>> + Send,
-{
-    control.check_at(Instant::now())?;
-    let cancellation = control.cancelled();
-    let timer = tokio::time::sleep_until(tokio::time::Instant::from_std(
-        control.deadline().expires_at(),
-    ));
-    tokio::pin!(future);
-    tokio::pin!(cancellation);
-    tokio::pin!(timer);
-
-    tokio::select! {
-        biased;
-        cancellation_error = &mut cancellation => {
-            match control.check_at(Instant::now()) {
-                Err(error) => Err(error),
-                Ok(()) => Err(cancellation_error),
-            }
-        }
-        _ = &mut timer => {
-            match control.check_at(Instant::now()) {
-                Err(error) => Err(error),
-                Ok(()) => Err(AgentError::deadline_exceeded()),
-            }
-        }
-        result = &mut future => {
-            control.check_at(Instant::now())?;
-            result
-        }
-    }
-}
-
-async fn catch_future_panic<Output, F>(
-    future: F,
-    code: AgentErrorCode,
-    summary: &'static str,
-) -> Result<Output, AgentError>
-where
-    F: Future<Output = Result<Output, AgentError>> + Send,
-{
-    CatchUnwindFuture::new(future)
-        .await
-        .map_err(|()| AgentError::new(code, summary))?
-}
-
-/// `std` 没有 async `catch_unwind`；把每次 poll 单独围住即可隔离同步与异步 panic。
-struct CatchUnwindFuture<F> {
-    future: Pin<Box<F>>,
-}
-
-impl<F> CatchUnwindFuture<F> {
-    fn new(future: F) -> Self {
-        Self {
-            future: Box::pin(future),
-        }
-    }
-}
-
-impl<F> Future for CatchUnwindFuture<F>
-where
-    F: Future,
-{
-    type Output = Result<F::Output, ()>;
-
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        catch_unwind(AssertUnwindSafe(|| this.future.as_mut().poll(context)))
-            .map_or(Poll::Ready(Err(())), |poll| poll.map(Ok))
     }
 }

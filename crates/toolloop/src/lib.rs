@@ -13,9 +13,7 @@ mod control;
 mod run;
 mod transcript;
 
-pub use control::{
-    await_with_control, catch_future_panic, is_run_control_error, CatchUnwindFuture,
-};
+pub use control::{await_with_control, is_run_control_error};
 
 pub use run::{
     AgentRun, AgentRunStep, AgentToolResult, ModelCompletion, PlannedToolCall,

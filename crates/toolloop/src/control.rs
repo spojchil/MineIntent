@@ -1,15 +1,15 @@
-//! 取消、deadline 与 panic 隔离——循环把外部实现接进来时唯一需要的三件事。
+//! 取消与 deadline——循环把外部实现接进来时需要的两件事。
 //!
-//! 这三件都与领域无关：无论工具是在挖方块还是在查数据库，「等它的时候要能被取消」
-//! 「超时要能干净收场」「它 panic 了不能连累循环」都成立。
+//! 两件都与领域无关：无论工具是在挖方块还是在查数据库，「等它的时候要能被取消」
+//! 和「超时要能干净收场」都成立。
+//!
+//! 这里**没有** panic 隔离。工具或 provider panic 时循环不再拦截，让它照常传播：
+//! 调用方的任务边界（生产路径上是 `process_wake` 里被 await 的那个
+//! `tokio::spawn`）会把它接成 `JoinError`，从而走失败流与 journal。压成一条
+//! 模型可见的普通失败只会让缺陷看起来像世界事实，而且模型会重试——panic 必然
+//! 可重现，重试注定再次 panic。
 
-use std::{
-    future::Future,
-    panic::{catch_unwind, AssertUnwindSafe},
-    pin::Pin,
-    task::{Context, Poll},
-    time::Instant,
-};
+use std::{future::Future, time::Instant};
 
 use mineintent_contracts::agent::{AgentError, AgentErrorCode, ExecutionControl};
 
@@ -63,45 +63,5 @@ where
             control.check_at(Instant::now())?;
             result
         }
-    }
-}
-
-/// 把一个 future 的 panic 转成结构化错误。
-pub async fn catch_future_panic<Output, F>(
-    future: F,
-    code: AgentErrorCode,
-    summary: &'static str,
-) -> Result<Output, AgentError>
-where
-    F: Future<Output = Result<Output, AgentError>> + Send,
-{
-    CatchUnwindFuture::new(future)
-        .await
-        .map_err(|()| AgentError::new(code, summary))?
-}
-
-/// `std` 没有 async `catch_unwind`；把每次 poll 单独围住即可隔离同步与异步 panic。
-pub struct CatchUnwindFuture<F> {
-    future: Pin<Box<F>>,
-}
-
-impl<F> CatchUnwindFuture<F> {
-    pub fn new(future: F) -> Self {
-        Self {
-            future: Box::pin(future),
-        }
-    }
-}
-
-impl<F> Future for CatchUnwindFuture<F>
-where
-    F: Future,
-{
-    type Output = Result<F::Output, ()>;
-
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        catch_unwind(AssertUnwindSafe(|| this.future.as_mut().poll(context)))
-            .map_or(Poll::Ready(Err(())), |poll| poll.map(Ok))
     }
 }

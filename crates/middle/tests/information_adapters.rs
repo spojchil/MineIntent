@@ -954,9 +954,15 @@ fn sound_history_dispose_drop_and_callback_panic_are_safe() {
             -5.0,
         ));
     }));
+    // 适配器**不再**自己隔离 panic：隔离是 backend dispatcher 的职责，而且它会
+    // 报告（facade 的 "listener panic isolated"）。适配器在里面再包一层的唯一
+    // 效果，是让我们自己代码里的缺陷被吞掉、那句报告永远不触发。
+    //
+    // 这里的 FakeBackend 直接调用 listener，不模拟那层隔离，所以 panic 会一路
+    // 传到本测试的 catch_unwind——这正是要断言的。
     assert!(
-        result.is_ok(),
-        "adapter listener must isolate backend callback panic"
+        result.is_err(),
+        "adapter must not swallow a panic; isolation belongs to the backend dispatcher"
     );
     assert_eq!(history.revision(), 0.0);
 }

@@ -216,11 +216,11 @@ impl ToolDispatcher for FailingDispatcher {
 }
 
 #[tokio::test]
-async fn dispatcher_errors_and_panics_stay_paired_and_the_loop_continues() {
+async fn dispatcher_errors_stay_paired_and_the_loop_continues() {
     let provider = ScriptedProvider::new(vec![
         model_completion(json!({
             "role": "assistant",
-            "tool_calls": [tool_call("error-id", "busy_tool"), tool_call("panic-id", "panic_tool")],
+            "tool_calls": [tool_call("error-id", "busy_tool"), tool_call("other-id", "busy_tool")],
         })),
         model_completion(json!({"role": "assistant", "content": "done"})),
     ]);
@@ -247,7 +247,29 @@ async fn dispatcher_errors_and_panics_stay_paired_and_the_loop_continues() {
     )
     .expect("second tool JSON");
     assert_eq!(first["result"]["summary"], "body_held_by_other");
-    assert_eq!(second["result"]["summary"], "tool_dispatch_panicked");
+    assert_eq!(second["result"]["summary"], "body_held_by_other");
+}
+
+/// 工具 panic 不再被压成一条普通的工具失败。
+///
+/// 原先它会变成 `tool_dispatch_panicked` 这个模型可见的失败摘要，与「工具正常
+/// 失败」不可区分，于是模型会重试——而 panic 必然可重现，同样的输入再 panic
+/// 一次。日志里只有那一句摘要，没有位置也没有栈。
+///
+/// 现在它照常传播。生产路径上 `process_wake` 的那次 `await` 会把它接成
+/// `JoinError`，走失败流 + journal，必要时把 participant 标成 Faulted——比
+/// 一条被模型重试的失败结果可查得多。
+#[tokio::test]
+#[should_panic(expected = "tool panic fixture")]
+async fn dispatcher_panic_propagates_instead_of_being_flattened() {
+    let provider = ScriptedProvider::new(vec![model_completion(json!({
+        "role": "assistant",
+        "tool_calls": [tool_call("panic-id", "panic_tool")],
+    }))]);
+    let driver = AgentLoopDriver::new(provider, FailingDispatcher);
+    let signal = NeverCancelled;
+    let mut run = initial_run();
+    let _ = driver.drive(&mut run, &[], active_control(&signal)).await;
 }
 
 struct PendingProvider {

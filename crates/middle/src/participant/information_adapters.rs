@@ -280,11 +280,11 @@ struct SoundEventListener {
 
 impl BackendEventListener for SoundEventListener {
     fn on_event(&self, event: BackendEventEnvelope) {
-        let _ = catch_unwind(AssertUnwindSafe(|| {
-            if let Some(inner) = self.inner.upgrade() {
-                inner.record(event);
-            }
-        }));
+        // 同 ProductionChatListener：backend 的 dispatcher 已包住并报告，
+        // 这里再包一层只会遮蔽我们自己的缺陷。
+        if let Some(inner) = self.inner.upgrade() {
+            inner.record(event);
+        }
     }
 }
 
