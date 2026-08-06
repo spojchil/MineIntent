@@ -600,3 +600,129 @@ MemoryStore::new(config.data_directory.join("memory.txt"))
 **与实际行为不符**。之所以没人发现，正是因为那个常量是死的（见 §7 死代码清单）。
 
 不影响功能（路径由装配处给），但它是「文档说 A、代码做 B」的现成例子。
+
+---
+
+## 7. 与外部实现的对照（rig）
+
+参考对象：[`0xPlaygrounds/rig`](https://github.com/0xPlaygrounds/rig)，Rust 的 LLM agent 框架，
+`rig-core` 79 732 行 / 157 文件（覆盖 20+ provider、向量库、嵌入等，规模不可直接类比）。
+下面只取**同题**的三处对照，不是「照抄它」的建议。
+
+### 7.1 工具 trait：rig 在关联类型上定型，只在擦除边界归一化
+
+```rust
+// rig：crates/rig-agent/src/tool/mod.rs:162
+pub trait Tool: Sized + Send + Sync {
+    const NAME: &'static str;
+    type Args:   for<'de> Deserialize<'de> + Send + Sync;   // 参数有类型
+    type Output: IntoToolOutput;                            // 输出有类型
+    type Error:  std::error::Error + Send + Sync + 'static; // 错误有类型
+    fn description(&self) -> String;
+    fn parameters(&self) -> serde_json::Value;
+}
+
+// 擦除只发生在一个 blanket impl 里：
+// rig：crates/rig-agent/src/tool/mod.rs:311-334
+impl<T> ErasedTool for T where T: Tool {
+    fn execute<'a>(&'a self, args: String, ctx: &'a mut ToolContext) -> ... {
+        let args = match parse_tool_args::<T::Args>(&args) { ... };   // ← 只写一次
+        ...
+    }
+}
+```
+
+rig 自己写明了这样做的理由（`tool/mod.rs:177-180`）：
+
+> Rig normalizes this error into `ToolExecutionError` **only at the erased dispatch boundary**.
+> This keeps ordinary `?` propagation and typed unit tests available to tool authors
+> **without creating a second runtime error representation**.
+
+MineIntent 的对应契约是**从头就擦除**的：
+
+```rust
+// contracts/src/capability/contracts.rs:98-107
+pub trait ToolCapability: Send + Sync {
+    fn definition(&self) -> &WireToolDefinition;
+    fn resource(&self) -> Option<ExecutionResource>;
+    fn execute<'a>(
+        &'a self,
+        invocation: CapabilityInvocation,     // arguments: JsonObject —— 无类型
+        context: CapabilityExecutionContext<'a>,
+    ) -> ContractFuture<'a, Result<Value, AgentError>>;   // 输出 Value —— 无类型
+}
+```
+
+后果在 `crates/middle/src/capability.rs`（1 788 行，全是生产码）里可以数出来：
+
+| 重复的样板 | 次数 |
+|---|---:|
+| `serde_json::from_value::<…Arguments>(…)` + 手写失败分支 | 5 |
+| `return body_failed_result(journal, &invocation, NAME, context, …).await`（每处约 9 行） | 14 |
+| `context.check_at(Instant::now())?` | 29 |
+
+关键不是「行数多」，而是**失败必须表达成 `Ok(failed_result(...))` 这个值**，
+于是每个能力都不能用 `?`，只能一层层 `match`。rig 那句注释说的正是这件事。
+
+**可行的小改动**（不改契约语义）：在 `middle` 侧加一个内部 trait
+`TypedCapability { type Args: DeserializeOwned; async fn run(&self, args: Args, …) -> Result<Value, AgentError> }`，
+再用一个 `impl<T: TypedCapability> ToolCapability for T` 把解析与失败转换收到一处。
+契约层 `ToolCapability` 保持不变，六个能力各减掉几十行。
+
+### 7.2 rig 完全不给进程内类型做版本判别
+
+在 `rig-core` 与 `rig-agent` 全库检索 `ProtocolV<n>` / `ContextProtocol` / `".v<n>"` 一类判别式：**零命中**。
+
+rig 面向的是**真正跨进程、跨供应商**的边界（20 多家 provider 的 wire 形状各不相同），
+它处理差异的办法是 provider 内部转换，而不是给自己的进程内类型盖版本号。
+
+这为 §1 的判断提供了一个外部参照：**版本判别式的收益来自「有别人写的对端」**，
+MineIntent 的 agent-context 没有这样的对端。
+
+### 7.3 轮次上限：rig 是每次运行的参数，MineIntent 是编译期常量
+
+```rust
+// rig：crates/rig-agent/src/agent/run/mod.rs:284,356-359
+max_turns: usize,
+pub fn max_turns(mut self, max_turns: usize) -> Self { self.max_turns = max_turns; self }
+// 用法：AgentRun::new("What is 2+2?").max_turns(3)
+```
+
+```rust
+// MineIntent：toolloop/src/run.rs:10-12
+pub const MAX_MODEL_REQUESTS_PER_RUN: usize = 16;
+pub const MAX_TOOL_CALLS_PER_RESPONSE: usize = 8;
+pub const MAX_TOOL_CALLS_PER_RUN: usize = 32;
+```
+
+**这条不是缺陷**，只是差异，而且 MineIntent 的选择可能是有意的（固定上限便于推理与验收）。
+记在这里是因为按 **W09**「每个决定都需要理由和记录；没有理由的选择保持待决」——
+这三个数字目前**没有写理由**。要么补上理由，要么它们按 W09 属于待决。
+
+### 7.4 rig 不在工具执行处捕获 panic
+
+`rig-core` 与 `rig-agent` 全库 `catch_unwind`：**零命中**。
+
+MineIntent 生产码有 9 处 `catch_unwind`：
+
+| 位置 | 包住什么 |
+|---|---|
+| `backend/src/facade.rs:651` | 监听器回调 |
+| `backend/src/runtime/events.rs:883` | 观察回调 |
+| `middle/src/speech/scheduler.rs:296` | 语音 transport 发送 |
+| `middle/src/capability.rs:1494` | `motor.release_all()` |
+| `middle/src/participant/production.rs:399` | `subscription.unsubscribe()` |
+| `middle/src/participant/information_adapters.rs:434` | `subscription.unsubscribe()` |
+| `middle/src/information/runtime.rs`（4 处以上） | provider 调用、trace、schema 解析、future poll |
+
+**库与应用的取舍本来就不同**，rig 是库、不该替调用方吞 panic，所以这不是「rig 对我们错」。
+真正值得看的是 MineIntent 自己已经写下的那句（`facade.rs:644-650`）：
+dispatcher 线程「本身没有独立理由」，事实流改成拉取式之后它和那处 catch 应当一起消失。
+
+远程分支 `origin/experiment/no-panic-catch`（「删除全部可执行的 panic 捕获，装 panic 钩子，
+观察真实崩溃形态」）与 `origin/docs/panic-audit-and-toolloop` 正在做这条线，
+本节的清单可以直接并进去。
+
+另外 §4.1 那条要一起看：`information/runtime.rs` 里那 4+ 处 `catch_unwind`
+**本来就不会执行**（整个控制面不在生产路径上），
+而 `information_adapters.rs` 明确依赖它们来接住自己抛出的 panic。
