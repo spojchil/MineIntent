@@ -15,10 +15,6 @@ use std::{
 
 use crate::{
     events::{JournalError, JsonlEventJournal},
-    execution::{
-        AcquireDecision, ExecutionArbiter, ExecutionRefusalCode, ExecutionRequest,
-        ResourceLeaseHandle,
-    },
     memory::{MemoryError, MemoryStore},
     speech::{SpeechRequest, SpeechScheduleError, SpeechScheduler, SpeechTransport},
 };
@@ -1698,25 +1694,8 @@ fn object(value: Value) -> JsonObject {
     value.as_object().cloned().unwrap_or_default()
 }
 
-struct LeaseDropGuard(Option<ResourceLeaseHandle>);
-
-impl LeaseDropGuard {
-    fn new(lease: ResourceLeaseHandle) -> Self {
-        Self(Some(lease))
-    }
-}
-
-impl Drop for LeaseDropGuard {
-    fn drop(&mut self) {
-        if let Some(lease) = self.0.take() {
-            lease.release();
-        }
-    }
-}
-
 pub struct RegistryToolDispatcher {
     registry: Arc<ToolCapabilityRegistry>,
-    arbiter: ExecutionArbiter,
     assembler: Arc<dyn CapabilityInvocationAssembler>,
     scope: Arc<CapabilityScopeAssembly>,
     observation_after: Arc<dyn ObservationAfterSource>,
@@ -1725,13 +1704,11 @@ pub struct RegistryToolDispatcher {
 impl RegistryToolDispatcher {
     pub fn new(
         registry: Arc<ToolCapabilityRegistry>,
-        arbiter: ExecutionArbiter,
         assembler: Arc<dyn CapabilityInvocationAssembler>,
         scope: Arc<CapabilityScopeAssembly>,
     ) -> Self {
         Self {
             registry,
-            arbiter,
             assembler,
             scope,
             observation_after: Arc::new(NullObservationAfter),
@@ -1748,10 +1725,6 @@ impl RegistryToolDispatcher {
 
     pub fn registry(&self) -> Arc<ToolCapabilityRegistry> {
         Arc::clone(&self.registry)
-    }
-
-    pub fn arbiter(&self) -> ExecutionArbiter {
-        self.arbiter.clone()
     }
 }
 
@@ -1785,17 +1758,6 @@ impl ContractToolDispatcher for RegistryToolDispatcher {
             })?;
             let context = self.scope.context(control);
             context.check_at(Instant::now())?;
-
-            let _lease = match self.arbiter.acquire(ExecutionRequest {
-                resource,
-                run_id: invocation.run_id.to_string(),
-                tool_name: invocation.name.to_string(),
-            }) {
-                AcquireDecision::Granted(lease) => LeaseDropGuard::new(lease),
-                AcquireDecision::Refused(refusal) => {
-                    return Err(map_execution_refusal(refusal.code, refusal.summary));
-                }
-            };
 
             let assembled = self.assembler.assemble(&invocation)?;
             context.check_at(Instant::now())?;
@@ -1833,13 +1795,4 @@ impl ContractToolDispatcher for RegistryToolDispatcher {
             Ok(ToolExecution::new(result, observation))
         })
     }
-}
-
-fn map_execution_refusal(code: ExecutionRefusalCode, summary: String) -> AgentError {
-    let code = match code {
-        ExecutionRefusalCode::ResourceBusy => AgentErrorCode::ResourceBusy,
-        ExecutionRefusalCode::UnknownTool => AgentErrorCode::UnknownTool,
-        ExecutionRefusalCode::ScopeInvalid => AgentErrorCode::ScopeInvalid,
-    };
-    AgentError::new(code, truncate_summary(summary))
 }

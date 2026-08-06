@@ -450,7 +450,6 @@ impl ParticipantAgentFactory for ConcreteRegistryFactory {
         });
         let dispatcher = RegistryToolDispatcher::new(
             Arc::clone(&self.registry),
-            Default::default(),
             Arc::new(ExplicitCapabilityInvocationAssembler::new(
                 Arc::new(RealActionIds),
                 Arc::new(RealUtc),

@@ -103,7 +103,7 @@ impl ModelProvider for ScriptedProvider {
 enum DispatchBehavior {
     Success,
     Failure,
-    Busy,
+    Refused,
     Panic,
 }
 
@@ -168,9 +168,9 @@ impl ToolDispatcher for ClassifiedDispatcher {
                     AgentErrorCode::ToolFailed,
                     "body_read_failed",
                 )),
-                DispatchBehavior::Busy => Err(AgentError::new(
-                    AgentErrorCode::ResourceBusy,
-                    "body_held_by_other",
+                DispatchBehavior::Refused => Err(AgentError::new(
+                    AgentErrorCode::ToolFailed,
+                    "body_refused_by_backend",
                 )),
                 DispatchBehavior::Panic => panic!("dispatcher panic fixture"),
             }
@@ -534,7 +534,7 @@ async fn body_failure_and_busy_still_sample_once() {
             "role": "assistant",
             "tool_calls": [
                 tool_call("failed", "body_failed"),
-                tool_call("busy", "body_busy"),
+                tool_call("busy", "body_refused"),
             ],
         })),
         completion(json!({"role": "assistant", "content": "done"})),
@@ -542,11 +542,11 @@ async fn body_failure_and_busy_still_sample_once() {
     let dispatcher = ClassifiedDispatcher::new(
         [
             ("body_failed", ExecutionResource::Body),
-            ("body_busy", ExecutionResource::Body),
+            ("body_refused", ExecutionResource::Body),
         ],
         [
             ("body_failed", DispatchBehavior::Failure),
-            ("body_busy", DispatchBehavior::Busy),
+            ("body_refused", DispatchBehavior::Refused),
         ],
     );
     let sampler = RecordingSampler::success(json!({"after": "failures"}));
@@ -565,7 +565,7 @@ async fn body_failure_and_busy_still_sample_once() {
     let first: Value = serde_json::from_str(replay[2]["content"].as_str().unwrap()).unwrap();
     let second: Value = serde_json::from_str(replay[3]["content"].as_str().unwrap()).unwrap();
     assert_eq!(first["result"]["summary"], "body_read_failed");
-    assert_eq!(second["result"]["summary"], "body_held_by_other");
+    assert_eq!(second["result"]["summary"], "body_refused_by_backend");
     assert_eq!(replay[4]["role"], "user");
     assert_eq!(
         frame_content(&replay[4])["viewport"]["visibleEntities"]["items"][0]["player"],

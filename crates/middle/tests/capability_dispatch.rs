@@ -595,8 +595,7 @@ fn harness() -> Harness {
         "chat-1",
         scope_guard,
     ));
-    let dispatcher =
-        RegistryToolDispatcher::new(registry, Default::default(), assembler, scope_assembly);
+    let dispatcher = RegistryToolDispatcher::new(registry, assembler, scope_assembly);
     Harness {
         dispatcher,
         backend,
@@ -764,10 +763,6 @@ async fn body_success_measures_effect_releases_lease_and_injects_one_observation
     assert_eq!(observation.calls(), 1);
     assert!(execution.observation_after.as_ref().is_some());
     assert_eq!(harness.backend.motor.release_calls(), 1);
-    assert!(dispatcher
-        .arbiter()
-        .lease_for(ExecutionResource::Body)
-        .is_none());
     let events = harness.journal.events();
     assert_eq!(events[0].0, "body_tool.completed");
     assert_eq!(events[0].1["actionId"], "action-call-look_relative");
@@ -811,10 +806,6 @@ async fn move_input_success_maps_forward_and_right_to_body_relative_effect() {
     assert_eq!(observation.calls(), 1);
     assert!(execution.observation_after.as_ref().is_some());
     assert_eq!(harness.backend.motor.release_calls(), 1);
-    assert!(dispatcher
-        .arbiter()
-        .lease_for(ExecutionResource::Body)
-        .is_none());
 }
 
 #[tokio::test]
@@ -848,10 +839,6 @@ async fn body_ordinary_failure_still_injects_observation_and_releases_lease() {
     assert_eq!(observation.calls(), 1);
     assert!(execution.observation_after.as_ref().is_some());
     assert_eq!(harness.backend.motor.release_calls(), 1);
-    assert!(dispatcher
-        .arbiter()
-        .lease_for(ExecutionResource::Body)
-        .is_none());
 }
 
 #[tokio::test]
@@ -1008,66 +995,45 @@ async fn cleanup_failure_does_not_keep_body_tool_gate_occupied() {
     .expect("cleanup failure is best effort");
     assert_eq!(execution.result["status"], "completed");
     assert_eq!(harness.backend.motor.release_calls(), 1);
-    assert!(harness
-        .dispatcher
-        .arbiter()
-        .lease_for(ExecutionResource::Body)
-        .is_none());
 }
 
+/// 原来这里还有半个断言：第二次派发会拿到 `resource_busy`。那半个连同仲裁器
+/// 一起删了——它只有在测试自己 `tokio::spawn` 造出第二条并发派发时才成立，而
+/// 生产侧的 `dispatch_in_order` 是顺序 for 循环，永远造不出来。剩下的这半个是
+/// 真的：马达卡住时取消一次身体动作，取消要能穿出来。
 #[tokio::test]
-async fn busy_lease_has_bounded_wait_and_first_lease_is_released_on_cancel() {
+async fn a_blocked_body_call_still_propagates_cancellation() {
     let harness = harness();
     harness.backend.motor.set_blocked(true);
-    let first_cancellation = TestCancellation::new();
+    let cancellation = TestCancellation::new();
     let dispatcher = Arc::new(harness.dispatcher);
-    let first_signal_for_task = first_cancellation.clone();
-    let first_dispatcher = Arc::clone(&dispatcher);
-    let first = tokio::spawn(async move {
-        first_dispatcher
+    let signal_for_task = cancellation.clone();
+    let dispatcher_for_task = Arc::clone(&dispatcher);
+    let call = tokio::spawn(async move {
+        dispatcher_for_task
             .dispatch(
                 tool_invocation(
                     "look_relative",
                     json!({"yaw_degrees": 1, "pitch_degrees": 0}),
                 ),
-                active_control(&first_signal_for_task),
+                active_control(&signal_for_task),
             )
             .await
     });
     tokio::time::timeout(TIMEOUT, harness.backend.motor.started.notified())
         .await
-        .expect("first body call starts");
+        .expect("body call starts");
 
-    let second_cancellation = TestCancellation::new();
-    let busy = tokio::time::timeout(
-        TIMEOUT,
-        dispatcher.dispatch(
-            tool_invocation(
-                "move_input",
-                json!({"directions": ["forward"], "duration_ms": 50}),
-            ),
-            active_control(&second_cancellation),
-        ),
-    )
-    .await
-    .expect("busy refusal is bounded")
-    .expect_err("body resource is busy");
-    assert_eq!(busy.code, AgentErrorCode::ResourceBusy);
-
-    first_cancellation.trigger();
-    let first_result = tokio::time::timeout(TIMEOUT, first)
+    cancellation.trigger();
+    let result = tokio::time::timeout(TIMEOUT, call)
         .await
-        .expect("cancelled first call completes")
-        .expect("first task joins");
+        .expect("cancelled call completes")
+        .expect("task joins");
     assert_eq!(
-        first_result.expect_err("cancelled body propagates").code,
+        result.expect_err("cancelled body propagates").code,
         AgentErrorCode::RunCancelled
     );
     harness.backend.motor.release_block();
-    assert!(dispatcher
-        .arbiter()
-        .lease_for(ExecutionResource::Body)
-        .is_none());
 }
 
 #[tokio::test]

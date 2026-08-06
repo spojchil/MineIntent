@@ -207,8 +207,8 @@ impl ToolDispatcher for FailingDispatcher {
             "panic_tool" => Box::pin(async { panic!("tool panic fixture") }),
             _ => Box::pin(async {
                 Err(AgentError::new(
-                    AgentErrorCode::ResourceBusy,
-                    "body_held_by_other",
+                    AgentErrorCode::ToolFailed,
+                    "body_refused_by_backend",
                 ))
             }),
         }
@@ -246,8 +246,8 @@ async fn dispatcher_errors_stay_paired_and_the_loop_continues() {
             .expect("second tool content"),
     )
     .expect("second tool JSON");
-    assert_eq!(first["result"]["summary"], "body_held_by_other");
-    assert_eq!(second["result"]["summary"], "body_held_by_other");
+    assert_eq!(first["result"]["summary"], "body_refused_by_backend");
+    assert_eq!(second["result"]["summary"], "body_refused_by_backend");
 }
 
 /// 工具 panic 不再被压成一条普通的工具失败。

@@ -11,7 +11,6 @@ pub enum AgentErrorCode {
     InvalidToolInvocation,
     DuplicateToolCapability,
     UnknownTool,
-    ResourceBusy,
     ScopeInvalid,
     RunCancelled,
     DeadlineExceeded,

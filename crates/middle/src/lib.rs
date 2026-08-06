@@ -5,7 +5,6 @@
 pub mod agent;
 pub mod capability;
 pub mod events;
-pub mod execution;
 pub mod information;
 pub mod memory;
 pub mod participant;

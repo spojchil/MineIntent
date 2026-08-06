@@ -128,7 +128,6 @@ impl ParticipantAgentFactory for AppAgentFactory {
         });
         let dispatcher = RegistryToolDispatcher::new(
             Arc::clone(&self.registry),
-            Default::default(),
             Arc::new(ExplicitCapabilityInvocationAssembler::new(
                 Arc::new(UuidActionIds),
                 Arc::new(SystemUtcSource),
