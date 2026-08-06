@@ -237,6 +237,12 @@ async fn additional_transport_failure_discards_current_request_and_continues_fif
     );
 }
 
+/// 实验分支：transport panic 的捕获已移除。
+///
+/// 移除之后 panic 会杀掉 speech worker 这个全局唯一的 tokio 任务，同伴从此
+/// 永久说不出话——而且**没有任何人观察那个 JoinHandle**，所以既不崩溃也不报错。
+/// 这正是要在实机上看的现象。
+#[ignore = "实验分支：speech transport panic 捕获已移除，worker 会被 panic 杀掉"]
 #[tokio::test(start_paused = true)]
 async fn additional_transport_panic_becomes_failed_and_worker_continues_fifo() {
     let transport = RecordingTransport::with_panics([true, false]);

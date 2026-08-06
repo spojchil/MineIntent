@@ -641,24 +641,10 @@ impl FacadeInner {
             if !delivery.state.begin() {
                 continue;
             }
-            // 不得不 catch 的理由：本函数跑在 dispatcher 线程上，而那根线程没有
-            // 监督者。panic 逃出去就是线程死亡 → EventBridge 再也不被排空 →
-            // 上游生产者依次卡在各自的背压点上 → 整条事实流永久停摆。
-            //
-            // 需要如实记一笔：这根线程本身**没有独立理由**——它是推送式事实流的
-            // 产物，不像 backend runtime 线程那样被 azalea 的 LocalSet 逼出来。
-            // 事实流改成拉取式之后，这根线程和这处 catch 应当一起消失。
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                delivery.listener.on_event(event.clone());
-            }));
+            // 实验分支：不捕获。panic 会杀掉 dispatcher 线程，事实流随之停摆——
+            // 这正是要观察的现象，而不是要掩盖的。
+            delivery.listener.on_event(event.clone());
             delivery.state.finish();
-            if result.is_err() {
-                tracing::error!(
-                    target: "mineintent_backend",
-                    subscription_id = delivery.id,
-                    "事件订阅者回调 panic：已隔离；这是缺陷，不是世界事实"
-                );
-            }
         }
     }
 
@@ -2810,6 +2796,14 @@ mod tests {
         }
     }
 
+    /// 实验分支：本测试的前提（订阅者 panic 被隔离）已被移除。
+    ///
+    /// 移除之后的实际行为是：panic 杀死 dispatcher 线程，之后的 FIFO 投递永远
+    /// 不到，测试表现为 `"FIFO callback should arrive: Timeout"`。注意它**不是
+    /// 崩溃而是静默挂起**——进程还活着，事实流断了却没有任何人说话。
+    ///
+    /// 这正是要在实机上观察的现象，所以这里先标记掉，不在单测里模拟。
+    #[ignore = "实验分支：订阅者 panic 隔离已移除，此测试的前提不再成立"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn facade_subscription_fifo_panic_unsubscribe_and_reentry_are_bounded() {
         let (facade, driver) = MinecraftBackendFacade::scripted(test_config());

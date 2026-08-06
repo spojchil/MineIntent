@@ -46,6 +46,47 @@ pub fn init_tracing() {
         .try_init();
 }
 
+/// 装 panic 钩子：把每一次 panic 连同**线程名、位置、消息、栈**一并记下来。
+///
+/// 没有它的时候，一次 panic 只会在 stderr 上留一行默认输出；而本项目有四个
+/// 长生命执行上下文（backend 专属线程、dispatcher 线程、participant worker、
+/// speech worker），其中任何一个死掉，进程都还活着——于是「谁死了」这个最要紧
+/// 的信息恰好是缺的那一条。
+///
+/// 钩子在 `init_tracing` 之后装，所以 panic 会同时进 tracing 与 dev.log。
+/// 栈依赖 `RUST_BACKTRACE=1` 与 debug 构建（release 配了 `strip = "symbols"`）。
+pub fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>").to_owned();
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_owned());
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string payload>".to_owned());
+        let backtrace = std::backtrace::Backtrace::force_capture();
+
+        tracing::error!(
+            target: "mineintent_app",
+            thread = %thread_name,
+            location = %location,
+            message = %message,
+            "PANIC"
+        );
+        log(
+            "panic",
+            format!("thread={thread_name} at={location} msg={message}\n{backtrace}"),
+        );
+        previous(info);
+    }));
+}
+
 /// 是否开启：`MINEINTENT_DEBUG` 为 1/true/on 即开。
 pub fn enabled() -> bool {
     matches!(

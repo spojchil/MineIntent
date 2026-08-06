@@ -5,7 +5,6 @@
 //! effect; the explicit observation-after port is the seam for a later runtime owner.
 
 use std::{
-    panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -1489,18 +1488,9 @@ impl Drop for ReleaseAllOnDrop {
         let Some(motor) = self.motor.take() else {
             return;
         };
-        // 不得不 catch 的理由：这是 `Drop`。如果这次 drop 发生在 unwind 途中
-        // （工具体内 panic 了），而 release_all 又 panic，就是 double panic ——
-        // Rust 直接 `abort()`：进程当场消失，没有栈、没有日志、没有 journal。
-        // 这是语言约束，不是我们的取舍。
-        //
-        // 出声是我们的取舍：原先连一句都没有，一次失败的松手完全不可见。
-        if let Err(_payload) = catch_unwind(AssertUnwindSafe(|| motor.release_all())) {
-            tracing::error!(
-                target: "mineintent_middle",
-                "释放身体控制时 panic：已隔离以避免 double panic 中止进程；这是缺陷"
-            );
-        }
+        // 实验分支：不捕获。若这次 drop 发生在 unwind 途中而 release_all 又
+        // panic，就是 double panic → abort()。那也是要观察的现象之一。
+        let _ = motor.release_all();
     }
 }
 

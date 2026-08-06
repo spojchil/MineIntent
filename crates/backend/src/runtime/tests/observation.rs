@@ -359,13 +359,19 @@ struct AUnsubscribesBListener {
 impl ObservationEventListener for AUnsubscribesBListener {
     fn on_event(&self, _event: ObservationEvent) {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        let mut subscription = self
+        // A 会被调用两次（测试先发 Entity 再发 Block），第二次 B 已经被退订。
+        // 原先这里 `.expect("B subscription should be present during A callback")`
+        // 在第二次必然 panic——测试之所以通过，是因为外层的 catch_unwind 把它
+        // 吞掉并记成一句「listener panic isolated」。捕获藏起来的是一个 fixture
+        // 缺陷，不是被保护的不变量。
+        let subscription = self
             .b_subscription
             .lock()
             .expect("B subscription mutex should not be poisoned")
-            .take()
-            .expect("B subscription should be present during A callback");
-        subscription.unsubscribe();
+            .take();
+        if let Some(mut subscription) = subscription {
+            subscription.unsubscribe();
+        }
     }
 }
 
@@ -932,21 +938,27 @@ fn typed_observation_payload_is_direct_and_kind_bound() {
     assert_eq!(events.lock().len(), 1);
 }
 
+/// 实验分支：订阅者 panic 不再被隔离。
+///
+/// 这条记的是删掉捕获的**实际代价**：一个订阅者的缺陷会中断整趟投递，排在它后面
+/// 的订阅者收不到已经发生的事实，panic 一路传到发事件的调用点。
+///
+/// 原测试名叫 `callback_panic_isolated_from_later_listeners_and_events`，断言的
+/// 正是被移除的那条性质。留着它只会让人以为隔离还在。
 #[test]
-fn callback_panic_isolated_from_later_listeners_and_events() {
+#[should_panic(expected = "observation listener test panic")]
+fn callback_panic_propagates_and_stops_the_dispatch_pass() {
     let handle = RuntimeHandle::new(RunConfig::default());
     handle.shared.begin_connection_attempt();
     let source = handle.observation_source();
     let _panic_subscription =
         ProtocolObservationSource::subscribe(&source, Arc::new(PanicListener))
             .expect("panic listener subscription should succeed");
-    let (listener, events) = recording_listener();
+    let (listener, _events) = recording_listener();
     let _recording_subscription =
         ProtocolObservationSource::subscribe(&source, listener).expect("subscribe");
 
     emit_test_fact(&handle, BackendEventKind::Entity);
-    emit_test_fact(&handle, BackendEventKind::Block);
-    assert_eq!(events.lock().len(), 2);
 }
 
 #[test]
