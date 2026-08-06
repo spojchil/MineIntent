@@ -11,3 +11,4 @@ pub mod memory;
 pub mod participant;
 pub mod speech;
 pub mod telemetry;
+pub mod viewport;

@@ -13,6 +13,9 @@ publish.workspace = true
 mineintent-contracts.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# 只要 time 与 macros：deadline 需要一个定时器，select! 需要宏。
+# 不引 rt/net/fs——循环不拥有运行时，也不碰 I/O。
+tokio = { workspace = true, features = ["macros", "time"] }
 
 [lints]
 workspace = true

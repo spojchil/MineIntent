@@ -9,8 +9,13 @@
 //! 换一套工具就是换一种 agent —— 这是它单独成 crate 的全部理由，也是它的
 //! 依赖表必须保持干净的理由。
 
+mod control;
 mod run;
 mod transcript;
+
+pub use control::{
+    await_with_control, catch_future_panic, is_run_control_error, CatchUnwindFuture,
+};
 
 pub use run::{
     AgentRun, AgentRunStep, AgentToolResult, ModelCompletion, PlannedToolCall,

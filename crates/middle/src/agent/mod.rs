@@ -7,9 +7,6 @@ mod context;
 mod driver;
 mod prompt;
 mod runner;
-mod viewport;
-mod viewport_mirror;
-mod viewport_reducer;
 
 // 循环本体与转录已迁往 `toolloop`（领域无关）。这里按原名转出，调用方不受影响；
 // 待 driver/runner 也脱离领域之后，本模块只剩领域侧的 context/prompt/viewport。
@@ -30,12 +27,13 @@ pub use prompt::{
     initial_messages, initial_messages_v4_legacy, system_prompt, template_text, PromptError,
 };
 pub use runner::{AgentRunnerImpl, ConcreteAgentRunner};
-pub use viewport::{
-    BackendRoundViewportSampler, FixedUtcTimestampSource, NoRoundViewportSampler,
-    RoundViewportSampler, SystemUtcTimestampSource, UtcTimestampSource,
+
+// 视口三件套已迁往 `crate::viewport`（领域侧）。这里按原名转出，调用方与测试
+// 不受影响；等 driver 不再持有 sampler 泛型之后，这几行可以一并撤掉。
+pub use crate::viewport::{
+    block_fact_key, BackendRoundViewportSampler, FixedUtcTimestampSource, KeyframeReason,
+    MirrorLimits, NoRoundViewportSampler, PendingViewportFrame, RoundViewportSampler,
+    SystemUtcTimestampSource, UtcTimestampSource, ViewportCommitError, ViewportFrame,
+    ViewportIncrementalReducer, ViewportMirror, ViewportMirrorError, ViewportObservation,
+    ViewportProposal, ViewportReducedState, ViewportReplayError,
 };
-pub use viewport_mirror::{
-    block_fact_key, KeyframeReason, MirrorLimits, PendingViewportFrame, ViewportCommitError,
-    ViewportFrame, ViewportMirror, ViewportMirrorError, ViewportObservation, ViewportProposal,
-};
-pub use viewport_reducer::{ViewportIncrementalReducer, ViewportReducedState, ViewportReplayError};

@@ -3106,6 +3106,7 @@ dependencies = [
  "mineintent-contracts",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
