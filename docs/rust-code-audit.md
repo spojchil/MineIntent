@@ -386,3 +386,217 @@ warning: struct `JavaScriptJsonFormatter` is never constructed
 
 相关背景：远程分支 `origin/experiment/no-panic-catch` 与 `origin/docs/panic-audit-and-toolloop`
 正是在做 panic 处置的专项，这条应当并进去看。
+
+---
+
+## 5. 同一个历法算法写了六遍，产出三种互不相同的时间戳格式
+
+`Cargo.toml` 的 workspace 依赖里有 `chrono`，`backend` 正在用它。
+但整个 workspace 里，「把 Unix 秒转成 ISO-8601 UTC 字符串」这件事被独立实现了**六次**：
+
+| # | 位置 | 符号 | 输出格式 |
+|---|---|---|---|
+| 1 | `chrono`（backend 依赖） | `DateTime::<Utc>::to_rfc3339()` | `2026-08-04T16:00:00+00:00` |
+| 2 | `toolloop/src/transcript.rs:304,320` | `utc_timestamp` + `civil_date_from_days` | `...T16:00:00Z`（秒级） |
+| 3 | `middle/src/events/mod.rs:197,213` | `current_timestamp` + `civil_date` | `...T16:00:00.123Z` |
+| 4 | `middle/src/telemetry/debug_state.rs:271,287` | `current_timestamp` + `civil_date` | 同上（与 #3 **逐字节相同**） |
+| 5 | `middle/src/information/support.rs:238,274,284` | `format_utc_millis` + `days_from_civil` + `civil_from_days` | `...T16:00:00.123Z` |
+| 6 | `middle/src/participant/runtime/support.rs:393` | `utc_now`（内联 civil-from-days） | `...T16:00:00Z`（秒级） |
+
+#3 与 #4 是同一段代码的两份副本，连变量名都一样（`shifted` / `day_of_era` / `year_of_era` /
+`month_prime`），这是重复扫描器抓到的最大一块跨文件重复（34 行）。
+
+### 5.1 三种格式都会进模型可见字段
+
+契约层对 `at` 的校验只有「非空 + 无控制字符」：
+
+```rust
+// contracts/src/agent/context.rs:1018        contracts/src/agent/viewport.rs:76
+fn validate_text(value: &str, label: &str)    pub fn validate_at(at: &str)
+    if value.is_empty()                           if at.trim().is_empty()
+        || value.chars().any(char::is_control)        || at.chars().any(char::is_control)
+```
+
+**没有任何地方约束格式。** 于是同一份模型上下文里可以同时出现：
+
+- `AgentFrameV5.at` / `AgentChatMessageV5.at` ← 后端事件的 `occurred_at`
+  ← `runtime/state.rs:53` 的 `now_utc().to_rfc3339()` → **格式 1**（`+00:00`）
+- 轮末追加的 `ViewportFrameMessageV2.at` ← `middle/src/viewport/sampler.rs:47`
+  的 `utc_timestamp_now()` → **格式 2**（`Z`，秒级）
+
+格式 1 有仓库自己的证据：`backend/src/facade.rs:2439` 的测试夹具写的是
+`died_at: "2026-08-04T16:00:00+00:00"`——写成这样是因为代码就产出这样。
+
+模型要在一轮里比较「聊天发生在什么时候」和「这帧视口是什么时候采的」，
+拿到的是两种带不同后缀、不同精度的字符串。这不是崩溃，是**可读性与可比性**问题，
+而它撞的是 `产品.md` 的 **W02**（AI 对世界的认识应来自它能获得的观察）——
+观察本身没错，但表述形式没有统一权威。
+
+### 5.2 一处潜在的负值分歧（不是现行缺陷）
+
+#6（`support.rs:406`）用 `.div_euclid(146_097)`，#3/#5 用 `/ 146_097`（截断除）。
+两者只在被除数为负时不同，而 `days + 719_468 < 0` 需要时钟回到公元 0 年之前。
+**记录在此，不作为缺陷**——它是"同一算法抄六遍"这件事的直接后果，
+说明六份之间已经开始各自漂移。
+
+### 5.3 `now_utc` 里有两处生产路径上的 panic
+
+```rust
+// backend/src/protocol.rs:15-21
+pub fn now_utc() -> DateTime<Utc> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("系统时间早于 Unix epoch")        // ← panic
+        .as_millis() as i64;
+    DateTime::<Utc>::from_timestamp_millis(millis).expect("系统时间超出 chrono 支持范围")  // ← panic
+}
+```
+
+`now_utc()` 在 `runtime/state.rs`、`runtime/lifecycle.rs` 多处被调用，属于生产热路径。
+系统时钟被设到 1970 年之前会让整个同伴进程崩溃。
+远程分支 `origin/docs/panic-audit-and-toolloop` 正在做 panic 专项，这两处应当并进去看。
+
+**建议**：这六份合并成一份，落在 `contracts` 或一个小的 `time` 模块里，实现直接用 `chrono`
+（已经是依赖，backend 已经在用）。格式统一为 `to_rfc3339_opts(SecondsFormat::Millis, true)`
+（毫秒 + `Z`）。这是纯机械改动，唯一需要确认的是**格式变化会不会动到已落盘的 journal 兼容性**。
+
+---
+
+## 6. 与产品条目相关的发现
+
+> 本节每一条都引 `docs/产品.md` 的条目编号。
+> **我不替产品作判断**——这里只指出「代码事实」与「条目文字」之间可核对的差距，
+> 该怎么办由维护者定（G04/G06）。
+
+### 6.1 ⚠ W06：「每次响应最多一个动作工具」只写在提示词里，运行时不管
+
+**W06｜已确认**：运行时能够可靠控制的权限、资源、生命周期和身体能力，
+应由运行时直接控制，**不能只写进系统提示词**。
+
+生产使用的提示词 `crates/middle/src/agent/prompts/participant-system/v2.txt`
+（由 `crates/app/src/lib.rs:188` 选定 `v2`）里写着：
+
+> 每次模型响应最多调用一个动作类工具，等它返回的效果和轮末视野帧再判断下一步；不要预先编排动作序列。
+
+而运行时的实际行为是：
+
+- `toolloop/src/run.rs:11` — `MAX_TOOL_CALLS_PER_RESPONSE = 8`
+- `middle/src/agent/driver.rs:129-155` — `dispatch_in_order` 对这一批的**每一个**调用依次执行
+- `ExecutionResource::Body`（`driver.rs:136`）**只**用来把 `body_dispatched` 置真，
+  决定轮末要不要采一帧视口；**从不用来拒绝第二个动作工具**
+
+三个工具声明自己是 `Body`：`look_relative`（`capability.rs:787`）、
+`move_input`（`capability.rs:955`）、`respawn`（`capability.rs:1371`）。
+模型在一条响应里同时发这三个，三个都会执行。
+
+这正是 W06 说的那种情况：**运行时完全有能力控制**（它就是派发方，`resource()` 就在手里），
+却只写在提示词里。而提示词对模型没有强制力。
+
+⚠ 但这里有个前置问题要先问：**「每次响应最多一个动作工具」本身是不是一条产品决定？**
+`产品.md` 里没有这条。按 **W09**（「每个决定都需要理由和记录；没有理由的选择保持待决」），
+它现在的状态是**待决**。所以不能直接「按 W06 把它挪进运行时」——
+那等于用实现把一条待决的事定下来，撞 **G05**（不得通过代码或提示词静默决定未决问题）。
+
+**要问的是**：这条规则要不要保留？如果要，它是产品决定还是纯工程约束？
+
+### 6.2 ⚠ S06：长期记忆被拼进系统提示词的同一条消息
+
+**S06｜已确认**：系统提示词用于向 AI 提供基本背景信息，**不与长期记忆混合**。
+**S07｜已确认**：系统提示词和长期记忆来自不同地方，由不同的人或过程修改，并且对 AI 有不同含义。
+
+```rust
+// crates/middle/src/agent/prompt.rs:72-80
+pub fn system_prompt(template: &PromptTemplateRef, memory: &str) -> Result<String, PromptError> {
+    let base = template_text(&template.key, &template.version)?;
+    let mut prompt = base.to_owned();
+    if !memory.is_empty() {
+        prompt.push_str("\n\n## 你记得的事\n");
+        prompt.push_str(memory);
+    }
+    Ok(prompt)
+}
+```
+
+`initial_messages_for_frame`（`prompt.rs:111-125`）把它作为**一条** `system` 消息发出。
+模型收到的是提示词与记忆首尾相连、只用一个 markdown 标题分隔的单一文本。
+
+我读不准 S06 的「混合」指的是**撰写**（提示词文件里不写记忆内容——当前满足）
+还是**送达**（不放进同一条消息——当前不满足）。两种读法导出的做法不同：
+后一种要求把记忆拆成独立消息（或独立字段），前一种则现状即可。
+
+**这是产品文字的解释问题，我不自己定。**
+
+### 6.3 Q01 未决定，而提示词已经写了 1 514 字节的运行策略
+
+**Q01｜未决定**：系统提示词具体应当介绍哪些基本背景信息。
+**A07a｜已确认**：系统提示词**只介绍基本背景信息**。
+**G05｜已确认**：任何人不得通过代码、**提示词**、配置、文档或测试，静默决定本文件尚未决定的产品问题。
+
+v2.txt 的内容远超「基本背景信息」，其中至少这些是运行策略而非背景：
+
+- 「每次模型响应最多调用一个动作类工具……不要预先编排动作序列」（见 6.1）
+- 「全部做完后直接结束本次决策，不要在最后输出台词、总结或解释」
+- 「不能把发出工具调用当作动作成功」
+- 「directed 只能复用观察中已有或玩家明确给出的坐标」
+
+我完全理解**要跑起来就得写点什么**——这不是指责，是登记：
+**当前提示词事实上回答了 Q01，而 Q01 在册上仍是未决定。**
+要么把这些内容降格为「临时实现，不构成产品答案」并记录，要么走 G06 把 Q01 定下来。
+
+### 6.4 P04：可执行能力覆盖约 5/54
+
+**P04｜已确认**：AI 为了参与共同经历，需要具备正常 Minecraft 玩家所具有的游戏能力。
+
+仓库自己的调研基线 `docs/minecraft-client-capability-panorama.md` 第 4 章列出
+**54 项**服务端可理解的可执行能力（4.1 移动姿态 11 项、4.2 方块实体物品交互 8 项、
+4.3 背包容器工作站 14 项、4.4 通信生命周期 17 项、4.5 UI 驱动请求 4 项）。
+
+当前 6 个模型可见工具（`capability.rs:45,720-724`）对应其中：
+
+| 全景条目 | MineIntent | 覆盖 |
+|---|---|---|
+| 方向输入（前后左右及组合） | `move_input` | 部分（`MoveInputArguments` = directions + duration_ms + sprint） |
+| 冲刺 | `move_input.sprint` | 有 |
+| 视角 | `look_relative` | 部分（**只有相对**转动，且每轴 ±90° 上限，`schemas.rs:39`） |
+| 发送聊天 | `say` | 有 |
+| 重生 | `respawn` | 有 |
+| **跳跃 / 潜行** | 无 | **缺** |
+| 挖掘 / 放置 / 攻击 / 使用物品 / 对方块使用 | 无 | **缺（4.2 整章 8 项全缺）** |
+| 快捷栏选择 / 丢弃 / 容器 / 合成 / 交易 / 告示牌 | 无 | **缺（4.3 整章 14 项全缺）** |
+
+`view` 与 `remember` 不在全景的可执行能力表里（前者是观察，后者不是 Minecraft 能力）。
+
+也就是说**约 5/54**。这与 `docs/architecture.md:198`「已知实现偏差 5：当前动作能力远低于正常玩家的能力范围」一致，
+本节只是把「远低于」量化成数字，供排优先级用。
+
+⚠ 特别指出一条容易被忽略的：**跳跃与潜行缺失**。它们在全景的 4.1，与已有的方向输入同章、
+同一条形成链（`protocol · maintained-model`），却没有工具。
+没有跳跃意味着同伴**过不去一格台阶**——这直接影响 P01/P02 说的「共同经历」是否成立。
+
+### 6.5 architecture.md 的「已知实现偏差 1」对 Rust 侧已经过期
+
+`docs/architecture.md:194` 写：
+
+> 1. 当前长期记忆仍是结构化多记录，不是单一、由 AI 直接编辑的文本记忆。
+
+对 TS 栈成立，**对 Rust 侧不成立**。`crates/middle/src/memory/mod.rs:1-7` 是 Issue #127 的
+单文本存储：`MemoryEdit::{Append, Replace, Rewrite}` 三种操作、每次组装从磁盘读全文、
+写前留滚动备份、首次发现旧 JSON 时一次性迁移。这符合 **M01/M03/M04a**。
+
+`architecture.md` 第 9 节已经声明自己描述的是 TS 栈，但「已知实现偏差」一节没有区分两栈，
+读者容易把这条当成对当前 Rust 树的判断。**建议在该节标明适用范围。**
+
+### 6.6 记忆默认文件名：常量说 `memory.md`，装配用 `memory.txt`
+
+```rust
+// crates/middle/src/memory/mod.rs:22
+pub const DEFAULT_MEMORY_FILE: &str = "memory.md";   // 全库零引用
+
+// crates/app/src/lib.rs:112
+MemoryStore::new(config.data_directory.join("memory.txt"))
+```
+
+模块文档（`memory/mod.rs:3-4`）也写「每次组装上下文时都从 `memory.md` 读取完整文本」——
+**与实际行为不符**。之所以没人发现，正是因为那个常量是死的（见 §7 死代码清单）。
+
+不影响功能（路径由装配处给），但它是「文档说 A、代码做 B」的现成例子。
