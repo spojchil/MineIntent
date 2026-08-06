@@ -925,7 +925,9 @@ where
             ordinal,
             cleanup,
             scope_control: false,
-            record_fact: !terminal,
+            // 见 support.rs `backend_event_is_fact`：事实队列只收推送通道该有的
+            // 东西，世界长什么样走视口，不从这里灌。
+            record_fact: !terminal && backend_event_is_fact(event),
             terminal,
         }
     }

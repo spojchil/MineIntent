@@ -221,6 +221,80 @@ pub(super) fn same_chat_identity(left: &AgentChatMessageV5, right: &AgentChatMes
     left.username == right.username && left.text == right.text && left.at == right.at
 }
 
+/// 这条后端事件该不该进事实队列。
+///
+/// 事实队列是**推送通道**：装它没人会主动去问、又必须知道的事。世界长什么样
+/// 不走这里——A06 与 W08c 都写明世界信息经视口到达 AI。声音有自己的
+/// `sound.recentSounds`，血量食物有 `status`，聊天有 `chat.items`，
+/// 这些每一帧都在，不需要再复制一份进事实队列。
+///
+/// 原型（`src/participant/runtime.ts`）整份只有两处 `#pushPending`：
+/// `participant.started` 和 `self.health.dropped`。实体移动、方块变化、声音
+/// **从来不是事实**。移植时改成了「每条后端事件都记一条事实」，后果实测如下：
+///
+/// 2026-08-06 实盘 130 秒，Paper 实服 + DeepSeek 真模型——
+/// 模型收到 128 条 `entity`（摘要一律是字面量 "entity_fact"，零信息），
+/// 外加一条「29777 pending events omitted」。被淹掉的类型里含
+/// `participant.started`：唯一有意义的那条事实，被噪声挤了出去。
+/// 队列不是太小，是灌进去的东西根本不该在里面。
+///
+/// 判据是「玩家能不能感知到，且别的通道给不了」：
+///
+/// - 生命周期（死亡、复活、断线）—— 玩家当然感知得到，别处没有
+/// - 维度/游戏模式变化 —— 同上
+/// - 别人说了话但没点名 —— 玩家听得见；`chat.items` 也有，但它是有界窗口，
+///   事实通道保留丢失位置的语义（NEW-11），两者不重复
+/// - 玩家进出世界 —— 原版会在聊天里显示「X joined the game」
+/// - 溢出标记 —— 它本身就是「你漏了什么」的载体，必须留
+///
+/// 挡掉的：
+///
+/// - 实体与方块 —— 视口的活（A06/W08c），且是量级最大的两类
+/// - 声音 —— 已经在 `sound.recentSounds` 里，重复投递
+/// - `player_list_update` —— tab 列表的延迟刷新，玩家根本感知不到
+/// - `SelfState` —— 目前只有 `ServerPositionCorrection`，是协议层的回拉纠正，
+///   不是玩家能察觉的事件；位置本身每帧都在 `pose` 里
+/// - `SnapshotChanged` —— 内部记账
+pub(super) fn backend_event_is_fact(event: &BackendEventEnvelope) -> bool {
+    match &event.payload {
+        BackendEventPayload::Lifecycle(_)
+        | BackendEventPayload::World(_)
+        | BackendEventPayload::Chat(_) => true,
+        BackendEventPayload::PlayerList(payload) => !matches!(
+            payload,
+            mineintent_contracts::minecraft::ProtocolPlayerListEvent::Update { .. }
+        ),
+        // 后端的溢出标记只有在「丢掉的东西本来会成为事实」时才有意义。后端
+        // 自己的队列满时丢的绝大多数是实体流水，而实体流水根本不进事实通道
+        // ——为它报一条「你漏了什么」，漏掉的却是本来就不该在这儿的东西。
+        BackendEventPayload::Overflow(payload) => {
+            payload.dropped_kinds.iter().any(backend_kind_is_fact)
+        }
+        BackendEventPayload::Entity(_)
+        | BackendEventPayload::Block(_)
+        | BackendEventPayload::Sound(_)
+        | BackendEventPayload::SelfState(_)
+        | BackendEventPayload::SnapshotChanged(_) => false,
+    }
+}
+
+/// 只看种类的粗判据，供溢出标记使用：标记里没有载荷，判不了
+/// `player_list` 到底是进出还是延迟刷新，从宽算作会成为事实。
+fn backend_kind_is_fact(kind: &BackendEventKind) -> bool {
+    match kind {
+        BackendEventKind::Lifecycle
+        | BackendEventKind::World
+        | BackendEventKind::Chat
+        | BackendEventKind::PlayerList => true,
+        BackendEventKind::Entity
+        | BackendEventKind::Block
+        | BackendEventKind::Sound
+        | BackendEventKind::SelfState
+        | BackendEventKind::SnapshotChanged
+        | BackendEventKind::Overflow => false,
+    }
+}
+
 pub(super) fn backend_fact_type(event: &BackendEventEnvelope) -> &'static str {
     if matches!(event.payload, BackendEventPayload::Chat(_)) {
         "player_chat_not_addressed"
@@ -424,4 +498,177 @@ pub(super) fn is_normal_agent_error(error: &AgentError) -> bool {
             | AgentErrorCode::DeadlineExceeded
             | AgentErrorCode::ScopeInvalid
     )
+}
+
+#[cfg(test)]
+mod fact_channel_tests {
+    use super::*;
+    use mineintent_contracts::minecraft::{
+        BackendEventProtocol, BackendOverflowPayload, ChatPosition, FactSource, HeardSoundType,
+        OverflowType, ProtocolBlockEvent, ProtocolChatEvent, ProtocolEntityEvent,
+        ProtocolPlayerListEvent, ProtocolSelfEvent, ProtocolSnapshotChangedEvent,
+        ProtocolSoundPayload, ProtocolSoundSource, ProtocolWorldEvent, RelativeMovementFlags,
+        Vec3Value,
+    };
+
+    fn envelope(payload: BackendEventPayload) -> BackendEventEnvelope {
+        BackendEventEnvelope {
+            protocol: BackendEventProtocol::V2,
+            id: "event-1".to_owned(),
+            kind: payload.kind(),
+            occurred_at: "2026-08-06T00:00:00Z".to_owned(),
+            process_session_id: "process".to_owned(),
+            connection_epoch: 1,
+            connection_attempt_id: "attempt".to_owned(),
+            world_id: "world".to_owned(),
+            dimension: Some("minecraft:overworld".to_owned()),
+            source: FactSource::ServerObserved,
+            payload,
+        }
+    }
+
+    fn origin() -> Vec3Value {
+        Vec3Value {
+            x: 0.0,
+            y: 64.0,
+            z: 0.0,
+        }
+    }
+
+    /// 世界长什么样经视口到达（A06 / W08c），不从事实通道灌。这几类正是
+    /// 2026-08-06 实盘里 130 秒堆出 29777 条丢弃的来源。
+    #[test]
+    fn world_traffic_is_not_a_fact() {
+        let denied = [
+            BackendEventPayload::Entity(ProtocolEntityEvent::Animation {
+                entity_key: "1:7".to_owned(),
+                animation: "swing_main_hand".to_owned(),
+            }),
+            BackendEventPayload::Block(ProtocolBlockEvent::Updated {
+                old_block: None,
+                new_block: None,
+            }),
+            BackendEventPayload::Sound(ProtocolSoundPayload {
+                event_type: HeardSoundType::Heard,
+                sound_key: "minecraft:entity.zombie.step".to_owned(),
+                sound_name: None,
+                sound_id: None,
+                category: None,
+                source_position: origin(),
+                volume: 1.0,
+                pitch: 1.0,
+                protocol_source: ProtocolSoundSource::SoundEffect,
+            }),
+            BackendEventPayload::SnapshotChanged(ProtocolSnapshotChangedEvent {
+                group: "world".to_owned(),
+                snapshot_revision: 3,
+            }),
+            BackendEventPayload::SelfState(ProtocolSelfEvent::ServerPositionCorrection {
+                teleport_id: 1,
+                position: origin(),
+                velocity: Vec3Value {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                yaw: 0.0,
+                pitch: 0.0,
+                relative: RelativeMovementFlags {
+                    x: false,
+                    y: false,
+                    z: false,
+                    yaw: false,
+                    pitch: false,
+                    delta_x: false,
+                    delta_y: false,
+                    delta_z: false,
+                    rotate_delta: false,
+                },
+            }),
+        ];
+        for payload in denied {
+            let event = envelope(payload);
+            assert!(
+                !backend_event_is_fact(&event),
+                "{:?} 不该进事实队列",
+                event.kind
+            );
+        }
+    }
+
+    /// 推送通道该装的：玩家感知得到、且别的通道给不了的东西。
+    #[test]
+    fn perceivable_events_without_another_channel_stay_facts() {
+        let allowed = [
+            BackendEventPayload::Lifecycle(BackendLifecyclePayload::Died),
+            BackendEventPayload::World(ProtocolWorldEvent::GameChanged {
+                dimension: Some("minecraft:the_nether".to_owned()),
+                game_mode: None,
+            }),
+            BackendEventPayload::Chat(ProtocolChatEvent {
+                plain_text: "随口说一句".to_owned(),
+                sender_username: Some("Alice".to_owned()),
+                verified: None,
+                position: Some(ChatPosition::Chat),
+            }),
+            BackendEventPayload::Overflow(BackendOverflowPayload {
+                event_type: OverflowType::Overflow,
+                dropped_count: 5,
+                dropped_kinds: vec![BackendEventKind::Lifecycle],
+            }),
+        ];
+        for payload in allowed {
+            let event = envelope(payload);
+            assert!(
+                backend_event_is_fact(&event),
+                "{:?} 该进事实队列",
+                event.kind
+            );
+        }
+    }
+
+    /// 进出世界原版会在聊天里显示；tab 列表的延迟刷新玩家根本感知不到。
+    #[test]
+    fn player_list_keeps_join_and_leave_but_drops_latency_refreshes() {
+        let join = envelope(BackendEventPayload::PlayerList(
+            ProtocolPlayerListEvent::Add {
+                uuid: "u".to_owned(),
+                username: "Alice".to_owned(),
+            },
+        ));
+        let leave = envelope(BackendEventPayload::PlayerList(
+            ProtocolPlayerListEvent::Remove {
+                uuid: "u".to_owned(),
+                username: "Alice".to_owned(),
+            },
+        ));
+        let refresh = envelope(BackendEventPayload::PlayerList(
+            ProtocolPlayerListEvent::Update {
+                uuid: "u".to_owned(),
+                username: "Alice".to_owned(),
+            },
+        ));
+        assert!(backend_event_is_fact(&join));
+        assert!(backend_event_is_fact(&leave));
+        assert!(!backend_event_is_fact(&refresh));
+    }
+
+    /// 后端队列满时丢的绝大多数是实体流水。为它报一条「你漏了什么」，漏掉的
+    /// 却是本来就不该进事实通道的东西——2026-08-06 实盘里这样的标记有 30 条。
+    #[test]
+    fn an_overflow_marker_about_world_traffic_only_is_not_a_fact() {
+        let world_traffic_only = envelope(BackendEventPayload::Overflow(BackendOverflowPayload {
+            event_type: OverflowType::Overflow,
+            dropped_count: 900,
+            dropped_kinds: vec![BackendEventKind::Entity, BackendEventKind::Block],
+        }));
+        assert!(!backend_event_is_fact(&world_traffic_only));
+
+        let lost_a_real_fact = envelope(BackendEventPayload::Overflow(BackendOverflowPayload {
+            event_type: OverflowType::Overflow,
+            dropped_count: 900,
+            dropped_kinds: vec![BackendEventKind::Entity, BackendEventKind::Chat],
+        }));
+        assert!(backend_event_is_fact(&lost_a_real_fact));
+    }
 }
