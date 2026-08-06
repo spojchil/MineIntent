@@ -216,7 +216,7 @@ impl EntityMovePatch {
             entity,
             delta: None,
             compact_look: None,
-            head_yaw: Some(compact_rotation_radians(head_yaw)),
+            head_yaw: Some(compact_rotation_degrees(head_yaw)),
             absolute_position: None,
             absolute_look: None,
             relative_position: [false; 3],
@@ -229,18 +229,16 @@ impl EntityMovePatch {
     }
 }
 
-pub(crate) fn compact_rotation_radians(value: i8) -> f64 {
-    (f64::from(i32::from(value) * 360) / 256.0).to_radians()
+pub(crate) fn compact_rotation_degrees(value: i8) -> f64 {
+    f64::from(i32::from(value) * 360) / 256.0
 }
 
-pub(crate) fn compact_pitch_radians(value: i8) -> f64 {
-    (f64::from(i32::from(value) * 360) / 256.0)
-        .clamp(-90.0, 90.0)
-        .to_radians()
+pub(crate) fn compact_pitch_degrees(value: i8) -> f64 {
+    (f64::from(i32::from(value) * 360) / 256.0).clamp(-90.0, 90.0)
 }
 
-fn clamp_pitch_radians(value: f64) -> f64 {
-    value.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2)
+fn clamp_pitch_degrees(value: f64) -> f64 {
+    value.clamp(-90.0, 90.0)
 }
 
 fn decode_relative_axis(base: f64, delta: i64) -> f64 {
@@ -490,7 +488,7 @@ fn apply_move_patch(snapshot: &mut NormalizedEntitySnapshot, patch: EntityMovePa
     let old_velocity = snapshot.velocity;
     let next_yaw = patch
         .compact_look
-        .map(|[yaw, _]| compact_rotation_radians(yaw))
+        .map(|[yaw, _]| compact_rotation_degrees(yaw))
         .or_else(|| {
             patch.absolute_look.map(|look| {
                 if patch.relative_look[0] {
@@ -503,10 +501,10 @@ fn apply_move_patch(snapshot: &mut NormalizedEntitySnapshot, patch: EntityMovePa
         .unwrap_or(snapshot.yaw);
     let next_pitch = patch
         .compact_look
-        .map(|[_, pitch]| compact_pitch_radians(pitch))
+        .map(|[_, pitch]| compact_pitch_degrees(pitch))
         .or_else(|| {
             patch.absolute_look.map(|look| {
-                clamp_pitch_radians(if patch.relative_look[1] {
+                clamp_pitch_degrees(if patch.relative_look[1] {
                     snapshot.pitch + look[1]
                 } else {
                     look[1]
@@ -530,8 +528,8 @@ fn apply_move_patch(snapshot: &mut NormalizedEntitySnapshot, patch: EntityMovePa
         }
     }
     if let Some([yaw, pitch]) = patch.compact_look {
-        snapshot.yaw = compact_rotation_radians(yaw);
-        snapshot.pitch = compact_pitch_radians(pitch);
+        snapshot.yaw = compact_rotation_degrees(yaw);
+        snapshot.pitch = compact_pitch_degrees(pitch);
     }
     if let Some(look) = patch.absolute_look {
         snapshot.yaw = if patch.relative_look[0] {
@@ -539,7 +537,7 @@ fn apply_move_patch(snapshot: &mut NormalizedEntitySnapshot, patch: EntityMovePa
         } else {
             look[0]
         };
-        snapshot.pitch = clamp_pitch_radians(if patch.relative_look[1] {
+        snapshot.pitch = clamp_pitch_degrees(if patch.relative_look[1] {
             snapshot.pitch + look[1]
         } else {
             look[1]
@@ -588,8 +586,8 @@ mod tests {
             username: None,
             position: [x, 64.0, 2.0],
             velocity: [0.0, 0.0, 0.0],
-            yaw: 90.0_f64.to_radians(),
-            pitch: 10.0_f64.to_radians(),
+            yaw: 90.0,
+            pitch: 10.0,
             head_yaw: None,
             width: 0.6,
             height: 1.8,
@@ -730,9 +728,9 @@ mod tests {
     }
 
     #[test]
-    fn compact_pitch_extreme_clamps_x_rot_100_to_half_pi() {
-        assert!((compact_pitch_radians(100) - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
-        assert!((compact_pitch_radians(-100) + std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+    fn compact_pitch_extreme_clamps_x_rot_100_to_ninety_degrees() {
+        assert!((compact_pitch_degrees(100) - 90.0).abs() < 1e-12);
+        assert!((compact_pitch_degrees(-100) + 90.0).abs() < 1e-12);
 
         let mut cache = EntityProducerCache::default();
         cache.reset_scope(1);
@@ -757,7 +755,7 @@ mod tests {
         assert!(matches!(
             moved,
             NormalizedEntityEvent::Moved { entity }
-                if (entity.pitch - std::f64::consts::FRAC_PI_2).abs() < 1e-12
+                if (entity.pitch - 90.0).abs() < 1e-12
         ));
     }
 
@@ -970,9 +968,9 @@ mod tests {
 
         let mut add_snapshot = snapshot(4, 7, 10.0);
         add_snapshot.velocity = [0.25, -0.5, 0.75];
-        add_snapshot.yaw = compact_rotation_radians(64);
-        add_snapshot.pitch = compact_pitch_radians(-32);
-        add_snapshot.head_yaw = Some(compact_rotation_radians(32));
+        add_snapshot.yaw = compact_rotation_degrees(64);
+        add_snapshot.pitch = compact_pitch_degrees(-32);
+        add_snapshot.head_yaw = Some(compact_rotation_degrees(32));
 
         let events = [
             cache.apply(
@@ -1011,9 +1009,9 @@ mod tests {
         assert_eq!(spawned.entity_key(), "4:7");
         assert_eq!(spawned.position, [10.0, 64.0, 2.0]);
         assert_eq!(spawned.velocity, [0.25, -0.5, 0.75]);
-        assert_eq!(spawned.yaw, compact_rotation_radians(64));
-        assert_eq!(spawned.pitch, compact_pitch_radians(-32));
-        assert_eq!(spawned.head_yaw, Some(compact_rotation_radians(32)));
+        assert_eq!(spawned.yaw, compact_rotation_degrees(64));
+        assert_eq!(spawned.pitch, compact_pitch_degrees(-32));
+        assert_eq!(spawned.head_yaw, Some(compact_rotation_degrees(32)));
 
         let Some(NormalizedEntityEvent::Moved { entity: first_move }) = &events[1] else {
             panic!("MovePos must produce Moved");
@@ -1021,12 +1019,12 @@ mod tests {
         assert_eq!(first_move.position, [11.0, 64.0, 2.0]);
         assert_eq!(
             first_move.yaw,
-            compact_rotation_radians(64),
+            compact_rotation_degrees(64),
             "pos-only must retain yaw"
         );
         assert_eq!(
             first_move.pitch,
-            compact_pitch_radians(-32),
+            compact_pitch_degrees(-32),
             "pos-only must retain pitch"
         );
 
@@ -1037,8 +1035,8 @@ mod tests {
             panic!("MovePosRot must produce Moved");
         };
         assert_eq!(second_move.position, [11.5, 64.0, 2.0]);
-        assert_eq!(second_move.yaw, compact_rotation_radians(32));
-        assert_eq!(second_move.pitch, compact_pitch_radians(-16));
+        assert_eq!(second_move.yaw, compact_rotation_degrees(32));
+        assert_eq!(second_move.pitch, compact_pitch_degrees(-16));
         assert!(second_move.on_ground);
 
         assert!(matches!(
@@ -1097,8 +1095,8 @@ mod tests {
         let mut cache = EntityProducerCache::default();
         cache.reset_scope(6);
         let mut add = snapshot(6, 7, 3.0);
-        add.yaw = 12.0_f64.to_radians();
-        add.pitch = -6.0_f64.to_radians();
+        add.yaw = 12.0;
+        add.pitch = -6.0;
         assert!(cache
             .apply(
                 6,
@@ -1120,8 +1118,8 @@ mod tests {
             panic!("known rot-only move must emit");
         };
         assert_eq!(rotated.position, [3.0, 64.0, 2.0]);
-        assert_eq!(rotated.yaw, compact_rotation_radians(16));
-        assert_eq!(rotated.pitch, compact_pitch_radians(-8));
+        assert_eq!(rotated.yaw, compact_rotation_degrees(16));
+        assert_eq!(rotated.pitch, compact_pitch_degrees(-8));
 
         let position = cache.apply(
             6,
@@ -1134,8 +1132,8 @@ mod tests {
             panic!("known pos-only move must emit");
         };
         assert_eq!(moved.position, [4.0, 64.0, 2.0]);
-        assert_eq!(moved.yaw, compact_rotation_radians(16));
-        assert_eq!(moved.pitch, compact_pitch_radians(-8));
+        assert_eq!(moved.yaw, compact_rotation_degrees(16));
+        assert_eq!(moved.pitch, compact_pitch_degrees(-8));
 
         let unknown_token = token(6, "admission:33:unknown-move");
         assert!(cache
@@ -1267,8 +1265,8 @@ mod tests {
         cache.reset_scope(8);
         let identity = EntityIdentity::new(8, 7);
         let mut add = snapshot(8, 7, 10.0);
-        add.yaw = 30.0_f64.to_radians();
-        add.pitch = 20.0_f64.to_radians();
+        add.yaw = 30.0;
+        add.pitch = 20.0;
         add.velocity = [1.0, 2.0, 3.0];
         assert!(cache
             .apply(
@@ -1287,7 +1285,7 @@ mod tests {
                 patch: EntityMovePatch::teleport(
                     identity,
                     [1.0, 70.0, -2.0],
-                    [50.0_f64.to_radians(), 35.0_f64.to_radians()],
+                    [50.0, 35.0],
                     [true, false, true],
                     [false, false],
                     [0.5, 4.0, -0.25],
@@ -1301,13 +1299,13 @@ mod tests {
             panic!("teleport must produce Moved");
         };
         assert_eq!(entity.position, [11.0, 70.0, 0.0]);
-        assert_eq!(entity.yaw, 50.0_f64.to_radians());
-        assert_eq!(entity.pitch, 35.0_f64.to_radians());
+        assert_eq!(entity.yaw, 50.0);
+        assert_eq!(entity.pitch, 35.0);
         // Use the vendor Vec3 implementation directly: it preserves the
         // f32 angle conversion and the locked x_rot(...).y_rot(...) order.
         let rotated = azalea::Vec3::new(1.0, 2.0, 3.0)
-            .x_rot((20.0_f64.to_radians() - 35.0_f64.to_radians()) as f32)
-            .y_rot((30.0_f64.to_radians() - 50.0_f64.to_radians()) as f32);
+            .x_rot((20.0 - 35.0) as f32)
+            .y_rot((30.0 - 50.0) as f32);
         assert!((entity.velocity[0] - (rotated.x + 0.5)).abs() < 1e-12);
         assert!((entity.velocity[1] - 4.0).abs() < 1e-12);
         assert!((entity.velocity[2] - (rotated.z - 0.25)).abs() < 1e-12);
@@ -1336,7 +1334,7 @@ mod tests {
                 patch: EntityMovePatch::position_sync(
                     identity,
                     [20.0, 65.0, -4.0],
-                    [180.0_f64.to_radians(), -30.0_f64.to_radians()],
+                    [180.0, -30.0],
                     [0.0, 1.25, 0.0],
                     true,
                 ),
@@ -1346,8 +1344,8 @@ mod tests {
             panic!("position sync must produce Moved");
         };
         assert_eq!(entity.position, [20.0, 65.0, -4.0]);
-        assert_eq!(entity.yaw, 180.0_f64.to_radians());
-        assert_eq!(entity.pitch, -30.0_f64.to_radians());
+        assert_eq!(entity.yaw, 180.0);
+        assert_eq!(entity.pitch, -30.0);
         assert_eq!(entity.velocity, [0.0, 1.25, 0.0]);
         assert!(entity.on_ground);
 
@@ -1361,9 +1359,9 @@ mod tests {
         let Some(NormalizedEntityEvent::Moved { entity }) = rotated else {
             panic!("rotate head must produce Moved");
         };
-        assert_eq!(entity.head_yaw, Some(compact_rotation_radians(64)));
+        assert_eq!(entity.head_yaw, Some(compact_rotation_degrees(64)));
         assert_eq!(entity.position, [20.0, 65.0, -4.0]);
-        assert_eq!(entity.yaw, 180.0_f64.to_radians());
+        assert_eq!(entity.yaw, 180.0);
         assert!(entity.on_ground, "head-only movement must retain on_ground");
     }
 
@@ -1488,7 +1486,7 @@ mod tests {
         ) else {
             panic!("unknown RotateHead should retry after Spawn");
         };
-        assert_eq!(entity.head_yaw, Some(compact_rotation_radians(32)));
+        assert_eq!(entity.head_yaw, Some(compact_rotation_degrees(32)));
 
         let invalid_token = token(10, "finite:retry");
         let mut invalid = snapshot(10, 5, 5.0);

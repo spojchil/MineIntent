@@ -17,8 +17,9 @@ use mineintent_contracts::{
     capability::{CapabilityExecutionContext, CapabilityInvocation},
     information::{SoundObservation as ContractSoundObservation, SoundValues},
     minecraft::{
-        BackendEventEnvelope, BackendEventKind, BackendEventListener, BackendEventPayload,
-        BackendEventProtocol, ChatPosition, MinecraftBackendApi, MinecraftFrameFacts, Subscription,
+        wrap_degrees, BackendEventEnvelope, BackendEventKind, BackendEventListener,
+        BackendEventPayload, BackendEventProtocol, ChatPosition, MinecraftBackendApi,
+        MinecraftFrameFacts, Subscription,
     },
 };
 
@@ -566,8 +567,11 @@ fn frame_capture_from_facts(
 ) -> Result<ParticipantFrameCapture, ParticipantSourceError> {
     let snapshot = &facts.snapshot;
     let self_snapshot = &snapshot.self_snapshot;
-    let yaw_degrees = self_snapshot.yaw.to_degrees();
-    let pitch_degrees = self_snapshot.pitch.to_degrees();
+    // 契约里的 yaw/pitch 就是角度制（azalea `LookDirection` 原样透出）。这里曾经
+    // 再调一次 `.to_degrees()`，把 −180° 变成 −10313.24° 送进模型的上下文。
+    // 归一化是给模型看的，未归一化的原值留在契约里。
+    let yaw_degrees = wrap_degrees(self_snapshot.yaw);
+    let pitch_degrees = self_snapshot.pitch;
     if !self_snapshot.position.x.is_finite()
         || !self_snapshot.position.y.is_finite()
         || !self_snapshot.position.z.is_finite()

@@ -8,6 +8,17 @@ use crate::agent::{
     ToolExecution, ToolInvocation, WireToolDefinition,
 };
 
+/// 临时决定（2026-08-06，无人可问，先记在这里）：这个枚举已经名不副实，暂留。
+///
+/// 它原本是仲裁器的租约键——四个「资源」互斥。仲裁器已删（守的是 TS 的 HTTP 桥，
+/// Rust 换成顺序派发后并发源就没了）。observationAfter 的闸也已拆掉。现在**只剩
+/// 一处**在读它：`AgentLoopDriver::dispatch_in_order` 用 `== Body` 决定轮末要不要
+/// 追加一帧视口。也就是说 Chat / Memory / Viewport 三个变体如今谁也不区分谁。
+///
+/// 没有当场删干净，是因为下一步的身体模型改造会重新定义「这一批动没动身体」：
+/// 工具将从「动作」改为「写身体状态向量的分量」，那时判据不再是按工具分类。
+/// `ToolDispatcher::after_batch`（本文件下方）就是为这次搬家留的接缝——判断搬进
+/// 领域侧之后，本枚举与 `ToolCapability::resource` 一起消失。现在做等于做两遍。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionResource {

@@ -284,6 +284,11 @@ struct FakeMotor {
 }
 
 impl FakeMotor {
+    /// 角度制，与契约同单位。
+    fn set_yaw(&self, yaw_degrees: f64) {
+        self.pose.lock().expect("pose lock").yaw = yaw_degrees;
+    }
+
     fn new(pose: Arc<Mutex<SelfPose>>) -> Self {
         Self {
             pose,
@@ -349,8 +354,10 @@ impl MinecraftMotorDriverApi for FakeMotor {
                 return Err(backend_failure("look failed"));
             }
             let mut pose = pose.lock().expect("pose lock");
-            pose.yaw -= request.yaw_degrees.to_radians();
-            pose.pitch -= request.pitch_degrees.to_radians();
+            // 与真实后端同形：command.rs 里是 set_direction(y_rot - yaw_degrees, …)，
+            // 全程角度制。这个假件原先按弧度契约写，现在跟着改回来。
+            pose.yaw -= request.yaw_degrees;
+            pose.pitch -= request.pitch_degrees;
             Ok(())
         })
     }
@@ -838,6 +845,37 @@ async fn body_ordinary_failure_still_injects_observation_and_releases_lease() {
     assert_eq!(observation.calls(), 1);
     assert!(execution.observation_after.as_ref().is_some());
     assert_eq!(harness.backend.motor.release_calls(), 1);
+}
+
+/// 「前」和「右」是按移动前的朝向算的，所以基向量必须用**弧度**做三角函数，而
+/// 契约里的 yaw 是**角度**。漏掉这次转换不会报错，只会把整组基向量转过一个任意角：
+/// 同伴向前走，返回的却是「主要在向右平移」——2026-08-05 实盘就是这个样子。
+///
+/// 这里让同伴朝向 yaw=90°（面向 −X），再让它在世界坐标里向 −Z 走半格。
+/// 面向 −X 时，−Z 正好是右手边，所以正确答案是「右 0.5，前 0」。
+/// 若把 90 当弧度用，基向量会转过约 −25.6°，前后两个分量都不为零。
+#[tokio::test]
+async fn move_effect_resolves_forward_and_right_against_the_yaw_in_degrees() {
+    let harness = harness();
+    harness.backend.motor.set_yaw(90.0);
+    let cancellation = TestCancellation::new();
+
+    let execution = dispatch(
+        &harness.dispatcher,
+        &cancellation,
+        "move_input",
+        json!({"directions": ["forward"], "duration_ms": 50}),
+    )
+    .await
+    .expect("move completes");
+
+    let displacement = &execution.result["effect"]["relativeDisplacement"];
+    let right = displacement[0].as_f64().expect("right component");
+    let up = displacement[1].as_f64().expect("up component");
+    let forward = displacement[2].as_f64().expect("forward component");
+    assert!((right - 0.5).abs() < 1e-9, "right = {right}");
+    assert!(up.abs() < 1e-9, "up = {up}");
+    assert!(forward.abs() < 1e-9, "forward = {forward}");
 }
 
 /// 这个测试原来叫 `non_body_capabilities_never_call_observation_after_and_return_null`，

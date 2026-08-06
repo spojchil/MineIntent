@@ -38,8 +38,9 @@ impl FrameBackend {
         snapshot.connection_attempt_id = "production-attempt".to_owned();
         snapshot.world.world_id = "production-world".to_owned();
         snapshot.world.dimension = "minecraft:overworld".to_owned();
-        snapshot.self_snapshot.yaw = std::f64::consts::FRAC_PI_2;
-        snapshot.self_snapshot.pitch = -std::f64::consts::FRAC_PI_4;
+        // 契约是角度制（azalea LookDirection 原样透出），不是弧度。
+        snapshot.self_snapshot.yaw = 90.0;
+        snapshot.self_snapshot.pitch = -45.0;
         snapshot.inventory.selected_hotbar_slot = 8;
         snapshot.inventory.slots = vec![
             mineintent_contracts::minecraft::InventorySlotSnapshot {

@@ -8,8 +8,9 @@ use std::{cmp::Ordering, collections::HashMap, f64::consts::PI};
 
 use mineintent_contracts::capability::validate_directed_positions;
 use mineintent_contracts::minecraft::{
-    BackendError, BlockInfo, BlockInfoPresenterRegistry, DirectedOccluder, DirectedSeenBlock,
-    DirectedUnseenBlock, DirectedViewportError, DirectedViewportProjection, DirectedWhy,
+    wrap_degrees, BackendError, BlockInfo, BlockInfoPresenterRegistry, DirectedOccluder,
+    DirectedSeenBlock, DirectedUnseenBlock, DirectedViewportError, DirectedViewportProjection,
+    DirectedWhy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -398,7 +399,9 @@ where
                     y: pose.position.y,
                     z: pose.position.z,
                 }),
-                yaw_degrees: round_one(pose.yaw as f64),
+                // 归一化只在给模型看的这一处做：视锥/遮挡的三角函数是周期的，
+                // 不在乎转了多少圈；模型在乎。
+                yaw_degrees: round_one(wrap_degrees(pose.yaw as f64)),
                 pitch_degrees: round_one(pose.pitch as f64),
             },
             legend: ViewportLegend {

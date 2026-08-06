@@ -240,7 +240,7 @@ fn production_packet_batch_keeps_each_callback_at_post_state() {
         &emitted[4].payload,
         BackendEventPayload::Entity(ContractProtocolEntityEvent::Moved { entity })
             if entity.head_yaw.is_some_and(|value| {
-                (value - std::f64::consts::FRAC_PI_2).abs() < 1e-6
+                (value - 90.0).abs() < 1e-6
             })
     ));
     assert!(
@@ -410,7 +410,7 @@ fn production_packet_adapter_keeps_each_packet_post_state_and_excludes_self() {
     assert_eq!(spawned[0].entity_type, "dark_oak_chest_boat");
     assert_eq!(spawned[0].position.x, 10.0);
     assert!(
-        (spawned[0].head_yaw.expect("spawn head yaw") - std::f64::consts::FRAC_PI_4).abs() < 1e-6
+        (spawned[0].head_yaw.expect("spawn head yaw") - 45.0).abs() < 1e-6
     );
     assert!(matches!(
         events.try_recv().expect("Spawn envelope").payload,
@@ -514,14 +514,14 @@ fn production_packet_adapter_keeps_each_packet_post_state_and_excludes_self() {
     );
     assert_eq!(
         source.list_tracked_entities().unwrap()[0].head_yaw,
-        Some((std::f64::consts::FRAC_PI_2 as f32) as f64)
+        Some(90.0)
     );
     assert!(matches!(
         events.try_recv().expect("RotateHead envelope").payload,
         BackendEventPayload::Entity(ContractProtocolEntityEvent::Moved { entity })
             if entity
                 .head_yaw
-                .is_some_and(|value| (value - std::f64::consts::FRAC_PI_2).abs() < 1e-6)
+                .is_some_and(|value| (value - 90.0).abs() < 1e-6)
     ));
 
     send_production_entity_packet(
@@ -556,7 +556,7 @@ fn production_packet_adapter_keeps_each_packet_post_state_and_excludes_self() {
             assert_eq!(last.position.x, 30.0);
             assert_eq!(
                 last.head_yaw,
-                Some((std::f64::consts::FRAC_PI_2 as f32) as f64)
+                Some(90.0)
             );
             assert!((last.velocity.x - 2.0).abs() < 0.001);
         }
@@ -678,7 +678,7 @@ fn observation_source_reads_rotate_and_motion_post_state_without_motion_envelope
     ));
     assert_eq!(
         source.list_tracked_entities().unwrap()[0].head_yaw,
-        Some((std::f64::consts::FRAC_PI_2 as f32) as f64)
+        Some(90.0)
     );
     let _rotate = events.try_recv().expect("rotate envelope");
 
@@ -787,7 +787,7 @@ fn entity_callback_reads_spawn_move_rotate_remove_post_state_immediately() {
     assert_eq!(states[1][0].position.x, 11.0);
     assert_eq!(
         states[2][0].head_yaw,
-        Some((std::f64::consts::FRAC_PI_2 as f32) as f64)
+        Some(90.0)
     );
     assert!(states[3].is_empty());
 }

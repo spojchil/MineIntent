@@ -1,5 +1,3 @@
-use std::f64::consts::{FRAC_PI_2, PI};
-
 use mineintent_contracts::information::RelativeDirection;
 use mineintent_middle::information::geometry::{
     distance_between, look_direction, relative_bearing, Point3,
@@ -22,11 +20,11 @@ fn distance_between_computes_3d_euclidean_distance() {
 }
 
 #[test]
-fn look_direction_matches_mineflayers_own_yaw_pitch_to_direction_formula() {
+fn look_direction_matches_the_vanilla_yaw_pitch_to_direction_formula_in_degrees() {
     let cases = [
         (0.0, 0.0, point(0.0, 0.0, -1.0)),
-        (FRAC_PI_2, 0.0, point(-1.0, 0.0, 0.0)),
-        (0.0, FRAC_PI_2, point(0.0, 1.0, 0.0)),
+        (90.0, 0.0, point(-1.0, 0.0, 0.0)),
+        (0.0, 90.0, point(0.0, 1.0, 0.0)),
     ];
     for (yaw, pitch, expected) in cases {
         let direction = look_direction(yaw, pitch);
@@ -69,7 +67,7 @@ fn relative_bearing_classifies_target_position_relative_to_self_facing() {
 #[test]
 fn relative_bearing_agrees_with_the_rightward_axis_of_look_direction_at_every_yaw() {
     let self_position = point(0.0, 64.0, 0.0);
-    for yaw in [0.0, FRAC_PI_2, PI, -FRAC_PI_2, 0.7] {
+    for yaw in [0.0, 90.0, 180.0, -90.0, 40.0] {
         let look = look_direction(yaw, 0.0);
         let rightward_x = -look.z;
         let rightward_z = look.x;
@@ -91,7 +89,7 @@ fn relative_bearing_agrees_with_the_rightward_axis_of_look_direction_at_every_ya
 #[test]
 fn relative_bearing_rotates_with_self_yaw() {
     let self_position = point(0.0, 64.0, 0.0);
-    let facing_positive_x = -FRAC_PI_2;
+    let facing_positive_x = -90.0;
     assert_eq!(
         relative_bearing(facing_positive_x, self_position, point(5.0, 64.0, 0.0)),
         RelativeDirection::Ahead

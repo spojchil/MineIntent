@@ -31,7 +31,7 @@ use mineintent_contracts::{
         ToolDispatcher as ContractToolDispatcher, ToolResultProtocol, ViewArguments, ViewMode,
     },
     minecraft::{
-        present_directed_viewport_v2, present_viewport_v2, BackendError, BoxFuture,
+        present_directed_viewport_v2, present_viewport_v2, wrap_degrees, BackendError, BoxFuture,
         CancellationSignal as BackendCancellationSignal, Deadline as BackendDeadline,
         DirectedViewportError, DirectedViewportProjection, LookRelativeRequest,
         MinecraftBackendApi, MinecraftMotorDriverApi, MotorMoveDirection, MoveInputRequest,
@@ -1509,8 +1509,10 @@ fn completed_body_result(effect: Value) -> Value {
 }
 
 fn measured_look_effect(before: &SelfPose, after: &SelfPose) -> Value {
-    let yaw_degrees = radians_to_degrees(normalize_radians(before.yaw - after.yaw));
-    let pitch_degrees = radians_to_degrees(before.pitch - after.pitch);
+    // 契约里的 yaw/pitch 是角度制。这里曾经当弧度处理，于是「实际转了多少度」
+    // 被放大了 57.3 倍——模型看到自己转了几千度，判定转向没生效。
+    let yaw_degrees = wrap_degrees(before.yaw - after.yaw);
+    let pitch_degrees = before.pitch - after.pitch;
     json!({
         "relativeTurnDegrees": {
             "yaw": without_negative_zero(yaw_degrees),
@@ -1525,8 +1527,11 @@ fn measured_move_effect(before: &SelfPose, after: &SelfPose) -> Value {
     let delta_x = after.position.x - before.position.x;
     let delta_y = after.position.y - before.position.y;
     let delta_z = after.position.z - before.position.z;
-    let forward_x = -before.yaw.sin();
-    let forward_z = -before.yaw.cos();
+    // 前/右基向量必须用弧度算三角函数，而 before.yaw 是角度制。漏掉这次转换，
+    // 基向量会整体转过一个任意角：同伴向前走，返回的却是「主要在向右平移」。
+    let yaw_radians = before.yaw.to_radians();
+    let forward_x = -yaw_radians.sin();
+    let forward_z = -yaw_radians.cos();
     let right_x = -forward_z;
     let right_z = forward_x;
     let relative_displacement = [
@@ -1542,21 +1547,6 @@ fn measured_move_effect(before: &SelfPose, after: &SelfPose) -> Value {
         "distance": without_negative_zero(distance),
         "movement": if distance > MOVE_EFFECT_EPSILON { "changed" } else { "no_effect" },
     })
-}
-
-fn normalize_radians(value: f64) -> f64 {
-    let mut normalized = value % (std::f64::consts::PI * 2.0);
-    if normalized > std::f64::consts::PI {
-        normalized -= std::f64::consts::PI * 2.0;
-    }
-    if normalized < -std::f64::consts::PI {
-        normalized += std::f64::consts::PI * 2.0;
-    }
-    normalized
-}
-
-fn radians_to_degrees(value: f64) -> f64 {
-    value * 180.0 / std::f64::consts::PI
 }
 
 fn without_negative_zero(value: f64) -> f64 {

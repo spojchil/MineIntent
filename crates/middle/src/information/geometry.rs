@@ -26,8 +26,14 @@ pub fn distance_between(a: Point3, b: Point3) -> f64 {
     (a.x - b.x).hypot(a.y - b.y).hypot(a.z - b.z)
 }
 
-/// Mineflayer's yaw/pitch-to-direction convention. Angles are radians.
-pub fn look_direction(yaw: f64, pitch: f64) -> Point3 {
+/// 原版的 yaw/pitch → 单位朝向向量。**角度制**——与契约里的
+/// `SelfPose::yaw`、azalea 的 `LookDirection::y_rot()` 同单位。
+///
+/// 这里原来写的是弧度，而传进来的一直是角度：声音的「前/后/左/右」因此是
+/// 按一个错误朝向算出来的。三角函数不会报错，只会安静地给出一个像样的错答案。
+pub fn look_direction(yaw_degrees: f64, pitch_degrees: f64) -> Point3 {
+    let yaw = yaw_degrees.to_radians();
+    let pitch = pitch_degrees.to_radians();
     Point3 {
         x: -yaw.sin() * pitch.cos(),
         y: pitch.sin(),

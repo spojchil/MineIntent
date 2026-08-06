@@ -91,9 +91,10 @@ pub struct SelfSnapshot {
     pub username: String,
     pub position: Vec3Value,
     pub velocity: Vec3Value,
-    /// Canonical snapshot/observation angle in radians.
+    /// 角度制。与原版、azalea `LookDirection::y_rot()` 同单位，未归一化：
+    /// 连续转身会累加出 −10313 这样的值，要给人或模型看时用 [`wrap_degrees`]。
     pub yaw: f64,
-    /// Canonical snapshot/observation angle in radians.
+    /// 角度制，原版把它钳在 ±90。
     pub pitch: f64,
     pub on_ground: bool,
     pub alive: bool,
@@ -223,10 +224,11 @@ pub struct ProtocolEntitySnapshot {
     pub uuid: Option<String>,
     pub position: Vec3Value,
     pub velocity: Vec3Value,
-    /// Canonical angle in radians.
+    /// 角度制，未归一化。见 [`SelfSnapshot::yaw`]。
     pub yaw: f64,
-    /// Canonical angle in radians.
+    /// 角度制，钳在 ±90。
     pub pitch: f64,
+    /// 角度制，未归一化。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head_yaw: Option<f64>,
     pub width: f64,
@@ -282,8 +284,79 @@ pub enum BlockReadResult {
 pub struct SelfPose {
     pub position: Vec3Value,
     pub velocity: Vec3Value,
-    /// Radians.
+    /// 角度制，未归一化。见 [`SelfSnapshot::yaw`]。
     pub yaw: f64,
-    /// Radians.
+    /// 角度制，钳在 ±90。
     pub pitch: f64,
+}
+
+/// 把角度收进 [−180, 180)，等价于原版 `Mth.wrapDegrees`。
+///
+/// 原版和 azalea 都不归一化 yaw：一直往同一个方向转，`y_rot` 会一路累加下去。
+/// 内部算三角函数无所谓（周期函数），但**给模型看的角度必须归一化**——实盘里
+/// 模型收到过 −10313.24°，它无从判断那和 126.76° 是同一个朝向，于是认定
+/// 「转向没有生效」。原版自己在 F3 界面上显示的也是归一化后的值。
+///
+/// 非有限数原样返回：缺陷不该在这里被伪装成一个像样的角度，由调用方的有限性
+/// 检查去处理。
+pub fn wrap_degrees(value: f64) -> f64 {
+    if !value.is_finite() {
+        return value;
+    }
+    let mut wrapped = value % 360.0;
+    if wrapped >= 180.0 {
+        wrapped -= 360.0;
+    }
+    if wrapped < -180.0 {
+        wrapped += 360.0;
+    }
+    // −0.0 与 0.0 是同一个朝向，但序列化出来是 "-0.0"，读的人会以为有区别。
+    if wrapped == 0.0 {
+        0.0
+    } else {
+        wrapped
+    }
+}
+
+#[cfg(test)]
+mod wrap_degrees_tests {
+    use super::wrap_degrees;
+
+    #[test]
+    fn wraps_into_the_vanilla_half_open_range() {
+        for (input, expected) in [
+            (0.0, 0.0),
+            (179.9, 179.9),
+            (180.0, -180.0),
+            (-180.0, -180.0),
+            (360.0, 0.0),
+            (-360.0, 0.0),
+            (-270.0, 90.0),
+            (450.0, 90.0),
+        ] {
+            assert_eq!(wrap_degrees(input), expected, "input {input}");
+        }
+    }
+
+    #[test]
+    fn wraps_the_value_the_live_run_actually_produced() {
+        // 2026-08-05 实盘：模型收到的是 −10313.24°。它和 126.76° 是同一个朝向。
+        let wrapped = wrap_degrees(-10_313.240_312_354_817);
+        assert!(
+            (wrapped - 126.759_687_645_183).abs() < 1e-9,
+            "wrapped = {wrapped}"
+        );
+    }
+
+    #[test]
+    fn a_non_finite_angle_passes_through_instead_of_becoming_a_plausible_one() {
+        assert!(wrap_degrees(f64::NAN).is_nan());
+        assert_eq!(wrap_degrees(f64::INFINITY), f64::INFINITY);
+    }
+
+    #[test]
+    fn negative_zero_is_reported_as_zero() {
+        assert!(wrap_degrees(-0.0).is_sign_positive());
+        assert!(wrap_degrees(-360.0).is_sign_positive());
+    }
 }

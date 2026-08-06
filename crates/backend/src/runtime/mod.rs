@@ -63,7 +63,7 @@ use tokio::sync::{oneshot, Notify};
 
 use crate::{
     entity_events::{
-        compact_pitch_radians, compact_rotation_radians, EntityIdentity, EntityMovePatch,
+        compact_pitch_degrees, compact_rotation_degrees, EntityIdentity, EntityMovePatch,
         EntityProducerCache, EntityProducerInput, EntityProducerToken, NormalizedEntityEvent,
         NormalizedEntitySnapshot,
     },
