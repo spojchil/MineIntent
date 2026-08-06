@@ -15,7 +15,7 @@ use mineintent_contracts::{
         ToolInvocation, WireToolDefinition,
     },
     capability::ToolCapabilityRegistry,
-    capability::{CapabilityExecutionContext, CapabilityInvocation, ExecutionResource, ScopeGuard},
+    capability::{CapabilityExecutionContext, CapabilityInvocation, ScopeGuard},
     information::InformationOmission,
     minecraft::{
         BackendClose, BackendError, BackendEventEnvelope, BackendEventKind, BackendEventListener,

@@ -243,7 +243,6 @@ impl ObservationAfterSource for CountingObservationAfter {
     fn observe_after<'a>(
         &'a self,
         _invocation: CapabilityInvocation,
-        _resource: ExecutionResource,
         _result: Value,
         context: CapabilityExecutionContext<'a>,
     ) -> ContractFuture<'a, Result<Option<JsonObject>, AgentError>> {
@@ -841,8 +840,12 @@ async fn body_ordinary_failure_still_injects_observation_and_releases_lease() {
     assert_eq!(harness.backend.motor.release_calls(), 1);
 }
 
+/// 这个测试原来叫 `non_body_capabilities_never_call_observation_after_and_return_null`，
+/// 断言的正是那道移植时加出来的闸。原型没有这道闸：桥对每次工具调用都无条件取一次
+/// 观察（app/mineintent-app.ts:33），说、看、记也不例外。实盘那一轮 45 个工具结果里
+/// observationAfter 全是 null，模型据此判断「视野捕获后端暂时不可用」——闸就是成因。
 #[tokio::test]
-async fn non_body_capabilities_never_call_observation_after_and_return_null() {
+async fn every_capability_gets_an_observation_after_not_just_body_ones() {
     let harness = harness();
     let observation = Arc::new(CountingObservationAfter::new());
     let dispatcher = harness
@@ -861,9 +864,9 @@ async fn non_body_capabilities_never_call_observation_after_and_return_null() {
         let execution = dispatch(&dispatcher, &cancellation, name, arguments)
             .await
             .expect("non-body capability returns paired result");
-        assert!(execution.observation_after.as_ref().is_none(), "{name}");
+        assert!(execution.observation_after.as_ref().is_some(), "{name}");
     }
-    assert_eq!(observation.calls(), 0);
+    assert_eq!(observation.calls(), 3);
 }
 
 #[tokio::test]

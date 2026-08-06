@@ -115,7 +115,6 @@ async fn production_observation_after_is_body_only_and_drains_facts_once() {
     let first = observation
         .observe_after(
             observation_invocation("first"),
-            ExecutionResource::Body,
             serde_json::json!({"status": "failed"}),
             CapabilityExecutionContext::new(
                 &run_scope.world_id,
@@ -145,7 +144,6 @@ async fn production_observation_after_is_body_only_and_drains_facts_once() {
     let second = observation
         .observe_after(
             observation_invocation("second"),
-            ExecutionResource::Body,
             serde_json::json!({"status": "completed"}),
             CapabilityExecutionContext::new(
                 &run_scope.world_id,
@@ -161,11 +159,10 @@ async fn production_observation_after_is_body_only_and_drains_facts_once() {
     assert!(second.get("status").is_some());
     assert_eq!(source.capture_calls(), 3, "opening plus two body samples");
 
-    for (resource, id) in [
-        (ExecutionResource::Viewport, "viewport"),
-        (ExecutionResource::Chat, "chat"),
-        (ExecutionResource::Memory, "memory"),
-    ] {
+    // 看、说、记也一样取观察：这是时间边界，不是因果主张——工具执行期间世界
+    // 发生的事属于随后这次观察，与工具做了什么无关。原型的桥对每次调用都无条件
+    // 取一次（app/mineintent-app.ts:33）。事实只排空一次，所以这几次只有状态。
+    for id in ["viewport", "chat", "memory"] {
         let signal = NeverCancelled;
         let guard = RealScopeGuard {
             checks: Arc::clone(&checks),
@@ -174,7 +171,6 @@ async fn production_observation_after_is_body_only_and_drains_facts_once() {
         let result = observation
             .observe_after(
                 observation_invocation(id),
-                resource,
                 serde_json::json!({"status": "completed"}),
                 CapabilityExecutionContext::new(
                     &run_scope.world_id,
@@ -184,10 +180,12 @@ async fn production_observation_after_is_body_only_and_drains_facts_once() {
                 ),
             )
             .await
-            .unwrap();
-        assert!(result.is_none(), "{resource:?} must not sample body facts");
+            .unwrap()
+            .unwrap_or_else(|| panic!("{id}: 每个工具之后都该有一次观察"));
+        assert!(result.get("events").is_none(), "{id}: 事实已经排空过");
+        assert!(result.get("status").is_some(), "{id}: 状态仍然要在");
     }
-    assert_eq!(source.capture_calls(), 3);
+    assert_eq!(source.capture_calls(), 6, "开场一次，加五次工具后观察");
     assert!(checks.load(Ordering::SeqCst) >= 7);
     runtime.stop().await.unwrap();
     drop(runtime);
@@ -198,7 +196,6 @@ async fn production_observation_after_is_body_only_and_drains_facts_once() {
     let error = observation
         .observe_after(
             observation_invocation("after-runtime-drop"),
-            ExecutionResource::Body,
             serde_json::json!({"status": "completed"}),
             CapabilityExecutionContext::new(
                 &run_scope.world_id,

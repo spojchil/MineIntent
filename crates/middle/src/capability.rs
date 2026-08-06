@@ -633,11 +633,12 @@ impl QueuedSayObserver for NoopQueuedSayObserver {
     fn record_queued(&self, _run_id: &mineintent_contracts::agent::RunId) {}
 }
 
+/// 一次工具执行之后的观察。派发器对**每一个**工具都调用它，不做工具种类的筛选
+/// ——「这次该不该观察」不是循环的判断，是这里的实现说了算。
 pub trait ObservationAfterSource: Send + Sync {
     fn observe_after<'a>(
         &'a self,
         invocation: CapabilityInvocation,
-        resource: ExecutionResource,
         result: Value,
         context: CapabilityExecutionContext<'a>,
     ) -> ContractFuture<'a, Result<Option<JsonObject>, AgentError>>;
@@ -652,7 +653,6 @@ impl ObservationAfterSource for NullObservationAfter {
     fn observe_after<'a>(
         &'a self,
         _invocation: CapabilityInvocation,
-        _resource: ExecutionResource,
         _result: Value,
         context: CapabilityExecutionContext<'a>,
     ) -> ContractFuture<'a, Result<Option<JsonObject>, AgentError>> {
@@ -1750,12 +1750,6 @@ impl ContractToolDispatcher for RegistryToolDispatcher {
                     format!("unknown tool: {}", invocation.name),
                 )
             })?;
-            let resource = capability.resource().ok_or_else(|| {
-                AgentError::new(
-                    AgentErrorCode::InvalidToolDefinition,
-                    format!("tool {} has no execution resource", invocation.name),
-                )
-            })?;
             let context = self.scope.context(control);
             context.check_at(Instant::now())?;
 
@@ -1769,26 +1763,32 @@ impl ContractToolDispatcher for RegistryToolDispatcher {
                 Err(error) => failed_result(truncate_summary(error.summary)),
             };
 
-            let observation = if resource == ExecutionResource::Body {
-                let observation_context = self.scope.context(control);
-                observation_context.check_at(Instant::now())?;
-                let observation_result = await_controlled(
-                    self.observation_after.observe_after(
-                        assembled,
-                        resource,
-                        result.clone(),
-                        observation_context,
-                    ),
-                    control,
-                )
-                .await?;
-                match observation_result {
-                    Ok(observation) => observation,
-                    Err(error) if is_structured_control_error(error.code) => return Err(error),
-                    Err(_) => None,
-                }
-            } else {
-                None
+            // 每一个工具之后都取一次观察，不看它是什么工具。
+            //
+            // 这是时间边界，不是因果主张：工具执行期间世界发生的事，属于随后
+            // 这一次观察，跟这个工具做了什么无关。原型就是这么做的——桥在
+            // `app/mineintent-app.ts:33` 对每次调用无条件取一次，`runtime.ts:519`
+            // 的注释也写着「即使这次观察取不到，工具结果依然成立」。
+            //
+            // Rust 移植曾在这里加过一道 `resource == Body` 的闸，oracle 没有这道闸。
+            // 后果是实盘那一轮 45 个工具结果里 observationAfter 全是 null，模型把它
+            // 读成「视野捕获后端暂时不可用」。而 TS 侧的测试写明了这条通道的用处：
+            // 没人问过的事实（比如挨了打）只能从这里进模型——拉取式设计根本看不见它。
+            //
+            // 取一次不贵：ParticipantFrameCapture 里没有视口，只有姿态、状态、
+            // 快捷栏、未读聊天与已积累的事实。视口另走轮末那一帧。
+            let observation_context = self.scope.context(control);
+            observation_context.check_at(Instant::now())?;
+            let observation_result = await_controlled(
+                self.observation_after
+                    .observe_after(assembled, result.clone(), observation_context),
+                control,
+            )
+            .await?;
+            let observation = match observation_result {
+                Ok(observation) => observation,
+                Err(error) if is_structured_control_error(error.code) => return Err(error),
+                Err(_) => None,
             };
             let final_context = self.scope.context(control);
             final_context.check_at(Instant::now())?;

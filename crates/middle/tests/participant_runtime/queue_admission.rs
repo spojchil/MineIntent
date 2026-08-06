@@ -66,7 +66,6 @@ async fn active_run_body_drain_precedes_queued_opening_without_fact_replay() {
     let first_observation = observation
         .observe_after(
             observation_invocation("seam-body-failure"),
-            ExecutionResource::Body,
             serde_json::json!({"status": "failed"}),
             CapabilityExecutionContext::new(
                 &run_scope.world_id,
@@ -92,7 +91,6 @@ async fn active_run_body_drain_precedes_queued_opening_without_fact_replay() {
     let second_observation = observation
         .observe_after(
             observation_invocation("seam-body-second"),
-            ExecutionResource::Body,
             serde_json::json!({"status": "failed"}),
             CapabilityExecutionContext::new(
                 &run_scope.world_id,
@@ -229,7 +227,6 @@ async fn body_observation_progresses_while_full_control_admission_waits() {
                 Deadline::after(std::time::Instant::now(), Duration::from_secs(1)).unwrap();
             observation_handle.block_on(observation.observe_after(
                 observation_invocation("deadlock-body"),
-                ExecutionResource::Body,
                 serde_json::json!({"status": "failed"}),
                 CapabilityExecutionContext::new(
                     &run_scope.world_id,

@@ -14,7 +14,7 @@ use mineintent_contracts::{
         AgentChatMessageV5, AgentError, AgentErrorCode, AgentFrameV5, AgentHotbarV5,
         AgentItemStackV5, AgentPoseV5, AgentStatusV5, ContractFuture, JsonObject,
     },
-    capability::{CapabilityExecutionContext, CapabilityInvocation, ExecutionResource},
+    capability::{CapabilityExecutionContext, CapabilityInvocation},
     information::{SoundObservation as ContractSoundObservation, SoundValues},
     minecraft::{
         BackendEventEnvelope, BackendEventKind, BackendEventListener, BackendEventPayload,
@@ -735,15 +735,10 @@ impl ObservationAfterSource for ParticipantObservationAfterSource {
     fn observe_after<'a>(
         &'a self,
         _invocation: CapabilityInvocation,
-        resource: ExecutionResource,
         _result: serde_json::Value,
         context: CapabilityExecutionContext<'a>,
     ) -> ContractFuture<'a, Result<Option<JsonObject>, AgentError>> {
         Box::pin(async move {
-            if resource != ExecutionResource::Body {
-                context.check_at(std::time::Instant::now())?;
-                return Ok(None);
-            }
             context.check_at(std::time::Instant::now())?;
             if context.world_id() != self.scope.world_id
                 || context.chat_event_id() != self.trigger_event_id
