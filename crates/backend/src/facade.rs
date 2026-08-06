@@ -787,6 +787,20 @@ impl RuntimeSession {
         let session = self.clone();
         let weak = Arc::downgrade(inner);
         let config = self.run_config.clone();
+        // 为什么是一根专属 OS 线程，而不是 tokio::spawn：
+        //
+        // azalea 在内部自建 `LocalSet` 并大量 `spawn_local`——`SwarmBuilder::start`
+        // 里 `task::LocalSet::new()` 之后注释写着「start_ecs_runner must be run
+        // inside of the LocalSet」，`azalea-client` 里还有函数明确声明「在 LocalSet
+        // 之外调用会 panic」。因此 `start` 的 future 持有 `Rc<LocalSet Context>`，
+        // 是 `!Send`：编译器会拒绝 `tokio::spawn`（实测错误为
+        // `Rc<tokio::task::local::Context>` cannot be sent between threads safely）。
+        //
+        // 而它一跑就是整个应用生命周期，所以也不能在 main 里直接 await——那样
+        // 停机信号与 participant runtime 都排不上。两条合起来才逼出这根线程。
+        //
+        // 注意约束来自 azalea 用了 LocalSet，不是「bevy 是 !Send」：`SwarmBuilder`
+        // 本身有 `where Self: Send`，并特意用 `SubApp` 而非 `App` 来保住 Send。
         let join = thread::Builder::new()
             .name(format!("mineintent-backend-runtime-{}", self.id))
             .spawn(move || {
