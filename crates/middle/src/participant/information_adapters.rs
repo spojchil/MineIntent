@@ -75,6 +75,20 @@ fn finite(value: f64) -> f64 {
     }
 }
 
+/// 不 panic 的 `finite`。活路径（声音历史）用它；仍在用 `finite` 的是尚未接线的
+/// source-port 实现，随 Information 子系统的处置一并决定。
+fn finite_or_none(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
+}
+
+fn finite_point3(value: Vec3Value) -> Option<Point3> {
+    Some(Point3 {
+        x: finite_or_none(value.x)?,
+        y: finite_or_none(value.y)?,
+        z: finite_or_none(value.z)?,
+    })
+}
+
 fn exact_u64(value: u64) -> f64 {
     let converted = value as f64;
     // u64::MAX as f64 rounds to 2^64, so check the upper bound before casting back.
@@ -289,6 +303,16 @@ impl BackendEventListener for SoundEventListener {
 }
 
 impl SoundHistoryInner {
+    /// 一条声音因为数值不可用被跳过。计数留在 revision 之外——它没有进入历史，
+    /// 所以读取方看到的就是「这条不存在」，而日志说明了为什么。
+    fn skip_non_finite(&self, field: &'static str) {
+        tracing::warn!(
+            target: "mineintent_middle",
+            field,
+            "声音观察被跳过：坐标或数值不是有限数"
+        );
+    }
+
     fn record(&self, event: BackendEventEnvelope) {
         if event.protocol != mineintent_contracts::minecraft::BackendEventProtocol::V2
             || event.kind != BackendEventKind::Sound
@@ -313,20 +337,37 @@ impl SoundHistoryInner {
             Err(_) => return,
         };
         let self_snapshot = &snapshot.self_snapshot;
+        // 非有限数曾经在这里 panic，指望 Information runtime 接住（见模块头）。
+        // 那个接手方从未接线，于是信号被 backend 的 dispatcher 泛泛地接成
+        // 「订阅者回调 panic」，原本的含义在翻译中丢失。
+        //
+        // 非有限坐标不是缺陷也不是异常，是一次读不出来的观察。按 W05a，影响要
+        // 能由公开的能力边界解释：「这条声音的坐标不是有限数，跳过」解释得了，
+        // 「回调 panic 了」解释不了。
+        let Some(self_position) = finite_point3(self_snapshot.position) else {
+            return self.skip_non_finite("self_position");
+        };
+        let Some(source_position) = finite_point3(payload.source_position) else {
+            return self.skip_non_finite("source_position");
+        };
+        let (Some(yaw), Some(volume), Some(pitch)) = (
+            finite_or_none(self_snapshot.yaw),
+            finite_or_none(payload.volume),
+            finite_or_none(payload.pitch),
+        ) else {
+            return self.skip_non_finite("yaw_volume_or_pitch");
+        };
+        let Some(distance) = finite_or_none(distance_between(self_position, source_position))
+        else {
+            return self.skip_non_finite("distance");
+        };
         let observation = SoundObservation {
             sound_name: payload.sound_name.clone(),
             category: payload.category.clone(),
-            distance: finite(distance_between(
-                point3(self_snapshot.position),
-                point3(payload.source_position),
-            )),
-            direction: relative_bearing(
-                finite(self_snapshot.yaw),
-                point3(self_snapshot.position),
-                point3(payload.source_position),
-            ),
-            volume: finite(payload.volume),
-            pitch: finite(payload.pitch),
+            distance,
+            direction: relative_bearing(yaw, self_position, source_position),
+            volume,
+            pitch,
             observed_at: event.occurred_at.clone(),
         };
         let entry = SoundEntry {

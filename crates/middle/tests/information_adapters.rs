@@ -366,6 +366,42 @@ fn entity(entity_key: &str, username: Option<&str>) -> ProtocolEntitySnapshot {
     }
 }
 
+/// 非有限坐标不再 panic：这条声音被跳过，历史不前进，其余事件照常记录。
+///
+/// 原先 `finite()` 会 panic，指望 Information runtime 接住；那个接手方从未接线，
+/// 于是信号被 backend dispatcher 泛泛接成「订阅者回调 panic」。非有限坐标是一次
+/// 读不出来的观察，不是缺陷。
+#[test]
+fn non_finite_sound_position_is_skipped_without_panicking() {
+    let backend = FakeBackend::new(snapshot(), FakeObservationSource::new());
+    let history = SoundHistory::new(backend.clone()).unwrap();
+
+    backend.emit(sound_event(
+        1,
+        "process-fixture-0001",
+        1,
+        "world-fixture",
+        Some("minecraft:overworld"),
+        f64::NAN,
+    ));
+    assert_eq!(history.revision(), 0.0, "非有限坐标不得进入历史");
+    assert!(history.recent(5.0).is_empty());
+
+    backend.emit(sound_event(
+        2,
+        "process-fixture-0001",
+        1,
+        "world-fixture",
+        Some("minecraft:overworld"),
+        -5.0,
+    ));
+    assert_eq!(history.revision(), 1.0, "跳过一条之后其余事件照常记录");
+    assert_eq!(
+        history.recent(5.0)[0].sound_name.as_deref(),
+        Some("sound-2")
+    );
+}
+
 fn sound_event(
     id: usize,
     process_session_id: &str,
