@@ -1,7 +1,6 @@
 use std::{
     any::Any,
     collections::VecDeque,
-    panic::{catch_unwind, AssertUnwindSafe},
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
@@ -284,29 +283,12 @@ where
             continue;
         };
 
-        // 不得不 catch 的理由：本函数是 speech worker 这个**全局唯一**的 tokio
-        // 任务。panic 逃出去 tokio 会接住，但没有人观察它的 JoinHandle（只在
-        // dispose 时 abort），于是 worker 无声死亡、同伴从此永久说不出话。
-        //
-        // 这处的正确终局是给 worker 配监督者（观察 JoinHandle → 报告 → 重建），
-        // catch 只是在那之前的替代品。
-        //
-        // 但**不能**把 panic 和普通发送失败混成一条 Failed：前者是我们的缺陷，
-        // 后者是世界的回答。混同就是把缺陷说成世界事实。
-        let result = match catch_unwind(AssertUnwindSafe(|| inner.transport.send(&delivery.text))) {
-            Ok(sent) => sent.map_err(|error| error.to_string()),
-            Err(payload) => {
-                let message = panic_message(payload.as_ref());
-                tracing::error!(
-                    target: "mineintent_middle",
-                    panic = %message,
-                    request_id = %delivery.request_id,
-                    segment = delivery.segment,
-                    "speech transport panic：已隔离以保住 worker；这是缺陷，不是发送失败"
-                );
-                Err(format!("speech_transport_panicked: {message}"))
-            }
-        };
+        // 实验分支：不捕获。panic 会杀掉 speech worker 这个全局唯一的 tokio 任务，
+        // 同伴从此永久说不出话——这正是要观察的现象。
+        let result = inner
+            .transport
+            .send(&delivery.text)
+            .map_err(|error| error.to_string());
         let completion = {
             let mut state = lock_recover(&inner.state);
             let is_current = state.queue.front().is_some_and(|queued| {

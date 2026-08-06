@@ -673,15 +673,24 @@ fn current_observation_callback_count(state: &ObservationSubscriptionState) -> u
     })
 }
 
+/// 一次订阅者回调的租约守卫。
+///
+/// `start_callback` 取走的那份 active 计数由本守卫的 `Drop` 归还——**不能**留给
+/// 调用点手动调 `finish_callback`。实测过一次：把外层的 panic 捕获拿掉之后，
+/// 一个 panic 的订阅者会跳过那行手动释放，`active_callbacks` 永不归零，此后任何
+/// unsubscribe（含 `Drop`）都永久卡在 `wait_for_quiescence` 的 Condvar 上。
+///
+/// 租约必须 RAII，才能在正常返回与 unwind 两条路径上都归还。
 pub(super) struct ObservationCallbackGuard {
     key: usize,
+    state: Arc<ObservationSubscriptionState>,
 }
 
 impl ObservationCallbackGuard {
-    pub(super) fn enter(state: &ObservationSubscriptionState) -> Self {
-        let key = observation_state_key(state);
+    pub(super) fn enter(state: Arc<ObservationSubscriptionState>) -> Self {
+        let key = observation_state_key(state.as_ref());
         OBSERVATION_CALLBACK_STACK.with(|stack| stack.borrow_mut().push(key));
-        Self { key }
+        Self { key, state }
     }
 }
 
@@ -691,6 +700,7 @@ impl Drop for ObservationCallbackGuard {
             let mut stack = stack.borrow_mut();
             debug_assert_eq!(stack.pop(), Some(self.key));
         });
+        self.state.finish_callback();
     }
 }
 
@@ -860,38 +870,10 @@ impl SharedRuntime {
             if !delivery.state.start_callback() {
                 continue;
             }
-            let callback_guard = ObservationCallbackGuard::enter(&delivery.state);
-            // 不得不 catch 的两条理由。
-            //
-            // 一、存在无监督的到达路径。`drain_events` 有十个调用点，线程各不
-            // 相同：ECS 生产者、命令完成与生命周期归约跑在 backend 的专属 OS
-            // 线程上（azalea 的 LocalSet 逼出来的那根，见 facade.rs 的 launch）；
-            // 公开 `stop()` 与 stop watchdog 则可能来自任意调用方线程，而
-            // `drain_events` 排空的是整条队列，所以停机时压在队里的
-            // Entity/Block/Sound 事件会在那条线程上回调。
-            //
-            // 其中专属线程那条没有任何监督者：它同时跑着 azalea 的 App 与
-            // read_packets，panic 逃出去就是线程死亡、世界停摆、KeepAlive 超时
-            // 掉线，而重连逻辑要用的也正是这根线程。
-            //
-            // 二、扇出隔离。这个循环要投递给多个订阅者，一个订阅者的缺陷不该让
-            // 其余订阅者收不到已经发生的事实。这条与线程无关，即使将来每条路径
-            // 都有了监督者，它仍然成立。
-            //
-            // 两条都不是「panic 不算 bug」——panic 照常记为 error，只是不允许它
-            // 顺手带走一根没人重建的线程或其余订阅者。
-            let callback_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                delivery.listener.on_event(observation_event.clone());
-            }));
-            drop(callback_guard);
-            delivery.state.finish_callback();
-            if callback_result.is_err() {
-                tracing::error!(
-                    target: "mineintent_backend",
-                    subscription_id = delivery.id,
-                    "观察订阅者回调 panic：已隔离，其余订阅者继续；这是缺陷，不是世界事实"
-                );
-            }
+            // 租约由守卫的 Drop 归还，正常返回与 unwind 两条路径都走它。
+            let _callback_guard = ObservationCallbackGuard::enter(delivery.state.clone());
+            // 实验分支：不捕获。panic 照常传播，让崩溃现场自己说话。
+            delivery.listener.on_event(observation_event.clone());
         }
     }
 
