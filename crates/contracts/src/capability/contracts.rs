@@ -162,4 +162,18 @@ pub trait ToolDispatcher: Send + Sync {
         invocation: ToolInvocation,
         control: ExecutionControl<'a>,
     ) -> ContractFuture<'a, Result<ToolExecution<Self::Observation>, AgentError>>;
+
+    /// 一批 tool-call 全部结算之后，dispatcher 可以追加一条模型可见消息。
+    ///
+    /// 驱动器**不解释**这条消息:它不知道里面是观察、提醒还是别的什么，只负责
+    /// panic 隔离与 deadline，然后原样追加。要不要发、发什么、读不到时怎么说，
+    /// 全部由实现方决定——「哪些工具动了身体」这类判断属于领域，不属于循环。
+    ///
+    /// 返回 `None` 表示这一批不需要追加。默认无消息，既有 dispatcher 不受影响。
+    fn after_batch<'a>(
+        &'a self,
+        _control: ExecutionControl<'a>,
+    ) -> ContractFuture<'a, Result<Option<JsonObject>, AgentError>> {
+        Box::pin(async { Ok(None) })
+    }
 }

@@ -16,11 +16,11 @@ use mineintent_contracts::{
 use serde::Serialize;
 use serde_json::json;
 
-use toolloop::utc_timestamp_now;
 use super::{
     AgentRun, AgentRunStep, AgentToolResult, ModelCompletion, NoRoundViewportSampler,
     PlannedToolCall, RoundViewportSampler,
 };
+use toolloop::utc_timestamp_now;
 
 /// 一轮 OpenAI-compatible completion 所需的 provider 无关输入。
 #[derive(Clone, Debug, PartialEq)]
