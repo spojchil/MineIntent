@@ -532,15 +532,30 @@ where
         }
 
         let target_result = read_cached(target.clone());
-        let target_info = match &target_result {
+        // 一次 match 同时定出「这块方块的身份」与「看不看得见」。拆成两次会让
+        // 第二次的 OutOfWorld 分支不可达，只能靠 unreachable! 兜住——而那个
+        // 不变量（同一个不可变值在两次 match 之间不变）编译器无法传播，只能
+        // 靠人读。合起来之后它不再需要被相信。
+        let (target_info, target_visible) = match &target_result {
             BlockReadResult::Loaded { block } => {
-                Some(BlockInfo::from_raw_properties_with_registry(
+                let info = BlockInfo::from_raw_properties_with_registry(
                     block.name.clone(),
                     &block.properties,
                     presenters,
-                ))
+                );
+                let visible = is_visible_candidate(
+                    &mut read_cached,
+                    eye,
+                    &target,
+                    distance,
+                    options.predicate,
+                    presenters,
+                    &mut checkpoint,
+                )
+                .map_err(DirectedViewportError::Backend)?;
+                (Some(info), visible)
             }
-            BlockReadResult::Unloaded => None,
+            BlockReadResult::Unloaded => (None, false),
             BlockReadResult::OutOfWorld => {
                 unseen.push(DirectedUnseenBlock {
                     at: [x, y, z],
@@ -551,21 +566,6 @@ where
                 });
                 continue;
             }
-        };
-
-        let target_visible = match &target_result {
-            BlockReadResult::Loaded { .. } => is_visible_candidate(
-                &mut read_cached,
-                eye,
-                &target,
-                distance,
-                options.predicate,
-                presenters,
-                &mut checkpoint,
-            )
-            .map_err(DirectedViewportError::Backend)?,
-            BlockReadResult::Unloaded => false,
-            BlockReadResult::OutOfWorld => unreachable!("out-of-world target returned above"),
         };
 
         if target_visible {
@@ -584,13 +584,11 @@ where
             presenters,
             &mut checkpoint,
         )?;
+        // outside_fov / too_far / out_of_world 三者中任意一个成立，上面的几何闸门
+        // 已经 continue 掉了；到这里它们必为 false。原先这里还各有一次 push，
+        // 是死代码——留着会让人误以为 why 可能因视锥或距离而非空，从而看不清
+        // 「why 为空 ⟹ target_info 是 Some」这条推理。
         let mut why = Vec::new();
-        if outside_fov {
-            why.push(DirectedWhy::OutsideFov);
-        }
-        if too_far {
-            why.push(DirectedWhy::TooFar);
-        }
         let mut by = None;
         match ray {
             DirectedRayOutcome::Hit(hit) => {
