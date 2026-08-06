@@ -169,12 +169,12 @@ serde_json 对整数键的 map 本来就渲染成字符串键 `"0"`/`"8"`；二�
 
 | # | 类型 | 位置 | 容量（ordinary/control/overflow） |
 |---|---|---|---|
-| 1 | `EventDispatchState` | `backend/src/runtime/events.rs:20-254` | 256 / 512 / 64 |
+| 1 | `EventDispatchState` | `backend/src/runtime/events.rs:5-254` | 256 / 512 / 64 |
 | 2 | `RuntimeEventQueue` | `backend/src/runtime/events.rs:256-472` | 256 / 512 / 64 |
 | 3 | `EventBridge` | `backend/src/facade.rs:48-320` | 256 / 512 / 64 |
 | 4 | `ParticipantEventQueue` | `middle/src/participant/runtime/queue.rs:102-…` | 16 / 8 / 4 |
 
-前三份合计 **725 行**生产码，第四份所在的 `queue.rs` 另有 446 行
+前三份合计 **740 行**生产码（250 + 217 + 273），第四份所在的 `queue.rs` 另有 446 行
 （第四份多带清理编排，不是纯队列）。四份之外还有各自的测试。
 
 四份都有同一套成员：`ordinary` / `control` / `overflow` / `terminal` 四个槽，
@@ -1054,3 +1054,16 @@ panic 面的分布里有一处值得单独看——**处数最多的文件正是
 
 这些都不是「写错了」——每一处都有当时成立的理由，而且大多写在注释里。
 问题是**理由的有效期过了**（并发源消失、oracle 退役、控制面没接上），而代码留了下来。
+
+---
+
+## 附：本文自身的核对
+
+本文引用的 **75 个 `文件:行号` 锚点**全部经脚本回读原文核对
+（打开该文件、取该行、比对内容）。核对发现并修正了 1 处错误：
+`EventDispatchState` 的跨度起点原写 `events.rs:20`，实际结构体定义在 `:5`
+（第 20 行是构造函数体内的一行），随之把前三份队列的合计行数由 725 订正为 740。
+
+核对脚本与本次用到的其余扫描器（`pub` 条目引用计数、跨文件重复块、
+函数长度/嵌套、panic 面统计）都是一次性工具，未入库。
+要复现，本文每条结论都写了可以直接跑的 `rg` 条件或编译命令。
