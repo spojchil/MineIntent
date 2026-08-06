@@ -756,6 +756,99 @@ dispatcher 线程「本身没有独立理由」，事实流改成拉取式之后
 
 ---
 
+## 7A. 复杂度：整体健康，尾巴很长
+
+对全部生产码做函数级测量（大括号配平，跳过 `#[cfg(test)]` 尾部）：
+
+**1 429 个生产函数，平均 17.0 行。** 这个数字是健康的——绝大多数函数很短。
+问题集中在尾部的少数几个：
+
+| 行数 | 嵌套 | 函数 | 位置 |
+|---:|---:|---|---|
+| 400 | 5 | `produce_entity_packet_events` | `backend/src/runtime/producers.rs:371` |
+| 297 | 3 | `read` | `middle/src/information/runtime.rs:536`（不在生产路径，见 §4） |
+| 223 | 4 | `read_viewport_attempt` | `backend/src/runtime/observation.rs:302` |
+| 215 | 5 | `handle_client` | `backend/src/runtime/driver.rs:97` |
+| 189 | 4 | `project_directed_with_presenters` | `backend/src/viewport.rs:448` |
+| 175 | 4 | `process_wake` | `middle/src/participant/runtime/mod.rs:1284` |
+
+### 7A.1 `produce_entity_packet_events`：对同一个值 `match` 了三次
+
+这个 400 行的函数里有**三个连续的 `match event.packet.as_ref()`**
+（函数内相对第 14 / 105 / 159 行），共 17 个 `ClientboundGamePacket::` 分支，
+段与段之间用 `continue` 跳过：
+
+```text
+for event in packets.read() {
+    match event.packet { Sound / ForgetLevelChunk / SoundEntity
+                       / LightUpdate / LevelChunkWithLight => …; continue
+                         _ => {} }          // ← 不需要 epoch 的包在这里走完
+    let Some(epoch) = … else { continue };  // ← epoch 守卫
+    match event.packet { Login / Respawn => …; continue
+                         _ => {} }          // ← 作用域边界包，必须先于下一段
+    match event.packet { …其余约 240 行… }
+}
+```
+
+**分段本身是有道理的**，注释也写清楚了（`producers.rs:469-474`：Login/Respawn 是
+「authoritative boundary positions」，必须在同一批的下一个包被准入之前重置作用域）。
+但代价是：判断某个包会走哪条路，要同时记住前两个 `match` 出现过哪些变体——
+而这三个 `match` 之间隔着 90 行和 50 行。
+
+**建议**：拆成三个函数，各返回一个 `Handled` / `FallThrough` 小枚举。
+纯机械改动，语义不变，顺序约束由调用处三行显式表达，比靠 `continue` 明确。
+
+### 7A.2 `runtime.rs` 的拆分只减了文件体积，没有建立模块边界
+
+`backend/src/runtime/` 是从一个 17.5k 行的大文件拆出来的（文档分支的中期更新 17 专项）。
+现在的形态是：
+
+- `runtime/mod.rs` **只有 153 行**，但它的 8 条 `use` 语句引入约 **150 个类型名**
+  （azalea、bevy_ecs、`mineintent_contracts::minecraft` 的约 40 个重命名类型等）；
+- 16 个子模块、合计 **9 377 行**，其中 15 个生产文件全部以 `use super::*;` 开头。
+
+也就是说：文件是拆开了，**命名空间还是平的**——每个子模块都看得见全部 150 个符号。
+
+后果是 Rust 正常的可读性手段没了：读 `producers.rs` 时想知道 `SwarmState`、
+`BackendEventPayload`、`ContractBlockPosition` 各自来自哪里，文件头部给不出答案，
+必须回 `runtime/mod.rs` 读那 60 行导入块。
+
+全库有 **36 个文件**用 `use super::*;`，其中 20 个是生产文件
+（`backend/src/runtime/` 15 个、`middle/src/participant/runtime/` 5 个）。
+
+**这不是「拆错了」**——拆分本身解决了「单文件 17.5k 行」这个真问题。
+但它是拆分**没做完**的标志：真正的模块边界要求各子模块显式声明自己依赖什么。
+如果不打算做完，至少值得在 `runtime/mod.rs` 写一句为什么保持平命名空间。
+
+### 7A.3 一个没测过、但算术上值得看的点
+
+`visible_blocks`（`backend/src/viewport.rs:806-925`）是 section 剔除 + 体素遍历的
+标准 6 层循环——**嵌套是算法本身，不是缺陷**。
+
+但有个数值：默认 `horizontal_radius = 32`、`vertical_radius = 20`（`viewport.rs:83-85`），
+体素空间是 65 × 65 × 41 ≈ **173 000 个**。section AABB 剔除会砍掉大部分，
+但 `checkpoint()?`（deadline 检查闭包）是在**最内层每个体素**上调用的（`viewport.rs:870`）。
+`view` 工具每次调用、以及每个动过身体的批次末尾，都要走一遍。
+
+**我没有测过实际开销**，这里只给算术。动之前应当先 profile——
+把 `checkpoint()` 改成每 N 个体素查一次是显而易见的做法，但在测量之前它只是猜测。
+
+### 7A.4 两处看着可疑、查完不成立的（如实记）
+
+免得以后有人重复怀疑：
+
+1. **`ResponsesModelProvider::complete` 的 `_control` 参数未使用**
+   （`app/src/model/responses.rs:290`）。看着像丢了截止与取消，实际两道保险都在：
+   - `toolloop/src/control.rs:32-67` 的 `await_with_control` 用 `biased select!`
+     竞速「取消 / deadline / future 完成」，丢弃 future 即取消 reqwest 请求；
+   - `responses.rs:48-49` 的 `Client::builder().timeout(REQUEST_TIMEOUT)` 另有 HTTP 层超时。
+
+2. **`speech/scheduler.rs:235` 的 `worker_loop` 嵌套深度 7**（本次扫描最深）。
+   读下来是好的：每层都是 `let x = { …lock… };` 块作用域，**锁在 `.await` 之前释放**。
+   深度来自块作用域，不是控制流。扫描器的数字在这里会误导。
+
+---
+
 ## 8. 死代码与不在生产路径上的代码：汇总
 
 分三类，判定强度不同。
