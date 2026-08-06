@@ -14,7 +14,7 @@ const requiredProjectDocuments = [
   'docs/guides/validation.md',
   'docs/history/index.md',
   'CONTRIBUTING.md',
-  'CLAUDE.md',
+  'AGENTS.md',
 ]
 const retiredProjectDocuments = [
   'PRODUCT_CONSTITUTION.md',
