@@ -486,24 +486,28 @@ where
                 return Err(error);
             }
         };
-        if matches!(&queue_admission, QueueAdmission::Ignored) {
-            if trigger_retained {
-                if let Some(trigger) = retained_trigger.as_ref() {
-                    self.frame_source.release_trigger(&scope, trigger);
+        // 一次 match 走完三种准入结果。原先是「先 if Ignored 提前 return，再
+        // match 剩下两种」，于是第二次 match 的 Ignored 分支不可达，只能靠
+        // unreachable! 兜住一个编译器无法传播的不变量。合起来之后它不再需要存在。
+        match queue_admission {
+            QueueAdmission::Ignored => {
+                if trigger_retained {
+                    if let Some(trigger) = retained_trigger.as_ref() {
+                        self.frame_source.release_trigger(&scope, trigger);
+                    }
+                }
+                return Ok(ParticipantAdmission::Ignored);
+            }
+            QueueAdmission::Accepted => {
+                if let Some(fact) = pending_fact {
+                    self.notify_admission_observer(&fact.event_type);
+                    self.record_fact(generation, fact);
                 }
             }
-            return Ok(ParticipantAdmission::Ignored);
-        }
-        if let Some(fact) = pending_fact {
-            if matches!(&queue_admission, QueueAdmission::Accepted) {
-                self.notify_admission_observer(&fact.event_type);
-            }
-            match queue_admission {
-                QueueAdmission::Accepted => self.record_fact(generation, fact),
-                QueueAdmission::OrdinaryDropped { event_type } => {
-                    self.record_pending_omission(generation, event_type)
+            QueueAdmission::OrdinaryDropped { event_type } => {
+                if pending_fact.is_some() {
+                    self.record_pending_omission(generation, event_type);
                 }
-                QueueAdmission::Ignored => unreachable!("ignored admission returned above"),
             }
         }
         Ok(match has_wake {
@@ -526,16 +530,14 @@ where
             ParticipantInternalEvent::ScopeChanged { .. } => {
                 self.admit_explicit_scope(&scope, true, None)
             }
-            ParticipantInternalEvent::Closed { .. }
-            | ParticipantInternalEvent::Faulted { .. }
-            | ParticipantInternalEvent::Stopped { .. } => {
-                let terminal_lifecycle = match &event {
-                    ParticipantInternalEvent::Faulted { .. } => ParticipantLifecycle::Faulted,
-                    ParticipantInternalEvent::Closed { .. }
-                    | ParticipantInternalEvent::Stopped { .. } => ParticipantLifecycle::Stopped,
-                    _ => unreachable!("terminal arm only contains terminal events"),
-                };
-                self.admit_explicit_scope(&scope, false, Some(terminal_lifecycle))
+            // 终止事件按 lifecycle 分成两条臂，而不是先合并再在里面重新 match
+            // 同一个值——那样第二次 match 的 `_` 分支不可达，只能靠 unreachable!
+            // 兜住一个编译器无法传播的不变量。
+            ParticipantInternalEvent::Faulted { .. } => {
+                self.admit_explicit_scope(&scope, false, Some(ParticipantLifecycle::Faulted))
+            }
+            ParticipantInternalEvent::Closed { .. } | ParticipantInternalEvent::Stopped { .. } => {
+                self.admit_explicit_scope(&scope, false, Some(ParticipantLifecycle::Stopped))
             }
             ParticipantInternalEvent::Fact { .. } => self.admit_explicit_scope(&scope, false, None),
         };
@@ -603,19 +605,20 @@ where
             },
             &mut serial,
         )?;
-        if matches!(&queue_admission, QueueAdmission::Ignored) {
-            return Ok(ParticipantAdmission::Ignored);
-        }
-        if let Some(fact) = pending_fact {
-            if matches!(&queue_admission, QueueAdmission::Accepted) {
-                self.notify_admission_observer(&fact.event_type);
-            }
-            match queue_admission {
-                QueueAdmission::Accepted => self.record_fact(generation, fact),
-                QueueAdmission::OrdinaryDropped { event_type } => {
-                    self.record_pending_omission(generation, event_type)
+        // 与 admit_scope_for_backend 同形：一次 match 走完三种准入结果，
+        // 不留需要 unreachable! 兜住的不可达分支。
+        match queue_admission {
+            QueueAdmission::Ignored => return Ok(ParticipantAdmission::Ignored),
+            QueueAdmission::Accepted => {
+                if let Some(fact) = pending_fact {
+                    self.notify_admission_observer(&fact.event_type);
+                    self.record_fact(generation, fact);
                 }
-                QueueAdmission::Ignored => unreachable!("ignored admission returned above"),
+            }
+            QueueAdmission::OrdinaryDropped { event_type } => {
+                if pending_fact.is_some() {
+                    self.record_pending_omission(generation, event_type);
+                }
             }
         }
         Ok(ParticipantAdmission::Recorded)
