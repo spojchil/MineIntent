@@ -19,7 +19,13 @@
 | `toolloop` | 1 022 | 0 | 领域无关的模型—工具循环 |
 | 合计 | **46 153** | **34 411** | 185 个 `.rs` 文件，80 564 行 |
 
-编译基线（`cargo check --workspace --all-targets`，nightly 1.99.0，3m27s）：**通过**，两条告警：
+验证基线（在本审查工作树 `MineIntent-worktrees/rust-audit` 上运行）：
+
+- `cargo check --workspace --all-targets`（nightly 1.99.0，3m27s）：**通过**
+- `cargo test --workspace --all-targets`：**通过**（退出码 0）
+- 各 crate `[dependencies]` 对照 `src/` 引用：**无未使用依赖**
+
+`cargo check` 只报出两条告警：
 
 - `crates/backend/src/runtime/frame.rs:216` — `method value_at is never used`
 - `crates/middle/tests/agent_round_frame.rs:107` — `variant Panic is never constructed`
@@ -86,14 +92,35 @@ v3/v4 fixtures 可能正是 oracle 比对的锚。要先确认：**这些 fixtur
 `AgentHotbarV5`（`context.rs:472-505`）为了把 `BTreeMap<u8, _>` 的键渲染成 `"0"`..`"8"`，
 专门写了一个 `HotbarSlots` 包装类型（15 行）。
 
-serde_json 对整数键的 map **本来就**序列化成字符串键。这一处需要实测确认（见 §9 待验证清单）。
-
 `AgentItemStackV5`（`context.rs:420-443`）手写 `Serialize`/`Deserialize` 把
-`struct AgentItemStackV5(String, u32)` 变成 JSON 数组——`#[derive(Serialize)]` 对二元元组结构体
-本来就产出数组。手写实现真正多做的只有 `validate()`。
+`struct AgentItemStackV5(String, u32)` 变成 JSON 数组。
+
+**已实测**（独立最小 crate，serde 1 / serde_json 1）：纯 `#[derive(Serialize)]`
+产出的字节与手写实现**完全一致**——
+
+```rust
+#[derive(Serialize)] struct ItemStack(String, u32);
+#[derive(Serialize)] struct Hotbar {
+    selected: u8,
+    slots: BTreeMap<u8, ItemStack>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "offHand")]
+    off_hand: Option<ItemStack>,
+}
+```
+
+```text
+derive 输出 : {"selected":0,"slots":{"0":["stone",3],"8":["torch",64]}}
+带 offHand  : {"selected":2,"slots":{},"offHand":["shield",1]}
+```
+
+serde_json 对整数键的 map 本来就渲染成字符串键 `"0"`/`"8"`；二元元组结构体本来就产出数组；
+`skip_serializing_if` 本来就给出「缺席即省略」。
+所以 `HotbarSlots`（15 行）与 `AgentItemStackV5` 的手写 impl **在形状上是多余的**，
+它们真正多做的只有 `validate()`。
 
 **这不等于「手写都该删」**：`validate()` 在序列化时报错是有意的纪律（不让非法值悄悄进模型上下文）。
-但 `#[serde(try_from = "Raw…", into = "Raw…")]` 能在保留校验的同时去掉大部分样板。
+但 `#[serde(try_from = "Raw…", into = "Raw…")]` 能在保留校验的同时去掉大部分样板——
+`Raw*` 结构体已经全都写好了（见 §1.1 列表），只差把它们挂到属性上。
 
 ---
 
@@ -726,3 +753,145 @@ dispatcher 线程「本身没有独立理由」，事实流改成拉取式之后
 另外 §4.1 那条要一起看：`information/runtime.rs` 里那 4+ 处 `catch_unwind`
 **本来就不会执行**（整个控制面不在生产路径上），
 而 `information_adapters.rs` 明确依赖它们来接住自己抛出的 panic。
+
+---
+
+## 8. 死代码与不在生产路径上的代码：汇总
+
+分三类，判定强度不同。
+
+### 8.1 编译器报出的（强度：确定）
+
+| 位置 | 内容 |
+|---|---|
+| `backend/src/runtime/frame.rs:216` | `value_at` —— `explain_at(...).ok()` 的三行包装，无人调用 |
+| `middle/tests/agent_round_frame.rs:107` | 枚举变体 `Panic` 从未构造 |
+
+### 8.2 `pub` 掩盖住的单个死条目（强度：确定，逐条 `rg` 复核过全库仅出现一次）
+
+`pub` + glob 再导出会让 `dead_code` lint 失效，所以这些编译器不报。
+下列 **18 条**在整个 `crates/` 里只出现一次——就是它自己的定义：
+
+| 位置 | 条目 |
+|---|---|
+| `backend/src/snapshot.rs:465` | `capture_tracked_entities` |
+| `contracts/src/agent/fixtures.rs:170` | `tool_execution` |
+| `contracts/src/minecraft/event.rs:51` | `is_product_kind` |
+| `contracts/src/minecraft/event.rs:170` | `map_payload` |
+| `contracts/src/minecraft/fixtures.rs:404` | `fixture_block` |
+| `contracts/src/minecraft/viewport.rs:715` | `type ViewportProjectionV2` |
+| `contracts/src/minecraft/viewport.rs:716` | `type DirectedViewportProjectionV2` |
+| `middle/src/agent/runner.rs:43` | `with_transcript_store` |
+| `middle/src/agent/runner.rs:53` | `with_transcript_sink` |
+| `middle/src/capability.rs:693` | `with_queued_say_observer` |
+| `middle/src/information/contracts/v1.rs:496` | `type InformationFieldId` |
+| `middle/src/information/source_ports/perception.rs:88` | `struct LookedAtBlock` |
+| `middle/src/information/source_ports/perception.rs:120` | `struct VisibleBlock` |
+| `middle/src/memory/mod.rs:22` | `DEFAULT_MEMORY_FILE`（且与装配处不一致，见 §6.6） |
+| `middle/src/participant/production.rs:348` | `with_sound_history` |
+| `middle/src/participant/runtime/mod.rs:235` | `tool_definitions` |
+| `middle/src/telemetry/debug_server.rs:87` | `with_default_port` |
+| `middle/src/viewport/mirror.rs:172` | `is_keyframe` |
+
+另有 `ViewFrustum`、`ScanMetrics`（同文件 `perception.rs`）只被上面两个死结构体引用，
+属于连带死亡。
+
+### 8.3 整块不在生产路径上的子系统（强度：Information 一块有编译实验；其余为静态判定）
+
+| 子系统 | 生产码 | 测试 | 判定依据 |
+|---|---:|---:|---|
+| Information 控制面（§4） | 5 110 | ~7 875 | **编译实验**：摘掉后 `mineintent-app --bins` 仍通过 |
+| 增量视口（休眠模块） | 1 560 | 984 | 生产装配只用 `ViewportReader` + `BackendRoundViewportSampler`；`ViewportMirror` / `ViewportIncrementalReducer` 无构造点 |
+| agent-context v3/v4（§1） | ~153（`context.rs`）+ fixtures | ~630（`tests/agent_contracts.rs`） | `crates/contracts` 之外零引用 |
+
+增量视口这块**是有意休眠的**（文档分支 commit `ac07d57`「合并：增量视口内核入库为休眠模块」），
+不是疏漏。记在这里有两个理由：一是它计入总量；
+二是 `middle/src/agent/mod.rs:33-39` 那段再导出把它按原名转出，
+读 `mineintent_middle::agent::ViewportMirror` 的人看不出它是休眠的。
+
+**合计约 6 800 行生产码 + 9 500 行测试**（约占全库 80 564 行的 **20%**）
+当前不在 `mineintent` 二进制的执行路径上。
+
+### 8.4 一条负面结果（如实记）
+
+各 crate 的 `[dependencies]` 逐条对照 `src/` 引用：**没有发现未使用的依赖**。
+五个 crate 的依赖表都是干净的。
+
+---
+
+## 9. 我**没有**验证的事（不要把本文当成已证实的全部）
+
+按 `AGENTS.md`「区分自动化检查、真实运行证据和推断」，这里显式列出边界：
+
+1. **没有实盘运行。** 本次全部结论来自静态阅读、`rg` 计数、`cargo check/test`
+   与一次模块摘除编译实验。没有连 Paper 服务端、没有跑真实模型。
+2. **§4.1 的 panic 风险没有触发验证。** 我确认了「注释所说的接管者不在生产路径上」，
+   但没有构造 backend 返回 `Err` 的场景去看它是否真的 panic。这条标的是**需要验证**。
+3. **§3.3 那条阻塞路径没有写测试证明可达。** 我给出的是对 `enqueue` 分支的推理
+   （ordinary 满 + `open_loss_segment == None` + overflow 满，靠控制车道准入清空丢失段来同时满足）。
+   要坐实应当补一个像 `facade.rs` 里现有 bridge 测试那样的单元测试。
+4. **§8.3 里增量视口与 v3/v4 两块没有做摘除实验**，只有静态判定。
+   Information 那块做了，所以强度不同。
+5. **性能没有测。** 四层队列串联的实际开销、`route_event` 每条事实一次锁的成本，
+   都没有量过。「排号闸从不 wait」是逻辑判断，不是 profile 结论。
+6. **没有读完全部 80 564 行。** `backend/src/runtime/` 的 lifecycle / ownership /
+   producers 三个大文件（合计 2 862 行）只做了结构扫描与重复检测，没有逐行读。
+
+---
+
+## 10. 如果要动手，我建议的顺序
+
+排序依据：**先做「删掉之后世界变简单」的，再做「需要产品答复」的，最后做增量新功能。**
+
+### 第一梯队：机械、低风险、收益立刻可见
+
+1. **合并六份时间戳实现为一份**（§5）。`chrono` 已是依赖。两处要确认：
+   - journal 已落盘数据的格式兼容性；
+   - `toolloop` 有一条测试**钉住了秒级精度**
+     （`transcript::tests::utc_format_is_second_precision_and_uses_gregorian_utc`），
+     统一格式会动到它——这条测试是有意的棘轮还是顺手写的，需要看一眼再决定改哪边。
+2. **删掉 §8.1 与 §8.2 的 20 条死条目**。零风险。
+3. **合并四份「一次性触发通知标志」**（`RelayCancellation` / `RelayDeadline` /
+   `RuntimeCancellation` / `RuntimeDeadline`，实现的是同一个 trait，代码逐字相同）。
+4. **给 `capability.rs` 加一层 `TypedCapability` blanket impl**（§7.1）。
+   契约不变，六个能力各减几十行，并且能重新用上 `?`。
+
+### 第二梯队：需要一次判断，但判断不难
+
+5. **v3/v4 协议的去留**（§1）。先回答一个问题：那些 fixture 还在被当迁移证据用吗？
+6. **Information 控制面的去留**（§4）。三种可能：删；移到独立分支封存；
+   或者「它本来就该接上，只是还没接」——如果是第三种，那 §4.1 的 panic 接管者问题要先解决。
+   连带 §2 的 173 行 JS 语义重实现随之消失。
+7. **`after_batch` 与 `ExecutionResource`**（`contracts/src/capability/contracts.rs:11-29,184-189`）。
+   `after_batch` 目前**零调用点、零实现**；`ExecutionResource` 四个变体只有 `Body` 被读。
+   身体模型改造会重新定义这里，现在动等于做两遍——但至少该确认这个判断还成立。
+
+### 第三梯队：需要维护者的产品答复，我不动
+
+8. **omission 计数的去留**（§3.4）。四级串联下 `dropped_count` 无良定义，
+   而 W07a 禁止把未知说成已知。这条我此前已经问过，还没有答复。
+9. **四层队列收敛成一层**（§3）。要先回答根问题：事实流为什么是推送式的？
+   `facade.rs:644-650` 的注释已经指向拉取式。这是架构判断，按 G07 走。
+10. **W06 / Q01 / S06 三条**（§6.1–6.3）。全部需要产品答复，不是实现选择。
+
+### 第四梯队：新增能力
+
+11. **身体模型**（工具从「动作」改为「状态分量」），以及 P04 的能力缺口（§6.4）。
+    建议**先补跳跃与潜行**——它们与已有的方向输入同章同链，缺了会让同伴过不去一格台阶。
+
+---
+
+## 11. 一句话总结
+
+这棵树最主要的形态是：**同一个东西被写了很多遍，而写多遍的原因往往是「上一次修补把问题往上推了一层」**。
+
+- 三车道准入算法 ×4，因为每层都在给下一层的背压兜底；
+- 历法算法 ×6，因为每个模块各自需要一个时间戳；
+- 一次性触发标志 ×4，因为两个模块各自需要取消与超时；
+- 手写 serde ×N，因为契约层选择在 trait 上就擦除类型。
+
+另有约 20% 的代码不在生产路径上，其中最大的一块（Information 控制面）
+连同它的 173 行 JavaScript 语义模拟，是把 TS 原型「已实现但未暴露」的状态**原样移植**的结果。
+
+这些都不是「写错了」——每一处都有当时成立的理由，而且大多写在注释里。
+问题是**理由的有效期过了**（并发源消失、oracle 退役、控制面没接上），而代码留了下来。
