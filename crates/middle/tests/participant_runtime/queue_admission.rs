@@ -858,11 +858,28 @@ async fn a_droppable_fact_never_blocks_the_producer_once_markers_are_exhausted()
         }
     }
 
+    // 关键的一步：让 worker 消化掉一条，再成功准入一条普通事实。成功准入会清掉
+    // open_loss_segment，于是下一次丢弃**不能**并进上一个标记——只有这样才会走到
+    // 「标记位耗尽」那条路。少了这一步，测试走的是旧快路，什么也证明不了。
+    runtime.worker_gate().allow(1);
+    for _ in 0..200 {
+        if runtime.queue_counts_for_test().0 < TEST_ORDINARY_CAPACITY {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        runtime.queue_counts_for_test().0 < TEST_ORDINARY_CAPACITY,
+        "worker 没有腾出 ordinary 的位置"
+    );
+    let mut filled = false;
     while runtime.queue_counts_for_test().0 < TEST_ORDINARY_CAPACITY {
         runtime
             .emit_internal(internal_fact("exhaust-tail", &current, "ordinary_fact"))
             .unwrap();
+        filled = true;
     }
+    assert!(filled, "至少要有一条成功准入来关闭当前丢失段");
     let (_, _, overflow, _, _) = runtime.queue_counts_for_test();
     assert_eq!(overflow, TEST_OVERFLOW_CAPACITY, "标记位应当已经耗尽");
 
