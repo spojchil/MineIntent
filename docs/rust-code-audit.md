@@ -135,24 +135,26 @@ serde_json 对整数键的 map **本来就**序列化成字符串键。这一处
 
 ---
 
-## 3. 后端：同一个三车道准入算法写了三遍，串联在一条链上
+## 3. 同一个三车道准入算法写了四遍，串联在一条链上
 
-这是本次梳理里最大的一处。事实从产生到送达监听器，要**依次穿过三个有界队列**，
-三个队列的结构、字段、算法和容量**逐字相同**：
+这是本次梳理里最大的一处。一条世界事实从产生到进入模型上下文，要**依次穿过四个有界队列**，
+四个队列的结构与字段**逐字相同**，前三个连容量都相同：
 
-| # | 类型 | 位置 | 容量常量 | 值 |
-|---|---|---|---|---|
-| 1 | `EventDispatchState` | `runtime/events.rs:20-254` | `RUNTIME_DISPATCH_{ORDINARY,CONTROL,OVERFLOW}_CAPACITY` | 256 / 512 / 64 |
-| 2 | `RuntimeEventQueue` | `runtime/events.rs:256-472` | `RUNTIME_BROKER_{ORDINARY,CONTROL,OVERFLOW}_CAPACITY` | 256 / 512 / 64 |
-| 3 | `EventBridge` | `facade.rs:48-320` | `{DISPATCH,CONTROL,OVERFLOW}_CAPACITY` | 256 / 512 / 64 |
+| # | 类型 | 位置 | 容量（ordinary/control/overflow） |
+|---|---|---|---|
+| 1 | `EventDispatchState` | `backend/src/runtime/events.rs:20-254` | 256 / 512 / 64 |
+| 2 | `RuntimeEventQueue` | `backend/src/runtime/events.rs:256-472` | 256 / 512 / 64 |
+| 3 | `EventBridge` | `backend/src/facade.rs:48-320` | 256 / 512 / 64 |
+| 4 | `ParticipantEventQueue` | `middle/src/participant/runtime/queue.rs:102-…` | 16 / 8 / 4 |
 
-**合计 725 行生产码**（另有 `runtime/tests/dispatch.rs` 与 `facade.rs` 测试模块中的对应测试）。
+前三份合计 **725 行**生产码，第四份所在的 `queue.rs` 另有 446 行
+（第四份多带清理编排，不是纯队列）。四份之外还有各自的测试。
 
-三份都有同一套成员：`ordinary` / `control` / `overflow` / `terminal` 四个槽，
-`next_sequence` / `next_admission` / `open_loss_segment` 三个游标；
-同一套方法：`enqueue`（或 `publish`）、`pop_next`、`record_overflow_loss`、`queued_counts`。
+四份都有同一套成员：`ordinary` / `control` / `overflow` / `terminal` 四个槽，
+`next_sequence`（第四份叫 `next_ticket`）/ `next_admission` / `open_loss_segment` 三个游标，
+外加 `closed`；同一套方法：`enqueue`、`pop_next`、`record_overflow_loss`、`queued_counts`。
 
-`enqueue` 的分支形状三处完全一致——先 terminal，再可丢事件的三段（有位置 / 并入当前丢失段 / 开新丢失段），
+前三份 `enqueue` 的分支形状完全一致——先 terminal，再可丢事件的三段（有位置 / 并入当前丢失段 / 开新丢失段），
 再控制车道，最后「取消就退出，否则 wait」：
 
 - `facade.rs:140` ↔ `events.rs:101` ↔ `events.rs:357`（terminal）
@@ -243,19 +245,144 @@ TS 原型里事实经 HTTP 桥从多个方向进来，排号是必要的；Rust 
 **结论**：在消费者停摆的场景下（也就是停机场景），一条本该被丢弃的实体事实会把生产者线程挂住。
 这正是 `停机不退出` 那条残余的具体形状——不是"控制车道满了才会阻塞"，可丢车道也会。
 
-### 3.4 三层各自产生 omission 标记，`dropped_count` 三个数不可合成
+### 3.4 四层各自产生 omission 标记，`dropped_count` 四个数不可合成
 
-`BackendEventKind::Overflow` 不在可丢集合里，所以上游产生的 overflow 标记
-到了下游会占用**控制**车道，并被如实转发。
+`BackendEventKind::Overflow` 不在可丢集合里（`facade.rs:1805`、`events.rs:556`），
+所以上游产生的 overflow 标记到了下游会占用**控制**车道，并被如实转发。
 
-于是一次突发可以产生三个标记：第 1 层丢了 500 条出一个，第 2 层把幸存的又丢了 100 条出一个，
-第 3 层再丢 30 条出一个。模型看到三条「丢了 N 条」，而这三个 N **既不是同一批事件，也无法相加**——
-它们描述的是同一条流在三个不同截面上的损失，彼此重叠关系不可知。
+于是一次突发可以产生四个标记：第 1 层丢了 500 条出一个，第 2 层把幸存的又丢了 100 条出一个，
+第 3 层再丢 30 条，第 4 层（容量只有 16/8/4）再丢一批。
+模型看到多条「丢了 N 条」，而这些 N **既不是同一批事件，也无法相加**——
+它们描述的是同一条流在四个不同截面上的损失，彼此重叠关系不可知。
 
 ⚠ 这直接落在我此前向维护者提出、尚未答复的那个问题上（「模型为什么要知道丢弃了多少」）。
-现在这个问题更尖锐了：**这个数字在三级串联下根本没有良定义。**
+现在这个问题更尖锐了：**这个数字在四级串联下根本没有良定义。**
 产品裁定要求的是「沉默不得伪装成完整」，一个布尔量「这里有损失」就能满足；
 一个不可合成的计数反而是在把未知说成已知——正撞 `产品.md` 的 **W07a**
 （「不得把未知说成已知」）。
 
 **这条我不自己动**：要不要保留计数、保留几层，是产品判断加架构判断，按 G06 走。
+
+---
+
+## 4. Information 子系统：约 15 100 行，控制面不在生产路径上
+
+`crates/middle/src/information/` 生产码 **7 225 行**，配套测试
+`crates/middle/tests/information_*.rs` **7 875 行**，合计约 **15 100 行**，
+占整个 Rust 代码库（80 564 行）的 **19%**。
+
+它实现了一整套通用信息查询控制面：catalog、query、selector、cursor、ref、
+access policy、trace、tool session、provider registry。
+
+**但它的控制面在生产里一次都没有被构造。**
+
+实测（`rg`，全库，区分「模块内 / 测试 / 模块外生产码」）：
+
+| 类型 | 模块外生产文件 |
+|---|---|
+| `InformationRuntime` | 无 |
+| `InformationToolSession` | 无 |
+| `InformationCatalogTool` | 无 |
+| `InformationRegistry` | 无 |
+| `InformationRefStore` | 无 |
+| `InformationCursorStore` | 无 |
+| `InformationAccessPolicy` | 无 |
+| `ViewportInformationProvider` | 无 |
+| `CurrentStatusProvider` / `InventoryProvider` / `SoundProvider` | 无 |
+| `InformationContextComposer` | 无 |
+| `InformationTrace` | 无 |
+
+`InformationRuntime` 这个名字在全库只出现在 6 个文件里：
+4 个在 `middle/src/information/` 内部，2 个是它自己的测试。
+组合根 `crates/app/src/lib.rs` 的 `use` 列表里**没有** `mineintent_middle::information`。
+
+模块外唯一的生产消费者是 `middle/src/participant/information_adapters.rs:23-33`，
+而它只用到四样东西：
+
+```rust
+use crate::information::{
+    format_utc_millis,                                        // support.rs
+    geometry::{distance_between, relative_bearing, Point3},   // geometry.rs  153 行
+    scope::InformationScopeSource,                            // scope.rs      80 行
+    source_ports::{ /* 14 个类型 */ },                        // source_ports/ 407 行
+    InformationClock, SystemInformationClock,                 // support.rs
+};
+```
+
+也就是说：**活着的大约 970 行，剩下约 6 250 行生产码加 7 875 行测试没有生产消费者。**
+
+这与 `docs/architecture.md:103-104` 记录的 TS 侧现状一致：
+
+> Information Runtime 还实现 catalog、help、selector、cursor 和权限机制，
+> 但这些通用接口目前没有作为模型工具暴露。
+
+移植把这个状态**原样搬了过来**：连同「没有暴露」这件事一起移植了。
+
+### 4.0 实测验证（不是推断）
+
+把 `information/mod.rs` 换成只保留 `contracts` / `geometry` / `scope` /
+`source_ports` / `support` 五项，其余 16 个文件的 `mod` 声明全部摘掉，然后编译：
+
+```
+$ cargo check -p mineintent-middle --lib
+    Finished `dev` profile ... （通过，11 条 warning）
+
+$ cargo check -p mineintent-app --bins
+    Finished `dev` profile ... （通过）
+```
+
+**生产二进制 `mineintent` 在整套 Information 控制面缺席的情况下照常编译。**
+摘掉的是 **5 110 行**生产码：
+
+| 文件 | 行 | 文件 | 行 |
+|---|---:|---|---:|
+| `runtime.rs` | 1 295 | `providers/viewport.rs` | 474 |
+| `registry.rs` | 475 | `providers/current_status.rs` | 250 |
+| `ref_store.rs` | 426 | `providers/inventory.rs` | 218 |
+| `context_composer.rs` | 368 | `providers/sound.rs` | 215 |
+| `cursor_store.rs` | 345 | `contracts/schemas.rs` | 221 |
+| `tool_session.rs` | 337 | `access_policy.rs` | 181 |
+| `control.rs` | 112 | `providers/schema.rs` | 67 |
+| `trace.rs` | 72 | `providers/mod.rs` | 54 |
+
+（`contracts/v1.rs` 1 093 行没摘，因为 `scope.rs` 依赖它；实际其中大部分也只服务于被摘掉的部分。）
+
+**这个实验还顺带证明了 §2**：摘掉之后 `middle` 冒出 11 条 `never used` 告警，
+逐条正是 §2 说的那套 JS 语义重实现：
+
+```
+warning: function `javascript_number_to_string` is never used
+warning: function `parse_javascript_date_millis` is never used
+warning: function `days_from_civil` is never used
+warning: function `clone_bounded_json` is never used
+warning: struct `JavaScriptJsonFormatter` is never constructed
+...（共 11 条，全部在 support.rs）
+```
+
+也就是说：**那 173 行 JavaScript 数字/日期语义的手工重实现，唯一的服务对象是
+`ref_store` 与 `cursor_store`，而这两个本身不在生产路径上。**
+它是服务于死代码的死代码——只是因为 `pub` 而没被编译器报出来。
+
+（实验后已 `git checkout` 还原，仓库状态未变。）
+
+### 4.1 一个由此产生的实际风险：无人接管的 panic
+
+`information_adapters.rs:1-6` 的模块文档写：
+
+> The source-port traits predate the Rust backend `Result` boundary, so failures
+> are converted to **stable panics** and are expected to be **caught by the
+> Information runtime/provider boundary**.
+
+于是文件里有 `snapshot_or_panic`（`:48`）、`observation_source_or_panic`（`:55`）、
+以及 `NON_FINITE_PANIC`（`:39`）。
+
+而**那个 boundary 不在生产路径上**——`InformationRuntime` 里那 9 处 `catch_unwind`
+（`runtime.rs:348/362/387/422/664/824/1107/1242`）全都不会执行。
+`information_adapters.rs` 自己只有一处 `catch_unwind`，在 `:434`，
+且只包住 `subscription.unsubscribe()`，不包这些取快照的路径。
+
+⚠ 我**没有**实测这些 panic 在生产里真的会发生（需要构造 backend 返回 `Err` 的场景），
+所以这条标为**需要验证**，不是已证实的缺陷。但「按注释所说的接管者不存在」这一点是确定的。
+
+相关背景：远程分支 `origin/experiment/no-panic-catch` 与 `origin/docs/panic-audit-and-toolloop`
+正是在做 panic 处置的专项，这条应当并进去看。
