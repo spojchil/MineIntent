@@ -7,13 +7,19 @@ use std::{
 
 use super::*;
 use crate::snapshot::{ExperienceSnapshot, InventorySnapshot, SelfSnapshot, WorldSnapshot};
+// Block / SelfState 的生产者已删（方块变化经视口到达，位置回拉 pose 就是当前值），
+// 但契约变体还在，覆盖全部 BackendEventKind 的夹具仍需构造它们。生产侧不再导入，
+// 所以在测试根这里引一次，子模块经 `use super::*` 共用。契约变体的去留见后续清理。
+use super::dto::contract_block_snapshot;
 use mineintent_contracts::minecraft::{
     BackendEventProtocol as ContractBackendEventProtocol,
     BlockPropertyValue as ContractBlockPropertyValue, CancellationSignal, Deadline,
-    HeardSoundType as ContractHeardSoundType, ProtocolEntityEvent as ContractProtocolEntityEvent,
+    HeardSoundType as ContractHeardSoundType, ProtocolBlockEvent as ContractProtocolBlockEvent,
+    ProtocolEntityEvent as ContractProtocolEntityEvent,
+    ProtocolSelfEvent as ContractProtocolSelfEvent,
     ProtocolSoundPayload as ContractProtocolSoundPayload,
     ProtocolSoundSource as ContractProtocolSoundSource,
-    ProtocolWorldEvent as ContractProtocolWorldEvent,
+    ProtocolWorldEvent as ContractProtocolWorldEvent, RelativeMovementFlags,
 };
 
 struct TestCancellation {
@@ -372,7 +378,6 @@ fn payload_json(event: &BackendEventEnvelope) -> serde_json::Value {
 }
 
 mod armor_formula;
-mod block_sound;
 mod command;
 mod dispatch;
 mod lifecycle;

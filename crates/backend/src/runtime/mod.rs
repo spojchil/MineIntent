@@ -19,7 +19,7 @@ use azalea::{
     bot::DefaultBotPlugins,
     ecs::{
         message::{MessageReader, MessageWriter},
-        prelude::{Add, Commands, On, Query, With},
+        prelude::{Commands, On, Query, With},
         system::Res,
     },
     entity::{dimensions::EntityDimensions, Dead, LocalEntity, Physics, Position},
@@ -41,8 +41,7 @@ use mineintent_contracts::minecraft::{
     DirectedViewportProjection, EntityEquipmentSnapshot as ContractEntityEquipmentSnapshot,
     EntityRemovalReason as ContractEntityRemovalReason, FactSource as ContractFactSource,
     HeardSoundType as ContractHeardSoundType, ObservationEvent, ObservationEventListener,
-    OperationControl, ProtocolBlockEvent as ContractProtocolBlockEvent,
-    ProtocolBlockSnapshot as ContractProtocolBlockSnapshot,
+    OperationControl, ProtocolBlockSnapshot as ContractProtocolBlockSnapshot,
     ProtocolChatEvent as ContractProtocolChatEvent,
     ProtocolEntityEvent as ContractProtocolEntityEvent,
     ProtocolEntitySnapshot as ContractProtocolEntitySnapshot, ProtocolObservationSource,
@@ -116,9 +115,9 @@ use driver::validate_run_config;
 use driver::SwarmState;
 pub use driver::{run, run_with_handle};
 use dto::{
-    backend_error_from_directed, contract_block_read_result, contract_block_snapshot,
-    contract_entity_snapshot, contract_fact_source, contract_self_pose,
-    contract_viewport_projection, observation_event_from_backend,
+    backend_error_from_directed, contract_block_read_result, contract_entity_snapshot,
+    contract_fact_source, contract_self_pose, contract_viewport_projection,
+    observation_event_from_backend,
 };
 use entity::merge_refreshed_tracked_entities;
 #[cfg(test)]
@@ -140,8 +139,8 @@ use frame::{read_block_from_world, LightCache, LightSectionGeometry};
 pub use handle::{RuntimeFrameFacts, RuntimeHandle};
 pub use observation::RuntimeObservationSource;
 #[cfg(test)]
-use producers::{produce_entity_packet_events, prove_has_skylight, CanonicalPacketSourceMetadata};
-use producers::{BlockSoundProducerPlugin, EntityProducerPlugin, RespawnBoundaryPlugin};
+use producers::{produce_entity_packet_events, prove_has_skylight};
+use producers::{EntityProducerPlugin, RespawnBoundaryPlugin};
 use state::*;
 
 #[cfg(test)]

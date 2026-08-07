@@ -19,7 +19,6 @@ fn stamped_block_app() -> (
         azalea::local_player::WorldHolder::new(owner, empty_world()),
         azalea::block_update::QueuedServerBlockUpdates::default(),
         azalea::interact::BlockStatePredictionHandler::default(),
-        CanonicalPacketSourceMetadata::default(),
     ));
     app.insert_resource(SwarmState {
         shared: handle.shared.clone(),
@@ -32,7 +31,6 @@ fn stamped_block_app() -> (
             azalea::block_update::handle_block_update_event,
         ),
     );
-    app.add_plugins(BlockSoundProducerPlugin);
     let events = handle.subscribe();
     (handle, app, owner, events)
 }
@@ -57,18 +55,6 @@ fn bind_stamped_attempt(
         .insert_resource(super::entity_events_owner_tests::TestAttemptToken(token));
 }
 
-fn block_update_packet(
-    position: azalea::BlockPos,
-    state_id: u32,
-) -> azalea::protocol::packets::game::ClientboundGamePacket {
-    azalea::protocol::packets::game::ClientboundGamePacket::BlockUpdate(
-        azalea::protocol::packets::game::ClientboundBlockUpdate {
-            pos: position,
-            block_state: test_block_state(state_id),
-        },
-    )
-}
-
 fn drain_events(receiver: &mut RuntimeEventReceiver) -> Vec<BackendEventEnvelope> {
     std::iter::from_fn(|| receiver.try_recv().ok()).collect()
 }
@@ -82,14 +68,10 @@ fn stamped_rebind_restores_production_and_late_a_packets_are_rejected() {
     let _ = drain_events(&mut events);
 
     // A packet is admitted on epoch 1 through the stamped source path.
-    queue_production_block_packet(
-        &mut app,
-        owner,
-        azalea::BlockPos { x: 0, y: 0, z: 0 },
-        test_block_state(1),
-    );
+    // 载体是声音包：方块生产者已删，本测试的主题是 token 绑定而不是方块。
+    queue_production_sound_packet(&mut app, owner, token_a, 1.0);
     app.update();
-    assert_eq!(block_events(&mut events).len(), 1);
+    assert_eq!(sound_events(&mut events).len(), 1);
 
     assert!(handle
         .shared
@@ -104,15 +86,10 @@ fn stamped_rebind_restores_production_and_late_a_packets_are_rejected() {
     bind_stamped_attempt(&handle, &mut app, owner, token_b);
     let _ = drain_events(&mut events);
 
-    queue_production_block_packet(
-        &mut app,
-        owner,
-        azalea::BlockPos { x: 1, y: 0, z: 0 },
-        test_block_state(2),
-    );
+    queue_production_sound_packet(&mut app, owner, token_b, 1.25);
     app.update();
     assert_eq!(
-        block_events(&mut events).len(),
+        sound_events(&mut events).len(),
         1,
         "stamped B must be accepted even after same-entity reuse made the fence ambiguous"
     );
@@ -126,18 +103,10 @@ fn stamped_rebind_restores_production_and_late_a_packets_are_rejected() {
             .is_none(),
         "a late A packet must be rejected at the stamped source admission"
     );
-    app.world_mut()
-        .write_message(azalea::packet::game::ReceiveGamePacketEvent {
-            entity: owner,
-            packet: Arc::new(block_update_packet(
-                azalea::BlockPos { x: 2, y: 0, z: 0 },
-                3,
-            )),
-            attempt_token: token_a,
-        });
+    queue_production_sound_packet(&mut app, owner, token_a, 1.5);
     app.update();
     assert!(
-        block_events(&mut events).is_empty(),
+        sound_events(&mut events).is_empty(),
         "a late A packet must not publish into B's epoch"
     );
 }

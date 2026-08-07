@@ -36,60 +36,20 @@ impl Plugin for EntityProducerPlugin {
     }
 }
 
-/// Completes the backend-owned block/chunk/sound observation seam around
-/// Azalea's existing ordered packet queue and world handlers.  It deliberately
-/// leaves light, armor, transport, and SoundEntity outside this slice.
-pub(super) struct BlockSoundProducerPlugin;
-
-/// Immutable source stamps produced by the one ordered raw-packet reducer.
-///
-/// The payloads remain in Azalea's own queue/messages. These vectors contain
-/// only one optional admission stamp per vendor queue item / ReceiveChunkEvent,
-/// are consumed by the corresponding Update system, and are cleared on every
-/// consumption even when their length does not match. A mismatch therefore
-/// fails closed for observation without becoming a cross-tick spill queue.
-#[derive(Component, Default)]
-pub(super) struct CanonicalPacketSourceMetadata {
-    block_updates: Vec<Option<CanonicalSourceAdmission>>,
-    chunk_loads: VecDeque<CanonicalChunkLoadStamp>,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct CanonicalChunkLoadStamp {
-    source: Option<CanonicalSourceAdmission>,
-    chunk_x: i32,
-    chunk_z: i32,
-}
-
-impl Plugin for BlockSoundProducerPlugin {
-    fn build(&self, app: &mut App) {
-        // The entity producer is the sole ordered raw-packet reducer. It
-        // stamps block/chunk items and publishes direct sound/unload facts at
-        // their packet positions before any Login/Respawn scope transition
-        // can be observed by a later raw item.
-        app.add_observer(attach_canonical_packet_source_metadata)
-            // Chunk loading must be observed after Azalea has completed its
-            // ReceiveChunkEvent handler.  Block updates then replace the vendor
-            // handler at the same ordering boundary, preserving packet order and
-            // post-state callbacks one item at a time.
-            .add_systems(
-                Update,
-                (produce_chunk_loaded_events, produce_block_update_events)
-                    .chain()
-                    .after(azalea::chunks::handle_receive_chunk_event)
-                    .before(azalea::block_update::handle_block_update_event),
-            );
-    }
-}
-
-pub(super) fn attach_canonical_packet_source_metadata(
-    trigger: On<Add, azalea::block_update::QueuedServerBlockUpdates>,
-    mut commands: Commands,
-) {
-    commands
-        .entity(trigger.entity)
-        .insert(CanonicalPacketSourceMetadata::default());
-}
+// 这里曾有 BlockSoundProducerPlugin：它把区块加载与方块更新转成
+// Block 事件，并顺带用 CanonicalPacketSourceMetadata 给每个 vendor 队列项打来源戳。
+//
+// 全部删除。方块更新那个 system 尤其要说明：它 `std::mem::take` 走 azalea 的
+// `QueuedServerBlockUpdates`，然后**自己把方块写进世界**（注释原话是「Match
+// Azalea's vendor handler exactly」），跑在 vendor handler 之前把队列清空。删掉之后
+// vendor handler 拿到满队列照常处理——职责交还 azalea，我们不再复制它。
+// （已确认没有 disable 掉 azalea 的方块插件：driver.rs 只 disable 了 AutoRespawn /
+// AcceptResourcePacks / AutoReconnect 三个。）
+//
+// 事件本身也不该存在：方块变化在 azalea 的世界模型里已经生效，视口读到的就是变化
+// 之后的状态。再发一条「方块变了」，描述的是视口本来就会读到的事，而它在参与者
+// 队列里既不成为事实也不能唤醒——只是占槽。判据见
+// docs/participant-queue-audit.md 与 docs/vanilla-client-perception.md。
 
 pub(super) fn canonical_sound_name(
     sound: &azalea::registry::Holder<
@@ -149,181 +109,6 @@ pub(super) fn current_light_geometry(
     LightSectionGeometry::from_world(&world)
 }
 
-pub(super) fn record_canonical_packet_source_metadata(
-    metadata: &mut Query<&mut CanonicalPacketSourceMetadata>,
-    event: &azalea::packet::game::ReceiveGamePacketEvent,
-    source: Option<CanonicalSourceAdmission>,
-) {
-    let Ok(mut metadata) = metadata.get_mut(event.entity) else {
-        // The Update consumer will see the missing component as a metadata
-        // mismatch and apply the vendor payloads without publishing them.
-        return;
-    };
-    match event.packet.as_ref() {
-        azalea::protocol::packets::game::ClientboundGamePacket::BlockUpdate(_) => {
-            metadata.block_updates.push(source);
-        }
-        azalea::protocol::packets::game::ClientboundGamePacket::SectionBlocksUpdate(packet) => {
-            for _ in &packet.states {
-                metadata.block_updates.push(source);
-            }
-        }
-        azalea::protocol::packets::game::ClientboundGamePacket::LevelChunkWithLight(packet) => {
-            metadata.chunk_loads.push_back(CanonicalChunkLoadStamp {
-                source,
-                chunk_x: packet.x,
-                chunk_z: packet.z,
-            });
-        }
-        _ => {}
-    }
-}
-
-pub(super) fn produce_chunk_loaded_events(
-    mut events: MessageReader<azalea::chunks::ReceiveChunkEvent>,
-    state: Res<SwarmState>,
-    world_holders: Query<&azalea::local_player::WorldHolder>,
-    mut source_metadata: Query<&mut CanonicalPacketSourceMetadata>,
-) {
-    let mut pending = Vec::new();
-    let mut metadata_aligned = true;
-    for event in events.read() {
-        let stamp = source_metadata
-            .get_mut(event.entity)
-            .ok()
-            .and_then(|mut metadata| metadata.chunk_loads.pop_front());
-        if stamp.is_none_or(|stamp| {
-            stamp.chunk_x != event.packet.x
-                || stamp.chunk_z != event.packet.z
-                || stamp
-                    .source
-                    .is_some_and(|source| source.entity != event.entity)
-        }) {
-            metadata_aligned = false;
-        }
-        pending.push((event, stamp));
-    }
-    // A missing or extra ReceiveChunkEvent is a metadata mismatch, never a
-    // reason to retain stamps for a later tick.
-    for mut metadata in source_metadata.iter_mut() {
-        if !metadata.chunk_loads.is_empty() {
-            metadata_aligned = false;
-        }
-        metadata.chunk_loads.clear();
-    }
-    if !metadata_aligned {
-        return;
-    }
-
-    for (event, stamp) in pending {
-        let Some(source) = stamp.and_then(|stamp| stamp.source) else {
-            continue;
-        };
-        let loaded = world_holders.get(event.entity).ok().is_some_and(|holder| {
-            holder
-                .shared
-                .read()
-                .chunks
-                .get(&azalea::core::position::ChunkPos::new(
-                    event.packet.x,
-                    event.packet.z,
-                ))
-                .is_some()
-        });
-        if !loaded {
-            continue;
-        }
-        state.shared.emit_canonical_observation_event(
-            source,
-            BackendEventPayload::Block(ContractProtocolBlockEvent::ChunkLoaded {
-                chunk_x: event.packet.x,
-                chunk_z: event.packet.z,
-            }),
-        );
-    }
-}
-
-pub(super) fn produce_block_update_events(
-    mut query: Query<(
-        bevy_ecs::entity::Entity,
-        &mut azalea::block_update::QueuedServerBlockUpdates,
-        &azalea::local_player::WorldHolder,
-        &mut azalea::interact::BlockStatePredictionHandler,
-        Option<&mut CanonicalPacketSourceMetadata>,
-    )>,
-    state: Res<SwarmState>,
-) {
-    for (entity, mut queued, world_holder, mut prediction_handler, source_metadata) in
-        query.iter_mut()
-    {
-        // This takes ownership of Azalea's existing ordered queue storage; it
-        // is not a second shadow/spill queue.  Every item is applied in order
-        // and published/drained before the next callback can run.
-        let updates = std::mem::take(&mut queued.list);
-        let block_stamps =
-            source_metadata.map(|mut metadata| std::mem::take(&mut metadata.block_updates));
-        let stamps_aligned = block_stamps.as_ref().is_some_and(|stamps| {
-            stamps.len() == updates.len()
-                && stamps
-                    .iter()
-                    .all(|stamp| stamp.is_none_or(|source| source.entity == entity))
-        });
-        for (index, (position, block_state)) in updates.into_iter().enumerate() {
-            let old_block = {
-                let world = world_holder.shared.read();
-                match read_block_from_world(
-                    &world,
-                    BlockPosition {
-                        x: position.x,
-                        y: position.y,
-                        z: position.z,
-                    },
-                ) {
-                    BlockReadResult::Loaded { block } => Some(block),
-                    BlockReadResult::Unloaded | BlockReadResult::OutOfWorld => None,
-                }
-            };
-
-            // Match Azalea's vendor handler exactly: a prediction acknowledgement
-            // consumes the server state without rewriting the world; otherwise
-            // the packet state is written to the shared world.
-            let prediction_consumed =
-                prediction_handler.update_known_server_state(position, block_state);
-            if !prediction_consumed {
-                let world = world_holder.shared.read();
-                world.chunks.set_block_state(position, block_state);
-            }
-
-            let source = stamps_aligned
-                .then(|| {
-                    block_stamps
-                        .as_ref()
-                        .and_then(|stamps| stamps.get(index).copied())
-                })
-                .flatten()
-                .flatten();
-            let Some(source) = source else {
-                continue;
-            };
-            let new_block = block_snapshot(
-                BlockPosition {
-                    x: position.x,
-                    y: position.y,
-                    z: position.z,
-                },
-                block_state,
-            );
-            state.shared.emit_canonical_observation_event(
-                source,
-                BackendEventPayload::Block(ContractProtocolBlockEvent::Updated {
-                    old_block: old_block.map(contract_block_snapshot),
-                    new_block: Some(contract_block_snapshot(new_block)),
-                }),
-            );
-        }
-    }
-}
-
 pub(super) fn admit_canonical_join_source(
     mut events: MessageReader<azalea::join::StartJoinServerEvent>,
     state: Res<SwarmState>,
@@ -373,14 +158,11 @@ pub(super) fn produce_entity_packet_events(
     state: Res<SwarmState>,
     local_entities: Query<&azalea::core::entity_id::MinecraftEntityId, With<LocalEntity>>,
     world_holders: Query<&azalea::local_player::WorldHolder>,
-    mut source_metadata: Query<&mut CanonicalPacketSourceMetadata>,
 ) {
     for event in packets.read() {
         let source = state
             .shared
             .admit_canonical_source_with_token(event.entity, Some(event.attempt_token));
-        record_canonical_packet_source_metadata(&mut source_metadata, event, source);
-
         match event.packet.as_ref() {
             azalea::protocol::packets::game::ClientboundGamePacket::Sound(packet) => {
                 if let (Some(source), Some((sound_name, source_position, volume, pitch))) =
@@ -397,17 +179,14 @@ pub(super) fn produce_entity_packet_events(
                 continue;
             }
             azalea::protocol::packets::game::ClientboundGamePacket::ForgetLevelChunk(packet) => {
+                // 只维护光照缓存。曾经这里还发一条 Block(ChunkUnloaded) 事件——
+                // 已删：区块卸载在 azalea 的世界模型里已经生效，视口读到的就是
+                // 卸载之后的状态（`BlockReadResult::Unloaded`），再发一条事件描述
+                // 的是视口本来就会看到的事。
                 if let Some(source) = source {
                     let _ = state
                         .shared
                         .remove_light_chunk(source, packet.pos.x, packet.pos.z);
-                    state.shared.emit_canonical_observation_event(
-                        source,
-                        BackendEventPayload::Block(ContractProtocolBlockEvent::ChunkUnloaded {
-                            chunk_x: packet.pos.x,
-                            chunk_z: packet.pos.z,
-                        }),
-                    );
                 }
                 continue;
             }

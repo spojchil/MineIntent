@@ -1,45 +1,5 @@
 use super::*;
 
-pub(super) struct ImmediateBlockObservationReader {
-    pub(super) source: RuntimeObservationSource,
-    pub(super) seen: Arc<parking_lot::Mutex<Vec<(Option<u32>, u32, Option<u32>)>>>,
-}
-
-impl ObservationEventListener for ImmediateBlockObservationReader {
-    fn on_event(&self, event: ObservationEvent) {
-        let ObservationEvent::Block(envelope) = event else {
-            return;
-        };
-        let ContractProtocolBlockEvent::Updated {
-            old_block,
-            new_block,
-        } = envelope.payload
-        else {
-            return;
-        };
-        let new_block = new_block.expect("accepted block update has a new block");
-        let position = ContractBlockPosition {
-            x: new_block.position.x,
-            y: new_block.position.y,
-            z: new_block.position.z,
-        };
-        let read_state_id = match self
-            .source
-            .read_block(position)
-            .expect("callback block read")
-        {
-            ContractBlockReadResult::Loaded { block } => Some(block.state_id),
-            ContractBlockReadResult::Unloaded => None,
-            other => panic!("callback block read left the world height, got {other:?}"),
-        };
-        self.seen.lock().push((
-            old_block.map(|block| block.state_id),
-            new_block.state_id,
-            read_state_id,
-        ));
-    }
-}
-
 pub(super) fn producer_test_app() -> (
     RuntimeHandle,
     App,
@@ -74,7 +34,6 @@ pub(super) fn producer_test_app_without_world() -> (
         azalea::local_player::WorldHolder::new(owner, shared_world.clone()),
         azalea::block_update::QueuedServerBlockUpdates::default(),
         azalea::interact::BlockStatePredictionHandler::default(),
-        CanonicalPacketSourceMetadata::default(),
     ));
     app.insert_resource(SwarmState {
         shared: handle.shared.clone(),
@@ -87,7 +46,6 @@ pub(super) fn producer_test_app_without_world() -> (
             azalea::block_update::handle_block_update_event,
         ),
     );
-    app.add_plugins(BlockSoundProducerPlugin);
 
     assert!(handle.shared.begin_connection_attempt());
     let test_token = synthetic_attempt_token();
@@ -109,57 +67,8 @@ pub(super) fn producer_test_app_without_world() -> (
     (handle, app, owner, shared_world, source, events)
 }
 
-pub(super) fn test_block_state(id: u32) -> azalea::block::BlockState {
-    azalea::block::BlockState::try_from(id).expect("test block state id")
-}
-
 pub(super) fn synthetic_attempt_token() -> azalea::join::AttemptToken {
     azalea::join::AttemptToken::mint()
-}
-
-pub(super) fn install_shared_chunk(
-    shared_world: &SharedWorld,
-    pos: azalea::core::position::ChunkPos,
-) -> Arc<parking_lot::RwLock<azalea::world::Chunk>> {
-    shared_world
-        .write()
-        .chunks
-        .upsert(pos, azalea::world::Chunk::default())
-}
-
-pub(super) fn expose_shared_chunk(
-    app: &mut App,
-    owner: bevy_ecs::entity::Entity,
-    pos: azalea::core::position::ChunkPos,
-    chunk: Arc<parking_lot::RwLock<azalea::world::Chunk>>,
-) {
-    let holder = app
-        .world_mut()
-        .get::<azalea::local_player::WorldHolder>(owner)
-        .expect("test world holder")
-        .clone();
-    holder.partial.write().chunks.limited_set(&pos, Some(chunk));
-}
-
-pub(super) fn queue_production_block_packet(
-    app: &mut App,
-    owner: bevy_ecs::entity::Entity,
-    position: azalea::BlockPos,
-    state: azalea::block::BlockState,
-) {
-    let packet = azalea::protocol::packets::game::ClientboundGamePacket::BlockUpdate(
-        azalea::protocol::packets::game::ClientboundBlockUpdate {
-            pos: position,
-            block_state: state,
-        },
-    );
-    azalea::packet::game::process_packet(
-        app.world_mut(),
-        owner,
-        &packet,
-        synthetic_attempt_token(),
-    );
-    queue_producer_packet(app, owner, packet);
 }
 
 pub(super) fn queue_producer_packet(
@@ -179,13 +88,39 @@ pub(super) fn queue_producer_packet(
         });
 }
 
-pub(super) fn block_events(events: &mut RuntimeEventReceiver) -> Vec<ContractProtocolBlockEvent> {
+/// 取出声音载荷。
+///
+/// 曾经这里是 `block_events`：方块更新有专门的生产者，测试拿方块包当「一条被
+/// 发布的观察事实」的载体。那个生产者已删（方块变化经视口到达，不再发事件），
+/// 载体换成声音——它是归约器仍然发布的那一类。
+pub(super) fn sound_events(events: &mut RuntimeEventReceiver) -> Vec<ContractProtocolSoundPayload> {
     std::iter::from_fn(|| events.try_recv().ok())
         .filter_map(|event| match event.payload {
-            BackendEventPayload::Block(payload) => Some(payload),
+            BackendEventPayload::Sound(payload) => Some(payload),
             _ => None,
         })
         .collect()
+}
+
+/// 把一条声音包投进归约器，作为「发布一条观察事实」的最小驱动。
+pub(super) fn queue_production_sound_packet(
+    app: &mut App,
+    owner: bevy_ecs::entity::Entity,
+    attempt_token: azalea::join::AttemptToken,
+    pitch: f32,
+) {
+    app.world_mut()
+        .write_message(azalea::packet::game::ReceiveGamePacketEvent {
+            entity: owner,
+            packet: Arc::new(sound_packet(
+                azalea::registry::Holder::Reference(
+                    azalea::registry::builtin::SoundEvent::BlockAnvilLand,
+                ),
+                1.0,
+                pitch,
+            )),
+            attempt_token,
+        });
 }
 
 pub(super) fn sound_packet(
@@ -206,24 +141,6 @@ pub(super) fn sound_packet(
             volume,
             pitch,
             seed: 42,
-        },
-    )
-}
-
-pub(super) fn empty_chunk_packet(
-    x: i32,
-    z: i32,
-) -> azalea::protocol::packets::game::ClientboundGamePacket {
-    azalea::protocol::packets::game::ClientboundGamePacket::LevelChunkWithLight(
-        azalea::protocol::packets::game::ClientboundLevelChunkWithLight {
-            x,
-            z,
-            chunk_data: azalea::protocol::packets::game::c_level_chunk_with_light::ClientboundLevelChunkPacketData {
-                heightmaps: Vec::new(),
-                data: Arc::new(Vec::<u8>::new().into_boxed_slice()),
-                block_entities: Vec::new(),
-            },
-            light_data: Default::default(),
         },
     )
 }

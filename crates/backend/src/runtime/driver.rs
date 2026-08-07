@@ -464,7 +464,6 @@ pub async fn run_with_handle(
             .disable::<AcceptResourcePacksPlugin>()
             .disable::<AutoReconnectPlugin>(),
         EntityProducerPlugin,
-        BlockSoundProducerPlugin,
         RespawnBoundaryPlugin,
         RuntimeShutdownPlugin,
         DefaultSwarmPlugins,

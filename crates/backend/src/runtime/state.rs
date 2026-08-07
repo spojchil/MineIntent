@@ -501,10 +501,13 @@ impl SharedRuntime {
         self.backend_state.read().clone()
     }
 
-    /// Publish one canonical block/sound observation after applying the
-    /// source fact.  Admission and writer envelope construction share the
-    /// command lock, while draining and callbacks happen only after all
-    /// world/producer locks have been released by the caller.
+    /// 按来源发布一条观察事实。载荷无关。
+    ///
+    /// 生产侧已经没有调用者：方块与位置回拉的生产者都已删除，声音走
+    /// `emit_canonical_sound`。保留它是因为两处测试要的正是「在某个来源上发布
+    /// 一条事实」这个**载荷无关**的原语，用来验证晚到作用域的 fail-closed
+    /// 与跨 attempt 的发布拒绝——那些测试的主题是准入，不是载荷。
+    #[cfg(test)]
     pub(super) fn emit_canonical_observation_event(
         &self,
         source: CanonicalSourceAdmission,
@@ -513,7 +516,6 @@ impl SharedRuntime {
         // Test probe runs *outside* the command admission lock, so a
         // deterministic test can rebind the owner between source admission
         // and publication without deadlocking.
-        #[cfg(test)]
         self.invoke_canonical_publication_probe();
         let should_drain = {
             let _admission = self.command_admission.lock();

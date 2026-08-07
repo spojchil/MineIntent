@@ -1,12 +1,5 @@
 use super::*;
 
-// SelfState 现在没有生产者（`record_server_position_corrections` 已删），但契约
-// 变体还在，下面覆盖全部 `BackendEventKind` 的夹具仍需要构造它。生产侧不再导入
-// 这两个类型，所以在这里单独引。契约变体本身的去留见后续清理。
-use mineintent_contracts::minecraft::{
-    ProtocolSelfEvent as ContractProtocolSelfEvent, RelativeMovementFlags,
-};
-
 #[test]
 fn observation_callback_can_stop_without_deadlock_and_preserves_fifo() {
     let handle = RuntimeHandle::new(RunConfig::default());
