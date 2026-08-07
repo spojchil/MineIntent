@@ -84,7 +84,8 @@ impl MineIntentApp {
     pub async fn start(config: AppConfig) -> Result<Self, AppError> {
         devlog::init_tracing();
         devlog::init(&config.data_directory);
-        // 实验分支：全仓无 panic 捕获，所以每一次 panic 都要能定位到线程与栈。
+        // 生产代码零 catch_unwind，所以每一次 panic 都要能定位到线程与栈。
+        // 这个钩子还是「允许丢弃 panic」的前提条件——规则见 docs/panic-practice.md。
         devlog::install_panic_hook();
         devlog::log(
             "app",
