@@ -28,19 +28,24 @@ public void onPlaySound(SoundInstance s, WeighedSoundEvents e, float range) {
 
 字幕来自 `sounds.json` 每个 sound event 的 `subtitle` 字段，**可选**。
 
-**从 1807 种声音收敛到 926 行，是三级归并：**
+**从 1902 种声音收敛到 926 行，是三级归并：**
 
 | 层级 | 数量 | 归并方式 | 出处 |
 |---|---:|---|---|
-| sound event | **1807** | —— | `SoundEvents.class` 常量池注册名（与 1808 个 sound-event 字段吻合） |
+| sound event | **1902** | —— | azalea `azalea-registry/src/builtin.rs` 的 `SoundEvent` 枚举（见 §4） |
 | subtitle 键 | **998** | 多个事件可共用一个键，也可以没有键 | `en_us.json` 的 `subtitles.*` |
 | **不同字幕文本** | **926** | 多个键可共用一段文本 | 上表去重 |
 | 同屏行数 | **≤926** | `SubtitleOverlay` 按文本 `equals` 再去重 | §1.2 |
 
-按名字直接匹配，1807 个事件里 928 个有同名字幕键、879 个没有。但这是**下界**——
-共用键的情况按名字匹配不上，已知例子：所有方块的脚步声共用
-`block.generic.footsteps`，各下界生物群系的环境音共用 `ambient.cave`。真正的映射
-在 `sounds.json` 里，而它不在 jar 里（见 §6）。
+> **计数订正。** 从 jar 的 `SoundEvents.class` 常量池只能提出 **1807** 条，那是个
+> 下界：cat / wolf / pig / cow / chicken 的声音变体族与 goat_horn 在 26.1.2 里改成
+> 了数据驱动的 `Map<XxxSoundVariants$SoundSet, …>` 字段，ID 不作为常量池字符串出现，
+> 共 95 条被漏掉。jar 提出的 1807 条是 azalea 1902 条的**真子集**（交集 1807，
+> jar 独有 0）。
+
+按名字直接匹配，事件里约 928 个有同名字幕键。剩下的是**下界不是真值**——共用键的
+情况按名字匹配不上，已知例子：所有方块的脚步声共用 `block.generic.footsteps`，
+各下界生物群系的环境音共用 `ambient.cave`。真正的映射在 `sounds.json` 里（见 §4.3）。
 
 **这个不确定性不影响结论**：无论多少事件有字幕，能出现的不同行**至多 926 种**，
 这个数是精确的。
@@ -168,9 +173,67 @@ protected EntityReference<Player> lastHurtByPlayer;
 3. **状态**：`lastHurtByMob` / `lastHurtByPlayer`——「谁打的我」是被维护的引用，不是事件
 4. **字幕**：`Player hurts` / `Player burns` / `Player drowning` 走 §1 的通道
 
-## 4. 对我们的意义
+## 4. azalea 已经给了我们什么
 
-### 4.1 声音的量级问题消解了
+工作树：`~/.cargo/git/checkouts/azalea-*/d0cc847`（我们钉住的 fork）。
+
+### 4.1 已有：声音事件
+
+`azalea-registry/src/builtin.rs` 的 `SoundEvent` 枚举，**1902 条**，带类型化变体与
+注册名：
+
+```rust
+enum SoundEvent {
+    EntityAllayAmbientWithItem => "entity.allay.ambient_with_item",
+    ...
+}
+```
+
+包体是 `ClientboundSound`（`azalea-protocol/src/packets/game/c_sound.rs`）：
+
+```rust
+pub struct ClientboundSound {
+    pub sound: azalea_registry::Holder<SoundEvent, CustomSound>,
+    pub source: SoundSource,     // Master/Music/Records/Weather/Blocks/
+                                 // Hostile/Neutral/Players/Ambient/Voice
+    pub x: i32, pub y: i32, pub z: i32,   // 定点，不是 BlockPos
+    pub volume: f32, pub pitch: f32, pub seed: u64,
+}
+```
+
+### 4.2 已有：字幕文本本身
+
+`azalea-language/src/en_us.json` 与 jar 内 `assets/minecraft/lang/en_us.json`
+**内容完全一致**：
+
+| | 总键数 | `subtitles.*` | 键差异 | 文本差异 |
+|---|---:|---:|---:|---:|
+| jar | 7886 | 998 | — | — |
+| azalea | 7886 | 998 | **0** | **0** |
+
+也就是说 **926 段字幕文本我们已经在依赖里了**，不需要额外下载。
+`azalea-chat/src/translatable_component.rs` 还带翻译键展开的机制。
+
+> ⚠ 易混：`azalea-protocol/.../c_set_subtitle_text.rs` 是**标题下方的副标题**
+> （Title/Subtitle 屏幕文字）那个包，与声音字幕无关。
+
+### 4.3 唯一缺的：event → subtitle 键的映射
+
+这个映射在 `sounds.json` 里，而它：
+
+- **不在 client.jar 里**——`assets/minecraft/` 第一层确认没有，它是单独下载的资产对象
+- **不在 azalea 里**——azalea 是无头客户端，不加载资产
+
+按名字约定能对上约一半（`entity.allay.death` → `subtitles.entity.allay.death`），
+另一半靠共用键，对不上。要精确映射，需要按资产索引取一次 `sounds.json`——一次性
+构建期产物，可以像 `client.jar` 一样入 `supplies/`。
+
+**当前差距因此非常具体**：我们已经有事件、有坐标、有类别、有全部字幕文本；差的是
+一张 1902 → 998 的映射表。
+
+## 5. 对我们的意义
+
+### 5.1 声音的量级问题消解了
 
 我此前记的待验证项「声音的真实量级没实测」，被字幕机制回答了：
 
@@ -183,28 +246,28 @@ protected EntityReference<Player> lastHurtByPlayer;
 | 超出 `range` 的 | 逐帧重判 | 0 条 |
 
 **「哪些声音该到模型」这个问题，Mojang 已经替我们答过了**——就是那 926 段文本，
-而且是从 1807 种声音三级归并下来的。
+而且是从 1902 种声音三级归并下来的。
 
-### 4.2 它是状态，不是流
+### 5.2 它是状态，不是流
 
 `SubtitleOverlay` 维护的是「此刻该显示什么」，每帧重算。这和我们现在
 `SoundHistory` 存原始声音事件（ID、类别、坐标、音量、音高，无归并、无字幕文本）
 不是一回事：模型现在收到的是**协议原料**，而不是玩家真正感知到的那一行。
 
-### 4.3 聊天历史工具（W08b）有了现成形状
+### 5.3 聊天历史工具（W08b）有了现成形状
 
 > **W08b｜已确认**：公屏历史工具应当让其保存范围内的**全部**消息可查。
 
 原版就是这么做的：100 条上界、带 `source` 三态、不带时间戳、按需回看。我们当前
 6 个工具里**没有这个工具**，聊天因此被塞进事件通道——而事件通道会丢它。
 
-### 4.4 一条判据
+### 5.4 一条判据
 
 原版对每一样瞬时事物都做了同一件事：**把「发生过什么」折叠成「现在该让玩家知道
 什么」**。折叠的方式各不相同（字幕按文本归并、聊天按条数截断、受伤按倒计时衰减），
 但方向一致——**没有任何一处保留了「待处理事件」的队列。**
 
-## 5. 复核命令
+## 6. 复核命令
 
 ```sh
 J=supplies/mojang/26.1.2/client.jar
@@ -219,19 +282,26 @@ unzip -o -j "$J" 'net/minecraft/client/gui/components/ChatComponent.class' \
                  'net/minecraft/client/multiplayer/chat/GuiMessage*.class' -d /tmp/mc
 "$JAVAP" -p -constants /tmp/mc/ChatComponent.class
 
-# 998 条字幕
+# 998 条字幕键 / 926 段不同文本（jar 与 azalea 结果一致）
 unzip -o -j "$J" assets/minecraft/lang/en_us.json -d /tmp/mc
 python3 -c "import json;d=json.load(open('/tmp/mc/en_us.json'));\
-print(sum(1 for k in d if k.startswith('subtitles.')))"
+s={k:v for k,v in d.items() if k.startswith('subtitles.')};\
+print(len(s),'键',len(set(s.values())),'段不同文本')"
+
+# azalea 侧：1902 个 sound event，且语言文件与 jar 一致
+A=~/.cargo/git/checkouts/azalea-*/d0cc847
+grep -c '=> "' $A/azalea-registry/src/builtin.rs   # 全部 registry，非仅 SoundEvent
+diff <(python3 -c "import json;print(json.dumps(json.load(open('/tmp/mc/en_us.json')),sort_keys=True))") \
+     <(python3 -c "import json;print(json.dumps(json.load(open('$A/azalea-language/src/en_us.json')),sort_keys=True))") \
+  && echo "语言文件一致"
 ```
 
-## 6. 本文没有查的
+## 7. 本文没有查的
 
 1. 淡出曲线的精确公式（`280.0/40.0`、`160.0/20.0` 两组常量的用途）——与设计无关，
    没有追。
-2. `sounds.json` 不在 jar 里（`assets/minecraft/` 第一层确认没有，它是单独下载的
-   资产对象），所以 sound event → subtitle 键的**精确映射**没拿到。按名字匹配得到
-   928 有 / 879 无，其中「无」是下界（共用键的匹配不上）。要精确数得下载资产索引。
-   **但这不影响任何结论**：能出现的不同行至多 926 种，这个数从 jar 里就是精确的。
+2. `sounds.json`（event → subtitle 键的精确映射）——见 §4.3，jar 与 azalea 都没有，
+   需要按资产索引单取。**但这不影响任何结论**：能出现的不同行至多 926 种，
+   这个数是精确的。
 3. 告示牌文字的到达路径——维护者已裁定它是特殊方块，走方块准入，故未查。
 4. 别人的私聊：客户端层面不存在这个概念，服务端决定发给谁；未追。
