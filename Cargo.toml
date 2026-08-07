@@ -41,7 +41,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1" }
 uuid = { version = "1", features = ["serde", "v4"] }
 
-# 发版配置：目标是可分发的单文件，同时保住两条产品行为。
+# 发版配置：目标是可分发的单文件，同时保住两条不能被体积优化掉的行为
+#（排障靠 dev.log/journal 而非符号表；panic 的接管层依赖 unwind）。
 [profile.release]
 # 跨 crate 内联：bevy/azalea 的泛型与小函数极多，整体 LTO 收益最大。
 lto = "fat"
@@ -50,9 +51,17 @@ codegen-units = 1
 # 去符号表与调试信息：体积的大头。排障靠开发者模式的 dev.log 与 journal，
 # 不依赖发版二进制里的符号（需要栈回溯时用 debug 构建复现）。
 strip = "symbols"
-# 显式保留 unwind：工具与模型 provider 的 panic 由 catch_unwind 捕获并转成
-# 结构化失败（agent/driver.rs），这是产品行为。改 abort 会让一次工具 panic
-# 直接杀掉整个同伴进程。
+# 显式保留 unwind。理由换过一次，写全以免再被当成性能选择：
+#
+# 旧理由（已作废）是「工具与 provider 的 panic 由 agent/driver.rs 的
+# catch_unwind 转成结构化失败」。那些捕获已经全部删除，生产代码里现在零处
+# catch_unwind——依据见 toolloop/src/control.rs 开头。
+#
+# 现在的理由是：删掉捕获之后，panic 的接管者换成了 tokio 的任务边界。worker
+# 任务 panic 被接成 JoinError，由 participant runtime 的 stop 记成
+# participant_worker_panicked；两根不在任务里的裸线程（backend worker 与
+# dispatcher）则在各自 join 处出声。改成 abort 会让这整个接管层一起失效，
+# 所以它不是改一行的事，得先决定缺陷发生时由谁负责。
 panic = "unwind"
 # 不用 opt-level="z"：ECS 每秒 20 tick 的热路径对吞吐敏感，
 # 拿运行时性能换几 MB 体积不划算。
