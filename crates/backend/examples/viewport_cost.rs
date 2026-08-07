@@ -33,6 +33,24 @@ fn stone() -> BlockState {
     BlockState::from(azalea::registry::builtin::BlockKind::Stone)
 }
 
+/// 微基准的取样方块。石头是**最便宜的非空气方块**——原版石头没有 blockstate
+/// 属性，`properties` 是空 BTreeMap，不分配。真实地形里到处是带属性的方块
+/// （楼梯有 facing/half/shape/waterlogged，树叶有 distance/persistent/waterlogged），
+/// 每个键和值都是一次独立的 String 分配。拿石头当代表会低估。
+const SAMPLE_BLOCKS: [(&str, fn() -> BlockState); 5] = [
+    ("air", || BlockState::AIR),
+    ("stone", stone),
+    ("grass_block", || {
+        BlockState::from(azalea::registry::builtin::BlockKind::GrassBlock)
+    }),
+    ("oak_leaves", || {
+        BlockState::from(azalea::registry::builtin::BlockKind::OakLeaves)
+    }),
+    ("oak_stairs", || {
+        BlockState::from(azalea::registry::builtin::BlockKind::OakStairs)
+    }),
+];
+
 /// 便宜的整数散列，用来造「碎」地形；不引随机数依赖，保证可复现。
 fn hashed(x: i32, y: i32, z: i32) -> u32 {
     let mut h = 2_166_136_261u32;
@@ -166,7 +184,7 @@ fn dto_share() {
     println!("DTO 构造成本（block_snapshot × {CALLS}，与上表唯一体素数同量级）");
     println!("{:<10} {:>10} {:>12} {:>12}", "方块", "总计ms", "每次ns", "占一刻");
 
-    for (label, state) in [("air", BlockState::AIR), ("stone", stone())] {
+    for (label, state) in SAMPLE_BLOCKS.map(|(label, kind)| (label, kind())) {
         let mut best = Duration::MAX;
         for _ in 0..5 {
             let started = Instant::now();
@@ -208,7 +226,7 @@ fn clone_share() {
     println!("缓存命中成本（BlockReadResult::clone × {HITS} = 候选 {CANDIDATES} × 邻居 {NEIGHBOURS}）");
     println!("{:<10} {:>10} {:>12} {:>12}", "方块", "总计ms", "每次ns", "占一刻");
 
-    for (label, state) in [("air", BlockState::AIR), ("stone", stone())] {
+    for (label, state) in SAMPLE_BLOCKS.map(|(label, kind)| (label, kind())) {
         let cached = BlockReadResult::Loaded {
             block: block_snapshot(BlockPosition { x: 0, y: 0, z: 0 }, state),
         };
