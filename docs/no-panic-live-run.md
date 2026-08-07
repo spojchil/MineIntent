@@ -51,10 +51,38 @@ mineintent_backend::runtime::driver::run_with_handle          ← MineIntent
                       └ parking_lot::raw_rwlock::lock_shared_slow   ← 永久阻塞
 ```
 
-**成因**：azalea 的 swarm 收尾代码在 `LocalSet` 的一个任务里**同步**阻塞于
-ECS World 的读锁；而这把锁只能由**同一个 `LocalSet` 上**的 ECS runner 任务释放。
-`LocalSet` 是单线程的，被阻塞的任务不让出线程，ECS runner 就永远轮不到。
-这是单线程执行器上的经典自锁。
+**成因（2026-08-07 追查到具体行，比初稿的说法精确得多）**：
+
+不是「LocalSet 上的任务等 ECS runner」这种间接死锁，而是**同一根线程上的重入锁**。
+`azalea/src/swarm/builder.rs:554-566`：
+
+```rust
+let ecs_mutex = first_bot.ecs.clone();
+let mut ecs = ecs_mutex.write();          // ← 555：拿【写】锁
+let mut query = ecs.query::<Option<&S>>();
+let Ok(Some(first_bot_state)) = query.get(&ecs, first_bot.entity) else {
+    error!("the first bot ({} / {}) is missing the required state component! ...",
+           first_bot.username(),           // ← 560：要【读】锁，同一把
+           first_bot.entity);
+    continue;
+};
+```
+
+`Client.ecs` 是 `Arc<parking_lot::RwLock<World>>`（`azalea-client/src/client.rs:164`，
+`use parking_lot::RwLock` 在 `:21`）；`username()` → `profile()` →
+`component::<GameProfileComponent>()` → `get_entity_component` → `ecs.read()`。
+
+**`parking_lot::RwLock` 不可重入**，写锁作用域内取同一把锁的读锁 = 当场自锁。
+`:578-588` 还有一处同形的（`bot.username()`）。
+
+**触发条件**：`query.get::<Option<&S>>` 拿不到状态组件 `S`（我们这里 `S = BotState`）。
+实体已销毁而客户端事件还排在 `bots_rx` 里时就会发生——**正是停机场景**。
+
+**上游状态**：最新上游（`6249c29`）**一字未改**，同样两处（行号 558-567、578-588）。
+所以这是 azalea 的未修缺陷，不是我们用错。
+
+**修法**：把 username 在取写锁**之前**算好，或者错误信息只打 `entity`。三行左右。
+按「受控依赖 bug 修在源头」，应当进我们的 fork，并提上游 PR。
 
 旁证：run2 停机时另有一条 bevy 报错
 `Unable to send event AppExit — Event must be added to the app with add_event()`。
