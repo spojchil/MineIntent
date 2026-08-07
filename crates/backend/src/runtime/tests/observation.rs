@@ -938,7 +938,7 @@ fn typed_observation_payload_is_direct_and_kind_bound() {
     assert_eq!(events.lock().len(), 1);
 }
 
-/// 实验分支：订阅者 panic 不再被隔离。
+/// 订阅者 panic 不再被隔离。
 ///
 /// 这条记的是删掉捕获的**实际代价**：一个订阅者的缺陷会中断整趟投递，排在它后面
 /// 的订阅者收不到已经发生的事实，panic 一路传到发事件的调用点。

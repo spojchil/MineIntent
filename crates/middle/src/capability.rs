@@ -1484,8 +1484,11 @@ impl Drop for ReleaseAllOnDrop {
         let Some(motor) = self.motor.take() else {
             return;
         };
-        // 实验分支：不捕获。若这次 drop 发生在 unwind 途中而 release_all 又
-        // panic，就是 double panic → abort()。那也是要观察的现象之一。
+        // 不捕获（规则一）。这里有一条已知风险：若这次 drop 发生在 unwind 途中
+        // 而 release_all 又 panic，就是 double panic → abort()。留着不处理是因为
+        // 处理它的唯一办法是在 Drop 里捕获，那会同时吞掉 release_all 自己的缺陷，
+        // 而 abort 至少是响的。std 的 catch_unwind 文档也点了这条（丢弃 Err 时
+        // 可能二次 panic）。
         let _ = motor.release_all();
     }
 }

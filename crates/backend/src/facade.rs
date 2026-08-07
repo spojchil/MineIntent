@@ -641,10 +641,20 @@ impl FacadeInner {
             if !delivery.state.begin() {
                 continue;
             }
-            // 实验分支：不捕获。panic 会杀掉 dispatcher 线程，事实流随之停摆——
-            // 这正是要观察的现象，而不是要掩盖的。
+            // 租约归还必须是 RAII，不能是 `begin(); ...; finish();` 这样的普通语句。
+            //
+            // 不捕获（规则一，见 docs/panic-practice.md），所以 listener panic 会
+            // 直接带走 dispatcher 线程。若归还写成 `finish()` 语句，它会被跳过，
+            // `active` 永不归零，此后每次 `remove_subscription` 的 `wait_quiescent`
+            // 都白等满 UNSUBSCRIBE_WAIT 才超时退出。
+            //
+            // 观察面有过同形缺陷且更严重——那边的 `wait_for_quiescence` 是裸
+            // Condvar 没有期限，一次泄漏就是永久卡死，实测表现为测试 600 秒不结束。
+            // 那处已改 RAII（runtime/events.rs 的 ObservationCallbackGuard）。
+            let _lease = ListenerLease {
+                state: &delivery.state,
+            };
             delivery.listener.on_event(event.clone());
-            delivery.state.finish();
         }
     }
 
@@ -1255,6 +1265,20 @@ struct ListenerDelivery {
 struct ListenerState {
     status: parking_lot::Mutex<ListenerStatus>,
     quiescent: parking_lot::Condvar,
+}
+
+/// 一次投递的活跃租约，归还写在 `Drop` 里。
+///
+/// 存在的理由只有一条：`on_event` 会 panic，而我们不捕获。归还若写成调用点的
+/// 一条语句，unwind 会跳过它。
+struct ListenerLease<'a> {
+    state: &'a ListenerState,
+}
+
+impl Drop for ListenerLease<'_> {
+    fn drop(&mut self) {
+        self.state.finish();
+    }
 }
 
 struct ListenerStatus {
@@ -2793,13 +2817,10 @@ mod tests {
         }
     }
 
-    struct PanicListener;
-
-    impl BackendEventListener for PanicListener {
-        fn on_event(&self, _event: BackendEventEnvelope) {
-            panic!("facade listener panic is an isolated test fault");
-        }
-    }
+    // 这里曾有一个 `PanicListener`，随上面那个测试里的 panic 段一起去掉。
+    // 它的名字（"...is an isolated test fault"）已经不成立：facade 侧不再隔离
+    // 订阅者的 panic。观察面那一侧仍有同名夹具，在 runtime/tests/observation.rs
+    // 里，那边的 panic 走的是调用方线程，可以用 #[should_panic] 断言。
 
     struct ReentrantListener {
         facade: MinecraftBackendFacade,
@@ -2823,16 +2844,20 @@ mod tests {
         }
     }
 
-    /// 实验分支：本测试的前提（订阅者 panic 被隔离）已被移除。
+    /// FIFO 次序、退订与重入边界。
     ///
-    /// 移除之后的实际行为是：panic 杀死 dispatcher 线程，之后的 FIFO 投递永远
-    /// 不到，测试表现为 `"FIFO callback should arrive: Timeout"`。注意它**不是
-    /// 崩溃而是静默挂起**——进程还活着，事实流断了却没有任何人说话。
+    /// 原先这里还订阅了一个 `PanicListener`，用来断言「一个订阅者 panic 不影响
+    /// 其余订阅者」。那条隔离随捕获一起删了，于是整个测试被 `#[ignore]` 掉——
+    /// 连带上面三条与 panic 无关的断言一起失效。永久 ignore 的测试比删掉更糟：
+    /// 看着像有覆盖，实际不跑也不报警。
     ///
-    /// 这正是要在实机上观察的现象，所以这里先标记掉，不在单测里模拟。
-    #[ignore = "实验分支：订阅者 panic 隔离已移除，此测试的前提不再成立"]
+    /// 现在只去掉 panic 那一段，其余断言恢复生效。删掉隔离之后的实际行为
+    /// （panic 杀死 dispatcher 线程 → 事实投递当场中断 → 进程照常活着）不适合
+    /// 在单测里断言：那是一次「什么都不再发生」，而且成因在另一根线程上。它的
+    /// 归宿是 dispatcher `Drop` 处的 tracing::error!（见 docs/panic-practice.md
+    /// §3 第 3 层）与实盘观测。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn facade_subscription_fifo_panic_unsubscribe_and_reentry_are_bounded() {
+    async fn facade_subscription_fifo_unsubscribe_and_reentry_are_bounded() {
         let (facade, driver) = MinecraftBackendFacade::scripted(test_config());
         let _start = facade.start(never_control());
         let ids = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -2843,9 +2868,6 @@ mod tests {
                 sent: Some(sent),
             }))
             .expect("recording subscription");
-        let _panic = facade
-            .subscribe(Arc::new(PanicListener))
-            .expect("panic subscription");
         let reentrant_slot = Arc::new(parking_lot::Mutex::new(None));
         let reentrant = facade
             .subscribe(Arc::new(ReentrantListener {

@@ -948,9 +948,14 @@ fn sound_history_ignores_non_sound_and_snapshot_unavailable_without_revision() {
     assert!(history.recent(20.0).is_empty());
 }
 
-#[ignore = "实验分支：dispose 中的退订 panic 捕获已移除"]
+// 原先这里是一个 `sound_history_dispose_drop_and_callback_panic_are_safe`，删掉
+// dispose 里的捕获之后被整体 `#[ignore]` 掉了——连带三段与 panic 无关的覆盖一起
+// 失效。永久 ignore 的测试比删掉更糟：看着像有覆盖，实际不跑也不报警。
+//
+// 拆成三个，每个断言的都是**当前**的契约。
+
 #[test]
-fn sound_history_dispose_drop_and_callback_panic_are_safe() {
+fn sound_history_dispose_and_drop_are_idempotent() {
     let backend = FakeBackend::new(snapshot(), FakeObservationSource::new());
     let history = SoundHistory::new(backend.clone()).unwrap();
     assert_eq!(backend.listener_count(), 1);
@@ -972,13 +977,35 @@ fn sound_history_dispose_drop_and_callback_panic_are_safe() {
     assert_eq!(backend.listener_count(), 1);
     drop(dropped);
     assert_eq!(backend.listener_count(), 0);
+}
 
-    let panic_on_unsubscribe = SoundHistory::new(backend.clone()).unwrap();
+/// `dispose` 不吞掉退订时的 panic。
+///
+/// 曾经吞：`dispose` 里包着 catch_unwind，于是「退订失败」被咽下去，调用方拿到
+/// 一个看起来正常返回的 dispose。现在照常传播——退订 panic 是 backend 侧的缺陷，
+/// 不是 SoundHistory 该替它兜的事。
+#[test]
+fn sound_history_propagates_a_panicking_unsubscribe() {
+    let backend = FakeBackend::new(snapshot(), FakeObservationSource::new());
+    let history = SoundHistory::new(backend.clone()).unwrap();
     backend.panic_next_unsubscribe.store(true, Ordering::SeqCst);
-    panic_on_unsubscribe.dispose();
-    assert_eq!(backend.listener_count(), 0);
-    drop(panic_on_unsubscribe);
+    let result = catch_unwind(AssertUnwindSafe(|| history.dispose()));
+    assert!(
+        result.is_err(),
+        "dispose must not swallow a panicking unsubscribe"
+    );
+}
 
+/// 适配器不吞掉监听回调里的 panic。
+///
+/// 隔离（如果需要）属于 backend 侧的投递循环，不属于适配器——适配器在里面再包
+/// 一层的唯一效果，是让我们自己代码里的缺陷消失得无声无息。
+///
+/// 这里的 FakeBackend 直接调用 listener，所以 panic 会一路传到本测试的
+/// catch_unwind——这正是要断言的。
+#[test]
+fn sound_history_does_not_swallow_a_listener_panic() {
+    let backend = FakeBackend::new(snapshot(), FakeObservationSource::new());
     let history = SoundHistory::new(backend.clone()).unwrap();
     backend.panic_next_snapshot.store(true, Ordering::SeqCst);
     let result = catch_unwind(AssertUnwindSafe(|| {
@@ -991,12 +1018,6 @@ fn sound_history_dispose_drop_and_callback_panic_are_safe() {
             -5.0,
         ));
     }));
-    // 适配器**不再**自己隔离 panic：隔离是 backend dispatcher 的职责，而且它会
-    // 报告（facade 的 "listener panic isolated"）。适配器在里面再包一层的唯一
-    // 效果，是让我们自己代码里的缺陷被吞掉、那句报告永远不触发。
-    //
-    // 这里的 FakeBackend 直接调用 listener，不模拟那层隔离，所以 panic 会一路
-    // 传到本测试的 catch_unwind——这正是要断言的。
     assert!(
         result.is_err(),
         "adapter must not swallow a panic; isolation belongs to the backend dispatcher"

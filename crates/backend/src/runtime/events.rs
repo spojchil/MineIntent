@@ -872,7 +872,9 @@ impl SharedRuntime {
             }
             // 租约由守卫的 Drop 归还，正常返回与 unwind 两条路径都走它。
             let _callback_guard = ObservationCallbackGuard::enter(delivery.state.clone());
-            // 实验分支：不捕获。panic 照常传播，让崩溃现场自己说话。
+            // 不捕获（规则一，见 docs/panic-practice.md）：panic 照常传播。
+            // 这条投递跑在调用方线程上，测试
+            // callback_panic_propagates_and_stops_the_dispatch_pass 钉住它。
             delivery.listener.on_event(observation_event.clone());
         }
     }

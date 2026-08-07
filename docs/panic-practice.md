@@ -97,7 +97,7 @@
 
 ## 3. 接管层的实际形状
 
-删掉捕获不等于没有接管。当前实际存在四层，从内到外：
+删掉捕获不等于没有接管。当前实际存在五层，从内到外：
 
 | 层 | 位置 | 接住什么 | 表现为 |
 |---|---|---|---|
@@ -105,6 +105,16 @@
 | 1 | `process_wake` 里的嵌套 `tokio::spawn` | 工具与 provider 的 panic | `JoinError` → `participant_handler_failed` |
 | 2 | `ParticipantRuntime::stop()` 的 worker join | worker 循环其余部分的 panic（journal 落盘、帧捕获、队列记账、终态处理） | `participant_worker_panicked` |
 | 3 | backend 两处线程 join（`join_worker_blocking`、dispatcher 的 `Drop`） | 两根不在 tokio 任务里的裸线程 | `tracing::error!` |
+| 4 | `SpeechScheduler::schedule` 的 `is_finished()` 检查 | speech worker 这根全局唯一任务的 panic（来自 transport） | `SpeechScheduleError::WorkerGone` + `tracing::error!` |
+
+第 4 层的形状与前几层不同，值得说明：speech worker 的 `JoinHandle` 只在 `Drop` 里
+被 `abort()`，运行期间没有任何自然的 join 点。所以接管点放在 `schedule`——它是
+唯一必然被走到的入口。查不到 worker 就报错而不是照常入队：排进一个没有消费者的
+队列，等于把「同伴哑了」这个缺陷伪装成「说了但没送到」。
+
+**每一层都必须有人接手，否则那层等于不存在。** 第 2、4 层都曾经是「有边界但结果
+被丢弃」——tokio 确实接住了 panic，进程也确实活着，但没有任何人查看那个句柄，于是
+参与者不再处理唤醒 / 同伴永久说不出话，而外面一片安静。
 
 第 1、2 层各有回归测试守着，位置在
 `crates/middle/tests/participant_runtime/lifecycle_teardown.rs`：
@@ -114,6 +124,15 @@
   worker；这条测试是那个变化的报警器。
 - `worker_panic_surfaces_as_failure_at_stop` — 钉住第 2 层。回退到修复前的写法验证
   过：该测试变红，且收集到的失败列表是**空的**。
+
+第 4 层由 `crates/middle/tests/speech_scheduler.rs` 的
+`transport_panic_kills_the_worker_and_schedule_reports_it` 守着。
+
+**不留 `#[ignore]`。** 删捕获时曾有三个测试因为「前提不再成立」被整体标记掉，其中
+两个还连带禁用了与 panic 无关的断言。永久 ignore 的测试比删掉更糟：看着像有覆盖，
+实际不跑也不报警。正确的两条出路是**改写成断言当前契约**（如上面几条与
+`callback_panic_propagates_and_stops_the_dispatch_pass`），或**拆掉失效的那一段、
+保住其余覆盖**。
 
 **依赖侧不改变这个形状**：bevy 的 system 捕获只为多打一行「哪个 system panic 了」，
 随后原样再抛——单线程执行器在捕获处紧接着 `resume_unwind`

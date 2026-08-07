@@ -392,7 +392,7 @@ impl ProductionParticipantFrameSource {
             state.omitted = 0;
         }
         if let Some(mut subscription) = lock(&self.chat_subscription).take() {
-            // 实验分支：不捕获。
+            // 不捕获（规则一）：退订 panic 是 backend 侧的缺陷。
             subscription.unsubscribe();
         }
         if self.owns_sound_history {

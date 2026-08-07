@@ -237,56 +237,33 @@ async fn additional_transport_failure_discards_current_request_and_continues_fif
     );
 }
 
-/// 实验分支：transport panic 的捕获已移除。
+/// transport panic 杀掉 speech worker 之后，`schedule` 必须说得出来。
 ///
-/// 移除之后 panic 会杀掉 speech worker 这个全局唯一的 tokio 任务，同伴从此
-/// 永久说不出话——而且**没有任何人观察那个 JoinHandle**，所以既不崩溃也不报错。
-/// 这正是要在实机上看的现象。
-#[ignore = "实验分支：speech transport panic 捕获已移除，worker 会被 panic 杀掉"]
+/// 不再断言「panic 变成 Failed、worker 继续 FIFO」——那是已被移除的捕获的语义。
+/// 现在 transport panic 是 transport 自己的缺陷，照常传播；worker 这根全局唯一
+/// 的任务随之结束。缺口曾经在这里：`JoinHandle` 只在 `Drop` 里 abort，运行期间
+/// 无人查看，于是同伴永久说不出话而没有任何人出声，队列还继续收。
+///
+/// 接管点放在 `schedule`——它是唯一必然被走到的入口。
+///
+/// 测试输出里的 panic 回溯是被测现象本身。
 #[tokio::test(start_paused = true)]
-async fn additional_transport_panic_becomes_failed_and_worker_continues_fifo() {
+async fn transport_panic_kills_the_worker_and_schedule_reports_it() {
     let transport = RecordingTransport::with_panics([true, false]);
     let events = EventLog::default();
     let scheduler =
         SpeechScheduler::new(transport.clone(), options(256, Duration::ZERO, &events)).unwrap();
     scheduler.schedule(request("panic", "第一条")).unwrap();
-    scheduler.schedule(request("good", "第二条")).unwrap();
 
     drive_worker().await;
 
+    // worker 已死：这一条不该被排进一个没有消费者的队列。
     assert_eq!(
-        transport
-            .snapshot()
-            .iter()
-            .map(|record| record.text.as_str())
-            .collect::<Vec<_>>(),
-        vec!["第二条"]
+        scheduler.schedule(request("good", "第二条")),
+        Err(SpeechScheduleError::WorkerGone)
     );
-    assert_eq!(
-        events.snapshot(),
-        vec![
-            SpeechEvent::Scheduled {
-                request_id: "panic".to_owned(),
-                segments: 1,
-            },
-            SpeechEvent::Scheduled {
-                request_id: "good".to_owned(),
-                segments: 1,
-            },
-            // transport panic 与「后端拒绝了这条聊天」必须可区分：前者是缺陷，
-            // 后者是世界的回答。reason 因此带 speech_transport_panicked 前缀，
-            // 并同时以 tracing::error! 出声。
-            SpeechEvent::Failed {
-                request_id: "panic".to_owned(),
-                reason: "speech_transport_panicked: scripted transport panic".to_owned(),
-            },
-            SpeechEvent::Sent {
-                request_id: "good".to_owned(),
-                segment: 0,
-                text: "第二条".to_owned(),
-            },
-        ]
-    );
+    // 也确实没有送出去过任何东西——包括 panic 的那一条。
+    assert!(transport.snapshot().is_empty());
 }
 
 #[tokio::test(start_paused = true)]

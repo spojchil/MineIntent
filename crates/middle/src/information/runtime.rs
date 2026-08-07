@@ -344,7 +344,8 @@ impl InformationRuntime {
         &self,
         interface_id: Option<InformationInterfaceId>,
     ) -> Result<InformationScopeSnapshot, InformationRequestError> {
-        // 实验分支：不再捕获 panic。scope_source 打断言就让它传播。
+        // 不捕获（规则一，见 docs/panic-practice.md）：scope_source 打断言是它
+        // 自己的缺陷，压成一次结构化失败只会让缺陷看起来像世界的回答。
         let _ = interface_id;
         Ok(self.scope_source.capture())
     }
@@ -1210,8 +1211,8 @@ impl<F: Future> Future for CatchUnwindFuture<F> {
     type Output = Result<F::Output, ()>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        // 实验分支：不再捕获 panic，poll 直接透传。保留 Result 外壳只是为了
-        // 不改调用方形状；provider 打断言就让它穿出去。
+        // 不捕获（规则一）：poll 直接透传。保留 Result 外壳只是为了不改调用方
+        // 形状；provider 打断言就让它穿出去。
         let this = self.get_mut();
         this.future.as_mut().poll(context).map(Ok)
     }

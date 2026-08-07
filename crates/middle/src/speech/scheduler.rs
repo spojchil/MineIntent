@@ -54,6 +54,12 @@ pub enum SpeechScheduleError {
     DuplicateRequest { request_id: String },
     #[error(transparent)]
     Segment(#[from] SegmentChatError),
+    /// worker 任务已经不在了——排队没有意义，因为没有人会来取。
+    ///
+    /// 唯一的成因是 worker 内部 panic（transport 的缺陷）。取消只发生在 `Drop`
+    /// 里，那之后没有人还能调用 `schedule`。
+    #[error("speech worker is gone; the participant can no longer speak")]
+    WorkerGone,
 }
 
 pub struct SpeechScheduler<T>
@@ -133,6 +139,20 @@ where
     /// Queues one request and synchronously emits `scheduled`; delivery always occurs from the
     /// worker after this method returns to the async runtime.
     pub fn schedule(&self, request: SpeechRequest) -> Result<usize, SpeechScheduleError> {
+        // worker 是全局唯一的一根 speech 任务，而它的 JoinHandle 只在 Drop 里被
+        // abort，运行期间无人查看。transport 一旦 panic，worker 就死了：同伴从此
+        // 永久说不出话，队列继续收，没有任何人出声。
+        //
+        // 这里是唯一必然被走到的入口，所以在这里查。查不到就报错而不是排队——
+        // 排进一个没有消费者的队列，等于把缺陷伪装成「说了但没送到」。
+        if self.worker.is_finished() {
+            tracing::error!(
+                target: "mineintent_middle",
+                request_id = %request.id,
+                "speech worker 已终止（transport panic），本次与后续发言都不会送达"
+            );
+            return Err(SpeechScheduleError::WorkerGone);
+        }
         if request.id.is_empty()
             || request
                 .text
@@ -282,8 +302,12 @@ where
             continue;
         };
 
-        // 实验分支：不捕获。panic 会杀掉 speech worker 这个全局唯一的 tokio 任务，
-        // 同伴从此永久说不出话——这正是要观察的现象。
+        // 不捕获（规则一，见 docs/panic-practice.md）。transport panic 是它自己的
+        // 缺陷，压成一次「这条没发出去」会让同伴以为世界拒绝了它，然后重试——而
+        // panic 可重现，重试注定再次 panic。
+        //
+        // panic 会杀掉这根全局唯一的 speech 任务。接管点在 `schedule`：那里查
+        // `is_finished()` 并返回 WorkerGone，所以「同伴哑了」这件事有人说得出来。
         let result = inner
             .transport
             .send(&delivery.text)

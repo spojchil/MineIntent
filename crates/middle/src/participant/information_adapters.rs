@@ -427,7 +427,8 @@ impl SoundHistory {
 
         let subscription = lock_recover(&self.subscription).take();
         if let Some(mut subscription) = subscription {
-            // 实验分支：不捕获。
+            // 不捕获（规则一）：退订 panic 是 backend 侧的缺陷，不该由这里代偿。
+            // 测试 sound_history_propagates_a_panicking_unsubscribe 钉住这条。
             subscription.unsubscribe();
         }
     }
