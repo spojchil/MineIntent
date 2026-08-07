@@ -14,6 +14,7 @@
 | 了解 Rust 树当前的欠账与复杂处 | [Rust 分支代码梳理](./rust-code-audit.md) |
 | 了解删掉 panic 捕获后的真实崩溃形态 | [实盘观测](./no-panic-live-run.md) |
 | 决定某处该不该捕获 panic、该不该写 `panic!` | [panic 处置：我们的做法](./panic-practice.md) |
+| 改动参与者事件队列前 | [参与者事件队列彻查](./participant-queue-audit.md) |
 | 准备贡献 | [贡献流程](../CONTRIBUTING.md) |
 
 ## 文件权威等级
@@ -31,6 +32,7 @@
 | [`docs/rust-code-audit.md`](./rust-code-audit.md) | Rust 树的代码梳理：重复、死代码、复杂处，以及与产品条目的可核对差距 | 无 |
 | [`docs/no-panic-live-run.md`](./no-panic-live-run.md) | 删空 panic 捕获后的四轮实盘观测与栈证据 | 无 |
 | [`docs/panic-practice.md`](./panic-practice.md) | panic 的处置规则、接管层形状，及其实盘与社区调查依据 | 无 |
+| [`docs/participant-queue-audit.md`](./participant-queue-audit.md) | 参与者事件队列的逐处彻查：票据语义、双重界限、控制车道死锁环 | 无 |
 | [`README.md`](../README.md) | 项目导航和最短启动 | 无 |
 | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | 人类贡献工作流 | 无 |
 | [`CLAUDE.md`](../CLAUDE.md) | 开发代理工作规则 | 无 |
