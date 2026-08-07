@@ -1,5 +1,4 @@
 use std::{
-    any::Any,
     collections::VecDeque,
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
@@ -364,14 +363,6 @@ where
             (inner.on_event)(event);
         }
     }
-}
-
-fn panic_message(payload: &(dyn Any + Send)) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|message| (*message).to_owned())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "speech transport panicked".to_owned())
 }
 
 /// Scheduler locks protect only local queue bookkeeping. No await, transport call or event callback

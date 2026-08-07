@@ -1496,52 +1496,17 @@ impl CloneDefinitionForTest for InformationProviderDefinition {
     }
 }
 
-struct PanicTrace;
-
-impl InformationTraceSink for PanicTrace {
-    fn append(&self, _record: mineintent_middle::information::contracts::InformationTraceRecord) {
-        panic!("fixture trace sink panic");
-    }
-}
-
-#[tokio::test]
-async fn rust_only_provider_panic_is_structured() {
-    let panic_read: ReadFn = Arc::new(|_, _, _| panic!("fixture provider panic"));
-    let result = setup(vec![status_provider_with(status_definition(), panic_read)])
-        .runtime
-        .query(
-            &caller(),
-            &read_request("current_status", "current_status:1", &["health"]),
-            control(),
-        )
-        .await;
-    assert_eq!(
-        result_code(result),
-        Some(mineintent_middle::information::contracts::InformationErrorCode::ProviderFailed)
-    );
-}
-
-#[tokio::test]
-async fn rust_only_trace_panic_is_structured_without_leaking_panic_summary() {
-    let runtime = setup_runtime_with_trace(
-        vec![status_provider()],
-        Arc::new(MutableInformationScopeSource::new(scope())),
-        grant(),
-        Arc::new(PanicTrace),
-    );
-    let result = runtime
-        .query(
-            &caller(),
-            &read_request("current_status", "current_status:1", &["health"]),
-            control(),
-        )
-        .await;
-    let InformationToolResult::Error(error) = result else {
-        panic!("trace panic must become a structured error");
-    };
-    assert_eq!(
-        error.code,
-        mineintent_middle::information::contracts::InformationErrorCode::ProviderFailed
-    );
-    assert_eq!(error.message, "The information trace sink failed.");
-}
+// 这里曾有两个测试：`rust_only_provider_panic_is_structured` 与
+// `rust_only_trace_panic_is_structured_without_leaking_panic_summary`，
+// 连同 `PanicTrace` 夹具。它们断言 provider / trace sink 的 panic 被转成
+// `ProviderFailed`，即上一版 Information 控制面那 8 处 catch_unwind 的语义。
+//
+// 那些捕获已经删除，所以这两个测试自 b1c6f51 起就是红的。删掉而不是修复，
+// 因为它们断言的行为本身是被推翻的那一个：把缺陷压成一条模型可见的普通失败，
+// 会让缺陷看起来像世界事实，而模型必然重试——panic 可重现，重试注定再次
+// panic（理由全文见 crates/toolloop/src/control.rs 开头）。
+//
+// 另一半理由是覆盖面：Information 控制面已由编译实验坐实不在生产路径上
+// （41cdf3c），这两个测试守的是一段没有调用者的代码。
+//
+// 若要恢复该语义，恢复捕获与这两个测试应当一起做，不要只补测试。
