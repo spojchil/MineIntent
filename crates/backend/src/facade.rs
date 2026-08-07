@@ -702,7 +702,15 @@ impl Drop for FacadeInner {
         }
         if let Some(join) = self.dispatcher_join.get_mut().take() {
             if join.thread().id() != thread::current().id() {
-                let _ = join.join();
+                // dispatcher 线程 panic 意味着事实投递在那一刻就停了，而进程照常
+                // 活着：运行期间没有任何东西查看这个句柄，这里是唯一能留下痕迹的
+                // 地方。丢掉它，现象就只剩「同伴忽然什么都不知道了」。
+                if join.join().is_err() {
+                    tracing::error!(
+                        target: "mineintent_backend",
+                        "dispatcher 线程 panic，事实投递在停机前已经中断"
+                    );
+                }
             }
         }
     }
@@ -869,7 +877,15 @@ impl RuntimeSession {
             if join.thread().id() == thread::current().id() {
                 return;
             }
-            let _ = join.join();
+            // 与异步的 join_worker 对齐——那条把 worker 的 panic 转成
+            // BackendFailure。这条跑在 Drop 与同步停机路径上，没有返回值可用，
+            // 但同样不能丢：worker 死了意味着世界那一侧从那一刻起就停了。
+            if join.join().is_err() {
+                tracing::error!(
+                    target: "mineintent_backend",
+                    "runtime worker 线程 panic，会话未经干净停机即结束"
+                );
+            }
             self.mark_joined();
         } else if self.worker_done.load(Ordering::Acquire) {
             self.mark_joined();

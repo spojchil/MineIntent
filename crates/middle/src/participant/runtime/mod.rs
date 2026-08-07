@@ -35,7 +35,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     sync::{broadcast, watch, Mutex as AsyncMutex, Notify},
-    task::{AbortHandle, JoinHandle},
+    task::{AbortHandle, JoinError, JoinHandle},
 };
 use uuid::Uuid;
 
@@ -693,12 +693,26 @@ where
         if let Some(worker) = worker_handle {
             let abort = worker.abort_handle();
             let mut worker = worker;
-            if tokio::time::timeout(STOP_WORKER_SETTLE, &mut worker)
-                .await
-                .is_err()
-            {
-                abort.abort();
-                let _ = worker.await;
+            // 三种收场必须分开看，此前它们被合成了一个 `.is_err()`。
+            //
+            // worker 已经 panic 时，`&mut worker` 立刻就绪，`timeout` 返回的是
+            // `Ok(Err(JoinError))`——`.is_err()` 为 false，于是既不 abort 也不
+            // 绑定那个 JoinError，停机继续走到 `Ok(())`。结果是：参与者从 panic
+            // 那一刻起就不再处理任何唤醒，而停机报告成功，journal 里一个字都没有。
+            //
+            // 这条路径正是 `toolloop/src/control.rs` 里「不做 panic 隔离，交给
+            // 调用方的任务边界接成 JoinError 走失败流」所指的那个接管点。tokio
+            // 确实接住了（进程活着），但接住之后没有人接手——删掉循环里的捕获，
+            // 依据的就是这里会出声，所以这里必须真的出声。
+            match tokio::time::timeout(STOP_WORKER_SETTLE, &mut worker).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => self.report_worker_join_failure(&error),
+                Err(_elapsed) => {
+                    abort.abort();
+                    if let Err(error) = worker.await {
+                        self.report_worker_join_failure(&error);
+                    }
+                }
             }
         }
         self.teardown_subscription();
@@ -1142,6 +1156,23 @@ where
             code: failure.code,
             summary: failure.summary,
         });
+    }
+
+    /// worker 任务非正常收场时出声。
+    ///
+    /// 取消不算失败——唯一的取消来自上面超时后我们自己发的 `abort()`，把它记成
+    /// 缺陷会让每一次收不干净的停机都伪装成 panic。除此之外只剩 panic，那是缺
+    /// 陷：worker 死了意味着此后没有任何唤醒被处理，必须留下痕迹。
+    fn report_worker_join_failure(&self, error: &JoinError) {
+        if error.is_cancelled() {
+            return;
+        }
+        self.fail_runtime_sync(
+            ParticipantFailureSource::Runtime,
+            "participant_worker_panicked",
+            &format!("participant worker panicked: {error}"),
+            None,
+        );
     }
 
     /// 事件入队路径的失败。与 worker 路径分开命名：前者会打死整个 runtime，
