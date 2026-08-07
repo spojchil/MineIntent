@@ -3,11 +3,12 @@
 //! 存在的理由：判断「模型给的工具数组要在 1 tick（50ms）内处理完」这个目标成不成立。
 //! 持续动作改成后台 job 之后只是入队、必然很快，全量投影是唯一可能超预算的工具。
 //!
-//! **与生产路径的差别只有一处**：生产的 `read_block` 还要走
+//! **与生产路径的差别只有一处**：生产的读取器还要走
 //! `world.get_block_state()`（区块调色板查表），这里直接给状态。
-//! DTO 构造走的是**生产的同一个 `block_snapshot`**，投影走的是
-//! 生产的同一个 `project_with_checkpoint` + `ViewportOptions::default()`
-//! （`runtime/observation.rs:420` 用的就是这两个）。
+//! 其余全是生产同一套东西——同一个 `block_probe`、同一个 `block_snapshot`、
+//! 同一个 `project_with_checkpoint_and_presenters`、同一个
+//! `ViewportOptions::default()`，以及同一个两层 `WorldReader` 形状
+//! （见 `runtime/observation.rs` 的投影调用处）。
 //!
 //! 所以读数是**生产耗时的下界**，缺的那部分是区块查表。
 //!
@@ -16,13 +17,19 @@
 //! cargo run --release -p mineintent-backend --example viewport_cost
 //! ```
 
-use std::time::{Duration, Instant};
+use std::{
+    cell::Cell,
+    time::{Duration, Instant},
+};
 
 use azalea::block::BlockState;
 use mineintent_backend::{
-    snapshot::{block_snapshot, BlockPosition, BlockReadResult, PoseSnapshot, Vec3Value},
-    viewport::{project_with_checkpoint, ViewportOptions},
+    snapshot::{
+        block_probe, block_snapshot, BlockPosition, BlockReadResult, PoseSnapshot, Vec3Value,
+    },
+    viewport::{project_with_checkpoint_and_presenters, ViewportOptions, WorldReader},
 };
+use mineintent_contracts::minecraft::BlockInfoPresenterRegistry;
 
 const WARMUP: usize = 3;
 const SAMPLES: usize = 20;
@@ -101,7 +108,8 @@ const SCENARIOS: &[Scenario] = &[
 
 struct Measurement {
     elapsed: Vec<Duration>,
-    reads: usize,
+    probes: usize,
+    fulls: usize,
     blocks: usize,
     truncated: bool,
 }
@@ -125,34 +133,56 @@ fn measure(scenario: &Scenario) -> Measurement {
     let options = ViewportOptions::default();
     let solid = scenario.solid;
 
-    let mut reads = 0usize;
+    let mut probes = 0usize;
+    let mut fulls = 0usize;
     let mut blocks = 0usize;
     let mut truncated = false;
     let mut elapsed = Vec::with_capacity(SAMPLES);
+    let presenters = BlockInfoPresenterRegistry::default();
 
     for iteration in 0..(WARMUP + SAMPLES) {
-        let mut counter = 0usize;
-        let read_block = |position: BlockPosition| {
-            counter += 1;
-            let state = if solid(position.x, position.y, position.z) {
+        let probe_calls = Cell::new(0usize);
+        let full_calls = Cell::new(0usize);
+        let state_at = |position: &BlockPosition| {
+            if solid(position.x, position.y, position.z) {
                 stone()
             } else {
                 BlockState::AIR
-            };
-            BlockReadResult::Loaded {
-                block: block_snapshot(position, state),
             }
         };
+        // 与生产同形的两层读取器：热路径走廉价探针，只有要交给模型的方块
+        // 才建完整 DTO（`runtime/observation.rs` 用的就是这个形状）。
+        let reader = WorldReader::new(
+            |position: BlockPosition| {
+                probe_calls.set(probe_calls.get() + 1);
+                block_probe(state_at(&position))
+            },
+            |position: BlockPosition| {
+                full_calls.set(full_calls.get() + 1);
+                let state = state_at(&position);
+                BlockReadResult::Loaded {
+                    block: block_snapshot(position, state),
+                }
+            },
+        );
 
         let started = Instant::now();
-        let projection = project_with_checkpoint(&pose, &[], read_block, &options, || Ok(()))
-            .expect("projection must succeed");
+        let projection = project_with_checkpoint_and_presenters(
+            &pose,
+            &[],
+            reader,
+            &options,
+            &presenters,
+            || Ok(()),
+        )
+        .expect("projection must succeed");
         let took = started.elapsed();
 
         if iteration >= WARMUP {
             elapsed.push(took);
         }
-        reads = counter;
+        probes = probe_calls.get();
+        fulls = full_calls.get();
         blocks = projection.visible_blocks.blocks.len();
         truncated = projection.visible_blocks.truncated;
     }
@@ -160,7 +190,8 @@ fn measure(scenario: &Scenario) -> Measurement {
     elapsed.sort();
     Measurement {
         elapsed,
-        reads,
+        probes,
+        fulls,
         blocks,
         truncated,
     }
@@ -182,7 +213,10 @@ fn dto_share() {
 
     println!();
     println!("DTO 构造成本（block_snapshot × {CALLS}，与上表唯一体素数同量级）");
-    println!("{:<10} {:>10} {:>12} {:>12}", "方块", "总计ms", "每次ns", "占一刻");
+    println!(
+        "{:<10} {:>10} {:>12} {:>12}",
+        "方块", "总计ms", "每次ns", "占一刻"
+    );
 
     for (label, state) in SAMPLE_BLOCKS.map(|(label, kind)| (label, kind())) {
         let mut best = Duration::MAX;
@@ -223,8 +257,13 @@ fn clone_share() {
     const HITS: usize = CANDIDATES * NEIGHBOURS;
 
     println!();
-    println!("缓存命中成本（BlockReadResult::clone × {HITS} = 候选 {CANDIDATES} × 邻居 {NEIGHBOURS}）");
-    println!("{:<10} {:>10} {:>12} {:>12}", "方块", "总计ms", "每次ns", "占一刻");
+    println!(
+        "缓存命中成本（BlockReadResult::clone × {HITS} = 候选 {CANDIDATES} × 邻居 {NEIGHBOURS}）"
+    );
+    println!(
+        "{:<10} {:>10} {:>12} {:>12}",
+        "方块", "总计ms", "每次ns", "占一刻"
+    );
 
     for (label, state) in SAMPLE_BLOCKS.map(|(label, kind)| (label, kind())) {
         let cached = BlockReadResult::Loaded {
@@ -250,8 +289,8 @@ fn clone_share() {
 
 fn main() {
     let options = ViewportOptions::default();
-    let box_voxels =
-        (2 * options.horizontal_radius as i64 + 1).pow(2) * (2 * options.vertical_radius as i64 + 1);
+    let box_voxels = (2 * options.horizontal_radius as i64 + 1).pow(2)
+        * (2 * options.vertical_radius as i64 + 1);
 
     println!("view 全量投影耗时测量");
     println!(
@@ -275,20 +314,21 @@ fn main() {
     );
     println!();
     println!(
-        "{:<14} {:>9} {:>9} {:>9} {:>10} {:>8} {:>7}  {}",
-        "场景", "最快ms", "中位ms", "最慢ms", "唯一体素", "可见块", "占一刻", "说明"
+        "{:<14} {:>9} {:>9} {:>9} {:>10} {:>8} {:>8} {:>7}  {}",
+        "场景", "最快ms", "中位ms", "最慢ms", "探针", "完整读", "可见块", "占一刻", "说明"
     );
 
     for scenario in SCENARIOS {
         let measurement = measure(scenario);
         let median = measurement.elapsed[measurement.elapsed.len() / 2];
         println!(
-            "{:<14} {:>9.2} {:>9.2} {:>9.2} {:>10} {:>8} {:>6.0}%  {}{}",
+            "{:<14} {:>9.2} {:>9.2} {:>9.2} {:>10} {:>8} {:>8} {:>6.0}%  {}{}",
             scenario.name,
             millis(measurement.elapsed[0]),
             millis(median),
             millis(measurement.elapsed[measurement.elapsed.len() - 1]),
-            measurement.reads,
+            measurement.probes,
+            measurement.fulls,
             measurement.blocks,
             millis(median) / millis(TICK) * 100.0,
             scenario.note,
@@ -304,9 +344,9 @@ fn main() {
 
     println!();
     println!("读法：");
-    println!("- 「唯一体素」是本 harness 的 read_block 被调用的次数。投影层在它外面套了一层");
-    println!("  HashMap 缓存（viewport.rs:349-358），只有未命中才落到这里，所以这个数是");
-    println!("  **实际读过的不重复体素**，不是总请求数。生产里每次未命中还要多一次区块");
-    println!("  调色板查表，本测量没算进去。");
+    println!("- 「探针」是廉价读取被调用的次数。投影层在它外面套了一层 HashMap 缓存，");
+    println!("  只有未命中才落到这里，所以这个数是**实际读过的不重复体素**，不是总请求数。");
+    println!("  「完整读」是建完整 DTO 的次数——它应当与「可见块」同量级，而不是与探针同量级。");
+    println!("  生产里每次读取还要多一次区块调色板查表，本测量没算进去。");
     println!("- 「占一刻」超过 100% 就意味着单次 view 已经吃掉整个 tick 预算。");
 }

@@ -15,8 +15,41 @@ use mineintent_contracts::minecraft::{
 use serde::{Deserialize, Serialize};
 
 use crate::snapshot::{
-    BlockPosition, BlockReadResult, PoseSnapshot, ProtocolBlockSnapshot, ProtocolEntitySnapshot,
+    BlockPosition, BlockProbe, BlockReadResult, PoseSnapshot, ProtocolBlockSnapshot,
+    ProtocolEntitySnapshot,
 };
+
+/// 投影期间读世界的两条通道。
+///
+/// 分成两层是因为量出来的成本分布：一次全量投影要问十几万次「这一格挡不挡
+/// 视线」，而真正需要方块名字与属性的最多 `block_limit` 个。让热路径搬完整
+/// DTO，等于为两位信息付三次堆分配——橡木楼梯每份 603 ns，
+/// 12.6 万次就是 76 ms，超过一整个 tick（实测见 `examples/viewport_cost.rs`）。
+///
+/// - `probe`：可 `Copy` 的两位事实，**带缓存**，扫描与射线全走它；
+/// - `full`：完整 DTO，**不带缓存**，只在需要把方块交给模型时调用。
+pub struct WorldReader<P, F> {
+    probe: P,
+    full: F,
+}
+
+impl<P, F> WorldReader<P, F>
+where
+    P: FnMut(BlockPosition) -> BlockProbe,
+    F: FnMut(BlockPosition) -> BlockReadResult,
+{
+    pub fn new(probe: P, full: F) -> Self {
+        Self { probe, full }
+    }
+
+    fn probe(&mut self, position: BlockPosition) -> BlockProbe {
+        (self.probe)(position)
+    }
+
+    fn full(&mut self, position: BlockPosition) -> BlockReadResult {
+        (self.full)(position)
+    }
+}
 
 /// MineIntent 视口使用的第一人称眼睛高度。
 pub const EYE_HEIGHT: f64 = 1.62;
@@ -235,8 +268,13 @@ enum RayProperty {
     Occludes,
 }
 
+/// 全量投影内部射线的结果。
+///
+/// 只带命中坐标，不带方块身份：三个调用方里两个（`line_reaches_voxel`、
+/// `line_is_clear`）只关心命中与否，而遮挡测试在碎地形里每次投影要跑上万条。
+/// 需要身份的只有 `raycast_looked_at_block`，它拿到坐标后自己读一次。
 enum RayOutcome {
-    Hit(BlockHit),
+    Hit(BlockPosition),
     Clear,
     Unloaded,
 }
@@ -276,22 +314,19 @@ const FACE_NORMALS: [Point3; 6] = [
 
 /// 在当前姿态和观察源上生成一次完整 viewport 投影。
 ///
-/// `read_block` 必须返回绝对坐标上的原始观察结果；`Unloaded` 会让相关射线保守失败，
+/// `reader` 必须返回绝对坐标上的原始观察结果；`Unloaded` 会让相关射线保守失败，
 /// 不会把未知区误报成空气或可见空间。
 pub fn project<F>(
     pose: &PoseSnapshot,
     entities: &[ProtocolEntitySnapshot],
-    read_block: F,
+    reader: F,
     options: &ViewportOptions,
 ) -> Result<ViewportProjection, String>
 where
     F: Fn(BlockPosition) -> BlockReadResult,
 {
-    let presenters = BlockInfoPresenterRegistry::default();
-    project_with_checkpoint_and_presenters(pose, entities, read_block, options, &presenters, || {
-        Ok(())
-    })
-    .map_err(|error| match error {
+    project_with_checkpoint(pose, entities, reader, options, || Ok(())).map_err(|error| match error
+    {
         BackendError::InvalidCommand { message, .. } => message,
         other => other.to_string(),
     })
@@ -300,6 +335,12 @@ where
 /// Generate a projection while exposing real cancellation/deadline checkpoints
 /// to the caller. The callback runs before each expensive geometry phase and
 /// before every block/ray read; an error exits the scan immediately.
+/// 单读取器便捷入口：探针由完整 DTO 折出。
+///
+/// 只适合测试与合成读取器——它每探测一格都会先建一个完整 DTO，
+/// 正是 [`WorldReader`] 要绕开的那笔开销。生产走
+/// [`project_with_checkpoint_and_presenters`] 并自带廉价探针
+/// （`crate::snapshot::block_probe`）。
 pub fn project_with_checkpoint<F, C>(
     pose: &PoseSnapshot,
     entities: &[ProtocolEntitySnapshot],
@@ -308,14 +349,17 @@ pub fn project_with_checkpoint<F, C>(
     checkpoint: C,
 ) -> Result<ViewportProjection, BackendError>
 where
-    F: FnMut(BlockPosition) -> BlockReadResult,
+    F: Fn(BlockPosition) -> BlockReadResult,
     C: FnMut() -> Result<(), BackendError>,
 {
     let presenters = BlockInfoPresenterRegistry::default();
     project_with_checkpoint_and_presenters(
         pose,
         entities,
-        read_block,
+        WorldReader::new(
+            |position| BlockProbe::from_read(&read_block(position)),
+            &read_block,
+        ),
         options,
         &presenters,
         checkpoint,
@@ -324,15 +368,16 @@ where
 
 /// Full projection variant with an explicit presenter registry. All block slots and ray hits
 /// use this same registry and the same `BlockInfo` serializer.
-pub fn project_with_checkpoint_and_presenters<F, C>(
+pub fn project_with_checkpoint_and_presenters<P, F, C>(
     pose: &PoseSnapshot,
     entities: &[ProtocolEntitySnapshot],
-    mut read_block: F,
+    reader: WorldReader<P, F>,
     options: &ViewportOptions,
     presenters: &BlockInfoPresenterRegistry,
     mut checkpoint: C,
 ) -> Result<ViewportProjection, BackendError>
 where
+    P: FnMut(BlockPosition) -> BlockProbe,
     F: FnMut(BlockPosition) -> BlockReadResult,
     C: FnMut() -> Result<(), BackendError>,
 {
@@ -343,45 +388,38 @@ where
             message,
         })?;
     checkpoint()?;
-    // 一个投影会反复读取同一体素：候选扫描、暴露面邻居和多条射线都会经过
-    // 它。RuntimeObservationSource 的单次 read_block 还会创建完整 DTO，局部
-    // 缓存既减少世界锁竞争，也避免同一块状态被重复转换。
-    let mut block_cache = HashMap::<(i32, i32, i32), BlockReadResult>::new();
-    let mut read_cached = |position: BlockPosition| {
-        let key = (position.x, position.y, position.z);
-        if let Some(result) = block_cache.get(&key).cloned() {
-            return result;
-        }
-        let result = read_block(position);
-        block_cache.insert(key, result.clone());
-        result
-    };
+    // 一个投影会反复读取同一体素：候选扫描、暴露面邻居和多条射线都会经过它。
+    // 缓存的是**探针**而不是完整 DTO——探针是 `Copy` 的，命中不分配。
+    // 缓存完整 DTO 时，命中一次要深拷 `String` + `Vec` + `BTreeMap`，
+    // 而命中数是未命中数的 5~9 倍，这曾是整次投影最大的一笔开销。
+    let mut probe_cache = HashMap::<(i32, i32, i32), BlockProbe>::new();
+    let WorldReader { probe, full } = reader;
+    let mut probe = probe;
+    let mut reader = WorldReader::new(
+        move |position: BlockPosition| {
+            let key = (position.x, position.y, position.z);
+            if let Some(probe) = probe_cache.get(&key) {
+                return *probe;
+            }
+            let result = probe(position);
+            probe_cache.insert(key, result);
+            result
+        },
+        full,
+    );
     let eye = Point3 {
         x: pose.position.x,
         y: pose.position.y + EYE_HEIGHT,
         z: pose.position.z,
     };
     let axes = view_axes(pose.yaw, pose.pitch);
-    let standing_on_block = standing_on_block(&mut read_cached, pose, presenters, &mut checkpoint)?;
-    let looked_at_block = raycast_looked_at_block(
-        &mut read_cached,
-        eye,
-        pose,
-        options,
-        presenters,
-        &mut checkpoint,
-    )?;
-    let visible_entities = visible_entities(
-        &mut read_cached,
-        entities,
-        eye,
-        axes,
-        options,
-        presenters,
-        &mut checkpoint,
-    )?;
+    let standing_on_block = standing_on_block(&mut reader, pose, presenters, &mut checkpoint)?;
+    let looked_at_block =
+        raycast_looked_at_block(&mut reader, eye, pose, options, presenters, &mut checkpoint)?;
+    let visible_entities =
+        visible_entities(&mut reader, entities, eye, axes, options, &mut checkpoint)?;
     let visible_blocks = visible_blocks(
-        &mut read_cached,
+        &mut reader,
         pose,
         eye,
         axes,
@@ -421,6 +459,7 @@ where
 /// The captured height bounds classify out-of-world targets without reads. A target read that
 /// independently returns `OutOfWorld` becomes the model-visible reason; neighbor reads follow
 /// the full kernel's conservative out-of-world boundary handling.
+/// 单读取器便捷入口，约束同 [`project_with_checkpoint`]。
 pub fn project_directed<F, C>(
     pose: &PoseSnapshot,
     positions: &[[i32; 3]],
@@ -430,14 +469,17 @@ pub fn project_directed<F, C>(
     checkpoint: C,
 ) -> Result<DirectedViewportProjection, DirectedViewportError>
 where
-    F: FnMut(BlockPosition) -> BlockReadResult,
+    F: Fn(BlockPosition) -> BlockReadResult,
     C: FnMut() -> Result<(), BackendError>,
 {
     let presenters = BlockInfoPresenterRegistry::default();
     project_directed_with_presenters(
         pose,
         positions,
-        read_block,
+        WorldReader::new(
+            |position| BlockProbe::from_read(&read_block(position)),
+            &read_block,
+        ),
         options,
         world_bounds,
         &presenters,
@@ -445,16 +487,17 @@ where
     )
 }
 
-pub fn project_directed_with_presenters<F, C>(
+pub fn project_directed_with_presenters<P, F, C>(
     pose: &PoseSnapshot,
     positions: &[[i32; 3]],
-    mut read_block: F,
+    reader: WorldReader<P, F>,
     options: &ViewportOptions,
     world_bounds: WorldHeightBounds,
     presenters: &BlockInfoPresenterRegistry,
     mut checkpoint: C,
 ) -> Result<DirectedViewportProjection, DirectedViewportError>
 where
+    P: FnMut(BlockPosition) -> BlockProbe,
     F: FnMut(BlockPosition) -> BlockReadResult,
     C: FnMut() -> Result<(), BackendError>,
 {
@@ -482,16 +525,22 @@ where
         z: pose.position.z,
     };
     let axes = view_axes(pose.yaw, pose.pitch);
-    let mut block_cache = HashMap::<(i32, i32, i32), BlockReadResult>::new();
-    let mut read_cached = |position: BlockPosition| {
-        let key = (position.x, position.y, position.z);
-        if let Some(result) = block_cache.get(&key).cloned() {
-            return result;
-        }
-        let result = read_block(position);
-        block_cache.insert(key, result.clone());
-        result
-    };
+    // 缓存探针而非完整 DTO，理由同全量投影。
+    let mut probe_cache = HashMap::<(i32, i32, i32), BlockProbe>::new();
+    let WorldReader { probe, full } = reader;
+    let mut probe = probe;
+    let mut reader = WorldReader::new(
+        move |position: BlockPosition| {
+            let key = (position.x, position.y, position.z);
+            if let Some(probe) = probe_cache.get(&key) {
+                return *probe;
+            }
+            let result = probe(position);
+            probe_cache.insert(key, result);
+            result
+        },
+        full,
+    );
     let directed_max_distance = options.max_distance.min(DIRECTED_MAX_DISTANCE);
     let mut seen = Vec::new();
     let mut unseen = Vec::new();
@@ -534,7 +583,9 @@ where
             continue;
         }
 
-        let target_result = read_cached(target.clone());
+        // 定向投影每个目标都要报出方块身份，所以这里必须走完整 DTO；
+        // 目标个数已由 `validate_directed_positions` 限住，不是热路径。
+        let target_result = reader.full(target.clone());
         // 一次 match 同时定出「这块方块的身份」与「看不看得见」。拆成两次会让
         // 第二次的 OutOfWorld 分支不可达，只能靠 unreachable! 兜住——而那个
         // 不变量（同一个不可变值在两次 match 之间不变）编译器无法传播，只能
@@ -547,12 +598,11 @@ where
                     presenters,
                 );
                 let visible = is_visible_candidate(
-                    &mut read_cached,
+                    &mut reader,
                     eye,
                     &target,
                     distance,
                     options.predicate,
-                    presenters,
                     &mut checkpoint,
                 )
                 .map_err(DirectedViewportError::Backend)?;
@@ -580,7 +630,7 @@ where
         }
 
         let ray = first_occluder_before_target(
-            &mut read_cached,
+            &mut reader,
             eye,
             center,
             &target,
@@ -641,8 +691,8 @@ enum DirectedRayOutcome {
     Unloaded,
 }
 
-fn first_occluder_before_target<F, C>(
-    read_block: &mut F,
+fn first_occluder_before_target<P, F, C>(
+    reader: &mut WorldReader<P, F>,
     origin: Point3,
     target: Point3,
     target_voxel: &BlockPosition,
@@ -650,6 +700,7 @@ fn first_occluder_before_target<F, C>(
     checkpoint: &mut C,
 ) -> Result<DirectedRayOutcome, DirectedViewportError>
 where
+    P: FnMut(BlockPosition) -> BlockProbe,
     F: FnMut(BlockPosition) -> BlockReadResult,
     C: FnMut() -> Result<(), BackendError>,
 {
@@ -675,8 +726,19 @@ where
         if same_voxel(&voxel, target_voxel) {
             break;
         }
-        match read_block(voxel.clone()) {
-            BlockReadResult::Loaded { block } if is_occluding_block(&block) => {
+        match reader.probe(voxel.clone()) {
+            BlockProbe::Loaded {
+                visible: true,
+                transparent_hint: false,
+            } => {
+                // 射线每一步都要问「挡不挡」，但只有命中的那一步会被报出去。
+                // 所以只在这里才付完整 DTO 的钱。
+                let BlockReadResult::Loaded { block } = reader.full(voxel.clone()) else {
+                    // 探针说这里有不透光方块，完整读却拿不到——只可能是两次读
+                    // 之间世界变了。按“没挡住”继续，宁可少报遮挡也不报一个读不
+                    // 出来的方块。
+                    continue;
+                };
                 return Ok(DirectedRayOutcome::Hit(BlockHit {
                     voxel,
                     block: BlockInfo::from_raw_properties_with_registry(
@@ -686,11 +748,11 @@ where
                     ),
                 }));
             }
-            BlockReadResult::Loaded { .. } => {}
-            BlockReadResult::Unloaded => return Ok(DirectedRayOutcome::Unloaded),
+            BlockProbe::Loaded { .. } => {}
+            BlockProbe::Unloaded => return Ok(DirectedRayOutcome::Unloaded),
             // Match the full kernel's conservative ray boundary: an out-of-world
             // neighbor is not evidence about the queried target and is skipped.
-            BlockReadResult::OutOfWorld => {}
+            BlockProbe::OutOfWorld => {}
         }
     }
     Ok(DirectedRayOutcome::Clear)
@@ -722,13 +784,14 @@ fn view_axes(yaw_degrees: f32, pitch_degrees: f32) -> ViewAxes {
     }
 }
 
-fn standing_on_block<F, C>(
-    read_block: &mut F,
+fn standing_on_block<P, F, C>(
+    reader: &mut WorldReader<P, F>,
     pose: &PoseSnapshot,
     presenters: &BlockInfoPresenterRegistry,
     checkpoint: &mut C,
 ) -> Result<Option<ViewportBlock>, BackendError>
 where
+    P: FnMut(BlockPosition) -> BlockProbe,
     F: FnMut(BlockPosition) -> BlockReadResult,
     C: FnMut() -> Result<(), BackendError>,
 {
@@ -738,24 +801,26 @@ where
         y: pose.position.y.floor() as i32 - 1,
         z: pose.position.z.floor() as i32,
     };
-    match read_cell(read_block, position.clone(), checkpoint)? {
-        BlockCell::Loaded => read_loaded_snapshot(read_block, position, presenters, checkpoint),
+    match read_cell(reader, position.clone(), checkpoint)? {
+        BlockCell::Loaded => read_loaded_snapshot(reader, position, presenters, checkpoint),
         BlockCell::Empty | BlockCell::Unloaded => Ok(None),
     }
 }
 
-fn read_loaded_snapshot<F, C>(
-    read_block: &mut F,
+fn read_loaded_snapshot<P, F, C>(
+    reader: &mut WorldReader<P, F>,
     position: BlockPosition,
     presenters: &BlockInfoPresenterRegistry,
     checkpoint: &mut C,
 ) -> Result<Option<ViewportBlock>, BackendError>
 where
+    P: FnMut(BlockPosition) -> BlockProbe,
     F: FnMut(BlockPosition) -> BlockReadResult,
     C: FnMut() -> Result<(), BackendError>,
 {
     checkpoint()?;
-    Ok(match read_block(position.clone()) {
+    // 这一格是要交给模型的（脚下 / 注视），必须走完整 DTO。
+    Ok(match reader.full(position.clone()) {
         BlockReadResult::Loaded { block } if is_visible_block(&block) => Some(ViewportBlock {
             block: BlockInfo::from_raw_properties_with_registry(
                 block.name,
@@ -770,8 +835,8 @@ where
     })
 }
 
-fn raycast_looked_at_block<F, C>(
-    read_block: &mut F,
+fn raycast_looked_at_block<P, F, C>(
+    reader: &mut WorldReader<P, F>,
     eye: Point3,
     pose: &PoseSnapshot,
     options: &ViewportOptions,
@@ -779,6 +844,7 @@ fn raycast_looked_at_block<F, C>(
     checkpoint: &mut C,
 ) -> Result<Option<ViewportBlock>, BackendError>
 where
+    P: FnMut(BlockPosition) -> BlockProbe,
     F: FnMut(BlockPosition) -> BlockReadResult,
     C: FnMut() -> Result<(), BackendError>,
 {
@@ -786,25 +852,34 @@ where
     let direction = view_axes(pose.yaw, pose.pitch).forward;
     Ok(
         match first_hit(
-            read_block,
+            reader,
             eye,
             direction,
             options.looked_at_max_distance,
             RayProperty::Visible,
-            presenters,
             checkpoint,
         )? {
-            RayOutcome::Hit(BlockHit { voxel, block }) => Some(ViewportBlock {
-                block,
-                position: [voxel.x, voxel.y, voxel.z],
-            }),
+            // 注视的方块要交给模型，这里才付完整 DTO 的钱——一次投影一次。
+            RayOutcome::Hit(voxel) => match reader.full(voxel.clone()) {
+                BlockReadResult::Loaded { block } => Some(ViewportBlock {
+                    block: BlockInfo::from_raw_properties_with_registry(
+                        block.name,
+                        &block.properties,
+                        presenters,
+                    ),
+                    position: [voxel.x, voxel.y, voxel.z],
+                }),
+                // 探针命中、完整读拿不到：只可能是两次读之间世界变了。
+                // 不报一个读不出来的方块。
+                BlockReadResult::Unloaded | BlockReadResult::OutOfWorld => None,
+            },
             RayOutcome::Clear | RayOutcome::Unloaded => None,
         },
     )
 }
 
-fn visible_blocks<F, C>(
-    read_block: &mut F,
+fn visible_blocks<P, F, C>(
+    reader: &mut WorldReader<P, F>,
     pose: &PoseSnapshot,
     eye: Point3,
     axes: ViewAxes,
@@ -813,6 +888,7 @@ fn visible_blocks<F, C>(
     checkpoint: &mut C,
 ) -> Result<VisibleBlocksResult, BackendError>
 where
+    P: FnMut(BlockPosition) -> BlockProbe,
     F: FnMut(BlockPosition) -> BlockReadResult,
     C: FnMut() -> Result<(), BackendError>,
 {
@@ -881,32 +957,22 @@ where
                             {
                                 continue;
                             }
-                            let BlockReadResult::Loaded { block } = read_block(position.clone())
+                            let BlockProbe::Loaded { visible: true, .. } =
+                                reader.probe(position.clone())
                             else {
                                 continue;
                             };
-                            if !is_visible_block(&block)
-                                || !is_visible_candidate(
-                                    read_block,
-                                    eye,
-                                    &position,
-                                    distance,
-                                    options.predicate,
-                                    presenters,
-                                    checkpoint,
-                                )?
-                            {
+                            if !is_visible_candidate(
+                                reader,
+                                eye,
+                                &position,
+                                distance,
+                                options.predicate,
+                                checkpoint,
+                            )? {
                                 continue;
                             }
-                            candidates.push((
-                                distance,
-                                position,
-                                BlockInfo::from_raw_properties_with_registry(
-                                    block.name,
-                                    &block.properties,
-                                    presenters,
-                                ),
-                            ));
+                            candidates.push((distance, position));
                         }
                     }
                 }
@@ -916,24 +982,37 @@ where
 
     candidates.sort_by(compare_candidate);
     let truncated = candidates.len() > options.block_limit;
-    let blocks = candidates
-        .into_iter()
-        .take(options.block_limit)
-        .map(|(_, position, block)| (block, position.x, position.y, position.z))
-        .collect();
+    // 排序截断之后才建 `BlockInfo`。可见候选可以远多于 `block_limit`——
+    // 露天平地一次就会被截断——先建再扔等于为扔掉的方块付全价。
+    // 排序只用距离与坐标（见 `compare_candidate`），所以延后不改次序。
+    let mut blocks = Vec::with_capacity(candidates.len().min(options.block_limit));
+    for (_, position) in candidates.into_iter().take(options.block_limit) {
+        checkpoint()?;
+        let BlockReadResult::Loaded { block } = reader.full(position.clone()) else {
+            // 探针判定可见、完整读却拿不到：只可能是两次读之间世界变了。
+            // 略过它，不把读不出来的方块报给模型。
+            continue;
+        };
+        blocks.push((
+            BlockInfo::from_raw_properties_with_registry(block.name, &block.properties, presenters),
+            position.x,
+            position.y,
+            position.z,
+        ));
+    }
     Ok(VisibleBlocksResult { blocks, truncated })
 }
 
-fn visible_entities<F, C>(
-    read_block: &mut F,
+fn visible_entities<P, F, C>(
+    reader: &mut WorldReader<P, F>,
     entities: &[ProtocolEntitySnapshot],
     eye: Point3,
     axes: ViewAxes,
     options: &ViewportOptions,
-    presenters: &BlockInfoPresenterRegistry,
     checkpoint: &mut C,
 ) -> Result<VisibleEntitiesResult, BackendError>
 where
+    P: FnMut(BlockPosition) -> BlockProbe,
     F: FnMut(BlockPosition) -> BlockReadResult,
     C: FnMut() -> Result<(), BackendError>,
 {
@@ -973,7 +1052,7 @@ where
                 checkpoint()?;
                 let point_delta = subtract(point, eye);
                 if inside_frustum(axes, point_delta, options)
-                    && line_is_clear(read_block, eye, point, presenters, checkpoint)?
+                    && line_is_clear(reader, eye, point, checkpoint)?
                 {
                     visible = true;
                     break;
@@ -1020,39 +1099,39 @@ where
     Ok(VisibleEntitiesResult { items, truncated })
 }
 
-fn is_visible_candidate<F, C>(
-    read_block: &mut F,
+fn is_visible_candidate<P, F, C>(
+    reader: &mut WorldReader<P, F>,
     eye: Point3,
     voxel: &BlockPosition,
     distance: f64,
     predicate: VisibilityPredicate,
-    presenters: &BlockInfoPresenterRegistry,
     checkpoint: &mut C,
 ) -> Result<bool, BackendError>
 where
+    P: FnMut(BlockPosition) -> BlockProbe,
     F: FnMut(BlockPosition) -> BlockReadResult,
     C: FnMut() -> Result<(), BackendError>,
 {
     checkpoint()?;
     Ok(match predicate {
         VisibilityPredicate::ExposedFace => {
-            exposed_face_reaches_eye(read_block, eye, voxel, presenters, checkpoint)?
+            exposed_face_reaches_eye(reader, eye, voxel, checkpoint)?
         }
         VisibilityPredicate::BlockCentre => {
-            has_exposed_face(read_block, voxel, checkpoint)?
-                && line_reaches_voxel(read_block, eye, voxel, distance, presenters, checkpoint)?
+            has_exposed_face(reader, voxel, checkpoint)?
+                && line_reaches_voxel(reader, eye, voxel, distance, checkpoint)?
         }
     })
 }
 
-fn exposed_face_reaches_eye<F, C>(
-    read_block: &mut F,
+fn exposed_face_reaches_eye<P, F, C>(
+    reader: &mut WorldReader<P, F>,
     eye: Point3,
     voxel: &BlockPosition,
-    presenters: &BlockInfoPresenterRegistry,
     checkpoint: &mut C,
 ) -> Result<bool, BackendError>
 where
+    P: FnMut(BlockPosition) -> BlockProbe,
     F: FnMut(BlockPosition) -> BlockReadResult,
     C: FnMut() -> Result<(), BackendError>,
 {
@@ -1079,9 +1158,9 @@ where
             y: voxel.y + normal.y as i32,
             z: voxel.z + normal.z as i32,
         };
-        match read_cell(read_block, neighbor.clone(), checkpoint)? {
+        match read_cell(reader, neighbor.clone(), checkpoint)? {
             BlockCell::Unloaded => continue,
-            BlockCell::Loaded if cell_occludes(read_block, neighbor, checkpoint)? => continue,
+            BlockCell::Loaded if cell_occludes(reader, neighbor, checkpoint)? => continue,
             BlockCell::Loaded | BlockCell::Empty => {}
         }
         candidates.push((squareness, add(face, scale(normal, FACE_EPSILON))));
@@ -1089,19 +1168,20 @@ where
     candidates.sort_by(|left, right| right.0.partial_cmp(&left.0).unwrap_or(Ordering::Equal));
     for (_, target) in candidates {
         checkpoint()?;
-        if line_is_clear(read_block, eye, target, presenters, checkpoint)? {
+        if line_is_clear(reader, eye, target, checkpoint)? {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-fn has_exposed_face<F, C>(
-    read_block: &mut F,
+fn has_exposed_face<P, F, C>(
+    reader: &mut WorldReader<P, F>,
     voxel: &BlockPosition,
     checkpoint: &mut C,
 ) -> Result<bool, BackendError>
 where
+    P: FnMut(BlockPosition) -> BlockProbe,
     F: FnMut(BlockPosition) -> BlockReadResult,
     C: FnMut() -> Result<(), BackendError>,
 {
@@ -1112,9 +1192,9 @@ where
             y: voxel.y + normal.y as i32,
             z: voxel.z + normal.z as i32,
         };
-        let exposed = match read_cell(read_block, neighbor.clone(), checkpoint)? {
+        let exposed = match read_cell(reader, neighbor.clone(), checkpoint)? {
             BlockCell::Unloaded => false,
-            BlockCell::Loaded => !cell_occludes(read_block, neighbor, checkpoint)?,
+            BlockCell::Loaded => !cell_occludes(reader, neighbor, checkpoint)?,
             BlockCell::Empty => true,
         };
         if exposed {
@@ -1124,15 +1204,15 @@ where
     Ok(false)
 }
 
-fn line_reaches_voxel<F, C>(
-    read_block: &mut F,
+fn line_reaches_voxel<P, F, C>(
+    reader: &mut WorldReader<P, F>,
     eye: Point3,
     voxel: &BlockPosition,
     distance: f64,
-    presenters: &BlockInfoPresenterRegistry,
     checkpoint: &mut C,
 ) -> Result<bool, BackendError>
 where
+    P: FnMut(BlockPosition) -> BlockProbe,
     F: FnMut(BlockPosition) -> BlockReadResult,
     C: FnMut() -> Result<(), BackendError>,
 {
@@ -1147,29 +1227,28 @@ where
     };
     Ok(
         match first_hit(
-            read_block,
+            reader,
             eye,
             normalize(subtract(center, eye), distance),
             distance + RAY_STEP,
             RayProperty::Occludes,
-            presenters,
             checkpoint,
         )? {
             RayOutcome::Clear => true,
-            RayOutcome::Hit(hit) => same_voxel(&hit.voxel, voxel),
+            RayOutcome::Hit(hit) => same_voxel(&hit, voxel),
             RayOutcome::Unloaded => false,
         },
     )
 }
 
-fn line_is_clear<F, C>(
-    read_block: &mut F,
+fn line_is_clear<P, F, C>(
+    reader: &mut WorldReader<P, F>,
     origin: Point3,
     target: Point3,
-    presenters: &BlockInfoPresenterRegistry,
     checkpoint: &mut C,
 ) -> Result<bool, BackendError>
 where
+    P: FnMut(BlockPosition) -> BlockProbe,
     F: FnMut(BlockPosition) -> BlockReadResult,
     C: FnMut() -> Result<(), BackendError>,
 {
@@ -1181,28 +1260,27 @@ where
     }
     Ok(matches!(
         first_hit(
-            read_block,
+            reader,
             origin,
             normalize(delta, distance),
             (distance - RAY_STEP).max(0.0),
             RayProperty::Occludes,
-            presenters,
             checkpoint,
         )?,
         RayOutcome::Clear
     ))
 }
 
-fn first_hit<F, C>(
-    read_block: &mut F,
+fn first_hit<P, F, C>(
+    reader: &mut WorldReader<P, F>,
     origin: Point3,
     direction: Point3,
     max_distance: f64,
     property: RayProperty,
-    presenters: &BlockInfoPresenterRegistry,
     checkpoint: &mut C,
 ) -> Result<RayOutcome, BackendError>
 where
+    P: FnMut(BlockPosition) -> BlockProbe,
     F: FnMut(BlockPosition) -> BlockReadResult,
     C: FnMut() -> Result<(), BackendError>,
 {
@@ -1215,75 +1293,67 @@ where
             y: (origin.y + direction.y * distance).floor() as i32,
             z: (origin.z + direction.z * distance).floor() as i32,
         };
-        let block = match read_block(voxel.clone()) {
-            BlockReadResult::Loaded { block } => block,
-            BlockReadResult::OutOfWorld => continue,
-            BlockReadResult::Unloaded => return Ok(RayOutcome::Unloaded),
+        let (visible, transparent_hint) = match reader.probe(voxel.clone()) {
+            BlockProbe::Loaded {
+                visible,
+                transparent_hint,
+            } => (visible, transparent_hint),
+            BlockProbe::OutOfWorld => continue,
+            BlockProbe::Unloaded => return Ok(RayOutcome::Unloaded),
         };
         let hits = match property {
-            RayProperty::Visible => is_visible_block(&block),
-            RayProperty::Occludes => is_occluding_block(&block),
+            RayProperty::Visible => visible,
+            RayProperty::Occludes => visible && !transparent_hint,
         };
         if hits {
-            return Ok(RayOutcome::Hit(BlockHit {
-                voxel,
-                block: BlockInfo::from_raw_properties_with_registry(
-                    block.name,
-                    &block.properties,
-                    presenters,
-                ),
-            }));
+            return Ok(RayOutcome::Hit(voxel));
         }
     }
     Ok(RayOutcome::Clear)
 }
 
-fn read_cell<F, C>(
-    read_block: &mut F,
+fn read_cell<P, F, C>(
+    reader: &mut WorldReader<P, F>,
     position: BlockPosition,
     checkpoint: &mut C,
 ) -> Result<BlockCell, BackendError>
 where
+    P: FnMut(BlockPosition) -> BlockProbe,
     F: FnMut(BlockPosition) -> BlockReadResult,
     C: FnMut() -> Result<(), BackendError>,
 {
     checkpoint()?;
-    Ok(match read_block(position) {
-        BlockReadResult::Loaded { block } => {
-            if is_visible_block(&block) {
-                BlockCell::Loaded
-            } else {
-                BlockCell::Empty
-            }
-        }
-        BlockReadResult::OutOfWorld => BlockCell::Empty,
-        BlockReadResult::Unloaded => BlockCell::Unloaded,
+    Ok(match reader.probe(position) {
+        BlockProbe::Loaded { visible: true, .. } => BlockCell::Loaded,
+        BlockProbe::Loaded { visible: false, .. } => BlockCell::Empty,
+        BlockProbe::OutOfWorld => BlockCell::Empty,
+        BlockProbe::Unloaded => BlockCell::Unloaded,
     })
 }
 
-fn cell_occludes<F, C>(
-    read_block: &mut F,
+fn cell_occludes<P, F, C>(
+    reader: &mut WorldReader<P, F>,
     position: BlockPosition,
     checkpoint: &mut C,
 ) -> Result<bool, BackendError>
 where
+    P: FnMut(BlockPosition) -> BlockProbe,
     F: FnMut(BlockPosition) -> BlockReadResult,
     C: FnMut() -> Result<(), BackendError>,
 {
     checkpoint()?;
-    Ok(match read_block(position) {
-        BlockReadResult::Loaded { block } => is_occluding_block(&block),
-        BlockReadResult::Unloaded => true,
-        BlockReadResult::OutOfWorld => false,
+    Ok(match reader.probe(position) {
+        BlockProbe::Loaded {
+            visible,
+            transparent_hint,
+        } => visible && !transparent_hint,
+        BlockProbe::Unloaded => true,
+        BlockProbe::OutOfWorld => false,
     })
 }
 
 fn is_visible_block(block: &ProtocolBlockSnapshot) -> bool {
-    !matches!(block.name.as_str(), "air" | "cave_air" | "void_air")
-}
-
-fn is_occluding_block(block: &ProtocolBlockSnapshot) -> bool {
-    is_visible_block(block) && !block.transparent_hint
+    !crate::snapshot::is_air_name(&block.name)
 }
 
 fn inside_frustum(axes: ViewAxes, delta: Point3, options: &ViewportOptions) -> bool {
@@ -1415,10 +1485,7 @@ fn section_of(value: i32) -> i32 {
     value.div_euclid(SECTION_SIZE)
 }
 
-fn compare_candidate(
-    left: &(f64, BlockPosition, BlockInfo),
-    right: &(f64, BlockPosition, BlockInfo),
-) -> Ordering {
+fn compare_candidate(left: &(f64, BlockPosition), right: &(f64, BlockPosition)) -> Ordering {
     left.0
         .partial_cmp(&right.0)
         .unwrap_or(Ordering::Equal)

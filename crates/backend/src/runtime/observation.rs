@@ -416,8 +416,15 @@ impl RuntimeObservationSource {
                     project_viewport_with_checkpoint(
                         &capture.pose,
                         &capture.entities,
-                        |position| read_block_from_world(&world_read, position),
+                        // 两层读取：扫描与射线走廉价探针（不建 DTO），只有要交给
+                        // 模型的方块才付完整 DTO 的钱。两者共用同一个世界读锁，
+                        // 所以对同一格的回答必然一致。
+                        WorldReader::new(
+                            |position| probe_block_from_world(&world_read, position),
+                            |position| read_block_from_world(&world_read, position),
+                        ),
                         &ViewportOptions::default(),
+                        &BlockInfoPresenterRegistry::default(),
                         || projection_control.preflight(operation),
                     )
                     .map_err(DirectedViewportError::Backend)?,
@@ -430,9 +437,13 @@ impl RuntimeObservationSource {
                     ViewportKernelProjection::Directed(project_directed_viewport(
                         &capture.pose,
                         &positions,
-                        |position| read_block_from_world(&world_read, position),
+                        WorldReader::new(
+                            |position| probe_block_from_world(&world_read, position),
+                            |position| read_block_from_world(&world_read, position),
+                        ),
                         &ViewportOptions::default(),
                         capture.world_bounds,
+                        &BlockInfoPresenterRegistry::default(),
                         || projection_control.preflight(operation),
                     )?)
                 }

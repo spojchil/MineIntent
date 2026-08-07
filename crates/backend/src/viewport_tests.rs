@@ -305,7 +305,8 @@ fn directed_exposed_face_matches_full_when_target_centre_is_blocked() {
         }
     };
 
-    let mut center_read = read;
+    let mut center_read =
+        WorldReader::new(|position| BlockProbe::from_read(&read(position)), &read);
     let center_hit = first_occluder_before_target(
         &mut center_read,
         Point3 {

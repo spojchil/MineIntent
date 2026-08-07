@@ -409,9 +409,7 @@ fn production_packet_adapter_keeps_each_packet_post_state_and_excludes_self() {
     assert_eq!(spawned[0].entity_key, "1:7");
     assert_eq!(spawned[0].entity_type, "dark_oak_chest_boat");
     assert_eq!(spawned[0].position.x, 10.0);
-    assert!(
-        (spawned[0].head_yaw.expect("spawn head yaw") - 45.0).abs() < 1e-6
-    );
+    assert!((spawned[0].head_yaw.expect("spawn head yaw") - 45.0).abs() < 1e-6);
     assert!(matches!(
         events.try_recv().expect("Spawn envelope").payload,
         BackendEventPayload::Entity(ContractProtocolEntityEvent::Spawned { entity })
@@ -554,10 +552,7 @@ fn production_packet_adapter_keeps_each_packet_post_state_and_excludes_self() {
         BackendEventPayload::Entity(ContractProtocolEntityEvent::Removed { last, .. }) => {
             assert_eq!(last.entity_key, "1:7");
             assert_eq!(last.position.x, 30.0);
-            assert_eq!(
-                last.head_yaw,
-                Some(90.0)
-            );
+            assert_eq!(last.head_yaw, Some(90.0));
             assert!((last.velocity.x - 2.0).abs() < 0.001);
         }
         payload => panic!("expected Remove envelope, got {payload:?}"),
@@ -785,10 +780,7 @@ fn entity_callback_reads_spawn_move_rotate_remove_post_state_immediately() {
     assert_eq!(states[0][0].entity_key, "1:7");
     assert_eq!(states[0][0].position.x, 10.0);
     assert_eq!(states[1][0].position.x, 11.0);
-    assert_eq!(
-        states[2][0].head_yaw,
-        Some(90.0)
-    );
+    assert_eq!(states[2][0].head_yaw, Some(90.0));
     assert!(states[3].is_empty());
 }
 

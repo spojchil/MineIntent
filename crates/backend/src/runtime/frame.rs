@@ -844,3 +844,29 @@ pub(super) fn read_block_from_world(
         block: block_snapshot(position, state),
     }
 }
+
+/// 投影扫描热路径专用：只取「是不是空气」和「透不透光」两位，不建 DTO。
+///
+/// 与 [`read_block_from_world`] 的世界读取、越界判定完全同形，区别只在
+/// 拿到 `BlockState` 之后不再走 `block_snapshot`——那一步要三次堆分配，
+/// 而扫描期每次投影要问十几万次。
+pub(super) fn probe_block_from_world(
+    world: &azalea::world::World,
+    position: BlockPosition,
+) -> BlockProbe {
+    let block_position = azalea::BlockPos {
+        x: position.x,
+        y: position.y,
+        z: position.z,
+    };
+    let y = i64::from(block_position.y);
+    let min_y = i64::from(world.chunks.min_y());
+    let max_y_exclusive = min_y + i64::from(world.chunks.height());
+    if y < min_y || y >= max_y_exclusive {
+        return BlockProbe::OutOfWorld;
+    }
+    let Some(state) = world.get_block_state(block_position) else {
+        return BlockProbe::Unloaded;
+    };
+    block_probe(state)
+}

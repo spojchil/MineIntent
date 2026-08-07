@@ -249,13 +249,17 @@ pub fn block_snapshot(
     }
 }
 
+/// 三种空气的注册名。视口把它们当作“这一格没有东西”，
+/// `transparent_hint` 也拿同一份名单当透明处理。
+pub(crate) fn is_air_name(name: &str) -> bool {
+    matches!(name, "air" | "cave_air" | "void_air")
+}
+
 fn transparent_hint(name: &str, outline_shape: &azalea::physics::collision::VoxelShape) -> bool {
     // Azalea 暴露了 outline/collision 几何，但 26.1 的方块注册表没有把
     // Mineflayer 的 `transparent` 布尔字段作为同名组件暴露。对常见的全体积
     // 透明块补充注册名提示，其余非完整轮廓按保守的“可能透光”处理。
-    let named_transparent = name == "air"
-        || name == "cave_air"
-        || name == "void_air"
+    let named_transparent = is_air_name(name)
         || name.contains("glass")
         || name.ends_with("leaves")
         || name == "water"
@@ -296,6 +300,88 @@ pub enum BlockReadResult {
     Loaded { block: ProtocolBlockSnapshot },
     Unloaded,
     OutOfWorld,
+}
+
+/// 视口扫描热路径上唯一用得到的事实。
+///
+/// 一次全量投影要问十几万次「这一格挡不挡视线」，而每次问的都只有两位：
+/// 是不是空气、透不透光。`ProtocolBlockSnapshot` 为回答这两位携带了
+/// `String` + `Vec` + `BTreeMap` 三个持堆字段，光是从缓存里取一份拷贝，
+/// 橡木楼梯就要 603 ns（实测见 `examples/viewport_cost.rs`）。
+///
+/// 这个类型是 `Copy` 的，缓存命中不分配。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockProbe {
+    Loaded {
+        /// 不是三种空气之一——也就是这一格“有东西”。
+        visible: bool,
+        transparent_hint: bool,
+    },
+    Unloaded,
+    OutOfWorld,
+}
+
+impl BlockProbe {
+    /// 从完整 DTO 折出探针。
+    ///
+    /// 给测试与合成读取器用。生产不该走这里——它已经付过建 DTO 的钱了；
+    /// 生产用 [`block_probe`]。
+    pub fn from_read(result: &BlockReadResult) -> Self {
+        match result {
+            BlockReadResult::Loaded { block } => Self::Loaded {
+                visible: !is_air_name(&block.name),
+                transparent_hint: block.transparent_hint,
+            },
+            BlockReadResult::Unloaded => Self::Unloaded,
+            BlockReadResult::OutOfWorld => Self::OutOfWorld,
+        }
+    }
+}
+
+/// `BlockProbe::Loaded` 的两位，按 `state_id` 预先算好。
+#[derive(Clone, Copy)]
+struct ProbeFacts {
+    visible: bool,
+    transparent_hint: bool,
+}
+
+/// 按 `state_id` 索引的探针表。
+///
+/// 两位事实都是 `state_id` 的纯函数，所以整张表首次使用时算一遍就够了。
+/// 建表本身不便宜（每个状态要 `Box::from` 一次、`to_aabbs()` 一次），
+/// 但它只发生一次；之后每次探测都是一次数组下标。
+/// `BlockStateIntegerRepr` 是 `u16`，表最大 64 KiB。
+fn probe_table() -> &'static [ProbeFacts] {
+    static TABLE: std::sync::OnceLock<Box<[ProbeFacts]>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        (0..=azalea::block::BlockState::MAX_STATE)
+            .map(|state_id| {
+                let Ok(state) = azalea::block::BlockState::try_from(state_id) else {
+                    // 不该发生：迭代范围就是合法区间。真出现了就按最保守的
+                    // 「有东西且不透光」处理，宁可少报可见块也不误报。
+                    return ProbeFacts {
+                        visible: true,
+                        transparent_hint: false,
+                    };
+                };
+                let block: Box<dyn azalea::block::BlockTrait> = Box::from(state);
+                let name = block.id();
+                ProbeFacts {
+                    visible: !is_air_name(name),
+                    transparent_hint: transparent_hint(name, state.outline_shape()),
+                }
+            })
+            .collect()
+    })
+}
+
+/// 不建 DTO 直接取探针：一次数组下标，零分配。
+pub fn block_probe(state: azalea::block::BlockState) -> BlockProbe {
+    let facts = probe_table()[usize::from(state.id())];
+    BlockProbe::Loaded {
+        visible: facts.visible,
+        transparent_hint: facts.transparent_hint,
+    }
 }
 
 pub fn capture_pose(bot: &Client) -> Option<PoseSnapshot> {
@@ -645,6 +731,26 @@ mod tests {
         assert!(block.collision_shapes.is_empty());
         assert_eq!(block.bounding_box, BlockBoundingBox::Empty);
         assert!(block.transparent_hint);
+    }
+
+    /// 探针表是绕开 DTO 的近路，所以它必须对**每一个** `BlockState` 都给出
+    /// 与走完整 DTO 完全相同的答案。一处不符就是视口会看错世界。
+    #[test]
+    fn block_probe_agrees_with_the_full_dto_for_every_state() {
+        let position = BlockPosition { x: 0, y: 0, z: 0 };
+        for state_id in 0..=azalea::block::BlockState::MAX_STATE {
+            let Ok(state) = azalea::block::BlockState::try_from(state_id) else {
+                continue;
+            };
+            let full = BlockReadResult::Loaded {
+                block: block_snapshot(position.clone(), state),
+            };
+            assert_eq!(
+                block_probe(state),
+                BlockProbe::from_read(&full),
+                "state_id {state_id} 的探针与完整 DTO 不一致"
+            );
+        }
     }
 
     #[test]

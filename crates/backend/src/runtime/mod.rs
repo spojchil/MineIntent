@@ -36,9 +36,10 @@ use mineintent_contracts::minecraft::{
     BackendEventKind as ContractBackendEventKind,
     BackendEventMetadata as ContractBackendEventMetadata, BackendEventPayload, BackendFailure,
     BackendFailureCode, BackendKick, BackendLifecyclePayload, BackendState, BackendTimeouts,
-    BlockBoundingBox as ContractBlockBoundingBox, BlockPosition as ContractBlockPosition,
-    BlockReadResult as ContractBlockReadResult, BoxFuture, ChatPosition, DirectedViewportError,
-    DirectedViewportProjection, EntityEquipmentSnapshot as ContractEntityEquipmentSnapshot,
+    BlockBoundingBox as ContractBlockBoundingBox, BlockInfoPresenterRegistry,
+    BlockPosition as ContractBlockPosition, BlockReadResult as ContractBlockReadResult, BoxFuture,
+    ChatPosition, DirectedViewportError, DirectedViewportProjection,
+    EntityEquipmentSnapshot as ContractEntityEquipmentSnapshot,
     EntityRemovalReason as ContractEntityRemovalReason, FactSource as ContractFactSource,
     HeardSoundType as ContractHeardSoundType, ObservationEvent, ObservationEventListener,
     OperationControl, ProtocolBlockEvent as ContractProtocolBlockEvent,
@@ -72,14 +73,14 @@ use crate::{
         FactSource, MotorDirection, BACKEND_COMMAND_PROTOCOL,
     },
     snapshot::{
-        block_snapshot, canonical_entity_type, capture, BlockBoundingBox, BlockPosition,
-        BlockReadResult, MinecraftSnapshotV1, PoseSnapshot, ProtocolBlockSnapshot,
-        ProtocolEntitySnapshot, TrackedPlayerSnapshot, Vec3Value,
+        block_probe, block_snapshot, canonical_entity_type, capture, BlockBoundingBox,
+        BlockPosition, BlockProbe, BlockReadResult, MinecraftSnapshotV1, PoseSnapshot,
+        ProtocolBlockSnapshot, ProtocolEntitySnapshot, TrackedPlayerSnapshot, Vec3Value,
     },
     viewport::{
-        project as project_viewport, project_directed as project_directed_viewport,
-        project_with_checkpoint as project_viewport_with_checkpoint, ViewportBlock,
-        ViewportOptions, ViewportProjection, WorldHeightBounds,
+        project as project_viewport, project_directed_with_presenters as project_directed_viewport,
+        project_with_checkpoint_and_presenters as project_viewport_with_checkpoint, ViewportBlock,
+        ViewportOptions, ViewportProjection, WorldHeightBounds, WorldReader,
     },
 };
 
@@ -137,7 +138,7 @@ pub(crate) use events::{
 };
 #[cfg(test)]
 use frame::{calculate_armor_values, floor_block_coordinate, CachedLightChunk};
-use frame::{read_block_from_world, LightCache, LightSectionGeometry};
+use frame::{probe_block_from_world, read_block_from_world, LightCache, LightSectionGeometry};
 pub use handle::{RuntimeFrameFacts, RuntimeHandle};
 pub use observation::RuntimeObservationSource;
 #[cfg(test)]
