@@ -1760,8 +1760,11 @@ impl ContractToolDispatcher for RegistryToolDispatcher {
             let observation_context = self.scope.context(control);
             observation_context.check_at(Instant::now())?;
             let observation_result = await_controlled(
-                self.observation_after
-                    .observe_after(assembled, result.clone(), observation_context),
+                self.observation_after.observe_after(
+                    assembled,
+                    result.clone(),
+                    observation_context,
+                ),
                 control,
             )
             .await?;
