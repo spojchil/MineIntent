@@ -8,8 +8,8 @@
 > | 证据 | 出处 |
 > |---|---|
 > | 四轮实盘（真模型 + Paper 服务端，含断线与死亡） | [实盘观测](./no-panic-live-run.md) |
-> | 281 个运行期依赖的 `catch_unwind` 全量扫描 | 本文 §5 |
-> | 18 个知名 Rust 仓库的 panic 策略与用法调查 | 本文 §5 |
+> | 281 个运行期依赖的 `catch_unwind` 与 panic 密度全量扫描 | 本文 §6 |
+> | 18 个知名 Rust 仓库的 panic 策略与用法调查 | 本文 §6 |
 
 ## 1. 现状（可核对）
 
@@ -17,7 +17,7 @@
 |---|---|---|
 | 生产代码 `catch_unwind` | **0 处** | `grep -rn catch_unwind crates/*/src --include='*.rs' \| grep -v /tests/` |
 | 测试代码 `catch_unwind` | 保留（断言式） | 主要在 `crates/middle/tests/information_adapters.rs` |
-| 生产代码显式 panic | **27 处**（18 `panic!` + 9 `unreachable!`） | 计数须剔除同文件内的 `#[cfg(test)]` 块，否则会多出 20 处 |
+| 生产代码显式 panic | **19 处** | 见 §4；计数口径见下 |
 | panic 钩子 | 无条件安装 | `crates/app/src/lib.rs` → `devlog::install_panic_hook()` |
 | `[profile.release] panic` | `unwind` | 理由写在 `Cargo.toml` 该行上方 |
 
@@ -55,7 +55,7 @@
 写得很清楚——*we should've logged the backtrace already*。没有这个前提就不允许丢。
 
 **(c) 捕获之后不能假装无事发生。**
-社区四种用法里没有一种是「吞掉后继续」（见 §5）。允许的收场只有两类：**上报给
+社区四种用法里没有一种是「吞掉后继续」（见 §6）。允许的收场只有两类：**上报给
 调用方**，或**有序退出**。
 
 特别地：**不允许把 panic 压成一条模型可见的普通失败**。那会让缺陷看起来像世界
@@ -82,16 +82,18 @@
 
 ### 规则四：写 `panic!` 要有资格
 
-生产代码里 27 处显式 panic 是我们**主动**制造的终止点。既然不再捕获，每一处都
+生产代码里 19 处显式 panic 是我们**主动**制造的终止点。既然不再捕获，每一处都
 直接决定一个任务或一根线程的存亡。新增时的判据：
 
 - **可以**：违反的是本模块自己维护、且编译器无法表达的不变量，继续执行会产生更
   难诊断的后果
 - **不可以**：条件依赖外部世界（服务端、模型、网络、文件系统）。那些是失败，不是
   缺陷，该走 `Result`
+- **另一条出路**：很多 `unreachable!` 说明的是「类型没把不变量表达出来」。能靠
+  类型消除的，就不要靠断言相信——`viewport.rs` 与 participant 入队路径都是这样
+  消掉的（合并两个 match，让不可能的分支不再存在）。
 
-现有 27 处按 crate：backend 13、middle 8、app 3、contracts 3。尚未逐处复核这条
-判据——见 §6。
+计数口径见 §4。
 
 ## 3. 接管层的实际形状
 
@@ -119,7 +121,46 @@
 payload 存起来、等这一轮调度的其余 system 跑完再 `resume_unwind`
 （`multi_threaded.rs:313`）。
 
-## 4. 测试里的 `catch_unwind` 是正当的
+## 4. 19 处显式 panic 的清单与去向
+
+### 4.1 计数口径
+
+三条都要做，否则数会虚高（这份文件的早期版本写过 27 和 47，都是口径错误）：
+
+1. 排除测试文件——不只是 `tests/` 目录，还有 `viewport_tests.rs`、
+   `entity_events_owner_tests/` 这类**不含** `/tests/` 的路径
+2. 排除 `#[cfg(test)] mod` 块
+3. 但**不能**把所有 `#[cfg(test)]` 都当模块开头——`facade.rs` 里大量 `#[cfg(test)]`
+   加在结构体字段上（`#[cfg(test)] scripted: bool,`），误判会吞掉整片正常代码
+
+### 4.2 清单
+
+| 组 | 处数 | 位置 | 去向 |
+|---|---:|---|---|
+| Information 适配器 | **8** | `middle/src/participant/information_adapters.rs` | 该控制面已由编译实验坐实不在生产路径上，实盘四轮一次未触发。随那部分代码的处置一起归零 |
+| 类型没表达清楚的 `unreachable!` | **6** | `contracts/minecraft/event.rs` ×3、`backend/runtime/observation.rs` ×2、`backend/runtime/dto.rs` ×1 | 靠类型消除，与 `viewport.rs`、participant 入队路径同形 |
+| `json!` 字面量 | **3** | `app/src/model/scripted.rs` | 改为直接构造 `serde_json::Map`，类型即 Object，断言消失 |
+| CLI 参数解析 | **2** | `backend/src/main.rs` | 独立二进制入口，参数错即退出。规范做法是返回 `Err` 交给 main，属常规，低优先级 |
+
+**预计 19 → 2~4 处。** 前三组共 17 处都有明确路径。
+
+`contracts/minecraft/event.rs` 那 3 处是光秃秃的 `_ => unreachable!()`，**当前就不
+满足规则四**——没有任何不变量说明。要么补，要么消除。
+
+### 4.3 密度对照
+
+同一把尺子（都剔除测试文件与 `#[cfg(test)] mod` 块）：
+
+| | 生产行数 | 宏 panic | /KLOC | `unwrap`/`expect` | /KLOC |
+|---|---:|---:|---:|---:|---:|
+| 我们 | 37,635 | 19 | **0.50** | 65 | 1.73 |
+| 271 个运行期依赖 | 1,160,809 | 1,756 | **1.51** | 4,976 | 4.29 |
+
+单 tokio 124 处、bevy_ecs 98 处、portable-atomic 128 处。**我们的密度是依赖侧的
+三分之一**——显式 panic 不是我们当前偏高的项。记这一条是为了防止把「减少 panic」
+当成不需要论证的好事：规则四的判据是「这处该不该存在」，不是「总数越少越好」。
+
+## 5. 测试里的 `catch_unwind` 是正当的
 
 作断言用（「这里必须 panic」）与规则一不冲突：那是在验证缺陷检测本身，不是在生产
 路径上掩盖缺陷。
@@ -128,9 +169,9 @@ payload 存起来、等这一轮调度的其余 system 跑完再 `resume_unwind`
 **只因为外层捕获吞掉了一次真实 panic 才通过**。捕获与断言同在时，要能说清楚断言
 到底断言了什么。
 
-## 5. 与社区做法的对照
+## 6. 与社区做法的对照
 
-### 5.1 用量：稀少，且全在边界
+### 6.1 用量：稀少，且全在边界
 
 我们的 281 个运行期依赖中，生产代码真的调用 `catch_unwind` 的只有 **12 个
 （4.3%）**：tokio、bevy_ecs、bevy_app、bevy_tasks、moka、async-task、futures-util、
@@ -141,7 +182,7 @@ futures-lite、crossbeam-utils，以及三个我们没启用或编译不进来�
 cargo 1（在 `tests/testsuite/`）、uv 2、deno 3、servo 4、nushell 6、zed 6、
 rust-analyzer 9。
 
-### 5.2 用法：四种形态，没有一种是「吞掉后继续」
+### 6.2 用法：四种形态，没有一种是「吞掉后继续」
 
 | 形态 | 实例 | 关键点 |
 |---|---|---|
@@ -150,7 +191,7 @@ rust-analyzer 9。
 | 捕获后终止应用 | zed `remote_server/src/server.rs` | `log::error!("app panicked. quitting.")` 后返回 `Err` |
 | 线程池丢弃 | rust-analyzer `stdx/src/thread/pool.rs` | `// discard the panic, we should've logged the backtrace already`——丢弃**有前提** |
 
-### 5.3 官方口径
+### 6.3 官方口径
 
 `std::panic::catch_unwind` 文档：
 
@@ -159,11 +200,12 @@ rust-analyzer 9。
 该用的地方是 **FFI 边界**。三条注意：abort 下接不到；外来异常行为未定义；**丢弃
 `Err` 时可能二次 panic**。
 
-## 6. 还没定的
+## 7. 还没定的
 
 1. **abort 与 unwind 的最终归宿。** 现状（unwind）自洽且有测试守着；改 abort 需要
    走完规则三列的三步。⚠ 我不自己定。
-2. **27 处显式 panic 未按规则四逐处复核。** 尤其 backend 那 13 处。
+2. **19 处显式 panic 的消除尚未动手。** 清单与去向已在 §4.2 列出，其中
+   `contracts/minecraft/event.rs` 那 3 处当前就不满足规则四。
 3. **第 1 层把 panic 归到 `participant_handler_failed`，与普通 handler 失败同码。**
    排障时分不清「工具有 bug」和「工具正常失败了」。改它要先定「panic 在失败分类里
    算哪一类」。
