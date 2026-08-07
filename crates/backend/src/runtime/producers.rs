@@ -769,23 +769,22 @@ pub(super) fn produce_entity_packet_events(
     }
 }
 
-/// 只从 Azalea 的底层接收包消息中筛选服务端位置校正。
+/// 修复 Azalea 的 `Spawn` 去重标记在 26.1 跨维度/重生边界上的失效。
 ///
-/// Azalea 的 `packet-event` feature 会把每一个游戏包再转发到高层
-/// `LocalPlayerEvents` unbounded channel；对带区块流量的 26.1 服务器而言，
-/// 这会制造无意义的积压。自有插件直接读取同一条 ECS message，只保留
-/// `ClientboundPlayerPosition` 这一条 M4 需要的服务端事实。
-pub(super) struct ServerPositionCorrectionPlugin;
+/// 曾经这里还有 `record_server_position_corrections`，把
+/// `ClientboundPlayerPosition` 转成 `SelfState::ServerPositionCorrection` 事实。
+/// 已删除：服务端位置回拉在 ECS 里**已经被应用**，`pose` 就是应用之后的当前值，
+/// 视口与帧都直接查它。再发一条「位置被校正了」的事件，描述的是快照本来就会读到
+/// 的状态变化——它既不成为事实（`backend_event_is_fact` 挡住），也不能唤醒
+/// （只有聊天唤醒），入队只是占槽。
+///
+/// 判据与理由见 `docs/participant-queue-audit.md` 与
+/// `docs/vanilla-client-perception.md`：状态走拉取，事件只留不留痕的那一类。
+pub(super) struct RespawnBoundaryPlugin;
 
-impl Plugin for ServerPositionCorrectionPlugin {
+impl Plugin for RespawnBoundaryPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(
-            Update,
-            (
-                record_server_position_corrections,
-                reset_spawn_marker_on_world_loaded,
-            ),
-        );
+        app.add_systems(Update, reset_spawn_marker_on_world_loaded);
         app.add_observer(record_respawn_packet);
     }
 }
@@ -841,54 +840,4 @@ pub(super) fn record_respawn_packet(
         .clone()
         .unwrap_or_else(|| "unknown".to_owned());
     state.shared.emit_respawn_transition_started(from_dimension);
-}
-
-pub(super) fn record_server_position_corrections(
-    mut packets: MessageReader<azalea::packet::game::ReceiveGamePacketEvent>,
-    state: Res<SwarmState>,
-) {
-    for event in packets.read() {
-        let azalea::protocol::packets::game::ClientboundGamePacket::PlayerPosition(packet) =
-            event.packet.as_ref()
-        else {
-            continue;
-        };
-        let Some(source) = state
-            .shared
-            .admit_canonical_source_with_token(event.entity, Some(event.attempt_token))
-        else {
-            continue;
-        };
-        // 这是服务端主动校正玩家位置的协议事实；它不代表每个 tick
-        // 都有一个服务端坐标包，因此客户端预测轨迹仍单独记录。
-        state.shared.emit_canonical_observation_event(
-            source,
-            BackendEventPayload::SelfState(ContractProtocolSelfEvent::ServerPositionCorrection {
-                teleport_id: packet.id,
-                position: ContractVec3Value {
-                    x: packet.change.pos.x,
-                    y: packet.change.pos.y,
-                    z: packet.change.pos.z,
-                },
-                velocity: ContractVec3Value {
-                    x: packet.change.delta.x,
-                    y: packet.change.delta.y,
-                    z: packet.change.delta.z,
-                },
-                yaw: packet.change.look_direction.y_rot(),
-                pitch: packet.change.look_direction.x_rot(),
-                relative: RelativeMovementFlags {
-                    x: packet.relative.x,
-                    y: packet.relative.y,
-                    z: packet.relative.z,
-                    yaw: packet.relative.y_rot,
-                    pitch: packet.relative.x_rot,
-                    delta_x: packet.relative.delta_x,
-                    delta_y: packet.relative.delta_y,
-                    delta_z: packet.relative.delta_z,
-                    rotate_delta: packet.relative.rotate_delta,
-                },
-            }),
-        );
-    }
 }

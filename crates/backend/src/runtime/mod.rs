@@ -47,10 +47,9 @@ use mineintent_contracts::minecraft::{
     ProtocolEntityEvent as ContractProtocolEntityEvent,
     ProtocolEntitySnapshot as ContractProtocolEntitySnapshot, ProtocolObservationSource,
     ProtocolPlayerListEvent as ContractProtocolPlayerListEvent,
-    ProtocolSelfEvent as ContractProtocolSelfEvent,
     ProtocolSnapshotChangedEvent as ContractProtocolSnapshotChangedEvent,
     ProtocolSoundPayload as ContractProtocolSoundPayload,
-    ProtocolSoundSource as ContractProtocolSoundSource, ReconnectPolicy, RelativeMovementFlags,
+    ProtocolSoundSource as ContractProtocolSoundSource, ReconnectPolicy,
     SelfPose as ContractSelfPose, Subscription, Vec3Value as ContractVec3Value,
     ViewportBlock as ContractViewportBlock, ViewportFrame as ContractViewportFrame,
     ViewportLegend as ContractViewportLegend, ViewportProjection as ContractViewportProjection,
@@ -142,7 +141,7 @@ pub use handle::{RuntimeFrameFacts, RuntimeHandle};
 pub use observation::RuntimeObservationSource;
 #[cfg(test)]
 use producers::{produce_entity_packet_events, prove_has_skylight, CanonicalPacketSourceMetadata};
-use producers::{BlockSoundProducerPlugin, EntityProducerPlugin, ServerPositionCorrectionPlugin};
+use producers::{BlockSoundProducerPlugin, EntityProducerPlugin, RespawnBoundaryPlugin};
 use state::*;
 
 #[cfg(test)]
