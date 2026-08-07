@@ -11,6 +11,8 @@
 | 追溯历史 | [历史来源与旧路径迁移表](./history/index.md)，再进入不可变 commit、Issue 或 PR |
 | 了解原版客户端能力范围（P04 参考） | [Minecraft Java 客户端能力全景](./minecraft-client-capability-panorama.md) |
 | 构建或运行 Rust 移植 | [Rust workspace 指南](./guides/rust-workspace.md) |
+| 了解 Rust 树当前的欠账与复杂处 | [Rust 分支代码梳理](./rust-code-audit.md) |
+| 了解删掉 panic 捕获后的真实崩溃形态 | [实盘观测](./no-panic-live-run.md) |
 | 准备贡献 | [贡献流程](../CONTRIBUTING.md) |
 
 ## 文件权威等级
@@ -25,6 +27,8 @@
 | [`docs/guides/rust-workspace.md`](./guides/rust-workspace.md) | Rust 移植的构建、运行、环境变量与开发者模式 | 无 |
 | [`docs/history/index.md`](./history/index.md) | 历史证据和旧路径导航 | 无 |
 | [`docs/minecraft-client-capability-panorama.md`](./minecraft-client-capability-panorama.md) | 原版客户端能力调研基线（26.1.2/775），P04 的参考材料 | 无 |
+| [`docs/rust-code-audit.md`](./rust-code-audit.md) | Rust 树的代码梳理：重复、死代码、复杂处，以及与产品条目的可核对差距 | 无 |
+| [`docs/no-panic-live-run.md`](./no-panic-live-run.md) | 删空 panic 捕获后的四轮实盘观测与栈证据 | 无 |
 | [`README.md`](../README.md) | 项目导航和最短启动 | 无 |
 | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | 人类贡献工作流 | 无 |
 | [`CLAUDE.md`](../CLAUDE.md) | 开发代理工作规则 | 无 |
