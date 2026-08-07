@@ -16,6 +16,8 @@
 | 决定某处该不该捕获 panic、该不该写 `panic!` | [panic 处置：我们的做法](./panic-practice.md) |
 | 改动参与者事件队列前 | [参与者事件队列彻查](./participant-queue-audit.md) |
 | 设计声音通道或聊天历史工具前 | [原版客户端如何呈现瞬时事件](./vanilla-client-perception.md) |
+| 判断某条世界信息该走状态还是事件 | [世界信息如何到达模型](./world-information-design.md) |
+| 了解正在进行的生产者摘除 | [施工记录](./refactor-log-producer-removal.md) |
 | 准备贡献 | [贡献流程](../CONTRIBUTING.md) |
 
 ## 文件权威等级
@@ -35,6 +37,8 @@
 | [`docs/panic-practice.md`](./panic-practice.md) | panic 的处置规则、接管层形状，及其实盘与社区调查依据 | 无 |
 | [`docs/participant-queue-audit.md`](./participant-queue-audit.md) | 参与者事件队列的逐处彻查：票据语义、双重界限、控制车道死锁环 | 无 |
 | [`docs/vanilla-client-perception.md`](./vanilla-client-perception.md) | 反汇编 26.1.2 client.jar 得到的字幕、聊天与受伤呈现机制 | 无 |
+| [`docs/world-information-design.md`](./world-information-design.md) | 状态与事件的切分判据，及其三视角推导与 azalea 对照 | 无 |
+| [`docs/refactor-log-producer-removal.md`](./refactor-log-producer-removal.md) | 摘除自建生产者的施工记录：切口、地雷、逐刀进度 | 无 |
 | [`README.md`](../README.md) | 项目导航和最短启动 | 无 |
 | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | 人类贡献工作流 | 无 |
 | [`CLAUDE.md`](../CLAUDE.md) | 开发代理工作规则 | 无 |
