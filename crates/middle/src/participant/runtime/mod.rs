@@ -432,6 +432,14 @@ where
             self.stop_cleanup.send_replace(true);
         }
 
+        // 作用域记账（上面的 admit + cleanup）照做——重连后第一条事件可能就是
+        // 实体事件，作用域变更得由它带进来。但入队到此为止：见 support.rs 的
+        // `backend_event_enters_queue`。实体与方块在队列里两条出路都是死的，
+        // 而它们会把没点名的玩家聊天挤出同一条 16 格车道。
+        if !backend_event_enters_queue(&event) {
+            return Ok(ParticipantAdmission::Ignored);
+        }
+
         let (event_type, wake_candidate) = self.evaluate_backend_wake(&event, &scope)?;
         let terminal_lifecycle = terminal.then(|| backend_terminal_lifecycle(&event));
 

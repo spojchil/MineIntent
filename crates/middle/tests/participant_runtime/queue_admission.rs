@@ -4,6 +4,54 @@
 
 use super::*;
 
+/// 实体流水不占队列的槽，因此挤不掉没点名的玩家聊天。
+///
+/// 这条钉住的是一个实盘缺陷。第四层的车道划分是「有 wake 或 scope_control 走
+/// control(8)，否则走 ordinary(16)」，而 `scope_control` 只含 Lifecycle 与
+/// Overflow。**没点名的聊天因此和实体流水抢同一条 16 格车道**——而 2026-08-06
+/// 实盘两分钟摄入了 59945 条实体事件。实盘确实观察到
+/// `event_type=player_chat` 被丢，而聊天不可重建（撞 `产品.md` W08b）。
+///
+/// 修法不是加大队列，是不让实体入队：它在队列里两条出路都是死的——
+/// `backend_event_is_fact` 挡住它成为事实，`evaluate_backend_wake` 只认聊天。
+/// 世界长什么样按 A06/W08c 经视口到达 AI。
+///
+/// 注意声音**不在**本条覆盖内：它现在同样既不是事实也不唤醒，但按裁定将来要作
+/// 唤醒源走事件通道，所以仍然入队。
+#[tokio::test]
+async fn entity_traffic_does_not_take_slots_from_unaddressed_player_chat() {
+    let agent = TestAgent::new(0);
+    let (runtime, source, journal, _speech, _motor, _backend) = runtime_parts(Arc::clone(&agent));
+    runtime.start_worker().unwrap();
+    let current = scope(1, "minecraft:overworld");
+    // 把 worker 停住，队列才会真的积压。
+    hold_worker_on_second_journal(&runtime, &journal, &current).await;
+
+    // 灌入远超 ordinary 车道容量的实体流水。
+    for index in 0..(TEST_ORDINARY_CAPACITY * 3) {
+        runtime
+            .ingest_backend_event(entity_event(&format!("entity-{index}"), 1))
+            .unwrap();
+    }
+    let (ordinary, _control, overflow, ..) = runtime.queue_counts_for_test();
+    assert_eq!(
+        ordinary, 0,
+        "实体流水不该占用 ordinary 车道，实际占了 {ordinary} 格"
+    );
+    assert_eq!(overflow, 0, "既然没入队，就不该产生任何丢弃标记");
+
+    // 此时来一条没点名的玩家聊天：它是事实，必须还有位置。
+    source.set_chats(vec![chat_input(50, "Alice", "今天天气不错")]);
+    let admission = runtime
+        .ingest_backend_event(chat_event("chat-after-flood", 1, "Alice", "今天天气不错"))
+        .unwrap();
+    assert_eq!(
+        admission,
+        mineintent_middle::participant::ParticipantAdmission::Recorded,
+        "没点名的聊天被实体流水挤掉了——聊天不可重建"
+    );
+}
+
 #[tokio::test]
 async fn active_run_body_drain_precedes_queued_opening_without_fact_replay() {
     let agent = TestAgent::new(1);

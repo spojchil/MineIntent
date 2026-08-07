@@ -255,6 +255,33 @@ pub(super) fn same_chat_identity(left: &AgentChatMessageV5, right: &AgentChatMes
 /// - `SelfState` —— 目前只有 `ServerPositionCorrection`，是协议层的回拉纠正，
 ///   不是玩家能察觉的事件；位置本身每帧都在 `pose` 里
 /// - `SnapshotChanged` —— 内部记账
+/// 这条后端事件该不该占用参与者队列的一个槽。
+///
+/// 与 [`backend_event_is_fact`] 是两件事：那条决定「记不记成事实」，这条决定
+/// 「进不进队列」。此前只有前者，于是实体与方块照样入队、占槽、被丢，并产生
+/// 队列自己的溢出标记——它们在队列里两条出路都是死的：
+///
+/// - 成为事实：`backend_event_is_fact` 已经挡住
+/// - 触发唤醒：`evaluate_backend_wake` 只认聊天，非聊天一律 `None`
+///
+/// 代价是真实的，不只是噪声。第四层的车道划分是「有 wake 或 scope_control 走
+/// control(8)，否则走 ordinary(16)」，而 `scope_control` 只含 Lifecycle 与
+/// Overflow。**没点名的玩家聊天因此和实体流水抢同一条 16 格车道**，而实盘两分
+/// 钟的实体摄入是 59945 条。实盘确实观察到 `event_type=player_chat` 被丢，
+/// 而聊天不可重建（撞 `产品.md` W08b）。
+///
+/// 声音**保留**：它现在既不是事实也不唤醒，但按维护者裁定，声音将来要作唤醒源
+/// 走事件通道进帧，与聊天同路。提前挡掉会让那条通道届时无处接。
+///
+/// 实体与方块不保留：世界长什么样按 A06/W08c 经视口到达 AI，是拉取式的，
+/// 丢一条「方块变了」不影响下一次看。
+pub(super) fn backend_event_enters_queue(event: &BackendEventEnvelope) -> bool {
+    !matches!(
+        event.payload,
+        BackendEventPayload::Entity(_) | BackendEventPayload::Block(_)
+    )
+}
+
 pub(super) fn backend_event_is_fact(event: &BackendEventEnvelope) -> bool {
     match &event.payload {
         BackendEventPayload::Lifecycle(_)

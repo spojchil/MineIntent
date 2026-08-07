@@ -929,6 +929,30 @@ fn scoped_chat_event_at_attempt(
     )
 }
 
+/// 一条实体流水事件。用 `Animation` 是因为它只需两个字符串——本夹具关心的是
+/// 「这类事件会不会占队列的槽」，不是它的内容。
+fn entity_event(id: &str, epoch: u64) -> BackendEventEnvelope {
+    BackendEventEnvelope::new(
+        BackendEventMetadata {
+            id: id.to_owned(),
+            occurred_at: "2026-08-03T00:01:00Z".to_owned(),
+            process_session_id: "process-test".to_owned(),
+            connection_epoch: epoch,
+            connection_attempt_id: "attempt-test".to_owned(),
+            world_id: "world-test".to_owned(),
+            dimension: Some("minecraft:overworld".to_owned()),
+        },
+        BackendEventKind::Entity,
+        FactSource::ServerObserved,
+        mineintent_contracts::minecraft::BackendEventPayload::Entity(
+            mineintent_contracts::minecraft::ProtocolEntityEvent::Animation {
+                entity_key: format!("1:{id}"),
+                animation: "swing_main_hand".to_owned(),
+            },
+        ),
+    )
+}
+
 fn chat_timestamp(text: &str) -> String {
     let seconds = text
         .bytes()
