@@ -7,7 +7,6 @@
 use std::{
     collections::{BTreeMap, HashSet},
     future::Future,
-    panic::{catch_unwind, AssertUnwindSafe},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -345,13 +344,9 @@ impl InformationRuntime {
         &self,
         interface_id: Option<InformationInterfaceId>,
     ) -> Result<InformationScopeSnapshot, InformationRequestError> {
-        catch_unwind(AssertUnwindSafe(|| self.scope_source.capture())).map_err(|_| {
-            error(
-                InformationErrorCode::ProviderFailed,
-                "The information scope is unavailable.",
-                interface_id,
-            )
-        })
+        // 实验分支：不再捕获 panic。scope_source 打断言就让它传播。
+        let _ = interface_id;
+        Ok(self.scope_source.capture())
     }
 
     fn resolve_grant(
@@ -359,13 +354,11 @@ impl InformationRuntime {
         caller: &TrustedInformationCaller,
         interface_id: Option<InformationInterfaceId>,
     ) -> Result<InformationGrant, InformationRequestError> {
-        let grant = catch_unwind(AssertUnwindSafe(|| {
-            self.access_policy
-                .resolve(&caller.grant_id, &caller.principal_id)
-        }))
-        .ok()
-        .and_then(Result::ok)
-        .flatten();
+        let grant = self
+            .access_policy
+            .resolve(&caller.grant_id, &caller.principal_id)
+            .ok()
+            .flatten();
         match grant {
             Some(grant) if grant.purpose == caller.purpose => Ok(grant),
             _ => Err(error(
@@ -384,11 +377,11 @@ impl InformationRuntime {
         fields: &[String],
         scope: &InformationScopeSnapshot,
     ) -> bool {
-        catch_unwind(AssertUnwindSafe(|| {
+        matches!(
             self.access_policy
-                .authorize(grant, descriptor, operation, fields, scope)
-        }))
-        .is_ok_and(|result| matches!(result, InformationAuthorizationResult::Allowed))
+                .authorize(grant, descriptor, operation, fields, scope),
+            InformationAuthorizationResult::Allowed
+        )
     }
 
     fn provider_availability(
@@ -418,8 +411,7 @@ impl InformationRuntime {
             },
             refs: &issuer,
         };
-        let availability =
-            catch_unwind(AssertUnwindSafe(|| provider.availability(&context))).map_err(|_| ())?;
+        let availability = provider.availability(&context);
         validate_availability(provider, &availability).map_err(|_| ())?;
         Ok(availability)
     }
@@ -661,18 +653,7 @@ impl InformationRuntime {
             },
         };
         let (child_control, child_cancel, child_deadline) = child_operation_control();
-        let provider_future = match catch_unwind(AssertUnwindSafe(|| {
-            provider.read(context, provider_request, child_control)
-        })) {
-            Ok(future) => future,
-            Err(_) => {
-                return InformationToolResult::Error(error(
-                    InformationErrorCode::ProviderFailed,
-                    "The information provider failed.",
-                    Some(request.interface_id),
-                ));
-            }
-        };
+        let provider_future = provider.read(context, provider_request, child_control);
         let provider_result = await_provider(
             provider_future,
             &control,
@@ -821,13 +802,7 @@ impl InformationRuntime {
             correlation_id: caller.correlation_id.clone(),
             observed_at: result.observed_at.clone(),
         };
-        if catch_unwind(AssertUnwindSafe(|| self.trace.append(trace_record))).is_err() {
-            return InformationToolResult::Error(error(
-                InformationErrorCode::ProviderFailed,
-                "The information trace sink failed.",
-                Some(request.interface_id),
-            ));
-        }
+        self.trace.append(trace_record);
         InformationToolResult::Read(result)
     }
 
@@ -1104,11 +1079,8 @@ fn validate_provider_result(
             .get(field)
             .cloned()
             .ok_or("The information provider returned an invalid field value.")?;
-        let parsed = match catch_unwind(AssertUnwindSafe(|| definition.value_schema.parse(value))) {
-            Ok(Ok(value)) => value,
-            Ok(Err(_)) | Err(_) => {
-                return Err("The information provider returned an invalid field value.");
-            }
+        let Ok(parsed) = definition.value_schema.parse(value) else {
+            return Err("The information provider returned an invalid field value.");
         };
         if !definition.source_kinds.contains(&result.source.kind) {
             return Err("The information provider returned a disallowed field source.");
@@ -1238,9 +1210,10 @@ impl<F: Future> Future for CatchUnwindFuture<F> {
     type Output = Result<F::Output, ()>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        // 实验分支：不再捕获 panic，poll 直接透传。保留 Result 外壳只是为了
+        // 不改调用方形状；provider 打断言就让它穿出去。
         let this = self.get_mut();
-        catch_unwind(AssertUnwindSafe(|| this.future.as_mut().poll(context)))
-            .map_or(Poll::Ready(Err(())), |poll| poll.map(Ok))
+        this.future.as_mut().poll(context).map(Ok)
     }
 }
 
