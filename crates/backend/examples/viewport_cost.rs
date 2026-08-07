@@ -1,0 +1,214 @@
+//! `view` 全量投影的耗时测量。
+//!
+//! 存在的理由：判断「模型给的工具数组要在 1 tick（50ms）内处理完」这个目标成不成立。
+//! 持续动作改成后台 job 之后只是入队、必然很快，全量投影是唯一可能超预算的工具。
+//!
+//! **与生产路径的差别只有一处**：生产的 `read_block` 还要走
+//! `world.get_block_state()`（区块调色板查表），这里直接给状态。
+//! DTO 构造走的是**生产的同一个 `block_snapshot`**，投影走的是
+//! 生产的同一个 `project_with_checkpoint` + `ViewportOptions::default()`
+//! （`runtime/observation.rs:420` 用的就是这两个）。
+//!
+//! 所以读数是**生产耗时的下界**，缺的那部分是区块查表。
+//!
+//! 跑法（必须 release，生产用的是 lto=fat / opt-level=3）：
+//! ```text
+//! cargo run --release -p mineintent-backend --example viewport_cost
+//! ```
+
+use std::time::{Duration, Instant};
+
+use azalea::block::BlockState;
+use mineintent_backend::{
+    snapshot::{block_snapshot, BlockPosition, BlockReadResult, PoseSnapshot, Vec3Value},
+    viewport::{project_with_checkpoint, ViewportOptions},
+};
+
+const WARMUP: usize = 3;
+const SAMPLES: usize = 20;
+/// 一个游戏刻。目标就是拿测得的耗时和它比。
+const TICK: Duration = Duration::from_millis(50);
+
+fn stone() -> BlockState {
+    BlockState::from(azalea::registry::builtin::BlockKind::Stone)
+}
+
+/// 便宜的整数散列，用来造「碎」地形；不引随机数依赖，保证可复现。
+fn hashed(x: i32, y: i32, z: i32) -> u32 {
+    let mut h = 2_166_136_261u32;
+    for value in [x, y, z] {
+        h ^= value as u32;
+        h = h.wrapping_mul(16_777_619);
+    }
+    h ^= h >> 15;
+    h
+}
+
+struct Scenario {
+    name: &'static str,
+    note: &'static str,
+    solid: fn(i32, i32, i32) -> bool,
+}
+
+const SCENARIOS: &[Scenario] = &[
+    Scenario {
+        name: "open_air",
+        note: "全空气：只剩视锥/距离剔除，下界",
+        solid: |_, _, _| false,
+    },
+    Scenario {
+        name: "flat_ground",
+        note: "y<=0 石头：典型露天站立",
+        solid: |_, y, _| y <= 0,
+    },
+    Scenario {
+        name: "cave_pocket",
+        note: "半径 6 空气球，其余石头：洞穴/矿道",
+        solid: |x, y, z| {
+            let dy = y - 1;
+            x * x + dy * dy + z * z > 36
+        },
+    },
+    Scenario {
+        name: "noise_30",
+        note: "30% 伪随机石头：最碎，暴露面最多",
+        solid: |x, y, z| hashed(x, y, z) % 100 < 30,
+    },
+    Scenario {
+        name: "solid",
+        note: "全石头：眼在石头里",
+        solid: |_, _, _| true,
+    },
+];
+
+struct Measurement {
+    elapsed: Vec<Duration>,
+    reads: usize,
+    blocks: usize,
+    truncated: bool,
+}
+
+fn measure(scenario: &Scenario) -> Measurement {
+    let pose = PoseSnapshot {
+        position: Vec3Value {
+            x: 0.5,
+            y: 1.0,
+            z: 0.5,
+        },
+        velocity: Vec3Value {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        yaw: 0.0,
+        pitch: 0.0,
+        on_ground: true,
+    };
+    let options = ViewportOptions::default();
+    let solid = scenario.solid;
+
+    let mut reads = 0usize;
+    let mut blocks = 0usize;
+    let mut truncated = false;
+    let mut elapsed = Vec::with_capacity(SAMPLES);
+
+    for iteration in 0..(WARMUP + SAMPLES) {
+        let mut counter = 0usize;
+        let read_block = |position: BlockPosition| {
+            counter += 1;
+            let state = if solid(position.x, position.y, position.z) {
+                stone()
+            } else {
+                BlockState::AIR
+            };
+            BlockReadResult::Loaded {
+                block: block_snapshot(position, state),
+            }
+        };
+
+        let started = Instant::now();
+        let projection = project_with_checkpoint(&pose, &[], read_block, &options, || Ok(()))
+            .expect("projection must succeed");
+        let took = started.elapsed();
+
+        if iteration >= WARMUP {
+            elapsed.push(took);
+        }
+        reads = counter;
+        blocks = projection.visible_blocks.blocks.len();
+        truncated = projection.visible_blocks.truncated;
+    }
+
+    elapsed.sort();
+    Measurement {
+        elapsed,
+        reads,
+        blocks,
+        truncated,
+    }
+}
+
+fn millis(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+fn main() {
+    let options = ViewportOptions::default();
+    let box_voxels =
+        (2 * options.horizontal_radius as i64 + 1).pow(2) * (2 * options.vertical_radius as i64 + 1);
+
+    println!("view 全量投影耗时测量");
+    println!(
+        "参数（生产默认值 ViewportOptions::default）：水平半径 {}、垂直半径 {}、最远 {} 格、\
+         上限 {} 块、判据 {:?}",
+        options.horizontal_radius,
+        options.vertical_radius,
+        options.max_distance,
+        options.block_limit,
+        options.predicate
+    );
+    println!(
+        "扫描盒 {}x{}x{} = {} 体素；预热 {} 次，取样 {} 次；一刻 = {} ms",
+        2 * options.horizontal_radius + 1,
+        2 * options.horizontal_radius + 1,
+        2 * options.vertical_radius + 1,
+        box_voxels,
+        WARMUP,
+        SAMPLES,
+        millis(TICK)
+    );
+    println!();
+    println!(
+        "{:<14} {:>9} {:>9} {:>9} {:>10} {:>8} {:>7}  {}",
+        "场景", "最快ms", "中位ms", "最慢ms", "唯一体素", "可见块", "占一刻", "说明"
+    );
+
+    for scenario in SCENARIOS {
+        let measurement = measure(scenario);
+        let median = measurement.elapsed[measurement.elapsed.len() / 2];
+        println!(
+            "{:<14} {:>9.2} {:>9.2} {:>9.2} {:>10} {:>8} {:>6.0}%  {}{}",
+            scenario.name,
+            millis(measurement.elapsed[0]),
+            millis(median),
+            millis(measurement.elapsed[measurement.elapsed.len() - 1]),
+            measurement.reads,
+            measurement.blocks,
+            millis(median) / millis(TICK) * 100.0,
+            scenario.note,
+            if measurement.truncated {
+                "（已截断）"
+            } else {
+                ""
+            }
+        );
+    }
+
+    println!();
+    println!("读法：");
+    println!("- 「唯一体素」是本 harness 的 read_block 被调用的次数。投影层在它外面套了一层");
+    println!("  HashMap 缓存（viewport.rs:349-358），只有未命中才落到这里，所以这个数是");
+    println!("  **实际读过的不重复体素**，不是总请求数。生产里每次未命中还要多一次区块");
+    println!("  调色板查表，本测量没算进去。");
+    println!("- 「占一刻」超过 100% 就意味着单次 view 已经吃掉整个 tick 预算。");
+}
