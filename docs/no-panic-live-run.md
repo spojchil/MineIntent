@@ -127,6 +127,16 @@ run4 用 RCON `/kill` 打死同伴。journal 全部 20 条：
 
 另外：所有条目 `wake: null`——同伴**没有因自己的死亡醒来**，也没调用 `respawn`。
 
+> **补充（初稿把它写成了疑似缺陷，实际是设计如此）**：
+> `evaluate_backend_wake`（`middle/src/participant/runtime/mod.rs:996-1017`）
+> 只对**被寻址的玩家聊天**产生唤醒，其余一律 `None`。
+> `docs/architecture.md:44` 也写明「当前决策入口是任何玩家的被寻址公屏聊天」。
+> 所以「死亡不唤醒」不是缺陷，是当前的既定行为——死亡以**事实**入账
+> （`backend_event_is_fact` 对 `Lifecycle` 返回 `true`，本轮 journal 里那条
+> `lifecycle` 就是它），等下一次有人说话时随帧送达。
+> 值得问的是产品问题：**同伴该不该因为自己死了而主动做点什么**，
+> 这在 `产品.md` 里没有条目。⚠ 我不自己定。
+
 ### 3.3 玩家聊天被当成"可重建事实"丢弃
 
 run/run2/run3 都出现过：
@@ -174,8 +184,16 @@ for delivery in deliveries {
 }
 ```
 
-一旦某个 listener panic，`finish()` 被跳过 → `remove_subscription` 里的
-`state.wait_quiescent()` 永久阻塞。与观察面那处是同一个缺陷。
+一旦某个 listener panic，`finish()` 被跳过 → `active` 永不归零 →
+此后每次 `remove_subscription` 的 `wait_quiescent` 都要白等满 `UNSUBSCRIBE_WAIT`。
+
+> **订正（本文初稿写错了）**：初稿写的是「永久阻塞」。实际不是——
+> `facade.rs:1303-1314` 的 `wait_quiescent` 带 `deadline`，超时 `break`，**有界 2 秒**；
+> 只有观察面的 `runtime/events.rs:637-647` 是裸 `Condvar::wait`，**无界**，
+> 一次泄漏才是永久卡死（实测表现为测试 600 秒不结束）。
+> 我是照观察面那处类推的，没有读 `wait_quiescent` 的函数体。
+> 两处的严重程度差一个量级：这边是每次退订浪费 2 秒，那边是永久。
+> 由 `refactor/panic-supervision` 分支指出并已在该分支改成 RAII（`ListenerLease`）。
 
 **这条应当修**，而且修法和云端那次一样：把租约归还搬进守卫的 `Drop`。
 它与「要不要保留捕获」无关——**无论捕获去留，RAII 都该是 RAII**。

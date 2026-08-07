@@ -771,12 +771,23 @@ dispatcher 线程「本身没有独立理由」，事实流改成拉取式之后
 
 对全部生产码做函数级测量（大括号配平，跳过 `#[cfg(test)]` 尾部）：
 
-**1 429 个生产函数，平均 17.0 行。** 这个数字是健康的——绝大多数函数很短。
+**1 706 个生产函数，平均 17.1 行。** 这个数字是健康的——绝大多数函数很短。
 问题集中在尾部的少数几个：
+
+> **订正（初稿的扫描器有 bug）**：初稿写的是「1 429 个，平均 17.0 行」，
+> 因为截断测试模块用的判据是「遇到独占一行的 `#[cfg(test)]` 就截断」，
+> 而 `facade.rs` 等文件里 `#[cfg(test)]` 大量加在**结构体字段**上
+> （`#[cfg(test)] scripted: bool,`）。全树因此少算 **5 596 行生产码**，
+> 其中 `facade.rs` 一个文件就少算 1 123 行（截在 958，实际到 2 081）。
+> 订正判据：`#[cfg(test)]` 后面紧跟 `mod` 才算测试模块开头。
+> 平均值几乎没变（17.0 → 17.1），**「整体健康」这个结论成立**；
+> 但下表**漏掉了一个 301 行的函数**，见表内标注。
+> 同一个 bug 的发现来自 `refactor/panic-supervision` 分支的 §4.1 计数口径。
 
 | 行数 | 嵌套 | 函数 | 位置 |
 |---:|---:|---|---|
 | 400 | 5 | `produce_entity_packet_events` | `backend/src/runtime/producers.rs:371` |
+| **301** | — | **`handle_command`**（初稿漏掉，整个落在被误截的区间里） | `backend/src/runtime/command.rs:377` |
 | 297 | 3 | `read` | `middle/src/information/runtime.rs:536`（不在生产路径，见 §4） |
 | 223 | 4 | `read_viewport_attempt` | `backend/src/runtime/observation.rs:302` |
 | 215 | 5 | `handle_client` | `backend/src/runtime/driver.rs:97` |
@@ -871,8 +882,13 @@ for event in packets.read() {
   | `backend/src/facade.rs:650` | 「事实流改成拉取式之后，这根线程和这处 catch 应当一起消失」 |
   | `contracts/src/capability/contracts.rs:11` | 「临时决定（2026-08-06，无人可问）：这个枚举已经名不副实，暂留」 |
   | `middle/src/participant/runtime/queue.rs:263` | 「临时决定（2026-08-06，维护者不在场）：并进最新标记」 |
-- **生产码里可 panic 的调用只有 55 处**（`unwrap()` / `expect(` / `panic!` / `unreachable!`，
-  去掉 `#[cfg(test)]` 尾部与测试文件后），分布在 17 个文件。对 46 153 行生产码来说很低。
+- **生产码里可 panic 的调用是 68 处**（`unwrap()` / `expect(` / `panic!` /
+  `unreachable!`），其中宏 panic **19**、`unwrap`/`expect` 49。对生产码规模来说很低。
+
+  > **订正**：初稿写 55，同样是上面那个截断 bug 造成的低估。
+  > 宏 panic 那一项（19）与 `refactor/panic-supervision` 分支独立数出的数字**完全一致**，
+  > 两边互为佐证；`unwrap`/`expect` 两边分别是 49 与 65，差异来自测试文件排除规则不同，
+  > 量级一致，不影响「很低」这个结论。
 - **依赖表零冗余**（§9.4）。
 - **`unsafe_code = "deny"`**（workspace lint），全库无 unsafe 豁免。
 
