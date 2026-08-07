@@ -3,7 +3,7 @@
 > 无产品权威。本文是**进行中**工作的记录，随施工更新。
 >
 > 判据与推导见[世界信息如何到达模型](./world-information-design.md)。
-> 分支：`refactor/panic-supervision`。
+> 分支：`refactor/panic-supervision`。姊妹篇：[panic 接管层施工记录](./refactor-log-panic-supervision.md)。
 
 ## 0. 目标
 
