@@ -59,6 +59,7 @@ struct TestAgent {
     run_index: AtomicUsize,
     release: watch::Sender<bool>,
     fail: AtomicBool,
+    panic_in_run: AtomicBool,
 }
 
 impl TestAgent {
@@ -72,7 +73,16 @@ impl TestAgent {
             run_index: AtomicUsize::new(0),
             release,
             fail: AtomicBool::new(false),
+            panic_in_run: AtomicBool::new(false),
         })
+    }
+
+    /// 让下一次 run 在报告过 run_count 之后 panic。
+    ///
+    /// 顺序是有意的：先 send_replace 再 panic，测试才能用 wait_for_runs 确认
+    /// worker 确实进到了这一次 run，而不是在 panic 之前就被停机抢先取消。
+    fn arm_panic(&self) {
+        self.panic_in_run.store(true, Ordering::SeqCst);
     }
 
     async fn wait_for_runs(&self, expected: usize) {
@@ -133,6 +143,7 @@ impl ParticipantAgentPort for TestAgent {
         let hold_runs = self.hold_runs.load(Ordering::SeqCst);
         let index = self.run_index.fetch_add(1, Ordering::SeqCst) + 1;
         let fail = self.fail.load(Ordering::SeqCst);
+        let panic_in_run = self.panic_in_run.load(Ordering::SeqCst);
         Box::pin(async move {
             let request_count = {
                 let mut requests = requests.lock().unwrap();
@@ -140,6 +151,9 @@ impl ParticipantAgentPort for TestAgent {
                 index
             };
             run_count.send_replace(request_count);
+            if panic_in_run {
+                panic!("test agent panic fixture");
+            }
             if fail {
                 return Err(AgentError::new(
                     AgentErrorCode::ProviderFailed,
@@ -188,6 +202,7 @@ struct TestJournal {
     gate: watch::Sender<bool>,
     step_after: AtomicUsize,
     step_release: watch::Sender<usize>,
+    panic_in_append: AtomicBool,
 }
 
 impl TestJournal {
@@ -202,7 +217,18 @@ impl TestJournal {
             gate,
             step_after: AtomicUsize::new(0),
             step_release,
+            panic_in_append: AtomicBool::new(false),
         })
+    }
+
+    /// 让此后每次 append 在计数已更新之后 panic。
+    ///
+    /// journal 的 append 由 worker 循环直接 await（process_item 里，早于
+    /// process_wake 的嵌套任务），所以这是让 panic 打到 **worker 任务边界**
+    /// 而不是 agent run 那个嵌套边界的钩子。先更新计数再 panic，测试才能用
+    /// wait_for_entries 同步而不是靠定时等待。
+    fn arm_panic(&self) {
+        self.panic_in_append.store(true, Ordering::SeqCst);
     }
 
     fn set_gate(&self, gated: bool) {
@@ -260,6 +286,7 @@ impl CapabilityJournal for TestJournal {
         let gate = self.gate.clone();
         let step_after = &self.step_after;
         let step_release = self.step_release.clone();
+        let panic_in_append = self.panic_in_append.load(Ordering::SeqCst);
         Box::pin(async move {
             let length = {
                 let mut entries = entries.lock().unwrap();
@@ -268,6 +295,9 @@ impl CapabilityJournal for TestJournal {
             };
             payloads.lock().unwrap().push(payload);
             count.send_replace(length);
+            if panic_in_append {
+                panic!("test journal panic fixture");
+            }
             let mut receiver = gate.subscribe();
             loop {
                 if !*receiver.borrow() {

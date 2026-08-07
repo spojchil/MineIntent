@@ -24,6 +24,106 @@ async fn request_stop_releases_before_bounded_worker_settle_and_speech_cancel() 
     );
 }
 
+/// worker 任务本身 panic 之后，停机必须出声。
+///
+/// 先说清楚这条**不**覆盖什么：工具与 provider 的 panic 发生在 process_wake
+/// 里那个嵌套 `tokio::spawn` 中，它的 JoinError 已经在 mod.rs 的
+/// `joined.map_err(..)` 处接住并变成 participant_handler_failed——那条路径
+/// 一直是通的，正是 crates/toolloop/src/control.rs 开头所依据的接管点。
+///
+/// 缺口在 agent run **之外**的那半个 worker 循环：journal 落盘、帧捕获、
+/// 队列记账、终态处理。这些直接在 worker 任务里 await，panic 会打到 worker
+/// 自己的任务边界。而 `stop()` 原本写的是
+///
+/// ```ignore
+/// if tokio::time::timeout(STOP_WORKER_SETTLE, &mut worker).await.is_err() { .. }
+/// ```
+///
+/// 只判超时。worker 已 panic 时 `&mut worker` 立刻就绪，timeout 返回的是
+/// `Ok(Err(JoinError))`——`.is_err()` 为 false，那个 JoinError 连绑定都没有，
+/// 停机径直走到 Stopped 与 `Ok(())`。真实后果是参与者从 panic 那一刻起不再
+/// 处理任何唤醒，运行期间无人发现，而停机报告成功。
+///
+/// 这里用 journal 的 append 作钩子，因为它是 worker 循环里最早、且必然被走到
+/// 的那个 await（process_item 中，早于 process_wake）。
+///
+/// 测试输出里会出现一条 fixture 的 panic 回溯，那是被测现象本身，不是失败。
+#[tokio::test]
+async fn worker_panic_surfaces_as_failure_at_stop() {
+    let agent = TestAgent::new(0);
+    let (runtime, source, journal, _speech, _motor, _backend) = runtime_parts(Arc::clone(&agent));
+    runtime.start_worker().unwrap();
+    let mut failures = runtime.subscribe_failures();
+    source.set_chats(vec![chat_input(50, "Alice", "@Bot boom")]);
+    journal.arm_panic();
+    runtime
+        .ingest_backend_event(chat_event("91", 1, "Alice", "@Bot boom"))
+        .unwrap();
+    // fixture 先更新计数再 panic，所以这一句返回时 panic 已经发生在 worker
+    // 任务里；随后让出几次，确保它完成解栈——不靠定时等待。
+    journal.wait_for_entries(1).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+
+    runtime.stop().await.unwrap();
+
+    let mut codes = Vec::new();
+    while let Ok(failure) = failures.try_recv() {
+        codes.push(failure.code);
+    }
+    assert!(
+        codes
+            .iter()
+            .any(|code| code == "participant_worker_panicked"),
+        "停机必须报告 worker 的 panic，实际收到 {codes:?}"
+    );
+}
+
+/// 工具与 provider 的 panic 止步于嵌套任务边界，不会带走 worker。
+///
+/// 这是上一条测试的另一半，也是 crates/toolloop/src/control.rs 删掉循环内
+/// panic 隔离时所依据的那条契约：「让它照常传播，调用方的任务边界会把它接成
+/// JoinError」。依据必须有测试守着，否则哪天 process_wake 不再 spawn，循环
+/// 里没有捕获、外面也没有边界，panic 会一路打死 worker 而无人察觉。
+///
+/// 一并钉住两件事：worker 活下来（没有 participant_worker_panicked），以及
+/// panic 被归到 participant_handler_failed。后者与普通 handler 失败同码——
+/// 已知，暂不改：改它要先定「panic 在失败分类里算哪一类」。
+///
+/// 测试输出里的 panic 回溯同样是被测现象本身。
+#[tokio::test]
+async fn agent_run_panic_stops_at_the_nested_task_boundary() {
+    let agent = TestAgent::new(0);
+    let (runtime, source, _journal, _speech, _motor, _backend) = runtime_parts(Arc::clone(&agent));
+    runtime.start_worker().unwrap();
+    let mut failures = runtime.subscribe_failures();
+    agent.arm_panic();
+    source.set_chats(vec![chat_input(50, "Alice", "@Bot boom")]);
+    runtime
+        .ingest_backend_event(chat_event("92", 1, "Alice", "@Bot boom"))
+        .unwrap();
+    wait_for_request(&agent, 1).await;
+
+    let failure = tokio::time::timeout(Duration::from_secs(2), failures.recv())
+        .await
+        .expect("嵌套边界必须在超时内报出这次 panic")
+        .expect("失败流仍在");
+    assert_eq!(failure.code, "participant_handler_failed");
+
+    runtime.stop().await.unwrap();
+    let mut codes = Vec::new();
+    while let Ok(failure) = failures.try_recv() {
+        codes.push(failure.code);
+    }
+    assert!(
+        !codes
+            .iter()
+            .any(|code| code == "participant_worker_panicked"),
+        "worker 不该被工具的 panic 带走，实际收到 {codes:?}"
+    );
+}
+
 #[tokio::test]
 async fn concurrent_stop_uses_one_cleanup_and_completion_owner() {
     let agent = TestAgent::new(0);
