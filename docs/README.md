@@ -15,6 +15,7 @@
 | 了解删掉 panic 捕获后的真实崩溃形态 | [实盘观测](./no-panic-live-run.md) |
 | 决定某处该不该捕获 panic、该不该写 `panic!` | [panic 处置：我们的做法](./panic-practice.md) |
 | 改动参与者事件队列前 | [参与者事件队列彻查](./participant-queue-audit.md) |
+| 设计声音通道或聊天历史工具前 | [原版客户端如何呈现瞬时事件](./vanilla-client-perception.md) |
 | 准备贡献 | [贡献流程](../CONTRIBUTING.md) |
 
 ## 文件权威等级
@@ -33,6 +34,7 @@
 | [`docs/no-panic-live-run.md`](./no-panic-live-run.md) | 删空 panic 捕获后的四轮实盘观测与栈证据 | 无 |
 | [`docs/panic-practice.md`](./panic-practice.md) | panic 的处置规则、接管层形状，及其实盘与社区调查依据 | 无 |
 | [`docs/participant-queue-audit.md`](./participant-queue-audit.md) | 参与者事件队列的逐处彻查：票据语义、双重界限、控制车道死锁环 | 无 |
+| [`docs/vanilla-client-perception.md`](./vanilla-client-perception.md) | 反汇编 26.1.2 client.jar 得到的字幕、聊天与受伤呈现机制 | 无 |
 | [`README.md`](../README.md) | 项目导航和最短启动 | 无 |
 | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | 人类贡献工作流 | 无 |
 | [`CLAUDE.md`](../CLAUDE.md) | 开发代理工作规则 | 无 |
