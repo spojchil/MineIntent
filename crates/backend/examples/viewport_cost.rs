@@ -152,6 +152,84 @@ fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
 
+/// 把「建 DTO」从「做几何」里拆出来。
+///
+/// 投影每读一个体素就调一次 `block_snapshot`，而它每次都要三次堆分配
+/// （`Box::from(state)`、`to_aabbs()` 收 Vec、`property_map()` 收 BTreeMap，
+/// 见 `snapshot.rs:218-233`）。但绝大多数体素只是被问「挡不挡光」这个布尔问题，
+/// 真正进输出的最多 256 个。这一段量的就是那笔冤枉钱有多大。
+fn dto_share() {
+    /// 与上表的唯一体素数同量级，便于直接对照。
+    const CALLS: usize = 21_000;
+
+    println!();
+    println!("DTO 构造成本（block_snapshot × {CALLS}，与上表唯一体素数同量级）");
+    println!("{:<10} {:>10} {:>12} {:>12}", "方块", "总计ms", "每次ns", "占一刻");
+
+    for (label, state) in [("air", BlockState::AIR), ("stone", stone())] {
+        let mut best = Duration::MAX;
+        for _ in 0..5 {
+            let started = Instant::now();
+            for index in 0..CALLS {
+                let position = BlockPosition {
+                    x: index as i32,
+                    y: 0,
+                    z: 0,
+                };
+                std::hint::black_box(block_snapshot(position, state));
+            }
+            best = best.min(started.elapsed());
+        }
+        println!(
+            "{:<10} {:>10.2} {:>12.0} {:>11.0}%",
+            label,
+            millis(best),
+            best.as_nanos() as f64 / CALLS as f64,
+            millis(best) / millis(TICK) * 100.0
+        );
+    }
+
+    clone_share();
+}
+
+/// 量投影层那个块缓存**每次命中**的代价。
+///
+/// `viewport.rs:352` 写的是 `block_cache.get(&key).cloned()`——命中也要把整个
+/// `BlockReadResult` 深拷一份，而它里面带 `Vec<[f64;6]>` 和 `BTreeMap`。
+/// 暴露面判据每个候选要探 6 个邻居，邻居基本都是已读过的候选，
+/// 所以命中次数大约是候选数的 6 倍。这一段量的就是那 6 倍要多少钱。
+fn clone_share() {
+    const CANDIDATES: usize = 21_000;
+    /// 暴露面判据每个候选最多探 6 个邻居。
+    const NEIGHBOURS: usize = 6;
+    const HITS: usize = CANDIDATES * NEIGHBOURS;
+
+    println!();
+    println!("缓存命中成本（BlockReadResult::clone × {HITS} = 候选 {CANDIDATES} × 邻居 {NEIGHBOURS}）");
+    println!("{:<10} {:>10} {:>12} {:>12}", "方块", "总计ms", "每次ns", "占一刻");
+
+    for (label, state) in [("air", BlockState::AIR), ("stone", stone())] {
+        let cached = BlockReadResult::Loaded {
+            block: block_snapshot(BlockPosition { x: 0, y: 0, z: 0 }, state),
+        };
+        let mut best = Duration::MAX;
+        for _ in 0..5 {
+            let started = Instant::now();
+            for _ in 0..HITS {
+                std::hint::black_box(cached.clone());
+            }
+            best = best.min(started.elapsed());
+        }
+        println!(
+            "{:<10} {:>10.2} {:>12.0} {:>11.0}%",
+            label,
+            millis(best),
+            best.as_nanos() as f64 / HITS as f64,
+            millis(best) / millis(TICK) * 100.0
+        );
+    }
+}
+
 fn main() {
     let options = ViewportOptions::default();
     let box_voxels =
@@ -203,6 +281,8 @@ fn main() {
             }
         );
     }
+
+    dto_share();
 
     println!();
     println!("读法：");
