@@ -1,15 +1,21 @@
 [package]
 name = "agent"
-description = "持有一段持续对话的 agent 会话：四端口注入，请求边界信箱投递"
+description = "Provider-neutral agent kernel with batch tool dispatch and boundary mailboxes"
 version = "0.0.1"
 edition = "2021"
 license = "MIT"
 publish = false
 
-# 通用模块：零项目依赖，目录可整体拷出独立构建。
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["rt", "sync"] }
 
 [dev-dependencies]
+reqwest = { version = "0.13", features = ["json"] }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+
+[[example]]
+name = "protocol_smoke"
+path = "examples/protocol-smoke/main.rs"
+test = true

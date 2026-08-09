@@ -1,84 +1,111 @@
-//! 会话：持有跨轮延续的对话，逐轮驱动状态机。
-//!
-//! 起轮与注入共用一把状态锁：检查与置位原子，拒绝时原物奉还。
-//! 轮末信箱有剩件则立即续轮；景清除。
+//! 围绕无 I/O `Turn` 的并发会话驱动器。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
-use serde_json::Value;
 use tokio::sync::{Mutex, Notify};
 
-use crate::mailbox::Mailbox;
-use crate::ports::{Compaction, Message, Model, ModelRequest, PromptSource, Tools};
-use crate::run::{PlannedToolCall, Turn, TurnStep};
-use crate::types::{AgentError, ModelUsage, RunId};
+use crate::events::{
+    AgentEvent, EventKind, EventMetadata, NoopObserver, Observer, RunStage, ToolCallSummary,
+};
+use crate::mailbox::{Mailbox, MailboxInput, MailboxRejected, MailboxRejectedReason};
+use crate::ports::{Compaction, Model, ModelRequest, PromptSource, ToolRuntime};
+use crate::run::{RequestBoundaryKind, Turn, TurnStep};
+use crate::types::{
+    validate_closed_transcript, AgentError, ModelOutput, ModelUsage, RunId, ToolResultStatus,
+    TranscriptItem,
+};
 
-/// 会话配置。对话段序列化字节数超过阈值即触发压缩。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct SessionConfig {
+    /// 当持久化对话记录的序列化大小超过此值时，在运行结束后压缩它。
     pub compaction_trigger_bytes: usize,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            // 占位值；按模型上下文窗调整。
-            compaction_trigger_bytes: 400_000,
+            compaction_trigger_bytes: 256 * 1024,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StartRejectedReason {
-    /// 已有活动轮（竞态窗口里被抢了）。调用方可转投 `inject_if_running`。
     Busy,
-    /// 会话正在停止或已停止。
     Stopping,
+    /// 初始记录段包含孤立或未闭合的工具调用/结果。
+    InvalidInput,
 }
 
-/// 拒绝时原物奉还，调用方决定重试还是丢弃。
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StartRejected {
     pub reason: StartRejectedReason,
-    pub messages: Vec<Message>,
+    pub initial_items: Vec<TranscriptItem>,
 }
 
-#[derive(Debug)]
+impl std::fmt::Display for StartRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "run start rejected: {:?}", self.reason)
+    }
+}
+
+impl std::error::Error for StartRejected {}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum TurnOutcome {
-    /// 正常走到终文。closing 是最后一轮的收尾文本。
     Completed {
-        closing: String,
+        output: ModelOutput,
         usage: Option<ModelUsage>,
     },
-    /// 被 `stop` 截停；已跑的部分如实留在对话里。
-    Stopped,
-    /// 循环失败（模型/工具/状态机错误）。已跑的部分如实留在对话里。
-    Failed { error: AgentError },
+    Stopped {
+        undelivered: Vec<MailboxInput>,
+    },
+    Failed {
+        error: AgentError,
+        undelivered: Vec<MailboxInput>,
+    },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunPhase {
+    Open,
+    Sealed,
+    Finalizing,
+}
+
+struct ActiveRun {
+    id: RunId,
+    phase: RunPhase,
+}
+
+#[derive(Default)]
 struct SessionState {
-    /// 跨轮延续的对话段。persona/situation 不在其中，每轮重新获取。
-    conversation: Vec<Message>,
-    mailbox: Mailbox,
-    turn_active: bool,
+    conversation: Vec<TranscriptItem>,
+    run_seq: u64,
+    active: Option<ActiveRun>,
     stopping: bool,
-    turn_seq: u64,
+    mailbox: Mailbox,
 }
 
+/// 持有持久化会话状态，并确保每个会话同时只有一个活跃驱动器。
 pub struct AgentSession {
     prompt: Arc<dyn PromptSource>,
-    tools: Arc<dyn Tools>,
+    tools: Arc<dyn ToolRuntime>,
     compaction: Arc<dyn Compaction>,
     model: Arc<dyn Model>,
+    observer: Arc<dyn Observer>,
     config: SessionConfig,
+    event_sequence: AtomicU64,
     state: Mutex<SessionState>,
-    turn_ended: Notify,
+    run_ended: Notify,
 }
 
 impl AgentSession {
     pub fn new(
         prompt: Arc<dyn PromptSource>,
-        tools: Arc<dyn Tools>,
+        tools: Arc<dyn ToolRuntime>,
         compaction: Arc<dyn Compaction>,
         model: Arc<dyn Model>,
         config: SessionConfig,
@@ -88,541 +115,536 @@ impl AgentSession {
             tools,
             compaction,
             model,
+            observer: Arc::new(NoopObserver),
             config,
-            state: Mutex::new(SessionState {
-                conversation: Vec::new(),
-                mailbox: Mailbox::default(),
-                turn_active: false,
-                stopping: false,
-                turn_seq: 0,
-            }),
-            turn_ended: Notify::new(),
+            event_sequence: AtomicU64::new(0),
+            state: Mutex::new(SessionState::default()),
+            run_ended: Notify::new(),
         }
     }
 
-    /// 忙：件进信箱，下一次模型请求前可见。闲：原物奉还，调用方转投
-    /// [`Self::start_if_idle`]。
-    pub async fn inject_if_running(&self, pieces: Vec<Message>) -> Result<(), Vec<Message>> {
-        let mut state = self.state.lock().await;
-        if state.turn_active && !state.stopping {
-            state.mailbox.post_pieces(pieces);
-            Ok(())
-        } else {
-            Err(pieces)
-        }
+    /// 在将会话包装进 `Arc` 前安装结构化事件接收器。
+    pub fn with_observer(mut self, observer: Arc<dyn Observer>) -> Self {
+        self.observer = observer;
+        self
     }
 
-    /// 景（处境更新）：在箱内顶替。闲时原物奉还。
-    pub async fn inject_scene_if_running(&self, scene: Message) -> Result<(), Message> {
-        let mut state = self.state.lock().await;
-        if state.turn_active && !state.stopping {
-            state.mailbox.post_scene(scene);
-            Ok(())
-        } else {
-            Err(scene)
-        }
+    /// 将任意规范化对话记录项加入活跃运行的队列，不预设角色。
+    pub async fn enqueue_if_running(&self, input: MailboxInput) -> Result<(), MailboxRejected> {
+        let (sequence, run_id, delivery, item_count) = {
+            let mut state = self.state.lock().await;
+            if state.stopping {
+                return Err(MailboxRejected {
+                    reason: MailboxRejectedReason::Stopping,
+                    input,
+                });
+            }
+            let Some(active) = &state.active else {
+                return Err(MailboxRejected {
+                    reason: MailboxRejectedReason::Idle,
+                    input,
+                });
+            };
+            if active.phase != RunPhase::Open {
+                return Err(MailboxRejected {
+                    reason: MailboxRejectedReason::Closing,
+                    input,
+                });
+            }
+            if validate_closed_transcript(&input.items).is_err() {
+                return Err(MailboxRejected {
+                    reason: MailboxRejectedReason::InvalidInput,
+                    input,
+                });
+            }
+
+            let event = (
+                self.next_event_sequence(),
+                active.id.clone(),
+                input.delivery,
+                input.items.len(),
+            );
+            state.mailbox.push(input);
+            event
+        };
+        self.emit_lazy(EventKind::MailboxEnqueued.metadata(), || {
+            AgentEvent::MailboxEnqueued {
+                sequence,
+                run_id,
+                delivery,
+                item_count,
+            }
+        });
+        Ok(())
     }
 
-    /// 闲时起轮。检查与置位原子；拒绝带稳定原因 + 原物奉还。
-    /// 本函数驱动到本次唤醒的所有轮结束（信箱剩件会连轮）；
-    /// 调用方通常 `spawn` 它。
-    pub async fn start_if_idle(&self, trigger: Vec<Message>) -> Result<TurnOutcome, StartRejected> {
-        {
+    /// 仅在空闲时启动运行。初始项在下次模型请求时投递。
+    pub async fn start_if_idle(
+        self: &Arc<Self>,
+        initial_items: Vec<TranscriptItem>,
+    ) -> Result<TurnOutcome, StartRejected> {
+        let (sequence, run_id, prior_items) = {
             let mut state = self.state.lock().await;
             if state.stopping {
                 return Err(StartRejected {
                     reason: StartRejectedReason::Stopping,
-                    messages: trigger,
+                    initial_items,
                 });
             }
-            if state.turn_active {
+            if state.active.is_some() {
                 return Err(StartRejected {
                     reason: StartRejectedReason::Busy,
-                    messages: trigger,
+                    initial_items,
                 });
             }
-            state.turn_active = true;
-            state.mailbox.post_pieces(trigger);
+            if validate_closed_transcript(&initial_items).is_err() {
+                return Err(StartRejected {
+                    reason: StartRejectedReason::InvalidInput,
+                    initial_items,
+                });
+            }
+
+            state.run_seq = state.run_seq.saturating_add(1);
+            let run_id = RunId::new(format!("run-{}", state.run_seq));
+            let prior_items = state.conversation.len();
+            state.active = Some(ActiveRun {
+                id: run_id.clone(),
+                phase: RunPhase::Open,
+            });
+            state
+                .mailbox
+                .push(MailboxInput::next_model_request(initial_items));
+            (self.next_event_sequence(), run_id, prior_items)
+        };
+
+        self.emit_lazy(EventKind::RunStarted.metadata(), || {
+            AgentEvent::RunStarted {
+                sequence,
+                run_id: run_id.clone(),
+                prior_transcript_items: prior_items,
+            }
+        });
+
+        // 驱动任务由 session 自己持有；等待方被取消时任务仍会继续，显式 `stop` 才是停止协议。
+        let driver = Arc::clone(self);
+        let driver_run_id = run_id.clone();
+        match tokio::spawn(async move { driver.drive_run(driver_run_id).await }).await {
+            Ok(outcome) => Ok(outcome),
+            Err(join_error) if join_error.is_panic() => {
+                // 端口 panic 表示实现缺陷，不能降级成普通的运行失败。先释放本轮占用并归还
+                // 尚未投递的信箱内容，再继续展开原始 panic，避免 session 永久停在 Busy。
+                let panic = join_error.into_panic();
+                let _ = self.recover_crashed_driver(&run_id).await;
+                std::panic::resume_unwind(panic);
+            }
+            Err(join_error) => {
+                let error = AgentError::new(
+                    crate::types::AgentErrorKind::InvalidState,
+                    format!("run_driver_task_failed: {join_error}"),
+                );
+                let (undelivered, sequence) = self.recover_crashed_driver(&run_id).await;
+                self.emit_lazy(EventKind::RunFailed.metadata(), || AgentEvent::RunFailed {
+                    sequence,
+                    run_id,
+                    stage: RunStage::Boundary,
+                    error_kind: error.kind,
+                });
+                Ok(TurnOutcome::Failed { error, undelivered })
+            }
         }
-        let outcome = self.drive_until_quiet().await;
-        {
-            let mut state = self.state.lock().await;
-            state.turn_active = false;
-        }
-        self.turn_ended.notify_waiters();
-        Ok(outcome)
     }
 
-    /// 停止：置位后等活动轮在下一个请求边界让出。幂等。
+    /// 永久停止会话。允许进行中的模型或工具工作自然结束；驱动器会在下一个请求边界退出。
+    /// 此方法是幂等的。
     pub async fn stop(&self) {
         loop {
-            let notified = self.turn_ended.notified();
-            {
+            let notified = self.run_ended.notified();
+            let idle = {
                 let mut state = self.state.lock().await;
                 state.stopping = true;
-                if !state.turn_active {
-                    return;
+                if let Some(active) = &mut state.active {
+                    active.phase = RunPhase::Finalizing;
+                    false
+                } else {
+                    true
                 }
+            };
+            if idle {
+                return;
             }
             notified.await;
         }
     }
 
-    /// 驱动轮，直到信箱无剩件或被停止。件晋升为下一轮触发在这儿发生。
-    async fn drive_until_quiet(&self) -> TurnOutcome {
-        loop {
-            let outcome = self.drive_one_turn().await;
+    pub async fn conversation(&self) -> Vec<TranscriptItem> {
+        self.state.lock().await.conversation.clone()
+    }
+
+    async fn drive_run(&self, run_id: RunId) -> TurnOutcome {
+        let mut prefix = self.prompt.base_context();
+        prefix.extend(self.prompt.run_context());
+        let protected_prefix_len = prefix.len();
+        let prior_conversation = self.state.lock().await.conversation.clone();
+        prefix.extend(prior_conversation);
+
+        let mut turn = Turn::new(run_id.clone(), prefix);
+        let core_outcome = self.drive_steps(&run_id, &mut turn).await;
+
+        // 在压缩前关闭本轮运行，使迟到的生产者收到 `Closing`，而不是成功写入已无法投递的输入。
+        let undelivered = {
             let mut state = self.state.lock().await;
-            state.mailbox.end_of_turn();
-            let continue_with_leftover = matches!(outcome, TurnOutcome::Completed { .. })
-                && state.mailbox.has_pieces()
-                && !state.stopping;
-            if continue_with_leftover {
-                continue;
+            if let Some(active) = &mut state.active {
+                if active.id == run_id {
+                    active.phase = RunPhase::Finalizing;
+                }
             }
-            return outcome;
+            state.mailbox.drain_all()
+        };
+
+        // 只持久化协议上已经闭合的前缀。工具批尚未完整返回时，模型产生的调用仍属于
+        // 运行中的暂存状态，不能进入下一轮的普通会话历史。
+        let conversation = turn.committable_transcript()[protected_prefix_len..].to_vec();
+        let conversation = self.maybe_compact(&run_id, conversation).await;
+        let terminal_sequence = {
+            let mut state = self.state.lock().await;
+            let owns_generation = state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.id == run_id);
+            if owns_generation {
+                state.conversation = conversation;
+                state.active = None;
+            }
+            self.next_event_sequence()
+        };
+        self.run_ended.notify_waiters();
+
+        match core_outcome {
+            CoreOutcome::Completed {
+                output,
+                usage,
+                stats,
+            } => {
+                let sequence = terminal_sequence;
+                self.emit_lazy(EventKind::RunCompleted.metadata(), || {
+                    AgentEvent::RunCompleted {
+                        sequence,
+                        run_id,
+                        model_requests: stats.model_requests,
+                        tool_batches: stats.tool_batches,
+                        usage: usage.clone(),
+                    }
+                });
+                debug_assert!(undelivered.is_empty());
+                TurnOutcome::Completed { output, usage }
+            }
+            CoreOutcome::Stopped => {
+                let sequence = terminal_sequence;
+                self.emit_lazy(EventKind::RunStopped.metadata(), || {
+                    AgentEvent::RunStopped {
+                        sequence,
+                        run_id: run_id.clone(),
+                    }
+                });
+                TurnOutcome::Stopped { undelivered }
+            }
+            CoreOutcome::Failed { error, stage } => {
+                let sequence = terminal_sequence;
+                self.emit_lazy(EventKind::RunFailed.metadata(), || AgentEvent::RunFailed {
+                    sequence,
+                    run_id,
+                    stage,
+                    error_kind: error.kind,
+                });
+                TurnOutcome::Failed { error, undelivered }
+            }
         }
     }
 
-    async fn drive_one_turn(&self) -> TurnOutcome {
-        // persona/situation 每轮重新获取，不进入对话段。
-        let persona = self.prompt.persona();
-        let situation = self.prompt.situation();
-        let (run_id, conversation) = {
-            let mut state = self.state.lock().await;
-            state.turn_seq += 1;
-            (
-                RunId::new(format!("turn-{}", state.turn_seq)),
-                state.conversation.clone(),
-            )
-        };
-        let mut initial = persona;
-        initial.extend(situation);
-        let prefix_len = initial.len();
-        initial.extend(conversation);
-        let mut turn = Turn::new(run_id, initial);
-
-        let outcome = self.drive_turn_steps(&mut turn).await;
-
-        // 无论完成、失败还是截停，已产生的消息都进入对话。
-        let new_conversation: Vec<Message> = turn.messages()[prefix_len..].to_vec();
-        let new_conversation = self.maybe_compact(new_conversation).await;
-        let mut state = self.state.lock().await;
-        state.conversation = new_conversation;
-        outcome
-    }
-
-    async fn drive_turn_steps(&self, turn: &mut Turn) -> TurnOutcome {
+    async fn drive_steps(&self, run_id: &RunId, turn: &mut Turn) -> CoreOutcome {
+        let mut stats = RunStats::default();
         loop {
-            // 请求边界：查停 + 全量排空信箱（件序在前，景最后）。
-            if turn.at_request_boundary() {
-                let drained = {
-                    let mut state = self.state.lock().await;
-                    if state.stopping {
-                        return TurnOutcome::Stopped;
-                    }
-                    state.mailbox.drain()
-                };
-                for message in drained {
-                    if let Err(error) = turn.append_user_message(message) {
-                        return TurnOutcome::Failed { error };
-                    }
-                }
-            }
             let step = match turn.next_step() {
                 Ok(step) => step,
-                Err(error) => return TurnOutcome::Failed { error },
-            };
-            match step {
-                TurnStep::CallModel { messages } => {
-                    let request = ModelRequest {
-                        messages,
-                        tools: self.tools.definitions(),
+                Err(error) => {
+                    return CoreOutcome::Failed {
+                        error,
+                        stage: RunStage::Boundary,
                     };
-                    let completion = match self.model.complete(request).await {
-                        Ok(completion) => completion,
-                        Err(error) => return TurnOutcome::Failed { error },
-                    };
-                    if let Err(error) = turn.model_response(completion) {
-                        return TurnOutcome::Failed { error };
-                    }
                 }
-                TurnStep::CallTools { calls } => {
-                    let mut results = Vec::with_capacity(calls.len());
-                    for call in calls {
-                        match call {
-                            PlannedToolCall::LocalResult(result) => results.push(result),
-                            PlannedToolCall::Dispatch(invocation) => {
-                                results.push(self.tools.call(invocation).await);
+            };
+
+            match step {
+                TurnStep::RequestBoundary { kind } => {
+                    let (items, sealed, drained_sequence, sealed_sequence) = {
+                        let mut state = self.state.lock().await;
+                        if state.stopping {
+                            if let Some(active) = &mut state.active {
+                                if active.id == *run_id {
+                                    active.phase = RunPhase::Finalizing;
+                                }
+                            }
+                            return CoreOutcome::Stopped;
+                        }
+
+                        let items = state.mailbox.drain(kind);
+                        let sealed =
+                            kind == RequestBoundaryKind::BeforeCompletion && items.is_empty();
+                        if sealed {
+                            if let Some(active) = &mut state.active {
+                                if active.id == *run_id {
+                                    // 空队列检查和封闭操作与生产者共用这把锁。
+                                    active.phase = RunPhase::Sealed;
+                                }
                             }
                         }
+                        let drained_sequence = self.next_event_sequence();
+                        let sealed_sequence = sealed.then(|| self.next_event_sequence());
+                        (items, sealed, drained_sequence, sealed_sequence)
+                    };
+
+                    self.emit_lazy(EventKind::BoundaryDrained.metadata(), || {
+                        AgentEvent::BoundaryDrained {
+                            sequence: drained_sequence,
+                            run_id: run_id.clone(),
+                            kind,
+                            item_count: items.len(),
+                        }
+                    });
+                    if sealed {
+                        let sequence = sealed_sequence.expect("sealed event sequence");
+                        self.emit_lazy(EventKind::CompletionSealed.metadata(), || {
+                            AgentEvent::CompletionSealed {
+                                sequence,
+                                run_id: run_id.clone(),
+                            }
+                        });
                     }
-                    if let Err(error) = turn.tool_results(results) {
-                        return TurnOutcome::Failed { error };
+                    if let Err(error) = turn.resume_boundary(items) {
+                        return CoreOutcome::Failed {
+                            error,
+                            stage: RunStage::Boundary,
+                        };
                     }
                 }
-                TurnStep::Done { closing, usage } => {
-                    return TurnOutcome::Completed { closing, usage };
+                TurnStep::CallModel { transcript } => {
+                    stats.model_requests = stats.model_requests.saturating_add(1);
+                    let definitions = self.tools.definitions();
+                    let sequence = self.next_event_sequence();
+                    self.emit_lazy(EventKind::ModelRequestStarted.metadata(), || {
+                        AgentEvent::ModelRequestStarted {
+                            sequence,
+                            run_id: run_id.clone(),
+                            request_index: stats.model_requests,
+                            transcript_items: transcript.len(),
+                            function_tools: definitions.len(),
+                        }
+                    });
+                    let started_at = Instant::now();
+                    let response = match self
+                        .model
+                        .complete(ModelRequest {
+                            transcript,
+                            function_tools: definitions,
+                        })
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => {
+                            return CoreOutcome::Failed {
+                                error,
+                                stage: RunStage::Model,
+                            };
+                        }
+                    };
+                    let sequence = self.next_event_sequence();
+                    self.emit_lazy(EventKind::ModelRequestFinished.metadata(), || {
+                        AgentEvent::ModelRequestFinished {
+                            sequence,
+                            run_id: run_id.clone(),
+                            request_index: stats.model_requests,
+                            local_tool_calls: response.output.tool_calls.len(),
+                            duration_ms: elapsed_ms(started_at),
+                            usage: response.usage.clone(),
+                        }
+                    });
+                    if let Err(error) = turn.model_response(response) {
+                        return CoreOutcome::Failed {
+                            error,
+                            stage: RunStage::Model,
+                        };
+                    }
+                }
+                TurnStep::DispatchTools { batch } => {
+                    stats.tool_batches = stats.tool_batches.saturating_add(1);
+                    let sequence = self.next_event_sequence();
+                    self.emit_lazy(EventKind::ToolBatchStarted.metadata(), || {
+                        let calls = batch
+                            .calls
+                            .iter()
+                            .map(|call| ToolCallSummary {
+                                id: call.id.clone(),
+                                name: call.name.clone(),
+                            })
+                            .collect();
+                        AgentEvent::ToolBatchStarted {
+                            sequence,
+                            run_id: run_id.clone(),
+                            batch_id: batch.batch_id.clone(),
+                            calls,
+                        }
+                    });
+                    let batch_id = batch.batch_id.clone();
+                    // 对模型生成的整个批次只调用一次 dispatch。
+                    let started_at = Instant::now();
+                    let results = match self.tools.dispatch(batch).await {
+                        Ok(results) => results,
+                        Err(error) => {
+                            return CoreOutcome::Failed {
+                                error,
+                                stage: RunStage::Tools,
+                            };
+                        }
+                    };
+                    let error_count = results
+                        .results
+                        .iter()
+                        .filter(|result| result.status == ToolResultStatus::Error)
+                        .count();
+                    let sequence = self.next_event_sequence();
+                    self.emit_lazy(EventKind::ToolBatchFinished.metadata(), || {
+                        AgentEvent::ToolBatchFinished {
+                            sequence,
+                            run_id: run_id.clone(),
+                            batch_id,
+                            result_count: results.results.len(),
+                            error_count,
+                            duration_ms: elapsed_ms(started_at),
+                        }
+                    });
+                    if let Err(error) = turn.tool_results(results) {
+                        return CoreOutcome::Failed {
+                            error,
+                            stage: RunStage::Tools,
+                        };
+                    }
+                }
+                TurnStep::Done { output, usage } => {
+                    return CoreOutcome::Completed {
+                        output,
+                        usage,
+                        stats,
+                    };
                 }
             }
         }
     }
 
-    /// 触发判定：对话段序列化字节数超过阈值则交给压缩策略。
-    async fn maybe_compact(&self, conversation: Vec<Message>) -> Vec<Message> {
-        let bytes: usize = conversation
-            .iter()
-            .map(|message| {
-                serde_json::to_string(&Value::Object(message.clone()))
-                    .map(|s| s.len())
-                    .unwrap_or(0)
-            })
-            .sum();
-        if bytes <= self.config.compaction_trigger_bytes {
+    async fn maybe_compact(
+        &self,
+        run_id: &RunId,
+        conversation: Vec<TranscriptItem>,
+    ) -> Vec<TranscriptItem> {
+        let estimated_bytes = serde_json::to_vec(&conversation)
+            .map(|encoded| encoded.len())
+            .unwrap_or(usize::MAX);
+        if estimated_bytes <= self.config.compaction_trigger_bytes {
             return conversation;
         }
-        self.compaction.compact(&conversation).await
+
+        let sequence = self.next_event_sequence();
+        self.emit_lazy(EventKind::CompactionStarted.metadata(), || {
+            AgentEvent::CompactionStarted {
+                sequence,
+                run_id: run_id.clone(),
+                transcript_items: conversation.len(),
+                estimated_bytes,
+            }
+        });
+        let started_at = Instant::now();
+        let compacted = self.compaction.compact(&conversation).await;
+        // 压缩是受信端口，但其输出仍不能破坏核心的工具轮闭合不变量。拒绝非法结果时保留
+        // 原始对话，避免一次可选优化污染下一次模型请求。
+        let compacted = if validate_closed_transcript(&compacted).is_ok() {
+            compacted
+        } else {
+            conversation
+        };
+        let sequence = self.next_event_sequence();
+        self.emit_lazy(EventKind::CompactionFinished.metadata(), || {
+            AgentEvent::CompactionFinished {
+                sequence,
+                run_id: run_id.clone(),
+                transcript_items: compacted.len(),
+                duration_ms: elapsed_ms(started_at),
+            }
+        });
+        compacted
     }
+
+    async fn recover_crashed_driver(&self, run_id: &RunId) -> (Vec<MailboxInput>, u64) {
+        let (undelivered, sequence) = {
+            let mut state = self.state.lock().await;
+            let owns_generation = state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.id == *run_id);
+            let undelivered = if owns_generation {
+                state.active = None;
+                state.mailbox.drain_all()
+            } else {
+                Vec::new()
+            };
+            (undelivered, self.next_event_sequence())
+        };
+        self.run_ended.notify_waiters();
+        (undelivered, sequence)
+    }
+
+    fn emit_lazy(&self, metadata: EventMetadata, build: impl FnOnce() -> AgentEvent) {
+        // 观测器的过滤和写入故障都不能破坏状态机或把 session 卡在 Busy。
+        let enabled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.observer.enabled(metadata)
+        }))
+        .unwrap_or(false);
+        if !enabled {
+            return;
+        }
+
+        let event = build();
+        debug_assert_eq!(event.metadata(), metadata);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.observer.observe(&event);
+        }));
+    }
+
+    fn next_event_sequence(&self) -> u64 {
+        self.event_sequence.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+#[derive(Default)]
+struct RunStats {
+    model_requests: u64,
+    tool_batches: u64,
+}
+
+enum CoreOutcome {
+    Completed {
+        output: ModelOutput,
+        usage: Option<ModelUsage>,
+        stats: RunStats,
+    },
+    Stopped,
+    Failed {
+        error: AgentError,
+        stage: RunStage,
+    },
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ports::{ModelCompletion, PortFuture};
-    use crate::run::ToolResult;
-    use crate::types::{JsonObject, ToolDefinition, ToolInvocation};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::mpsc;
-
-    fn user_msg(text: &str) -> Message {
-        let mut m = Message::new();
-        m.insert("role".to_owned(), Value::String("user".to_owned()));
-        m.insert("content".to_owned(), Value::String(text.to_owned()));
-        m
-    }
-
-    fn final_completion(text: &str) -> ModelCompletion {
-        let mut message = JsonObject::new();
-        message.insert("role".to_owned(), Value::String("assistant".to_owned()));
-        message.insert("content".to_owned(), Value::String(text.to_owned()));
-        ModelCompletion {
-            message: Some(message),
-            ..Default::default()
-        }
-    }
-
-    fn tool_completion(call_id: &str, name: &str) -> ModelCompletion {
-        let mut message = JsonObject::new();
-        message.insert("role".to_owned(), Value::String("assistant".to_owned()));
-        message.insert(
-            "tool_calls".to_owned(),
-            serde_json::json!([{
-                "id": call_id,
-                "type": "function",
-                "function": {"name": name, "arguments": "{}"}
-            }]),
-        );
-        ModelCompletion {
-            message: Some(message),
-            ..Default::default()
-        }
-    }
-
-    fn message_texts(messages: &[Message]) -> Vec<String> {
-        messages
-            .iter()
-            .filter_map(|m| m.get("content").and_then(Value::as_str))
-            .map(str::to_owned)
-            .collect()
-    }
-
-    /// persona 静态；situation 带计数器，用于断言每轮重新获取。
-    struct CountingPrompt {
-        situations: AtomicUsize,
-    }
-
-    impl PromptSource for CountingPrompt {
-        fn persona(&self) -> Vec<Message> {
-            let mut m = Message::new();
-            m.insert("role".to_owned(), Value::String("system".to_owned()));
-            m.insert("content".to_owned(), Value::String("persona".to_owned()));
-            vec![m]
-        }
-
-        fn situation(&self) -> Vec<Message> {
-            let n = self.situations.fetch_add(1, Ordering::SeqCst) + 1;
-            vec![user_msg(&format!("situation-{n}"))]
-        }
-    }
-
-    /// 请求经通道交给测试检视，completion 由测试按需投喂，时序全受控。
-    struct ChannelModel {
-        requests: mpsc::UnboundedSender<Vec<Message>>,
-        completions: Mutex<mpsc::UnboundedReceiver<Result<ModelCompletion, AgentError>>>,
-    }
-
-    impl Model for ChannelModel {
-        fn complete<'a>(
-            &'a self,
-            request: ModelRequest,
-        ) -> PortFuture<'a, Result<ModelCompletion, AgentError>> {
-            Box::pin(async move {
-                self.requests
-                    .send(request.messages)
-                    .expect("test holds receiver");
-                self.completions
-                    .lock()
-                    .await
-                    .recv()
-                    .await
-                    .expect("test sends completion")
-            })
-        }
-    }
-
-    /// 执行前先通知测试、再等测试放行，制造"工具执行期间"这个注入窗口。
-    struct GatedTools {
-        started: mpsc::UnboundedSender<()>,
-        gate: Arc<tokio::sync::Semaphore>,
-    }
-
-    impl Tools for GatedTools {
-        fn definitions(&self) -> Vec<ToolDefinition> {
-            Vec::new()
-        }
-
-        fn call<'a>(&'a self, invocation: ToolInvocation) -> PortFuture<'a, ToolResult> {
-            Box::pin(async move {
-                self.started.send(()).expect("test holds receiver");
-                let _permit = self.gate.acquire().await.expect("gate open");
-                let mut output = JsonObject::new();
-                output.insert("status".to_owned(), Value::String("ok".to_owned()));
-                ToolResult::new(invocation.tool_call_id, output)
-            })
-        }
-    }
-
-    struct MarkerCompaction;
-
-    impl Compaction for MarkerCompaction {
-        fn compact<'a>(&'a self, _conversation: &'a [Message]) -> PortFuture<'a, Vec<Message>> {
-            Box::pin(async move { vec![user_msg("[compacted]")] })
-        }
-    }
-
-    struct Fixture {
-        session: Arc<AgentSession>,
-        requests: mpsc::UnboundedReceiver<Vec<Message>>,
-        completions: mpsc::UnboundedSender<Result<ModelCompletion, AgentError>>,
-        tool_started: mpsc::UnboundedReceiver<()>,
-        tool_gate: Arc<tokio::sync::Semaphore>,
-        situations: Arc<CountingPrompt>,
-    }
-
-    fn fixture(config: SessionConfig) -> Fixture {
-        let (req_tx, req_rx) = mpsc::unbounded_channel();
-        let (comp_tx, comp_rx) = mpsc::unbounded_channel();
-        let (started_tx, started_rx) = mpsc::unbounded_channel();
-        let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let prompt = Arc::new(CountingPrompt {
-            situations: AtomicUsize::new(0),
-        });
-        let session = Arc::new(AgentSession::new(
-            prompt.clone(),
-            Arc::new(GatedTools {
-                started: started_tx,
-                gate: gate.clone(),
-            }),
-            Arc::new(MarkerCompaction),
-            Arc::new(ChannelModel {
-                requests: req_tx,
-                completions: Mutex::new(comp_rx),
-            }),
-            config,
-        ));
-        Fixture {
-            session,
-            requests: req_rx,
-            completions: comp_tx,
-            tool_started: started_rx,
-            tool_gate: gate,
-            situations: prompt,
-        }
-    }
-
-    #[tokio::test]
-    async fn idle_injection_returns_the_messages_untouched() {
-        let f = fixture(SessionConfig::default());
-        let rejected = f
-            .session
-            .inject_if_running(vec![user_msg("hello")])
-            .await
-            .expect_err("no active turn");
-        assert_eq!(message_texts(&rejected), vec!["hello"]);
-    }
-
-    #[tokio::test]
-    async fn a_turn_completes_and_the_conversation_persists_across_turns() {
-        let mut f = fixture(SessionConfig::default());
-        let session = f.session.clone();
-        let handle =
-            tokio::spawn(async move { session.start_if_idle(vec![user_msg("hi")]).await });
-
-        let first = f.requests.recv().await.expect("first request");
-        // 前缀:persona + situation-1;触发件经信箱排空跟在其后。
-        assert_eq!(message_texts(&first), vec!["persona", "situation-1", "hi"]);
-        f.completions.send(Ok(final_completion("done"))).unwrap();
-
-        let outcome = handle.await.unwrap().expect("not rejected");
-        assert!(matches!(outcome, TurnOutcome::Completed { ref closing, .. } if closing == "done"));
-
-        // 第二轮:situation 重导出(situation-2),对话段(hi + 终文)延续。
-        let session = f.session.clone();
-        let handle =
-            tokio::spawn(async move { session.start_if_idle(vec![user_msg("again")]).await });
-        let second = f.requests.recv().await.expect("second request");
-        assert_eq!(
-            message_texts(&second),
-            vec!["persona", "situation-2", "hi", "done", "again"]
-        );
-        f.completions.send(Ok(final_completion("bye"))).unwrap();
-        handle.await.unwrap().expect("not rejected");
-        assert_eq!(f.situations.situations.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn pieces_injected_while_tools_run_arrive_at_the_next_request_boundary() {
-        let mut f = fixture(SessionConfig::default());
-        let session = f.session.clone();
-        let handle =
-            tokio::spawn(async move { session.start_if_idle(vec![user_msg("dig")]).await });
-
-        let _first = f.requests.recv().await.expect("first request");
-        f.completions
-            .send(Ok(tool_completion("call-1", "mine")))
-            .unwrap();
-
-        // 工具执行中(被门拦住)——这是玩家说话的窗口。
-        f.tool_started.recv().await.expect("tool started");
-        f.session
-            .inject_if_running(vec![user_msg("stop please")])
-            .await
-            .expect("turn is active");
-        f.tool_gate.add_permits(1);
-
-        // 下一次请求:工具结果之后、紧跟注入的件。
-        let second = f.requests.recv().await.expect("second request");
-        let texts = message_texts(&second);
-        assert_eq!(texts.last().map(String::as_str), Some("stop please"));
-        assert!(texts.iter().any(|t| t.contains("\"status\":\"ok\"")));
-
-        f.completions.send(Ok(final_completion("ok"))).unwrap();
-        handle.await.unwrap().expect("not rejected");
-    }
-
-    #[tokio::test]
-    async fn leftover_pieces_start_the_next_turn_and_scenes_evaporate() {
-        let mut f = fixture(SessionConfig::default());
-        let session = f.session.clone();
-        let handle =
-            tokio::spawn(async move { session.start_if_idle(vec![user_msg("hi")]).await });
-
-        let _first = f.requests.recv().await.expect("first request");
-        // 模型答复在途时,玩家又说了一句、处境也更新了一版。
-        f.session
-            .inject_if_running(vec![user_msg("one more")])
-            .await
-            .expect("active");
-        f.session
-            .inject_scene_if_running(user_msg("scene-stale"))
-            .await
-            .expect("active");
-        // 终文直达轮末:件晋升为下一轮触发,景蒸发。
-        f.completions.send(Ok(final_completion("done"))).unwrap();
-
-        let second = f.requests.recv().await.expect("auto second turn");
-        let texts = message_texts(&second);
-        assert!(texts.contains(&"one more".to_owned()));
-        assert!(!texts.contains(&"scene-stale".to_owned()));
-        assert!(texts.contains(&"situation-2".to_owned()));
-
-        f.completions.send(Ok(final_completion("bye"))).unwrap();
-        let outcome = handle.await.unwrap().expect("not rejected");
-        assert!(matches!(outcome, TurnOutcome::Completed { ref closing, .. } if closing == "bye"));
-    }
-
-    #[tokio::test]
-    async fn busy_start_is_rejected_with_the_messages_returned() {
-        let mut f = fixture(SessionConfig::default());
-        let session = f.session.clone();
-        let handle =
-            tokio::spawn(async move { session.start_if_idle(vec![user_msg("hi")]).await });
-        let _first = f.requests.recv().await.expect("first request");
-
-        let rejected = f
-            .session
-            .start_if_idle(vec![user_msg("late")])
-            .await
-            .expect_err("busy");
-        assert_eq!(rejected.reason, StartRejectedReason::Busy);
-        assert_eq!(message_texts(&rejected.messages), vec!["late"]);
-
-        f.completions.send(Ok(final_completion("done"))).unwrap();
-        handle.await.unwrap().expect("not rejected");
-    }
-
-    #[tokio::test]
-    async fn compaction_replaces_the_conversation_when_the_window_overflows() {
-        let mut f = fixture(SessionConfig {
-            compaction_trigger_bytes: 1,
-        });
-        let session = f.session.clone();
-        let handle =
-            tokio::spawn(async move { session.start_if_idle(vec![user_msg("hi")]).await });
-        let _first = f.requests.recv().await.expect("first request");
-        f.completions.send(Ok(final_completion("done"))).unwrap();
-        handle.await.unwrap().expect("not rejected");
-
-        // 第二轮的对话段只剩压缩标记;persona/situation 在保护区外照常。
-        let session = f.session.clone();
-        let handle =
-            tokio::spawn(async move { session.start_if_idle(vec![user_msg("again")]).await });
-        let second = f.requests.recv().await.expect("second request");
-        assert_eq!(
-            message_texts(&second),
-            vec!["persona", "situation-2", "[compacted]", "again"]
-        );
-        f.completions.send(Ok(final_completion("bye"))).unwrap();
-        handle.await.unwrap().expect("not rejected");
-    }
-
-    #[tokio::test]
-    async fn stop_ends_the_turn_at_the_next_request_boundary() {
-        let mut f = fixture(SessionConfig::default());
-        let session = f.session.clone();
-        let handle =
-            tokio::spawn(async move { session.start_if_idle(vec![user_msg("dig")]).await });
-        let _first = f.requests.recv().await.expect("first request");
-        f.completions
-            .send(Ok(tool_completion("call-1", "mine")))
-            .unwrap();
-        f.tool_started.recv().await.expect("tool started");
-
-        // 工具还被门拦着时请求停止;放行后轮应在下一个边界让出。
-        let session = f.session.clone();
-        let stop = tokio::spawn(async move { session.stop().await });
-        f.tool_gate.add_permits(1);
-
-        let outcome = handle.await.unwrap().expect("not rejected");
-        assert!(matches!(outcome, TurnOutcome::Stopped));
-        stop.await.unwrap();
-
-        // 停止后不再接受新轮。
-        let rejected = f
-            .session
-            .start_if_idle(vec![user_msg("late")])
-            .await
-            .expect_err("stopping");
-        assert_eq!(rejected.reason, StartRejectedReason::Stopping);
-    }
-}
+mod tests;

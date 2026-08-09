@@ -1,58 +1,68 @@
-//! 会话要求的四个端口。
+//! 会话驱动器所需的输入输出端口。
 
 use std::future::Future;
 use std::pin::Pin;
 
 use serde_json::Value;
 
-use crate::run::ToolResult;
-use crate::types::{AgentError, JsonObject, ModelUsage, ToolDefinition, ToolInvocation};
+use crate::types::{
+    AgentError, ModelOutput, ModelUsage, ToolCallBatch, ToolDefinition, ToolResultBatch,
+    TranscriptItem,
+};
 
-/// 消息保持 wire 形状（role + content + …），无损；
-/// 不把任何一家 provider 的私有字段提升为公共契约。
-pub type Message = JsonObject;
-
-/// 端口返回的 future。不引第三方 trait 库，标准库自足。
+/// 装箱后的端口异步返回值使本包无需依赖 `async-trait` 宏。
 pub type PortFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// 提示词源。persona 稳定；situation 每轮重新获取。
-/// 两段都不进入压缩策略的输入。
+/// 可压缩对话之外的上下文。每次新运行都会刷新这两部分。
 pub trait PromptSource: Send + Sync {
-    /// 系统提示词 / 人格。
-    fn persona(&self) -> Vec<Message>;
-    /// 开场处境。
-    fn situation(&self) -> Vec<Message>;
+    fn base_context(&self) -> Vec<TranscriptItem>;
+    fn run_context(&self) -> Vec<TranscriptItem>;
 }
 
-/// 工具：定义与执行。
-pub trait Tools: Send + Sync {
+/// 可移植的工具目录，以及一次分发整个批次的操作。
+///
+/// 内核不会逐个遍历调用，也不公开并行标志。工具查找、参数校验、审批、依赖排序、加锁、
+/// 并发、限流、重试和远程转发均由实现负责。返回的异步结果应完成整个批次。
+pub trait ToolRuntime: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
-    fn call<'a>(&'a self, invocation: ToolInvocation) -> PortFuture<'a, ToolResult>;
+
+    fn dispatch<'a>(
+        &'a self,
+        batch: ToolCallBatch,
+    ) -> PortFuture<'a, Result<ToolResultBatch, AgentError>>;
 }
 
-/// 上下文压缩策略。何时压由会话按阈值判定，本接口只负责怎么压；
-/// 输入仅为对话段。需要模型的实现在构造时自行持有。
+/// 对话压缩策略。它只接收持久对话，不接收基础上下文或单次运行上下文。需要调用模型的
+/// 实现自行持有该依赖。
 pub trait Compaction: Send + Sync {
-    fn compact<'a>(&'a self, conversation: &'a [Message]) -> PortFuture<'a, Vec<Message>>;
+    fn compact<'a>(
+        &'a self,
+        conversation: &'a [TranscriptItem],
+    ) -> PortFuture<'a, Vec<TranscriptItem>>;
 }
 
-/// 一次模型请求：累积消息 + 工具定义。
+/// 传给服务商适配器的规范请求。
 pub struct ModelRequest {
-    pub messages: Vec<Message>,
-    pub tools: Vec<ToolDefinition>,
+    pub transcript: Vec<TranscriptItem>,
+    /// 仅包含可移植的本地分发函数。托管工具和服务商原生工具在模型适配器中配置，
+    /// 不会进入 `ToolRuntime::dispatch`。
+    pub function_tools: Vec<ToolDefinition>,
 }
 
-/// Provider 已归一化的一次 assistant completion。
-/// `message` 保持 JSON object 无损（reasoning_content、tool_calls 原样保留）。
+/// 经模型适配器规范化的服务商响应。
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct ModelCompletion {
-    pub message: Option<JsonObject>,
-    /// 缺字段用 `None`。仅记录，不据此判断。
+pub struct ModelResponse {
+    pub output: ModelOutput,
+    /// 仅用于诊断的服务商值；内核不会据此分支。
     pub finish_reason: Option<Value>,
     pub usage: Option<ModelUsage>,
 }
 
-/// 模型。一次调用一次语义；重试与超时由实现方处理。
+/// 一次模型请求只对应一次语义完整的响应。重试、超时、流式聚合和服务商传输格式转换
+/// 均由适配器负责。
 pub trait Model: Send + Sync {
-    fn complete<'a>(&'a self, request: ModelRequest) -> PortFuture<'a, Result<ModelCompletion, AgentError>>;
+    fn complete<'a>(
+        &'a self,
+        request: ModelRequest,
+    ) -> PortFuture<'a, Result<ModelResponse, AgentError>>;
 }

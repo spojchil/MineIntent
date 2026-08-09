@@ -1,89 +1,127 @@
-//! 请求边界信箱。两类条目，两种语义：
+//! 运行时输入信箱。
 //!
-//! - **件**：积攒，按到达序；轮末剩件留箱，供会话续轮。
-//! - **景**：顶替，箱内至多一条；轮末清除。
+//! 投递时机由状态机边界而非模型角色决定：
+//! - `NextModelRequest` 是引导输入，在下次调用模型前排空；如果模型即将结束，
+//!   则改为再调用一次模型。
+//! - `WhenIdle` 是后续输入，仅在本次运行原本将要结束时排空。
 
-use crate::ports::Message;
+use std::collections::VecDeque;
+
+use serde::{Deserialize, Serialize};
+
+use crate::run::RequestBoundaryKind;
+use crate::types::TranscriptItem;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Delivery {
+    NextModelRequest,
+    WhenIdle,
+}
+
+/// 一个原子信箱信封，其中的项目保持顺序并整体投递。
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct MailboxInput {
+    pub delivery: Delivery,
+    pub items: Vec<TranscriptItem>,
+}
+
+impl MailboxInput {
+    pub fn next_model_request(items: Vec<TranscriptItem>) -> Self {
+        Self {
+            delivery: Delivery::NextModelRequest,
+            items,
+        }
+    }
+
+    pub fn when_idle(items: Vec<TranscriptItem>) -> Self {
+        Self {
+            delivery: Delivery::WhenIdle,
+            items,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MailboxRejectedReason {
+    Idle,
+    Closing,
+    Stopping,
+    /// 信封中的记录段包含孤立或未闭合的工具调用/结果。
+    InvalidInput,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MailboxRejected {
+    pub reason: MailboxRejectedReason,
+    pub input: MailboxInput,
+}
+
+impl std::fmt::Display for MailboxRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mailbox input rejected: {:?}", self.reason)
+    }
+}
+
+impl std::error::Error for MailboxRejected {}
 
 #[derive(Default)]
 pub(crate) struct Mailbox {
-    pieces: Vec<Message>,
-    scene: Option<Message>,
+    next_request: VecDeque<MailboxInput>,
+    when_idle: VecDeque<MailboxInput>,
 }
 
 impl Mailbox {
-    /// 件：积攒。
-    pub(crate) fn post_pieces(&mut self, pieces: Vec<Message>) {
-        self.pieces.extend(pieces);
+    pub(crate) fn push(&mut self, input: MailboxInput) {
+        match input.delivery {
+            Delivery::NextModelRequest => self.next_request.push_back(input),
+            Delivery::WhenIdle => self.when_idle.push_back(input),
+        }
     }
 
-    /// 景：顶替。
-    pub(crate) fn post_scene(&mut self, scene: Message) {
-        self.scene = Some(scene);
-    }
-
-    /// 全量排空：件按到达序在前，景（若有）最后。
-    pub(crate) fn drain(&mut self) -> Vec<Message> {
-        let mut drained = std::mem::take(&mut self.pieces);
-        if let Some(scene) = self.scene.take() {
-            drained.push(scene);
+    /// 排空操作是信箱的线性化点：检查与清除在一次操作中完成。
+    /// 在完成边界，引导输入优先；每类输入内部保持先进先出。
+    pub(crate) fn drain(&mut self, boundary: RequestBoundaryKind) -> Vec<TranscriptItem> {
+        let mut drained = Self::flatten(&mut self.next_request);
+        if boundary == RequestBoundaryKind::BeforeCompletion {
+            drained.extend(Self::flatten(&mut self.when_idle));
         }
         drained
     }
 
-    /// 轮末：清除景。件留在箱里。
-    pub(crate) fn end_of_turn(&mut self) {
-        self.scene = None;
+    pub(crate) fn drain_all(&mut self) -> Vec<MailboxInput> {
+        let mut pending = self.next_request.drain(..).collect::<Vec<_>>();
+        pending.extend(self.when_idle.drain(..));
+        pending
     }
 
-    pub(crate) fn has_pieces(&self) -> bool {
-        !self.pieces.is_empty()
+    fn flatten(queue: &mut VecDeque<MailboxInput>) -> Vec<TranscriptItem> {
+        queue.drain(..).flat_map(|input| input.items).collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
+    use crate::types::InputMessage;
 
-    fn msg(text: &str) -> Message {
-        let mut m = Message::new();
-        m.insert("role".to_owned(), Value::String("user".to_owned()));
-        m.insert("content".to_owned(), Value::String(text.to_owned()));
-        m
+    fn item(role: &str, text: &str) -> TranscriptItem {
+        InputMessage::text(role, text).into()
     }
 
     #[test]
-    fn pieces_accumulate_in_order_and_scene_replaces() {
+    fn next_request_and_idle_delivery_have_distinct_boundaries() {
         let mut mailbox = Mailbox::default();
-        mailbox.post_pieces(vec![msg("a")]);
-        mailbox.post_pieces(vec![msg("b")]);
-        mailbox.post_scene(msg("scene-1"));
-        mailbox.post_scene(msg("scene-2"));
+        mailbox.push(MailboxInput::when_idle(vec![item("operator", "later")]));
+        mailbox.push(MailboxInput::next_model_request(vec![item(
+            "developer",
+            "now",
+        )]));
 
-        let drained = mailbox.drain();
-        let contents: Vec<&str> = drained
-            .iter()
-            .map(|m| m.get("content").and_then(Value::as_str).unwrap())
-            .collect();
-        // 件按到达序，景顶替后只剩最新一条、排最后。
-        assert_eq!(contents, vec!["a", "b", "scene-2"]);
-        assert!(mailbox.drain().is_empty());
-    }
+        let first = mailbox.drain(RequestBoundaryKind::BeforeModelRequest);
+        assert_eq!(first, vec![item("developer", "now")]);
 
-    #[test]
-    fn end_of_turn_evaporates_scene_but_keeps_pieces() {
-        let mut mailbox = Mailbox::default();
-        mailbox.post_pieces(vec![msg("leftover")]);
-        mailbox.post_scene(msg("stale-scene"));
-        mailbox.end_of_turn();
-
-        assert!(mailbox.has_pieces());
-        let drained = mailbox.drain();
-        assert_eq!(drained.len(), 1);
-        assert_eq!(
-            drained[0].get("content").and_then(Value::as_str),
-            Some("leftover")
-        );
+        let final_boundary = mailbox.drain(RequestBoundaryKind::BeforeCompletion);
+        assert_eq!(final_boundary, vec![item("operator", "later")]);
     }
 }
