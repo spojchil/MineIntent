@@ -2,7 +2,8 @@
 //!
 //! 内核只负责维护协议不变量：
 //! - 模型适配器返回类型化的本地工具调用，而不是提供方的传输格式 JSON；
-//! - 一个完整的调用数组只向 `ToolRuntime::dispatch` 转发一次；
+//! - 默认把完整调用数组只向 `ToolRuntime::dispatch` 转发一次；选择增量端口的实现则按
+//!   `(batch_attempt_id, slot)` 接管完整调用，并通过独立封口信号结束传输；
 //! - 完整结果通过标识符关联，并按模型的发出顺序提交；
 //! - 运行时输入仅在显式的请求或完成边界排空。
 //!
@@ -20,16 +21,21 @@ mod types;
 
 pub use events::{
     AgentEvent, EventCategory, EventKind, EventLevel, EventMetadata, FilteredObserver, LevelFilter,
-    NoopObserver, Observer, RunStage, ToolCallSummary,
+    ModelStreamObservation, NoopObserver, NoopStreamObserver, ObservedModelStreamEvent, Observer,
+    RunStage, StreamObserver, ToolCallSummary,
 };
 pub use mailbox::{Delivery, MailboxInput, MailboxRejected, MailboxRejectedReason};
 pub use ports::{
-    Compaction, Model, ModelRequest, ModelResponse, PortFuture, PromptSource, ToolRuntime,
+    Compaction, IncrementalToolBatch, Model, ModelRequest, ModelResponse, ModelStreamEvent,
+    ModelStreamSink, PortFuture, PromptSource, ToolRuntime,
 };
 pub use run::{RequestBoundaryKind, Turn, TurnStep};
 pub use session::{AgentSession, SessionConfig, StartRejected, StartRejectedReason, TurnOutcome};
 pub use types::{
-    AgentError, AgentErrorKind, ContentPart, InputMessage, JsonObject, ModelOutput, ModelUsage,
-    RunId, ToolBatchId, ToolCall, ToolCallBatch, ToolCallId, ToolDefinition, ToolName, ToolResult,
-    ToolResultBatch, ToolResultStatus, TranscriptItem,
+    AbortedToolBatch, AbortedToolCall, AbortedToolCallOutcome, AgentError, AgentErrorKind,
+    ContentPart, IncrementalToolCall, InputMessage, InterruptedToolBatchReceipt,
+    InterruptedToolCallOutcome, InterruptedToolCallReceipt, JsonObject, ModelOutput, ModelUsage,
+    RunId, ToolBatchAbortReason, ToolBatchAttemptId, ToolBatchId, ToolBatchStart, ToolCall,
+    ToolCallBatch, ToolCallId, ToolCallSlot, ToolDefinition, ToolName, ToolResult, ToolResultBatch,
+    ToolResultStatus, TranscriptItem,
 };

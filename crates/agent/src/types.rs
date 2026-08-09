@@ -129,6 +129,44 @@ string_id!(
     /// 一次运行中由模型生成的一个工具批次的稳定 ID。
     ToolBatchId
 );
+string_id!(
+    /// 一次模型流中候选工具批次的稳定 ID。
+    ///
+    /// 候选批次可能最终提交，也可能因模型流中断而终止；两种情况下都使用同一个 ID。
+    /// 当前生成方式只保证单个 `AgentSession` 生命周期内唯一，不能直接充当跨进程或跨会话
+    /// 的持久幂等键；远程 runtime 必须再加入自己的会话命名空间或执行账本键。
+    ToolBatchAttemptId
+);
+
+impl From<ToolBatchAttemptId> for ToolBatchId {
+    fn from(value: ToolBatchAttemptId) -> Self {
+        Self::new(value.into_inner())
+    }
+}
+
+impl From<&ToolBatchAttemptId> for ToolBatchId {
+    fn from(value: &ToolBatchAttemptId) -> Self {
+        Self::new(value.as_str())
+    }
+}
+
+/// 工具调用在一个候选批次中的规范化序号。
+///
+/// 适配器负责把服务商的块索引或数组索引归一化为从零开始的工具序号。不同调用可以乱序
+/// 完成，但在批次封口时必须恰好覆盖 `0..call_count`。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct ToolCallSlot(u32);
+
+impl ToolCallSlot {
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
 
 /// 刻意保持精简的内容中间表示。未知的多模态或服务商原生内容块通过 `Opaque`
 /// 无损保留，并且仅由模型适配器解释。
@@ -232,6 +270,92 @@ pub struct ToolCallBatch {
     pub run_id: RunId,
     pub batch_id: ToolBatchId,
     pub calls: Vec<ToolCall>,
+}
+
+/// 增量工具运行时接收候选批次时的稳定上下文。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ToolBatchStart {
+    pub run_id: RunId,
+    pub batch_attempt_id: ToolBatchAttemptId,
+}
+
+/// 一个已完整解析、可交给增量工具运行时接管的调用。
+///
+/// 此结构不表示调用已经执行，也不表示它是批次的最后一项。批次是否已经传输完整由随后
+/// 独立的 `calls_sealed` 操作声明。
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct IncrementalToolCall {
+    pub run_id: RunId,
+    pub batch_attempt_id: ToolBatchAttemptId,
+    pub slot: ToolCallSlot,
+    pub call: ToolCall,
+}
+
+/// 候选工具批次终止的原因。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolBatchAbortReason {
+    /// 模型传输失败、返回 `incomplete`，或在成功终态前结束。
+    ModelStreamInterrupted,
+    /// 流事件与最终聚合响应不一致，不能安全提交。
+    ModelOutputMismatch,
+    /// 工具运行时在接管调用或批次封口时返回错误。
+    ToolRuntimeRejected,
+}
+
+/// 批次中断后，工具运行时对一个已经传给 `submit` 的调用给出的冻结结论。
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "status", content = "value", rename_all = "snake_case")]
+pub enum AbortedToolCallOutcome {
+    /// 已经获得可信的普通工具结果。
+    Settled(ToolResult),
+    /// 运行时确认该调用尚未开始且以后也不会开始。
+    CancelledBeforeStart,
+    /// 调用可能已经产生影响，但运行时无法确定最终结果。
+    OutcomeUnknown { summary: String },
+}
+
+/// 中断批次中一个已经尝试提交给 runtime 的调用及其冻结结论。
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AbortedToolCall {
+    pub slot: ToolCallSlot,
+    pub call_id: ToolCallId,
+    pub outcome: AbortedToolCallOutcome,
+}
+
+/// 增量工具运行时在 `abort` 时返回的完整冻结报告。
+///
+/// `calls` 必须对每个已经传给 `submit` 的 slot 恰好给出一个结论，包括 `submit` 因确认
+/// 不确定而返回 `Err` 的当前调用；返回后不得再执行该批次中的任何工作，也不得再产生
+/// 迟到结果。
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AbortedToolBatch {
+    pub batch_attempt_id: ToolBatchAttemptId,
+    pub calls: Vec<AbortedToolCall>,
+}
+
+/// 写入下一次正常模型输入的中断批次执行事实。
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct InterruptedToolBatchReceipt {
+    pub batch_attempt_id: ToolBatchAttemptId,
+    pub calls: Vec<InterruptedToolCallReceipt>,
+}
+
+/// 一个需要在恢复消息中告知模型的已发生或结果不确定调用。
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct InterruptedToolCallReceipt {
+    pub slot: ToolCallSlot,
+    pub call_id: ToolCallId,
+    pub name: ToolName,
+    pub arguments: Value,
+    pub outcome: InterruptedToolCallOutcome,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "status", content = "value", rename_all = "snake_case")]
+pub enum InterruptedToolCallOutcome {
+    Settled(ToolResult),
+    OutcomeUnknown { summary: String },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

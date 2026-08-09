@@ -8,8 +8,11 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use crate::mailbox::Delivery;
+use crate::ports::ModelStreamEvent;
 use crate::run::RequestBoundaryKind;
-use crate::types::{AgentErrorKind, ModelUsage, RunId, ToolBatchId, ToolCallId, ToolName};
+use crate::types::{
+    AgentErrorKind, ModelUsage, RunId, ToolBatchAttemptId, ToolBatchId, ToolCallId, ToolName,
+};
 
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -81,6 +84,8 @@ pub enum EventKind {
     CompletionSealed,
     ModelRequestStarted,
     ModelRequestFinished,
+    ToolCallsSealed,
+    ToolBatchAborted,
     ToolBatchStarted,
     ToolBatchFinished,
     CompactionStarted,
@@ -100,9 +105,10 @@ impl EventKind {
             Self::ModelRequestStarted | Self::ModelRequestFinished => {
                 (EventLevel::Debug, EventCategory::Model)
             }
-            Self::ToolBatchStarted | Self::ToolBatchFinished => {
-                (EventLevel::Debug, EventCategory::Tools)
-            }
+            Self::ToolCallsSealed
+            | Self::ToolBatchAborted
+            | Self::ToolBatchStarted
+            | Self::ToolBatchFinished => (EventLevel::Debug, EventCategory::Tools),
             Self::CompactionStarted | Self::CompactionFinished => {
                 (EventLevel::Debug, EventCategory::Compaction)
             }
@@ -179,6 +185,20 @@ pub enum AgentEvent {
         duration_ms: u64,
         usage: Option<ModelUsage>,
     },
+    ToolCallsSealed {
+        sequence: u64,
+        run_id: RunId,
+        batch_attempt_id: ToolBatchAttemptId,
+        call_count: u32,
+    },
+    ToolBatchAborted {
+        sequence: u64,
+        run_id: RunId,
+        batch_attempt_id: ToolBatchAttemptId,
+        settled_count: usize,
+        cancelled_count: usize,
+        unknown_count: usize,
+    },
     ToolBatchStarted {
         sequence: u64,
         run_id: RunId,
@@ -210,6 +230,7 @@ pub enum AgentEvent {
         run_id: RunId,
         model_requests: u64,
         tool_batches: u64,
+        interrupted_tool_recoveries: u64,
         usage: Option<ModelUsage>,
     },
     RunStopped {
@@ -235,6 +256,8 @@ impl AgentEvent {
             | Self::CompletionSealed { sequence, .. }
             | Self::ModelRequestStarted { sequence, .. }
             | Self::ModelRequestFinished { sequence, .. }
+            | Self::ToolCallsSealed { sequence, .. }
+            | Self::ToolBatchAborted { sequence, .. }
             | Self::ToolBatchStarted { sequence, .. }
             | Self::ToolBatchFinished { sequence, .. }
             | Self::CompactionStarted { sequence, .. }
@@ -253,6 +276,8 @@ impl AgentEvent {
             Self::CompletionSealed { .. } => EventKind::CompletionSealed,
             Self::ModelRequestStarted { .. } => EventKind::ModelRequestStarted,
             Self::ModelRequestFinished { .. } => EventKind::ModelRequestFinished,
+            Self::ToolCallsSealed { .. } => EventKind::ToolCallsSealed,
+            Self::ToolBatchAborted { .. } => EventKind::ToolBatchAborted,
             Self::ToolBatchStarted { .. } => EventKind::ToolBatchStarted,
             Self::ToolBatchFinished { .. } => EventKind::ToolBatchFinished,
             Self::CompactionStarted { .. } => EventKind::CompactionStarted,
@@ -275,6 +300,52 @@ pub trait Observer: Send + Sync {
     }
 
     fn observe(&self, event: &AgentEvent);
+}
+
+/// 带运行关联信息的高频模型流事件。
+///
+/// 与 [`AgentEvent`] 不同，此结构可能包含模型正文、完整工具参数和服务商扩展字段，不应
+/// 默认写入普通日志。需要持久化它的应用负责显式启用、限长和脱敏。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObservedModelStreamEvent {
+    pub sequence: u64,
+    pub run_id: RunId,
+    pub request_index: u64,
+    pub payload: ModelStreamObservation,
+}
+
+/// 流观察层的一次增量或明确终态。
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModelStreamObservation {
+    /// 在模型请求成功前都只是暂存内容。
+    Delta(ModelStreamEvent),
+    /// 模型适配器已经返回一份通过内核校验的完整响应。
+    AttemptCommitted,
+    /// 本次流草稿已经丢弃；同一运行可能随后通过恢复回执继续请求模型。
+    AttemptAborted { error_kind: AgentErrorKind },
+}
+
+/// 模型正文和工具调用增量的同步观察端。
+///
+/// 它在网络流读取路径上调用，接收端应快速返回，通常只把事件转发到自己的队列。驱动器会
+/// 隔离 `enabled` 和 `observe` 的 panic；观察端是否启用或失败都不会影响可靠的工具转发。
+pub trait StreamObserver: Send + Sync {
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    fn observe(&self, event: &ObservedModelStreamEvent);
+}
+
+#[derive(Default)]
+pub struct NoopStreamObserver;
+
+impl StreamObserver for NoopStreamObserver {
+    fn enabled(&self) -> bool {
+        false
+    }
+
+    fn observe(&self, _event: &ObservedModelStreamEvent) {}
 }
 
 /// 用原子级别和类别掩码包装任意 Observer，可在运行期间无锁切换。

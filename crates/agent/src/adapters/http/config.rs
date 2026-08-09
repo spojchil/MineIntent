@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use super::transport::Protocol;
 
-/// 默认允许读取的最大响应正文长度（8 MiB）。
+/// 默认允许读取的最大响应正文长度；SSE 模式按整条流的累计字节数计算（8 MiB）。
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// HTTP 请求使用的鉴权头。
@@ -35,7 +35,7 @@ impl HttpAuth {
     }
 }
 
-/// 是否记录完整 wire body。完整日志可能包含敏感对话内容，默认关闭。
+/// 是否记录完整 wire JSON body 或逐条 SSE 事件。完整日志可能包含敏感对话内容，默认关闭。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum WireLogPolicy {

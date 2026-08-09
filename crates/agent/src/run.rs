@@ -7,8 +7,9 @@ use std::collections::HashSet;
 
 use crate::ports::ModelResponse;
 use crate::types::{
-    order_tool_results, validate_closed_transcript, AgentError, AgentErrorKind, ModelOutput,
-    ModelUsage, RunId, ToolBatchId, ToolCallBatch, ToolCallId, ToolResultBatch, TranscriptItem,
+    order_tool_results, validate_closed_transcript, AgentError, AgentErrorKind, InputMessage,
+    ModelOutput, ModelUsage, RunId, ToolBatchAttemptId, ToolBatchId, ToolCallBatch, ToolCallId,
+    ToolResultBatch, TranscriptItem,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,7 +61,6 @@ pub struct Turn {
     run_id: RunId,
     transcript: Vec<TranscriptItem>,
     committable_len: usize,
-    seen_tool_call_ids: HashSet<ToolCallId>,
     tool_batch_seq: u64,
     usage: Option<ModelUsage>,
     state: TurnState,
@@ -87,7 +87,6 @@ impl Turn {
             run_id,
             transcript,
             committable_len,
-            seen_tool_call_ids: HashSet::new(),
             tool_batch_seq: 0,
             usage: None,
             state: TurnState::NeedBoundary(Boundary::ModelRequest),
@@ -181,6 +180,26 @@ impl Turn {
 
     /// 提交规范化响应，并准备其完整本地调用批次，或进入完成边界。此处不解析服务商 JSON。
     pub fn model_response(&mut self, response: ModelResponse) -> Result<(), AgentError> {
+        self.model_response_inner(response, None)
+    }
+
+    /// 提交一个已经分配候选工具批次 ID 的规范化响应。
+    ///
+    /// 流式驱动器在模型请求开始时就分配此 ID，使提前转发的单项调用、中断报告和最终完整
+    /// 批次始终使用同一个关联值。没有工具调用时该 ID 不会进入对话记录。
+    pub fn model_response_for_attempt(
+        &mut self,
+        response: ModelResponse,
+        batch_attempt_id: ToolBatchAttemptId,
+    ) -> Result<(), AgentError> {
+        self.model_response_inner(response, Some(batch_attempt_id))
+    }
+
+    fn model_response_inner(
+        &mut self,
+        response: ModelResponse,
+        batch_attempt_id: Option<ToolBatchAttemptId>,
+    ) -> Result<(), AgentError> {
         if !matches!(self.state, TurnState::WaitingModel) {
             return Err(Self::invalid_state("turn_not_waiting_for_model"));
         }
@@ -204,17 +223,36 @@ impl Turn {
             return self.fail(error);
         }
         self.tool_batch_seq = self.tool_batch_seq.saturating_add(1);
-        let batch = ToolCallBatch {
-            run_id: self.run_id.clone(),
-            batch_id: ToolBatchId::new(format!(
+        let batch_id = batch_attempt_id.map(ToolBatchId::from).unwrap_or_else(|| {
+            ToolBatchId::new(format!(
                 "{}/tools/{}",
                 self.run_id.as_str(),
                 self.tool_batch_seq
-            )),
+            ))
+        });
+        let batch = ToolCallBatch {
+            run_id: self.run_id.clone(),
+            batch_id,
             calls: output.tool_calls.clone(),
         };
         self.transcript.push(TranscriptItem::ModelOutput(output));
         self.state = TurnState::NeedTools(batch);
+        Ok(())
+    }
+
+    /// 丢弃一次未完成的模型草稿，并把已经发生的外部事实作为一条正常输入提交。
+    ///
+    /// 此方法仅能在等待模型时调用。调用方不得把残缺的模型输出或孤立 `ToolResults`
+    /// 混入消息；恢复回执使用开放 role 的 [`InputMessage`] 表达。
+    pub fn recover_model_attempt(&mut self, receipt: InputMessage) -> Result<(), AgentError> {
+        if !matches!(self.state, TurnState::WaitingModel) {
+            return Err(Self::invalid_state("turn_not_waiting_for_model_recovery"));
+        }
+
+        self.transcript.push(TranscriptItem::Input(receipt));
+        self.commit_transcript();
+        // 恢复事实先写入；随后仍经过正常请求边界，使已在信箱中的输入排在回执之后。
+        self.state = TurnState::NeedBoundary(Boundary::ModelRequest);
         Ok(())
     }
 
@@ -251,14 +289,13 @@ impl Turn {
                     "empty_tool_call_id",
                 ));
             }
-            if !current.insert(call.id.clone()) || self.seen_tool_call_ids.contains(&call.id) {
+            if !current.insert(call.id.clone()) {
                 return Err(AgentError::new(
                     AgentErrorKind::InvalidToolBatch,
                     "duplicate_tool_call_id",
                 ));
             }
         }
-        self.seen_tool_call_ids.extend(current);
         Ok(())
     }
 

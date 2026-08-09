@@ -1,5 +1,6 @@
 //! 围绕无 I/O `Turn` 的并发会话驱动器。
 
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -7,26 +8,45 @@ use std::time::Instant;
 use tokio::sync::{Mutex, Notify};
 
 use crate::events::{
-    AgentEvent, EventKind, EventMetadata, NoopObserver, Observer, RunStage, ToolCallSummary,
+    AgentEvent, EventKind, EventMetadata, ModelStreamObservation, NoopObserver, NoopStreamObserver,
+    ObservedModelStreamEvent, Observer, RunStage, StreamObserver, ToolCallSummary,
 };
 use crate::mailbox::{Mailbox, MailboxInput, MailboxRejected, MailboxRejectedReason};
-use crate::ports::{Compaction, Model, ModelRequest, PromptSource, ToolRuntime};
+use crate::ports::{
+    Compaction, IncrementalToolBatch, Model, ModelRequest, ModelResponse, ModelStreamEvent,
+    ModelStreamSink, PortFuture, PromptSource, ToolRuntime,
+};
 use crate::run::{RequestBoundaryKind, Turn, TurnStep};
 use crate::types::{
-    validate_closed_transcript, AgentError, ModelOutput, ModelUsage, RunId, ToolResultStatus,
-    TranscriptItem,
+    validate_closed_transcript, AbortedToolBatch, AbortedToolCallOutcome, AgentError,
+    AgentErrorKind, ContentPart, IncrementalToolCall, InputMessage, InterruptedToolBatchReceipt,
+    InterruptedToolCallOutcome, InterruptedToolCallReceipt, ModelOutput, ModelUsage, RunId,
+    ToolBatchAbortReason, ToolBatchAttemptId, ToolBatchStart, ToolCall, ToolCallSlot,
+    ToolResultStatus, TranscriptItem,
 };
+
+const RECOVERY_RECEIPT_MARKER_KEY: &str = "agent.interrupted_tool_batch_receipt";
+const RECOVERY_RECEIPT_KIND: &str = "interrupted_tool_batch_receipt";
 
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
     /// 当持久化对话记录的序列化大小超过此值时，在运行结束后压缩它。
     pub compaction_trigger_bytes: usize,
+    /// 中断工具批次的执行事实在下一次模型请求中使用的普通输入角色。
+    ///
+    /// 默认 `user` 只用于兼容现有协议；内核不赋予该字符串固定语义，应用可按适配器能力
+    /// 改为 `developer`、`operator` 或自定义角色。
+    pub interrupted_tool_receipt_role: String,
+    /// 单次运行允许从“已有工具执行事实的模型流中断”自动继续的最大次数。
+    pub max_interrupted_tool_recoveries: u32,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             compaction_trigger_bytes: 256 * 1024,
+            interrupted_tool_receipt_role: "user".to_owned(),
+            max_interrupted_tool_recoveries: 3,
         }
     }
 }
@@ -89,6 +109,396 @@ struct SessionState {
     mailbox: Mailbox,
 }
 
+enum IncrementalMode<'a> {
+    Uninitialized,
+    Unsupported,
+    Active(Box<dyn IncrementalToolBatch + 'a>),
+    Closed,
+}
+
+/// 一次模型请求期间的暂存聚合状态。模型 adapter 仍负责解析 wire；这里仅校验规范事件，
+/// 并把已经完整的调用转发给可选的增量工具运行时。
+struct ModelAttemptSink<'a> {
+    session: &'a AgentSession,
+    tools: &'a dyn ToolRuntime,
+    run_id: RunId,
+    request_index: u64,
+    start: ToolBatchStart,
+    ready_calls: BTreeMap<ToolCallSlot, ToolCall>,
+    offered_calls: BTreeMap<ToolCallSlot, ToolCall>,
+    sealed_count: Option<u32>,
+    mode: IncrementalMode<'a>,
+    runtime_rejected: bool,
+    first_failure: Option<AgentError>,
+    closed: bool,
+}
+
+impl<'a> ModelAttemptSink<'a> {
+    fn new(session: &'a AgentSession, run_id: RunId, request_index: u64) -> Self {
+        let batch_attempt_id =
+            ToolBatchAttemptId::new(format!("{}/model/{request_index}/tools", run_id.as_str()));
+        Self {
+            session,
+            tools: session.tools.as_ref(),
+            start: ToolBatchStart {
+                run_id: run_id.clone(),
+                batch_attempt_id,
+            },
+            run_id,
+            request_index,
+            ready_calls: BTreeMap::new(),
+            offered_calls: BTreeMap::new(),
+            sealed_count: None,
+            mode: IncrementalMode::Uninitialized,
+            runtime_rejected: false,
+            first_failure: None,
+            closed: false,
+        }
+    }
+
+    fn batch_attempt_id(&self) -> &ToolBatchAttemptId {
+        &self.start.batch_attempt_id
+    }
+
+    fn close(&mut self) {
+        self.closed = true;
+    }
+
+    fn runtime_rejected(&self) -> bool {
+        self.runtime_rejected
+    }
+
+    fn first_failure(&self) -> Option<&AgentError> {
+        self.first_failure.as_ref()
+    }
+
+    async fn ensure_incremental(&mut self) -> Result<(), AgentError> {
+        if !matches!(self.mode, IncrementalMode::Uninitialized) {
+            return Ok(());
+        }
+
+        let receiver = match self.tools.begin_incremental(self.start.clone()).await {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                self.runtime_rejected = true;
+                return Err(error);
+            }
+        };
+        self.mode = match receiver {
+            Some(receiver) => IncrementalMode::Active(receiver),
+            None => IncrementalMode::Unsupported,
+        };
+        Ok(())
+    }
+
+    async fn accept_ready(&mut self, slot: ToolCallSlot, call: ToolCall) -> Result<(), AgentError> {
+        if self.sealed_count.is_some() {
+            return Err(AgentError::new(
+                AgentErrorKind::Model,
+                "tool_call_ready_after_calls_sealed",
+            ));
+        }
+        if call.id.as_str().is_empty() {
+            return Err(AgentError::new(
+                AgentErrorKind::InvalidToolBatch,
+                "empty_tool_call_id",
+            ));
+        }
+        if let Some(previous) = self.ready_calls.get(&slot) {
+            return if previous == &call {
+                Ok(())
+            } else {
+                Err(AgentError::new(
+                    AgentErrorKind::Model,
+                    "conflicting_tool_call_slot",
+                ))
+            };
+        }
+        if self
+            .ready_calls
+            .values()
+            .any(|previous| previous.id == call.id)
+        {
+            return Err(AgentError::new(
+                AgentErrorKind::InvalidToolBatch,
+                "duplicate_tool_call_id",
+            ));
+        }
+
+        self.ready_calls.insert(slot, call.clone());
+        self.ensure_incremental().await?;
+        if let IncrementalMode::Active(receiver) = &mut self.mode {
+            let item = IncrementalToolCall {
+                run_id: self.run_id.clone(),
+                batch_attempt_id: self.start.batch_attempt_id.clone(),
+                slot,
+                call: call.clone(),
+            };
+            // 先记录已经交给 submit 的调用。即使确认包丢失导致 submit 返回 Err，runtime
+            // 仍可能已经接管或执行；随后 abort 必须把这个不确定窗口分类出来。
+            self.offered_calls.insert(slot, call);
+            // 此 await 只等待运行时可靠确认接管，不允许等待实际工具执行完成。
+            if let Err(error) = receiver.submit(item).await {
+                self.runtime_rejected = true;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    async fn accept_seal(&mut self, call_count: u32) -> Result<(), AgentError> {
+        if let Some(previous) = self.sealed_count {
+            return if previous == call_count {
+                Ok(())
+            } else {
+                Err(AgentError::new(
+                    AgentErrorKind::Model,
+                    "conflicting_tool_call_count",
+                ))
+            };
+        }
+
+        let ready_count = u32::try_from(self.ready_calls.len())
+            .map_err(|_| AgentError::new(AgentErrorKind::Model, "tool_call_count_exceeds_u32"))?;
+        let contiguous =
+            (0..call_count).all(|slot| self.ready_calls.contains_key(&ToolCallSlot::new(slot)));
+        if ready_count != call_count || !contiguous {
+            return Err(AgentError::new(
+                AgentErrorKind::Model,
+                "tool_calls_sealed_before_all_calls_ready",
+            ));
+        }
+
+        if call_count > 0 {
+            self.ensure_incremental().await?;
+            if let IncrementalMode::Active(receiver) = &mut self.mode {
+                // 与 submit 相同，此处只等待运行时接管“不会再有新调用”的事实。
+                if let Err(error) = receiver.calls_sealed(call_count).await {
+                    self.runtime_rejected = true;
+                    return Err(error);
+                }
+            }
+        }
+        self.sealed_count = Some(call_count);
+        self.session.emit_tool_calls_sealed(
+            &self.run_id,
+            self.start.batch_attempt_id.clone(),
+            call_count,
+        );
+        Ok(())
+    }
+
+    async fn reconcile_success(&mut self, response: &ModelResponse) -> Result<(), AgentError> {
+        let calls = &response.output.tool_calls;
+        let final_count = u32::try_from(calls.len())
+            .map_err(|_| AgentError::new(AgentErrorKind::Model, "tool_call_count_exceeds_u32"))?;
+
+        // 在把终态响应中尚未流出的调用交给 runtime 之前，先验证整个数组。
+        // 这样 one-shot 与 Chat 的批量终态不会因后项非法而提前执行前项。
+        let mut final_call_ids = HashSet::with_capacity(calls.len());
+        for call in calls {
+            if call.id.as_str().is_empty() {
+                return Err(AgentError::new(
+                    AgentErrorKind::InvalidToolBatch,
+                    "empty_tool_call_id",
+                ));
+            }
+            if !final_call_ids.insert(&call.id) {
+                return Err(AgentError::new(
+                    AgentErrorKind::InvalidToolBatch,
+                    "duplicate_tool_call_id",
+                ));
+            }
+        }
+
+        for (slot, streamed) in &self.ready_calls {
+            let Some(final_call) = calls.get(slot.get() as usize) else {
+                return Err(AgentError::new(
+                    AgentErrorKind::Model,
+                    "streamed_tool_call_missing_from_final_response",
+                ));
+            };
+            if streamed != final_call {
+                return Err(AgentError::new(
+                    AgentErrorKind::Model,
+                    "streamed_tool_call_differs_from_final_response",
+                ));
+            }
+        }
+        if let Some(sealed_count) = self.sealed_count {
+            if sealed_count != final_count {
+                return Err(AgentError::new(
+                    AgentErrorKind::Model,
+                    "sealed_tool_call_count_differs_from_final_response",
+                ));
+            }
+        }
+
+        for (index, call) in calls.iter().enumerate() {
+            let slot = ToolCallSlot::new(u32::try_from(index).map_err(|_| {
+                AgentError::new(AgentErrorKind::Model, "tool_call_index_exceeds_u32")
+            })?);
+            if !self.ready_calls.contains_key(&slot) {
+                self.accept_ready(slot, call.clone()).await?;
+            }
+        }
+
+        if final_count > 0 && self.sealed_count.is_none() {
+            self.accept_seal(final_count).await?;
+        }
+        Ok(())
+    }
+
+    fn take_incremental(&mut self) -> Option<Box<dyn IncrementalToolBatch + 'a>> {
+        match std::mem::replace(&mut self.mode, IncrementalMode::Closed) {
+            IncrementalMode::Active(receiver) => Some(receiver),
+            IncrementalMode::Uninitialized
+            | IncrementalMode::Unsupported
+            | IncrementalMode::Closed => None,
+        }
+    }
+
+    async fn abort(
+        &mut self,
+        reason: ToolBatchAbortReason,
+    ) -> Result<Option<InterruptedToolBatchReceipt>, AgentError> {
+        self.close();
+        let Some(receiver) = self.take_incremental() else {
+            return Ok(None);
+        };
+        let report = receiver.abort(reason).await?;
+        self.validate_abort_report(report)
+    }
+
+    fn validate_abort_report(
+        &self,
+        mut report: AbortedToolBatch,
+    ) -> Result<Option<InterruptedToolBatchReceipt>, AgentError> {
+        if report.batch_attempt_id != self.start.batch_attempt_id {
+            return Err(AgentError::new(
+                AgentErrorKind::InvalidToolBatch,
+                "aborted_tool_batch_id_mismatch",
+            ));
+        }
+        if report.calls.len() != self.offered_calls.len() {
+            return Err(AgentError::new(
+                AgentErrorKind::InvalidToolBatch,
+                "aborted_tool_call_count_mismatch",
+            ));
+        }
+        report.calls.sort_by_key(|call| call.slot);
+        let mut seen = HashSet::with_capacity(report.calls.len());
+        let mut receipts = Vec::new();
+        let mut settled_count = 0;
+        let mut cancelled_count = 0;
+        let mut unknown_count = 0;
+
+        for aborted in report.calls {
+            if !seen.insert(aborted.slot) {
+                return Err(AgentError::new(
+                    AgentErrorKind::InvalidToolBatch,
+                    "duplicate_aborted_tool_call_slot",
+                ));
+            }
+            let Some(call) = self.offered_calls.get(&aborted.slot) else {
+                return Err(AgentError::new(
+                    AgentErrorKind::InvalidToolBatch,
+                    "unknown_aborted_tool_call_slot",
+                ));
+            };
+            if aborted.call_id != call.id {
+                return Err(AgentError::new(
+                    AgentErrorKind::InvalidToolBatch,
+                    "aborted_tool_call_id_mismatch",
+                ));
+            }
+
+            let outcome = match aborted.outcome {
+                AbortedToolCallOutcome::Settled(result) => {
+                    if result.call_id != call.id {
+                        return Err(AgentError::new(
+                            AgentErrorKind::InvalidToolBatch,
+                            "aborted_tool_result_id_mismatch",
+                        ));
+                    }
+                    settled_count += 1;
+                    Some(InterruptedToolCallOutcome::Settled(result))
+                }
+                AbortedToolCallOutcome::CancelledBeforeStart => {
+                    cancelled_count += 1;
+                    None
+                }
+                AbortedToolCallOutcome::OutcomeUnknown { summary } => {
+                    unknown_count += 1;
+                    Some(InterruptedToolCallOutcome::OutcomeUnknown { summary })
+                }
+            };
+            if let Some(outcome) = outcome {
+                receipts.push(InterruptedToolCallReceipt {
+                    slot: aborted.slot,
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    outcome,
+                });
+            }
+        }
+
+        self.session.emit_tool_batch_aborted(
+            &self.run_id,
+            self.start.batch_attempt_id.clone(),
+            settled_count,
+            cancelled_count,
+            unknown_count,
+        );
+        if receipts.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(InterruptedToolBatchReceipt {
+                batch_attempt_id: self.start.batch_attempt_id.clone(),
+                calls: receipts,
+            }))
+        }
+    }
+}
+
+impl ModelStreamSink for ModelAttemptSink<'_> {
+    fn emit<'b>(&'b mut self, event: ModelStreamEvent) -> PortFuture<'b, Result<(), AgentError>> {
+        Box::pin(async move {
+            if let Some(error) = self.first_failure.clone() {
+                return Err(error);
+            }
+            if self.closed {
+                return Err(AgentError::new(
+                    AgentErrorKind::InvalidState,
+                    "model_stream_event_after_attempt_closed",
+                ));
+            }
+
+            self.session
+                .emit_stream_delta(&self.run_id, self.request_index, &event);
+            let result = match event {
+                ModelStreamEvent::TextDelta { .. } => Ok(()),
+                ModelStreamEvent::ToolCallReady { slot, call } => {
+                    self.accept_ready(slot, call).await
+                }
+                ModelStreamEvent::ToolCallsSealed { call_count } => {
+                    self.accept_seal(call_count).await
+                }
+            };
+            if let Err(error) = &result {
+                self.first_failure = Some(error.clone());
+            }
+            result
+        })
+    }
+}
+
+struct PendingIncrementalBatch<'a> {
+    batch_attempt_id: ToolBatchAttemptId,
+    receiver: Box<dyn IncrementalToolBatch + 'a>,
+}
+
 /// 持有持久化会话状态，并确保每个会话同时只有一个活跃驱动器。
 pub struct AgentSession {
     prompt: Arc<dyn PromptSource>,
@@ -96,6 +506,7 @@ pub struct AgentSession {
     compaction: Arc<dyn Compaction>,
     model: Arc<dyn Model>,
     observer: Arc<dyn Observer>,
+    stream_observer: Arc<dyn StreamObserver>,
     config: SessionConfig,
     event_sequence: AtomicU64,
     state: Mutex<SessionState>,
@@ -116,6 +527,7 @@ impl AgentSession {
             compaction,
             model,
             observer: Arc::new(NoopObserver),
+            stream_observer: Arc::new(NoopStreamObserver),
             config,
             event_sequence: AtomicU64::new(0),
             state: Mutex::new(SessionState::default()),
@@ -126,6 +538,12 @@ impl AgentSession {
     /// 在将会话包装进 `Arc` 前安装结构化事件接收器。
     pub fn with_observer(mut self, observer: Arc<dyn Observer>) -> Self {
         self.observer = observer;
+        self
+    }
+
+    /// 安装可能接收正文和完整工具参数的高频流观察器。
+    pub fn with_stream_observer(mut self, observer: Arc<dyn StreamObserver>) -> Self {
+        self.stream_observer = observer;
         self
     }
 
@@ -332,6 +750,7 @@ impl AgentSession {
                         run_id,
                         model_requests: stats.model_requests,
                         tool_batches: stats.tool_batches,
+                        interrupted_tool_recoveries: stats.interrupted_tool_recoveries,
                         usage: usage.clone(),
                     }
                 });
@@ -363,6 +782,7 @@ impl AgentSession {
 
     async fn drive_steps(&self, run_id: &RunId, turn: &mut Turn) -> CoreOutcome {
         let mut stats = RunStats::default();
+        let mut pending_incremental: Option<PendingIncrementalBatch<'_>> = None;
         loop {
             let step = match turn.next_step() {
                 Ok(step) => step,
@@ -429,51 +849,123 @@ impl AgentSession {
                 }
                 TurnStep::CallModel { transcript } => {
                     stats.model_requests = stats.model_requests.saturating_add(1);
+                    let request_index = stats.model_requests;
                     let definitions = self.tools.definitions();
                     let sequence = self.next_event_sequence();
                     self.emit_lazy(EventKind::ModelRequestStarted.metadata(), || {
                         AgentEvent::ModelRequestStarted {
                             sequence,
                             run_id: run_id.clone(),
-                            request_index: stats.model_requests,
+                            request_index,
                             transcript_items: transcript.len(),
                             function_tools: definitions.len(),
                         }
                     });
                     let started_at = Instant::now();
-                    let response = match self
+                    let mut sink = ModelAttemptSink::new(self, run_id.clone(), request_index);
+                    let response = self
                         .model
-                        .complete(ModelRequest {
-                            transcript,
-                            function_tools: definitions,
-                        })
-                        .await
-                    {
+                        .complete_stream(
+                            ModelRequest {
+                                transcript,
+                                function_tools: definitions,
+                            },
+                            &mut sink,
+                        )
+                        .await;
+                    // adapter 已经归还 complete_stream 的独占借用；从这里起明确禁止任何
+                    // 新的 CallReady，再等待 runtime 给出冻结的 abort 报告。
+                    sink.close();
+                    // 即使第三方 adapter 错误地吞掉 sink 返回的 Err 并最终返回 Ok，首次
+                    // sink 失败仍是粘滞的，本次 attempt 绝不能进入 reconcile 或 commit。
+                    let response = match response {
+                        Ok(response) => match sink.first_failure().cloned() {
+                            Some(error) => Err(error),
+                            None => Ok(response),
+                        },
+                        Err(error) => Err(sink.first_failure().cloned().unwrap_or(error)),
+                    };
+                    let response = match response {
                         Ok(response) => response,
                         Err(error) => {
-                            return CoreOutcome::Failed {
-                                error,
-                                stage: RunStage::Model,
+                            let reason = if sink.runtime_rejected() {
+                                ToolBatchAbortReason::ToolRuntimeRejected
+                            } else {
+                                ToolBatchAbortReason::ModelStreamInterrupted
                             };
+                            match self
+                                .resolve_failed_model_attempt(
+                                    run_id, turn, &mut sink, error, reason, &mut stats,
+                                )
+                                .await
+                            {
+                                Ok(()) => continue,
+                                Err(outcome) => return outcome,
+                            }
                         }
                     };
+
+                    if let Err(error) = sink.reconcile_success(&response).await {
+                        let reason = if sink.runtime_rejected() {
+                            ToolBatchAbortReason::ToolRuntimeRejected
+                        } else {
+                            ToolBatchAbortReason::ModelOutputMismatch
+                        };
+                        match self
+                            .resolve_failed_model_attempt(
+                                run_id, turn, &mut sink, error, reason, &mut stats,
+                            )
+                            .await
+                        {
+                            Ok(()) => continue,
+                            Err(outcome) => return outcome,
+                        }
+                    }
+
+                    let batch_attempt_id = sink.batch_attempt_id().clone();
                     let sequence = self.next_event_sequence();
                     self.emit_lazy(EventKind::ModelRequestFinished.metadata(), || {
                         AgentEvent::ModelRequestFinished {
                             sequence,
                             run_id: run_id.clone(),
-                            request_index: stats.model_requests,
+                            request_index,
                             local_tool_calls: response.output.tool_calls.len(),
                             duration_ms: elapsed_ms(started_at),
                             usage: response.usage.clone(),
                         }
                     });
-                    if let Err(error) = turn.model_response(response) {
+
+                    if let Err(error) =
+                        turn.model_response_for_attempt(response, batch_attempt_id.clone())
+                    {
+                        // 走到这里表示无 I/O 状态机与已经校验过的规范响应不一致，是严格的
+                        // 内核错误。尽力冻结 runtime，但不伪造恢复回执。
+                        let _ = sink.abort(ToolBatchAbortReason::ModelOutputMismatch).await;
+                        self.emit_stream_terminal(
+                            run_id,
+                            request_index,
+                            ModelStreamObservation::AttemptAborted {
+                                error_kind: error.kind,
+                            },
+                        );
                         return CoreOutcome::Failed {
                             error,
                             stage: RunStage::Model,
                         };
                     }
+
+                    if let Some(receiver) = sink.take_incremental() {
+                        debug_assert!(pending_incremental.is_none());
+                        pending_incremental = Some(PendingIncrementalBatch {
+                            batch_attempt_id,
+                            receiver,
+                        });
+                    }
+                    self.emit_stream_terminal(
+                        run_id,
+                        request_index,
+                        ModelStreamObservation::AttemptCommitted,
+                    );
                 }
                 TurnStep::DispatchTools { batch } => {
                     stats.tool_batches = stats.tool_batches.saturating_add(1);
@@ -495,9 +987,23 @@ impl AgentSession {
                         }
                     });
                     let batch_id = batch.batch_id.clone();
-                    // 对模型生成的整个批次只调用一次 dispatch。
                     let started_at = Instant::now();
-                    let results = match self.tools.dispatch(batch).await {
+                    let result = if let Some(pending) = pending_incremental.take() {
+                        if pending.batch_attempt_id.as_str() != batch.batch_id.as_str() {
+                            Err(AgentError::new(
+                                AgentErrorKind::InvalidState,
+                                "incremental_tool_batch_id_mismatch",
+                            ))
+                        } else {
+                            // commit 的顶层错误表示运行时无法生成可信的完整结果批。模型流已经
+                            // 成功，不能再把它伪装成可恢复的中断回执，因此严格终止本次运行。
+                            pending.receiver.commit().await
+                        }
+                    } else {
+                        // 不支持增量接管的 runtime 仍然只收到一次完整数组。
+                        self.tools.dispatch(batch).await
+                    };
+                    let results = match result {
                         Ok(results) => results,
                         Err(error) => {
                             return CoreOutcome::Failed {
@@ -530,6 +1036,7 @@ impl AgentSession {
                     }
                 }
                 TurnStep::Done { output, usage } => {
+                    debug_assert!(pending_incremental.is_none());
                     return CoreOutcome::Completed {
                         output,
                         usage,
@@ -538,6 +1045,203 @@ impl AgentSession {
                 }
             }
         }
+    }
+
+    async fn resolve_failed_model_attempt(
+        &self,
+        run_id: &RunId,
+        turn: &mut Turn,
+        sink: &mut ModelAttemptSink<'_>,
+        error: AgentError,
+        reason: ToolBatchAbortReason,
+        stats: &mut RunStats,
+    ) -> Result<(), CoreOutcome> {
+        sink.close();
+        self.emit_stream_terminal(
+            run_id,
+            sink.request_index,
+            ModelStreamObservation::AttemptAborted {
+                error_kind: error.kind,
+            },
+        );
+
+        let receipt = match sink.abort(reason).await {
+            Ok(receipt) => receipt,
+            Err(abort_error) => {
+                return Err(CoreOutcome::Failed {
+                    error: abort_error,
+                    stage: RunStage::Tools,
+                });
+            }
+        };
+        let Some(receipt) = receipt else {
+            let stage = if reason == ToolBatchAbortReason::ToolRuntimeRejected {
+                RunStage::Tools
+            } else {
+                RunStage::Model
+            };
+            return Err(CoreOutcome::Failed { error, stage });
+        };
+
+        let message = match self.interrupted_tool_receipt_message(&receipt) {
+            Ok(message) => message,
+            Err(message_error) => {
+                return Err(CoreOutcome::Failed {
+                    error: message_error,
+                    stage: RunStage::Boundary,
+                });
+            }
+        };
+        if let Err(boundary_error) = turn.recover_model_attempt(message) {
+            return Err(CoreOutcome::Failed {
+                error: boundary_error,
+                stage: RunStage::Boundary,
+            });
+        }
+
+        if reason == ToolBatchAbortReason::ToolRuntimeRejected {
+            return Err(CoreOutcome::Failed {
+                error,
+                stage: RunStage::Tools,
+            });
+        }
+        if stats.interrupted_tool_recoveries
+            >= u64::from(self.config.max_interrupted_tool_recoveries)
+        {
+            return Err(CoreOutcome::Failed {
+                error: AgentError::new(
+                    AgentErrorKind::Model,
+                    "interrupted_tool_recovery_limit_exceeded",
+                ),
+                stage: RunStage::Model,
+            });
+        }
+
+        stats.interrupted_tool_recoveries = stats.interrupted_tool_recoveries.saturating_add(1);
+        Ok(())
+    }
+
+    fn interrupted_tool_receipt_message(
+        &self,
+        receipt: &InterruptedToolBatchReceipt,
+    ) -> Result<InputMessage, AgentError> {
+        // `ToolResult::metadata` 属于应用内部关联数据，正常协议编码也不会把它交给模型。
+        // 恢复回执只携带模型本来就能看到的 status/content，避免意外暴露追踪或凭据字段。
+        let mut visible_calls = receipt.calls.clone();
+        for call in &mut visible_calls {
+            if let InterruptedToolCallOutcome::Settled(result) = &mut call.outcome {
+                result.metadata.clear();
+            }
+        }
+        let calls = serde_json::to_value(&visible_calls).map_err(|error| {
+            AgentError::new(
+                AgentErrorKind::InvalidState,
+                format!("serialize_interrupted_tool_receipt_failed:{error}"),
+            )
+        })?;
+        let value = serde_json::json!({
+            "kind": RECOVERY_RECEIPT_KIND,
+            "aborted": true,
+            "batch_attempt_id": receipt.batch_attempt_id.as_str(),
+            "calls": calls,
+            "unconfirmed_remainder": "discarded"
+        });
+        let mut message = InputMessage::new(
+            self.config.interrupted_tool_receipt_role.clone(),
+            vec![ContentPart::json(value)],
+        );
+        // 该标记属于内核持久化元数据，不依赖 role，也不应由协议 adapter 改写。
+        message.provider_data.insert(
+            RECOVERY_RECEIPT_MARKER_KEY.to_owned(),
+            serde_json::json!({
+                "version": 1,
+                "batch_attempt_id": receipt.batch_attempt_id.as_str()
+            }),
+        );
+        Ok(message)
+    }
+
+    fn emit_stream_delta(&self, run_id: &RunId, request_index: u64, event: &ModelStreamEvent) {
+        self.emit_stream_observation(run_id, request_index, || {
+            ModelStreamObservation::Delta(event.clone())
+        });
+    }
+
+    fn emit_stream_terminal(
+        &self,
+        run_id: &RunId,
+        request_index: u64,
+        payload: ModelStreamObservation,
+    ) {
+        debug_assert!(matches!(
+            &payload,
+            ModelStreamObservation::AttemptCommitted
+                | ModelStreamObservation::AttemptAborted { .. }
+        ));
+        self.emit_stream_observation(run_id, request_index, || payload);
+    }
+
+    fn emit_stream_observation(
+        &self,
+        run_id: &RunId,
+        request_index: u64,
+        build: impl FnOnce() -> ModelStreamObservation,
+    ) {
+        // 高频观察端完全独立于工具控制路径；过滤或 panic 不能丢失 CallReady/Seal。
+        let enabled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.stream_observer.enabled()
+        }))
+        .unwrap_or(false);
+        if !enabled {
+            return;
+        }
+        let event = ObservedModelStreamEvent {
+            sequence: self.next_event_sequence(),
+            run_id: run_id.clone(),
+            request_index,
+            payload: build(),
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.stream_observer.observe(&event);
+        }));
+    }
+
+    fn emit_tool_calls_sealed(
+        &self,
+        run_id: &RunId,
+        batch_attempt_id: ToolBatchAttemptId,
+        call_count: u32,
+    ) {
+        let sequence = self.next_event_sequence();
+        self.emit_lazy(EventKind::ToolCallsSealed.metadata(), || {
+            AgentEvent::ToolCallsSealed {
+                sequence,
+                run_id: run_id.clone(),
+                batch_attempt_id,
+                call_count,
+            }
+        });
+    }
+
+    fn emit_tool_batch_aborted(
+        &self,
+        run_id: &RunId,
+        batch_attempt_id: ToolBatchAttemptId,
+        settled_count: usize,
+        cancelled_count: usize,
+        unknown_count: usize,
+    ) {
+        let sequence = self.next_event_sequence();
+        self.emit_lazy(EventKind::ToolBatchAborted.metadata(), || {
+            AgentEvent::ToolBatchAborted {
+                sequence,
+                run_id: run_id.clone(),
+                batch_attempt_id,
+                settled_count,
+                cancelled_count,
+                unknown_count,
+            }
+        });
     }
 
     async fn maybe_compact(
@@ -565,7 +1269,9 @@ impl AgentSession {
         let compacted = self.compaction.compact(&conversation).await;
         // 压缩是受信端口，但其输出仍不能破坏核心的工具轮闭合不变量。拒绝非法结果时保留
         // 原始对话，避免一次可选优化污染下一次模型请求。
-        let compacted = if validate_closed_transcript(&compacted).is_ok() {
+        let compacted = if validate_closed_transcript(&compacted).is_ok()
+            && preserves_recovery_receipts(&conversation, &compacted)
+        {
             compacted
         } else {
             conversation
@@ -623,6 +1329,23 @@ impl AgentSession {
     }
 }
 
+fn is_recovery_receipt(item: &TranscriptItem) -> bool {
+    matches!(
+        item,
+        TranscriptItem::Input(message)
+            if message.provider_data.contains_key(RECOVERY_RECEIPT_MARKER_KEY)
+    )
+}
+
+/// 压缩可以改写普通历史，但不能静默遗忘已经发生的工具副作用。所有带内核标记的恢复
+/// 回执必须按原顺序、原内容出现在压缩结果中。
+fn preserves_recovery_receipts(original: &[TranscriptItem], compacted: &[TranscriptItem]) -> bool {
+    original
+        .iter()
+        .filter(|item| is_recovery_receipt(item))
+        .eq(compacted.iter().filter(|item| is_recovery_receipt(item)))
+}
+
 fn elapsed_ms(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -631,6 +1354,7 @@ fn elapsed_ms(started_at: Instant) -> u64 {
 struct RunStats {
     model_requests: u64,
     tool_batches: u64,
+    interrupted_tool_recoveries: u64,
 }
 
 enum CoreOutcome {
