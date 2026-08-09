@@ -1,49 +1,121 @@
-//! OpenAI Responses API wire codec。
+//! OpenAI Responses wire 协议。
 
-use agent::{
-    AgentError, ContentPart, JsonObject, ModelOutput, ModelRequest, ModelResponse, ModelUsage,
-    ToolCall, TranscriptItem,
+use serde_json::{json, Map, Value};
+
+use crate::adapters::http::{
+    content_as_text, merge_request_fields, model_error, parse_arguments, WireCodec,
 };
-use serde_json::{json, Value};
-
-use super::transport::{content_as_text, model_error, parse_arguments, AuthStyle, WireCodec};
+use crate::ports::{ModelRequest, ModelResponse};
+use crate::types::{
+    AgentError, ContentPart, JsonObject, ModelOutput, ModelUsage, ToolCall, TranscriptItem,
+};
 
 const RAW_OUTPUT_KEY: &str = "openai.responses.output";
 const ITEM_ID_KEY: &str = "openai.responses.item_id";
 const RESPONSE_ID_KEY: &str = "openai.responses.response_id";
 
-pub(super) struct OpenAiResponsesCodec;
+/// Responses 请求的协议级可选字段。
+///
+/// `additional_fields` 不得覆盖 `model`、`input`、`tools`、`tool_choice` 或
+/// `max_output_tokens`。本适配器不支持 SSE，`stream: true` 会被拒绝。
+#[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
+pub struct RequestOptions {
+    pub max_output_tokens: Option<u64>,
+    pub tool_choice: Option<Value>,
+    pub additional_fields: JsonObject,
+}
 
-impl WireCodec for OpenAiResponsesCodec {
-    fn auth_style(&self) -> AuthStyle {
-        AuthStyle::Bearer
+impl RequestOptions {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    fn encode_request(&self, request: &ModelRequest, model: &str) -> Result<Value, AgentError> {
-        let tools = request
-            .function_tools
-            .iter()
-            .map(|tool| {
-                let mut definition = json!({
-                    "type": "function",
-                    "name": tool.name.as_str(),
-                    "parameters": tool.input_schema,
-                });
-                if let Some(description) = &tool.description {
-                    definition["description"] = Value::String(description.clone());
-                }
-                definition
-            })
-            .collect::<Vec<_>>();
+    pub fn with_max_output_tokens(mut self, max_output_tokens: u64) -> Self {
+        self.max_output_tokens = Some(max_output_tokens);
+        self
+    }
 
-        Ok(json!({
-            "model": model,
-            "input": encode_input(&request.transcript)?,
-            "tools": tools,
-            "tool_choice": "auto",
-            "max_output_tokens": 256,
-            "stream": false,
-        }))
+    pub fn with_tool_choice(mut self, tool_choice: impl Into<Value>) -> Self {
+        self.tool_choice = Some(tool_choice.into());
+        self
+    }
+
+    pub fn with_additional_field(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<Value>,
+    ) -> Self {
+        self.additional_fields.insert(key.into(), value.into());
+        self
+    }
+}
+
+pub(crate) struct OpenAiResponsesCodec {
+    options: RequestOptions,
+}
+
+impl OpenAiResponsesCodec {
+    pub(crate) fn new(options: RequestOptions) -> Self {
+        Self { options }
+    }
+}
+
+impl WireCodec for OpenAiResponsesCodec {
+    fn encode_request(&self, request: &ModelRequest, model: &str) -> Result<Value, AgentError> {
+        if self.options.max_output_tokens == Some(0) {
+            return Err(model_error("openai_responses_invalid_max_output_tokens"));
+        }
+        if request.function_tools.is_empty() && self.options.tool_choice.is_some() {
+            return Err(model_error("openai_responses_tool_choice_without_tools"));
+        }
+
+        let mut body = Map::new();
+        body.insert("model".to_owned(), Value::String(model.to_owned()));
+        body.insert(
+            "input".to_owned(),
+            Value::Array(encode_input(&request.transcript)?),
+        );
+        if !request.function_tools.is_empty() {
+            let tools = request
+                .function_tools
+                .iter()
+                .map(|tool| {
+                    let mut definition = json!({
+                        "type": "function",
+                        "name": tool.name.as_str(),
+                        "parameters": tool.input_schema,
+                    });
+                    if let Some(description) = &tool.description {
+                        definition["description"] = Value::String(description.clone());
+                    }
+                    definition
+                })
+                .collect();
+            body.insert("tools".to_owned(), Value::Array(tools));
+            if let Some(tool_choice) = &self.options.tool_choice {
+                body.insert("tool_choice".to_owned(), tool_choice.clone());
+            }
+        }
+        if let Some(max_output_tokens) = self.options.max_output_tokens {
+            body.insert(
+                "max_output_tokens".to_owned(),
+                Value::from(max_output_tokens),
+            );
+        }
+        merge_request_fields(
+            &mut body,
+            &self.options.additional_fields,
+            &[
+                "model",
+                "input",
+                "tools",
+                "tool_choice",
+                "max_output_tokens",
+            ],
+            "openai_responses",
+        )?;
+        Ok(Value::Object(body))
     }
 
     fn decode_response(&self, value: Value) -> Result<ModelResponse, AgentError> {
@@ -71,9 +143,7 @@ impl WireCodec for OpenAiResponsesCodec {
                     kind: format!("openai.responses.{kind}"),
                     data: item.clone(),
                 }),
-                None => {
-                    return Err(model_error("openai_responses_output_item_missing_type"));
-                }
+                None => return Err(model_error("openai_responses_output_item_missing_type")),
             }
         }
 

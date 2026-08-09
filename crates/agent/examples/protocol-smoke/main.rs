@@ -1,9 +1,9 @@
 //! 用同一套场景验证 OpenAI Chat、OpenAI Responses 与 Anthropic Messages 兼容入口。
 //!
 //! `MODEL_API_KEY` 仅在真正运行示例时读取，测试与编译不会访问它。模型名、完整
-//! endpoint 与日志开关由 `config` 模块统一解析，协议细节位于 `adapter` 模块。
+//! endpoint 与日志开关由 `config` 模块统一解析，wire 协议由 crate 的公共 `adapters`
+//! 模块实现。
 
-mod adapter;
 mod config;
 mod harness;
 

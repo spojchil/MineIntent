@@ -6,8 +6,11 @@
 //! - 完整结果通过标识符关联，并按模型的发出顺序提交；
 //! - 运行时输入仅在显式的请求或完成边界排空。
 //!
-//! 工具调度以及提供方特有的消息和工具格式有意放在本 crate 之外。
+//! 工具调度策略仍由应用实现；提供方 wire 格式位于可选的 `adapters` 模块，不进入核心
+//! 状态机。`openai` 与 `anthropic` feature 分别启用相应协议，二者共享 `http` transport。
 
+#[cfg(any(feature = "openai", feature = "anthropic"))]
+pub mod adapters;
 mod events;
 mod mailbox;
 mod ports;

@@ -1,19 +1,25 @@
 //! 只验证 wire 投影，不访问环境变量或网络。
 
-use agent::{
+use serde_json::json;
+
+use crate::{
     InputMessage, ModelRequest, ToolCallId, ToolDefinition, ToolResult, ToolResultBatch,
     TranscriptItem,
 };
-use serde_json::json;
 
-use super::anthropic_messages::AnthropicMessagesCodec;
-use super::openai_chat::OpenAiChatCodec;
-use super::openai_responses::OpenAiResponsesCodec;
-use super::transport::WireCodec;
+#[cfg(feature = "anthropic")]
+use super::anthropic::messages::{AnthropicMessagesCodec, RequestOptions as AnthropicOptions};
+use super::http::WireCodec;
+#[cfg(feature = "openai")]
+use super::openai::{
+    chat::{OpenAiChatCodec, RequestOptions as OpenAiChatOptions},
+    responses::{OpenAiResponsesCodec, RequestOptions as OpenAiResponsesOptions},
+};
 
+#[cfg(feature = "openai")]
 #[test]
 fn chat_uses_tool_call_id_as_the_canonical_id() {
-    let codec = OpenAiChatCodec;
+    let codec = OpenAiChatCodec::new(OpenAiChatOptions::default());
     let response = codec
         .decode_response(json!({
             "id": "chat-response",
@@ -55,9 +61,10 @@ fn chat_uses_tool_call_id_as_the_canonical_id() {
     );
 }
 
+#[cfg(feature = "openai")]
 #[test]
 fn responses_preserves_output_items_and_correlates_with_call_id() {
-    let codec = OpenAiResponsesCodec;
+    let codec = OpenAiResponsesCodec::new(OpenAiResponsesOptions::default());
     let response = codec
         .decode_response(json!({
             "id": "resp_1",
@@ -111,9 +118,10 @@ fn responses_preserves_output_items_and_correlates_with_call_id() {
     assert_eq!(input.last().unwrap()["content"], "结果齐全后简短回答");
 }
 
+#[cfg(feature = "anthropic")]
 #[test]
 fn anthropic_groups_the_complete_result_batch_before_steering_text() {
-    let codec = AnthropicMessagesCodec;
+    let codec = AnthropicMessagesCodec::new(AnthropicOptions::default());
     let response = codec
         .decode_response(json!({
             "id": "msg_1",
@@ -152,9 +160,10 @@ fn anthropic_groups_the_complete_result_batch_before_steering_text() {
     assert_eq!(final_user[2]["text"], "结果齐全后简短回答");
 }
 
+#[cfg(feature = "anthropic")]
 #[test]
 fn anthropic_extracts_initial_system_context_and_rejects_late_system_input() {
-    let codec = AnthropicMessagesCodec;
+    let codec = AnthropicMessagesCodec::new(AnthropicOptions::default());
     let request = ModelRequest {
         transcript: vec![
             InputMessage::text("system", "基础约束").into(),
@@ -177,7 +186,8 @@ fn anthropic_extracts_initial_system_context_and_rejects_late_system_input() {
     assert!(codec.encode_request(&late, "test-model").is_err());
 }
 
-fn continuation_request(output: agent::ModelOutput) -> ModelRequest {
+#[cfg(any(feature = "openai", feature = "anthropic"))]
+fn continuation_request(output: crate::ModelOutput) -> ModelRequest {
     let calls = output.tool_calls.clone();
     ModelRequest {
         transcript: vec![
@@ -204,9 +214,11 @@ fn continuation_request(output: agent::ModelOutput) -> ModelRequest {
     }
 }
 
+#[cfg(feature = "openai")]
 #[test]
 fn responses_rejects_an_item_id_without_a_call_id() {
-    let error = OpenAiResponsesCodec
+    let codec = OpenAiResponsesCodec::new(OpenAiResponsesOptions::default());
+    let error = codec
         .decode_response(json!({
             "status": "completed",
             "output": [{
@@ -217,12 +229,14 @@ fn responses_rejects_an_item_id_without_a_call_id() {
             }]
         }))
         .unwrap_err();
-    assert_eq!(error.kind, agent::AgentErrorKind::Model);
+    assert_eq!(error.kind, crate::AgentErrorKind::Model);
 }
 
+#[cfg(feature = "openai")]
 #[test]
 fn responses_rejects_an_incomplete_response() {
-    let error = OpenAiResponsesCodec
+    let codec = OpenAiResponsesCodec::new(OpenAiResponsesOptions::default());
+    let error = codec
         .decode_response(json!({
             "status": "incomplete",
             "output": []

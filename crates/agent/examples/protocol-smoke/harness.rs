@@ -4,6 +4,14 @@ use std::error::Error;
 use std::io;
 use std::sync::Arc;
 
+use agent::adapters::{
+    anthropic::messages::RequestOptions as AnthropicRequestOptions,
+    http::{HttpModel, HttpModelConfig, Protocol},
+    openai::{
+        chat::RequestOptions as OpenAiChatRequestOptions,
+        responses::RequestOptions as OpenAiResponsesRequestOptions,
+    },
+};
 use agent::{
     AgentError, AgentErrorKind, AgentEvent, AgentSession, Compaction, FilteredObserver,
     InputMessage, MailboxInput, Observer, PortFuture, PromptSource, SessionConfig, ToolCallBatch,
@@ -14,12 +22,14 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::timeout;
 
-use crate::adapter::{HttpModel, Protocol};
-use crate::config::SmokeConfig;
+use crate::config::{SmokeConfig, SmokeProtocol};
 
 type SmokeError = Box<dyn Error + Send + Sync>;
 
-pub(crate) async fn run_smoke(protocol: Protocol, config: &SmokeConfig) -> Result<(), SmokeError> {
+pub(crate) async fn run_smoke(
+    protocol: SmokeProtocol,
+    config: &SmokeConfig,
+) -> Result<(), SmokeError> {
     println!("\n== {} ==", protocol.label());
     let (started_tx, mut started_rx) = mpsc::unbounded_channel();
     let gate = Arc::new(Semaphore::new(0));
@@ -28,12 +38,14 @@ pub(crate) async fn run_smoke(protocol: Protocol, config: &SmokeConfig) -> Resul
         config.level,
     ));
     let model = HttpModel::new(
-        config.api_key.clone(),
-        config.model.clone(),
-        config.endpoint(protocol).to_owned(),
-        protocol,
-        config.timeout,
-        config.wire_log,
+        HttpModelConfig::new(
+            config.endpoint(protocol),
+            config.api_key.clone(),
+            config.model.clone(),
+            wire_protocol(protocol),
+        )
+        .with_timeout(config.timeout)
+        .with_wire_log(config.wire_log),
     )?;
     let session = Arc::new(
         AgentSession::new(
@@ -105,6 +117,25 @@ pub(crate) async fn run_smoke(protocol: Protocol, config: &SmokeConfig) -> Resul
             Ok(())
         }
         other => Err(io::Error::other(format!("冒烟测试未正常完成：{other:?}")).into()),
+    }
+}
+
+/// 显式保留旧冒烟适配器的请求参数，避免公共适配器的通用默认值改变测试强度。
+fn wire_protocol(protocol: SmokeProtocol) -> Protocol {
+    match protocol {
+        SmokeProtocol::OpenAiChat => Protocol::openai_chat_with(
+            OpenAiChatRequestOptions::new()
+                .with_max_tokens(256)
+                .with_tool_choice("auto"),
+        ),
+        SmokeProtocol::OpenAiResponses => Protocol::openai_responses_with(
+            OpenAiResponsesRequestOptions::new()
+                .with_max_output_tokens(256)
+                .with_tool_choice("auto"),
+        ),
+        SmokeProtocol::AnthropicMessages => Protocol::anthropic_messages_with(
+            AnthropicRequestOptions::new(256).with_tool_choice(json!({"type": "auto"})),
+        ),
     }
 }
 
@@ -193,7 +224,7 @@ impl Compaction for NoCompaction {
 }
 
 struct PrintingObserver {
-    protocol: Protocol,
+    protocol: SmokeProtocol,
 }
 
 impl Observer for PrintingObserver {

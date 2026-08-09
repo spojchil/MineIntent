@@ -1,51 +1,135 @@
-//! Anthropic Messages API wire codec。
+//! Anthropic Messages wire 协议。
 
-use agent::{
-    AgentError, ContentPart, JsonObject, ModelOutput, ModelRequest, ModelResponse, ModelUsage,
-    ToolCall, ToolResultStatus, TranscriptItem,
+use serde_json::{json, Map, Value};
+
+use crate::adapters::http::{content_as_text, merge_request_fields, model_error, WireCodec};
+use crate::ports::{ModelRequest, ModelResponse};
+use crate::types::{
+    AgentError, ContentPart, JsonObject, ModelOutput, ModelUsage, ToolCall, ToolResultStatus,
+    TranscriptItem,
 };
-use serde_json::{json, Value};
-
-use super::transport::{content_as_text, model_error, AuthStyle, WireCodec};
 
 const RAW_CONTENT_KEY: &str = "anthropic.messages.content";
 const MESSAGE_ID_KEY: &str = "anthropic.messages.message_id";
 
-pub(super) struct AnthropicMessagesCodec;
+/// Anthropic Messages 请求的默认输出 token 上限。
+pub const DEFAULT_MAX_TOKENS: u64 = 1024;
 
-impl WireCodec for AnthropicMessagesCodec {
-    fn auth_style(&self) -> AuthStyle {
-        AuthStyle::Anthropic
+/// Messages 请求的协议级可选字段。
+///
+/// Anthropic 协议要求 `max_tokens`，其值必须大于零。`additional_fields` 不得覆盖
+/// `model`、`system`、`messages`、`tools`、`tool_choice` 或 `max_tokens`。本适配器不支持
+/// SSE，`stream: true` 会被拒绝。
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct RequestOptions {
+    pub max_tokens: u64,
+    pub tool_choice: Option<Value>,
+    pub additional_fields: JsonObject,
+}
+
+impl Default for RequestOptions {
+    fn default() -> Self {
+        Self {
+            max_tokens: DEFAULT_MAX_TOKENS,
+            tool_choice: None,
+            additional_fields: JsonObject::new(),
+        }
+    }
+}
+
+impl RequestOptions {
+    pub fn new(max_tokens: u64) -> Self {
+        Self {
+            max_tokens,
+            ..Self::default()
+        }
     }
 
+    pub fn with_max_tokens(mut self, max_tokens: u64) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    pub fn with_tool_choice(mut self, tool_choice: impl Into<Value>) -> Self {
+        self.tool_choice = Some(tool_choice.into());
+        self
+    }
+
+    pub fn with_additional_field(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<Value>,
+    ) -> Self {
+        self.additional_fields.insert(key.into(), value.into());
+        self
+    }
+}
+
+pub(crate) struct AnthropicMessagesCodec {
+    options: RequestOptions,
+}
+
+impl AnthropicMessagesCodec {
+    pub(crate) fn new(options: RequestOptions) -> Self {
+        Self { options }
+    }
+}
+
+impl WireCodec for AnthropicMessagesCodec {
     fn encode_request(&self, request: &ModelRequest, model: &str) -> Result<Value, AgentError> {
-        let (system, messages) = encode_conversation(&request.transcript)?;
-        let tools = request
-            .function_tools
-            .iter()
-            .map(|tool| {
-                let mut definition = json!({
-                    "name": tool.name.as_str(),
-                    "input_schema": tool.input_schema,
-                });
-                if let Some(description) = &tool.description {
-                    definition["description"] = Value::String(description.clone());
-                }
-                definition
-            })
-            .collect::<Vec<_>>();
-        let mut body = json!({
-            "model": model,
-            "max_tokens": 256,
-            "messages": messages,
-            "tools": tools,
-            "tool_choice": {"type": "auto"},
-            "stream": false,
-        });
-        if !system.is_empty() {
-            body["system"] = Value::Array(system);
+        if self.options.max_tokens == 0 {
+            return Err(model_error("anthropic_messages_invalid_max_tokens"));
         }
-        Ok(body)
+        if request.function_tools.is_empty() && self.options.tool_choice.is_some() {
+            return Err(model_error("anthropic_messages_tool_choice_without_tools"));
+        }
+
+        let (system, messages) = encode_conversation(&request.transcript)?;
+        let mut body = Map::new();
+        body.insert("model".to_owned(), Value::String(model.to_owned()));
+        body.insert(
+            "max_tokens".to_owned(),
+            Value::from(self.options.max_tokens),
+        );
+        body.insert("messages".to_owned(), Value::Array(messages));
+        if !system.is_empty() {
+            body.insert("system".to_owned(), Value::Array(system));
+        }
+        if !request.function_tools.is_empty() {
+            let tools = request
+                .function_tools
+                .iter()
+                .map(|tool| {
+                    let mut definition = json!({
+                        "name": tool.name.as_str(),
+                        "input_schema": tool.input_schema,
+                    });
+                    if let Some(description) = &tool.description {
+                        definition["description"] = Value::String(description.clone());
+                    }
+                    definition
+                })
+                .collect();
+            body.insert("tools".to_owned(), Value::Array(tools));
+            if let Some(tool_choice) = &self.options.tool_choice {
+                body.insert("tool_choice".to_owned(), tool_choice.clone());
+            }
+        }
+        merge_request_fields(
+            &mut body,
+            &self.options.additional_fields,
+            &[
+                "model",
+                "max_tokens",
+                "system",
+                "messages",
+                "tools",
+                "tool_choice",
+            ],
+            "anthropic_messages",
+        )?;
+        Ok(Value::Object(body))
     }
 
     fn decode_response(&self, value: Value) -> Result<ModelResponse, AgentError> {

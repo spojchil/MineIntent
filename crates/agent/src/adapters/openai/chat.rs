@@ -1,48 +1,111 @@
-//! OpenAI Chat Completions wire codec。
+//! OpenAI Chat Completions wire 协议。
 
-use agent::{
-    AgentError, ContentPart, JsonObject, ModelOutput, ModelRequest, ModelResponse, ModelUsage,
-    ToolCall, TranscriptItem,
+use serde_json::{json, Map, Value};
+
+use crate::adapters::http::{
+    content_as_text, merge_request_fields, model_error, parse_arguments, WireCodec,
 };
-use serde_json::{json, Value};
-
-use super::transport::{content_as_text, model_error, parse_arguments, AuthStyle, WireCodec};
+use crate::ports::{ModelRequest, ModelResponse};
+use crate::types::{
+    AgentError, ContentPart, JsonObject, ModelOutput, ModelUsage, ToolCall, TranscriptItem,
+};
 
 const RAW_MESSAGE_KEY: &str = "openai.chat.message";
 const RESPONSE_ID_KEY: &str = "openai.chat.response_id";
 
-pub(super) struct OpenAiChatCodec;
+/// Chat Completions 请求的协议级可选字段。
+///
+/// `additional_fields` 可承载兼容端点扩展，但不得覆盖 `model`、`messages`、`tools`、
+/// `tool_choice` 或 `max_tokens`。本适配器不支持 SSE，`stream: true` 会被拒绝。
+#[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
+pub struct RequestOptions {
+    pub max_tokens: Option<u64>,
+    pub tool_choice: Option<Value>,
+    pub additional_fields: JsonObject,
+}
 
-impl WireCodec for OpenAiChatCodec {
-    fn auth_style(&self) -> AuthStyle {
-        AuthStyle::Bearer
+impl RequestOptions {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    fn encode_request(&self, request: &ModelRequest, model: &str) -> Result<Value, AgentError> {
-        let messages = encode_messages(&request.transcript)?;
-        let tools = request
-            .function_tools
-            .iter()
-            .map(|tool| {
-                let mut function = json!({
-                    "name": tool.name.as_str(),
-                    "parameters": tool.input_schema,
-                });
-                if let Some(description) = &tool.description {
-                    function["description"] = Value::String(description.clone());
-                }
-                json!({"type": "function", "function": function})
-            })
-            .collect::<Vec<_>>();
+    pub fn with_max_tokens(mut self, max_tokens: u64) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
 
-        Ok(json!({
-            "model": model,
-            "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
-            "max_tokens": 256,
-            "stream": false,
-        }))
+    pub fn with_tool_choice(mut self, tool_choice: impl Into<Value>) -> Self {
+        self.tool_choice = Some(tool_choice.into());
+        self
+    }
+
+    pub fn with_additional_field(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<Value>,
+    ) -> Self {
+        self.additional_fields.insert(key.into(), value.into());
+        self
+    }
+}
+
+pub(crate) struct OpenAiChatCodec {
+    options: RequestOptions,
+}
+
+impl OpenAiChatCodec {
+    pub(crate) fn new(options: RequestOptions) -> Self {
+        Self { options }
+    }
+}
+
+impl WireCodec for OpenAiChatCodec {
+    fn encode_request(&self, request: &ModelRequest, model: &str) -> Result<Value, AgentError> {
+        if self.options.max_tokens == Some(0) {
+            return Err(model_error("openai_chat_invalid_max_tokens"));
+        }
+        if request.function_tools.is_empty() && self.options.tool_choice.is_some() {
+            return Err(model_error("openai_chat_tool_choice_without_tools"));
+        }
+
+        let mut body = Map::new();
+        body.insert("model".to_owned(), Value::String(model.to_owned()));
+        body.insert(
+            "messages".to_owned(),
+            Value::Array(encode_messages(&request.transcript)?),
+        );
+
+        if !request.function_tools.is_empty() {
+            let tools = request
+                .function_tools
+                .iter()
+                .map(|tool| {
+                    let mut function = json!({
+                        "name": tool.name.as_str(),
+                        "parameters": tool.input_schema,
+                    });
+                    if let Some(description) = &tool.description {
+                        function["description"] = Value::String(description.clone());
+                    }
+                    json!({"type": "function", "function": function})
+                })
+                .collect();
+            body.insert("tools".to_owned(), Value::Array(tools));
+            if let Some(tool_choice) = &self.options.tool_choice {
+                body.insert("tool_choice".to_owned(), tool_choice.clone());
+            }
+        }
+        if let Some(max_tokens) = self.options.max_tokens {
+            body.insert("max_tokens".to_owned(), Value::from(max_tokens));
+        }
+        merge_request_fields(
+            &mut body,
+            &self.options.additional_fields,
+            &["model", "messages", "tools", "tool_choice", "max_tokens"],
+            "openai_chat",
+        )?;
+        Ok(Value::Object(body))
     }
 
     fn decode_response(&self, value: Value) -> Result<ModelResponse, AgentError> {
@@ -88,7 +151,7 @@ impl WireCodec for OpenAiChatCodec {
             .unwrap_or_default();
 
         let mut provider_data = JsonObject::new();
-        // 原始消息可无损保留兼容端点添加的未知字段，并在续轮时完整回放。
+        // 原始消息保留兼容端点添加的未知字段，并在续轮时完整回放。
         provider_data.insert(RAW_MESSAGE_KEY.to_owned(), message.clone());
         if let Some(response_id) = value.get("id") {
             provider_data.insert(RESPONSE_ID_KEY.to_owned(), response_id.clone());

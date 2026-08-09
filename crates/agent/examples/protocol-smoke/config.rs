@@ -4,12 +4,31 @@ use std::env;
 use std::io;
 use std::time::Duration;
 
+use agent::adapters::http::WireLogPolicy;
 use agent::LevelFilter;
 
-use crate::adapter::{Protocol, WireLogPolicy};
-
 const DEFAULT_TIMEOUT_SECS: u64 = 90;
-const USAGE: &str = "cargo run --example protocol_smoke -- [chat|responses|anthropic|all]";
+const USAGE: &str =
+    "cargo run --example protocol_smoke --features all-adapters -- [chat|responses|anthropic|all]";
+
+/// 冒烟示例可选择的协议；与携带请求选项的公共 [`agent::adapters::http::Protocol`]
+/// 分开保存，便于作为 endpoint 配置的稳定键。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SmokeProtocol {
+    OpenAiChat,
+    OpenAiResponses,
+    AnthropicMessages,
+}
+
+impl SmokeProtocol {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::OpenAiChat => "openai-chat",
+            Self::OpenAiResponses => "openai-responses",
+            Self::AnthropicMessages => "anthropic-messages",
+        }
+    }
+}
 
 /// 示例应用汇总后的强类型配置；核心 crate 与协议适配器不读取这些外部来源。
 pub(crate) struct SmokeConfig {
@@ -18,8 +37,8 @@ pub(crate) struct SmokeConfig {
     pub(crate) level: LevelFilter,
     pub(crate) timeout: Duration,
     pub(crate) wire_log: WireLogPolicy,
-    pub(crate) protocols: Vec<Protocol>,
-    endpoints: Vec<(Protocol, String)>,
+    pub(crate) protocols: Vec<SmokeProtocol>,
+    endpoints: Vec<(SmokeProtocol, String)>,
 }
 
 impl SmokeConfig {
@@ -54,7 +73,7 @@ impl SmokeConfig {
     }
 
     /// 返回指定协议对应的完整 HTTP endpoint。
-    pub(crate) fn endpoint(&self, protocol: Protocol) -> &str {
+    pub(crate) fn endpoint(&self, protocol: SmokeProtocol) -> &str {
         self.endpoints
             .iter()
             .find_map(|(candidate, endpoint)| (*candidate == protocol).then_some(endpoint.as_str()))
@@ -71,15 +90,15 @@ fn parse_selection(arguments: impl IntoIterator<Item = String>) -> Result<String
     Ok(selection)
 }
 
-fn select_protocols(value: &str) -> Result<Vec<Protocol>, io::Error> {
+fn select_protocols(value: &str) -> Result<Vec<SmokeProtocol>, io::Error> {
     match value.to_ascii_lowercase().as_str() {
-        "chat" => Ok(vec![Protocol::OpenAiChat]),
-        "responses" => Ok(vec![Protocol::OpenAiResponses]),
-        "anthropic" => Ok(vec![Protocol::AnthropicMessages]),
+        "chat" => Ok(vec![SmokeProtocol::OpenAiChat]),
+        "responses" => Ok(vec![SmokeProtocol::OpenAiResponses]),
+        "anthropic" => Ok(vec![SmokeProtocol::AnthropicMessages]),
         "all" => Ok(vec![
-            Protocol::OpenAiChat,
-            Protocol::OpenAiResponses,
-            Protocol::AnthropicMessages,
+            SmokeProtocol::OpenAiChat,
+            SmokeProtocol::OpenAiResponses,
+            SmokeProtocol::AnthropicMessages,
         ]),
         value => Err(invalid_input(format!(
             "未知协议：{value}；用法：chat|responses|anthropic|all"
@@ -87,19 +106,19 @@ fn select_protocols(value: &str) -> Result<Vec<Protocol>, io::Error> {
     }
 }
 
-fn endpoint_variable(protocol: Protocol) -> &'static str {
+fn endpoint_variable(protocol: SmokeProtocol) -> &'static str {
     match protocol {
-        Protocol::OpenAiChat => "MODEL_CHAT_ENDPOINT",
-        Protocol::OpenAiResponses => "MODEL_RESPONSES_ENDPOINT",
-        Protocol::AnthropicMessages => "MODEL_ANTHROPIC_ENDPOINT",
+        SmokeProtocol::OpenAiChat => "MODEL_CHAT_ENDPOINT",
+        SmokeProtocol::OpenAiResponses => "MODEL_RESPONSES_ENDPOINT",
+        SmokeProtocol::AnthropicMessages => "MODEL_ANTHROPIC_ENDPOINT",
     }
 }
 
 /// 只读取并解析本次实际选择的协议，未选择的协议不要求配置 endpoint。
 fn parse_selected_endpoints(
-    protocols: &[Protocol],
-    mut read: impl FnMut(Protocol) -> Result<String, io::Error>,
-) -> Result<Vec<(Protocol, String)>, io::Error> {
+    protocols: &[SmokeProtocol],
+    mut read: impl FnMut(SmokeProtocol) -> Result<String, io::Error>,
+) -> Result<Vec<(SmokeProtocol, String)>, io::Error> {
     protocols
         .iter()
         .copied()
@@ -182,9 +201,9 @@ mod tests {
         assert_eq!(
             select_protocols("all").unwrap(),
             vec![
-                Protocol::OpenAiChat,
-                Protocol::OpenAiResponses,
-                Protocol::AnthropicMessages
+                SmokeProtocol::OpenAiChat,
+                SmokeProtocol::OpenAiResponses,
+                SmokeProtocol::AnthropicMessages
             ]
         );
         assert!(select_protocols("unknown").is_err());
@@ -213,14 +232,14 @@ mod tests {
 
     #[test]
     fn selected_endpoint_parser_does_not_require_unselected_protocols() {
-        let endpoints = parse_selected_endpoints(&[Protocol::OpenAiResponses], |protocol| {
-            assert_eq!(protocol, Protocol::OpenAiResponses);
+        let endpoints = parse_selected_endpoints(&[SmokeProtocol::OpenAiResponses], |protocol| {
+            assert_eq!(protocol, SmokeProtocol::OpenAiResponses);
             Ok("https://gateway.example/v1/responses?api-version=latest".to_owned())
         })
         .unwrap();
 
         assert_eq!(endpoints.len(), 1);
-        assert_eq!(endpoints[0].0, Protocol::OpenAiResponses);
+        assert_eq!(endpoints[0].0, SmokeProtocol::OpenAiResponses);
         assert_eq!(
             endpoints[0].1,
             "https://gateway.example/v1/responses?api-version=latest"
@@ -229,11 +248,13 @@ mod tests {
 
     #[test]
     fn every_selected_protocol_requires_a_valid_full_endpoint() {
-        let protocols = [Protocol::OpenAiChat, Protocol::AnthropicMessages];
+        let protocols = [SmokeProtocol::OpenAiChat, SmokeProtocol::AnthropicMessages];
         let error = parse_selected_endpoints(&protocols, |protocol| match protocol {
-            Protocol::OpenAiChat => Ok("https://gateway.example/v1/chat/completions".to_owned()),
-            Protocol::AnthropicMessages => Ok("not-a-url".to_owned()),
-            Protocol::OpenAiResponses => unreachable!(),
+            SmokeProtocol::OpenAiChat => {
+                Ok("https://gateway.example/v1/chat/completions".to_owned())
+            }
+            SmokeProtocol::AnthropicMessages => Ok("not-a-url".to_owned()),
+            SmokeProtocol::OpenAiResponses => unreachable!(),
         })
         .unwrap_err();
 
