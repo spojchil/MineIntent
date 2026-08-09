@@ -1,20 +1,15 @@
 [package]
 name = "agent"
 description = "持有一段持续对话的 agent 会话：四端口注入，请求边界信箱投递"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-publish.workspace = true
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
 
+# 通用模块：零项目依赖，目录可整体拷出独立构建。
 [dependencies]
-# 只依赖公共契约类型；对 Minecraft、对世界零知识。
-mineintent-contracts.workspace = true
-serde_json.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
-
-[lints]
-workspace = true
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }

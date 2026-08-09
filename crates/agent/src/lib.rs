@@ -9,7 +9,12 @@ mod mailbox;
 mod ports;
 mod run;
 mod session;
+mod types;
 
 pub use ports::{Compaction, Message, Model, ModelCompletion, ModelRequest, PortFuture, PromptSource, Tools};
 pub use run::{PlannedToolCall, ToolResult, Turn, TurnStep};
 pub use session::{AgentSession, SessionConfig, StartRejected, StartRejectedReason, TurnOutcome};
+pub use types::{
+    AgentError, AgentErrorKind, JsonObject, ModelUsage, RunId, ToolCallId, ToolDefinition,
+    ToolInvocation, ToolName,
+};

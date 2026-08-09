@@ -5,13 +5,13 @@
 
 use std::sync::Arc;
 
-use mineintent_contracts::agent::{AgentError, ModelUsage, RunId};
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify};
 
 use crate::mailbox::Mailbox;
 use crate::ports::{Compaction, Message, Model, ModelRequest, PromptSource, Tools};
 use crate::run::{PlannedToolCall, Turn, TurnStep};
+use crate::types::{AgentError, ModelUsage, RunId};
 
 /// 会话配置。对话段序列化字节数超过阈值即触发压缩。
 #[derive(Clone, Copy, Debug)]
@@ -192,8 +192,7 @@ impl AgentSession {
             let mut state = self.state.lock().await;
             state.turn_seq += 1;
             (
-                RunId::new(format!("turn-{}", state.turn_seq))
-                    .unwrap_or_else(|_| unreachable!("固定格式的 run id 恒合法")),
+                RunId::new(format!("turn-{}", state.turn_seq)),
                 state.conversation.clone(),
             )
         };
@@ -291,7 +290,7 @@ mod tests {
     use super::*;
     use crate::ports::{ModelCompletion, PortFuture};
     use crate::run::ToolResult;
-    use mineintent_contracts::agent::{JsonObject, ToolInvocation, WireToolDefinition};
+    use crate::types::{JsonObject, ToolDefinition, ToolInvocation};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
 
@@ -388,7 +387,7 @@ mod tests {
     }
 
     impl Tools for GatedTools {
-        fn definitions(&self) -> Vec<WireToolDefinition> {
+        fn definitions(&self) -> Vec<ToolDefinition> {
             Vec::new()
         }
 

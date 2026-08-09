@@ -3,10 +3,10 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use mineintent_contracts::agent::{AgentError, JsonObject, ModelUsage, ToolInvocation, WireToolDefinition};
 use serde_json::Value;
 
 use crate::run::ToolResult;
+use crate::types::{AgentError, JsonObject, ModelUsage, ToolDefinition, ToolInvocation};
 
 /// 消息保持 wire 形状（role + content + …），无损；
 /// 不把任何一家 provider 的私有字段提升为公共契约。
@@ -26,7 +26,7 @@ pub trait PromptSource: Send + Sync {
 
 /// 工具：定义与执行。
 pub trait Tools: Send + Sync {
-    fn definitions(&self) -> Vec<WireToolDefinition>;
+    fn definitions(&self) -> Vec<ToolDefinition>;
     fn call<'a>(&'a self, invocation: ToolInvocation) -> PortFuture<'a, ToolResult>;
 }
 
@@ -39,7 +39,7 @@ pub trait Compaction: Send + Sync {
 /// 一次模型请求：累积消息 + 工具定义。
 pub struct ModelRequest {
     pub messages: Vec<Message>,
-    pub tools: Vec<WireToolDefinition>,
+    pub tools: Vec<ToolDefinition>,
 }
 
 /// Provider 已归一化的一次 assistant completion。

@@ -5,13 +5,13 @@
 
 use std::collections::HashSet;
 
-use mineintent_contracts::agent::{
-    AgentError, AgentErrorCode, JsonObject, ModelUsage, RunId, ToolCallId, ToolInvocation,
-    ToolName,
-};
 use serde_json::Value;
 
 use crate::ports::ModelCompletion;
+use crate::types::{
+    AgentError, AgentErrorKind, JsonObject, ModelUsage, RunId, ToolCallId, ToolInvocation,
+    ToolName,
+};
 
 /// 一次已与 tool-call ID 配对、可回放进上下文的工具结果。
 #[derive(Clone, Debug, PartialEq)]
@@ -117,13 +117,13 @@ impl Turn {
     pub fn append_user_message(&mut self, message: JsonObject) -> Result<(), AgentError> {
         if !matches!(self.state, TurnState::NeedModel) {
             return Err(AgentError::new(
-                AgentErrorCode::InvalidRequest,
+                AgentErrorKind::InvalidRequest,
                 "turn_not_at_request_boundary",
             ));
         }
         if message.get("role").and_then(Value::as_str) != Some("user") {
             return Err(AgentError::new(
-                AgentErrorCode::InvalidRequest,
+                AgentErrorKind::InvalidRequest,
                 "injected_message_requires_user_role",
             ));
         }
@@ -158,19 +158,19 @@ impl Turn {
             TurnState::WaitingModel => {
                 self.state = TurnState::WaitingModel;
                 Err(AgentError::new(
-                    AgentErrorCode::InvalidRequest,
+                    AgentErrorKind::InvalidRequest,
                     "turn_waiting_for_model",
                 ))
             }
             TurnState::WaitingTools(pending) => {
                 self.state = TurnState::WaitingTools(pending);
                 Err(AgentError::new(
-                    AgentErrorCode::InvalidRequest,
+                    AgentErrorKind::InvalidRequest,
                     "turn_waiting_for_tools",
                 ))
             }
             TurnState::Failed => Err(AgentError::new(
-                AgentErrorCode::InvalidRequest,
+                AgentErrorKind::InvalidRequest,
                 "turn_failed",
             )),
         }
@@ -180,13 +180,13 @@ impl Turn {
     pub fn model_response(&mut self, completion: ModelCompletion) -> Result<(), AgentError> {
         if !matches!(self.state, TurnState::WaitingModel) {
             return Err(AgentError::new(
-                AgentErrorCode::InvalidRequest,
+                AgentErrorKind::InvalidRequest,
                 "turn_not_waiting_for_model",
             ));
         }
         let Some(message) = completion.message else {
             return self.fail(AgentError::new(
-                AgentErrorCode::ProviderFailed,
+                AgentErrorKind::Provider,
                 "model_response_missing_assistant_message",
             ));
         };
@@ -212,7 +212,7 @@ impl Turn {
 
         let Some(content) = message.get("content").and_then(Value::as_str) else {
             return self.fail(AgentError::new(
-                AgentErrorCode::ProviderFailed,
+                AgentErrorKind::Provider,
                 "model_final_content_missing",
             ));
         };
@@ -226,7 +226,7 @@ impl Turn {
     pub fn tool_results(&mut self, results: Vec<ToolResult>) -> Result<(), AgentError> {
         let TurnState::WaitingTools(pending) = &self.state else {
             return Err(AgentError::new(
-                AgentErrorCode::InvalidRequest,
+                AgentErrorKind::InvalidRequest,
                 "turn_not_waiting_for_tools",
             ));
         };
@@ -237,7 +237,7 @@ impl Turn {
                 .any(|(result, expected)| result.tool_call_id() != expected)
         {
             return self.fail(AgentError::new(
-                AgentErrorCode::InvalidToolInvocation,
+                AgentErrorKind::InvalidToolCall,
                 "tool_result_batch_mismatch",
             ));
         }
@@ -245,7 +245,7 @@ impl Turn {
         for result in results {
             let content = serde_json::to_string(&Value::Object(result.output)).map_err(|_| {
                 AgentError::new(
-                    AgentErrorCode::ToolFailed,
+                    AgentErrorKind::Tool,
                     "tool_result_serialization_failed",
                 )
             })?;
@@ -274,21 +274,16 @@ impl Turn {
                 .filter(|id| !id.is_empty())
                 .ok_or_else(|| {
                     AgentError::new(
-                        AgentErrorCode::InvalidToolInvocation,
+                        AgentErrorKind::InvalidToolCall,
                         "tool_call_missing_id",
                     )
                 })?;
-            let Ok(tool_call_id) = ToolCallId::new(id.to_owned()) else {
-                return Err(AgentError::new(
-                    AgentErrorCode::InvalidToolInvocation,
-                    "tool_call_id_invalid",
-                ));
-            };
+            let tool_call_id = ToolCallId::new(id.to_owned());
             if self.seen_tool_call_ids.contains(&tool_call_id)
                 || !claimed_in_batch.insert(tool_call_id.clone())
             {
                 return Err(AgentError::new(
-                    AgentErrorCode::InvalidToolInvocation,
+                    AgentErrorKind::InvalidToolCall,
                     "tool_call_id_reused",
                 ));
             }
@@ -303,23 +298,24 @@ impl Turn {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             // name/arguments 的问题降级为给模型的一句话，不失败整批。
-            let plan = match (ToolName::new(name.to_owned()), serde_json::from_str(arguments)) {
-                (Ok(name), Ok(Value::Object(arguments))) => {
-                    PlannedToolCall::Dispatch(ToolInvocation {
+            let plan = if name.is_empty() {
+                PlannedToolCall::LocalResult(ToolResult::failed(
+                    tool_call_id.clone(),
+                    "tool call is missing a function name; rewrite the call",
+                ))
+            } else {
+                match serde_json::from_str(arguments) {
+                    Ok(Value::Object(arguments)) => PlannedToolCall::Dispatch(ToolInvocation {
                         run_id: self.run_id.clone(),
                         tool_call_id: tool_call_id.clone(),
-                        name,
+                        name: ToolName::new(name.to_owned()),
                         arguments,
-                    })
+                    }),
+                    _ => PlannedToolCall::LocalResult(ToolResult::failed(
+                        tool_call_id.clone(),
+                        "tool arguments must be a JSON object; rewrite the input",
+                    )),
                 }
-                (Err(_), _) => PlannedToolCall::LocalResult(ToolResult::failed(
-                    tool_call_id.clone(),
-                    "tool call has a missing or invalid function name; rewrite the call",
-                )),
-                (Ok(_), _) => PlannedToolCall::LocalResult(ToolResult::failed(
-                    tool_call_id.clone(),
-                    "tool arguments must be a JSON object; rewrite the input",
-                )),
             };
             plans.push(plan);
             self.seen_tool_call_ids.insert(tool_call_id);
