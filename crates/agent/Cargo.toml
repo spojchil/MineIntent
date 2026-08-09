@@ -1,6 +1,6 @@
 [package]
 name = "agent"
-description = "顶层模块：持有一段持续对话的纯对话机器（规格见仓库根 TEMP_顶层模块接口.md）"
+description = "持有一段持续对话的 agent 会话：四端口注入，请求边界信箱投递"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

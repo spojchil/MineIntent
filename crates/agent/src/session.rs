@@ -1,8 +1,7 @@
-//! 会话：持有一段持续的对话，驱动一轮轮的状态机。
+//! 会话：持有跨轮延续的对话，逐轮驱动状态机。
 //!
-//! 忙/闲原子对采 codex 形状（`session/inject.rs`）：检查与置位在同一把锁下，
-//! 拒绝时原物奉还并带稳定原因。对话跨轮延续；轮末信箱有剩件立即成为
-//! 下一轮触发（忙→闲切换点零遗漏），景蒸发。
+//! 起轮与注入共用一把状态锁：检查与置位原子，拒绝时原物奉还。
+//! 轮末信箱有剩件则立即续轮；景清除。
 
 use std::sync::Arc;
 
@@ -14,8 +13,7 @@ use crate::mailbox::Mailbox;
 use crate::ports::{Compaction, Message, Model, ModelRequest, PromptSource, Tools};
 use crate::run::{PlannedToolCall, Turn, TurnStep};
 
-/// 会话配置。唯一的预算就是上下文窗：对话段序列化字节数超过阈值即触发压缩。
-/// 声明式数据，归会话持有；策略只答"怎么压"。
+/// 会话配置。对话段序列化字节数超过阈值即触发压缩。
 #[derive(Clone, Copy, Debug)]
 pub struct SessionConfig {
     pub compaction_trigger_bytes: usize,
@@ -24,7 +22,7 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            // 粗阈值占位；真实取值随④的供应商上下文窗定（规格 ⑤-2）。
+            // 占位值；按模型上下文窗调整。
             compaction_trigger_bytes: 400_000,
         }
     }
@@ -114,8 +112,7 @@ impl AgentSession {
         }
     }
 
-    /// 景（处境更新）：在箱内顶替。闲时原物奉还——景是可重导出的状态，
-    /// 无轮可插时无处可去也无需去（下一轮 situation 由①现拉）。
+    /// 景（处境更新）：在箱内顶替。闲时原物奉还。
     pub async fn inject_scene_if_running(&self, scene: Message) -> Result<(), Message> {
         let mut state = self.state.lock().await;
         if state.turn_active && !state.stopping {
@@ -188,7 +185,7 @@ impl AgentSession {
     }
 
     async fn drive_one_turn(&self) -> TurnOutcome {
-        // persona/situation 每轮重导出——压缩的保护区，摘要永不背负它们。
+        // persona/situation 每轮重新获取，不进入对话段。
         let persona = self.prompt.persona();
         let situation = self.prompt.situation();
         let (run_id, conversation) = {
@@ -208,7 +205,7 @@ impl AgentSession {
 
         let outcome = self.drive_turn_steps(&mut turn).await;
 
-        // 无论成败截停，跑到哪儿算哪儿——对话如实延续（W07a 的方向）。
+        // 无论完成、失败还是截停，已产生的消息都进入对话。
         let new_conversation: Vec<Message> = turn.messages()[prefix_len..].to_vec();
         let new_conversation = self.maybe_compact(new_conversation).await;
         let mut state = self.state.lock().await;
@@ -272,7 +269,7 @@ impl AgentSession {
         }
     }
 
-    /// 触发判定：对话段序列化字节数。粗但机械——这是循环的数据，不是策略的判断。
+    /// 触发判定：对话段序列化字节数超过阈值则交给压缩策略。
     async fn maybe_compact(&self, conversation: Vec<Message>) -> Vec<Message> {
         let bytes: usize = conversation
             .iter()

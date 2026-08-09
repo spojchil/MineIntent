@@ -1,10 +1,7 @@
 //! 轮状态机：一次触发 → 若干次（模型请求 → 工具批）→ 终文。
 //!
-//! 从旧 `toolloop::AgentRun` 重写吸收。保留的是正确性纪律：
-//! tool-call ID 一次性 claim、结果批与调用批严格配对、
-//! 消息追加只在请求边界（`NeedModel`）合法。
-//! 不保留的是预算脚手架（每轮 16 次请求那类）——
-//! 真实约束是上下文窗，由会话层的压缩触发持有。
+//! 不变量：tool-call ID 一次性 claim、结果批与调用批严格配对、
+//! 消息追加只在请求边界（`NeedModel`）合法。本层不设请求次数上限。
 
 use std::collections::HashSet;
 
@@ -31,8 +28,7 @@ impl ToolResult {
         }
     }
 
-    /// 参数无效一类的失败：不产生世界副作用，但必须回放。
-    /// 失败文案是给模型看的一句话，不是系统错误（opencode 的教训）。
+    /// 未执行的失败结果。文案面向模型，提示其改写调用。
     pub fn failed(tool_call_id: ToolCallId, summary: impl AsRef<str>) -> Self {
         let mut output = JsonObject::new();
         output.insert("status".to_owned(), Value::String("failed".to_owned()));
@@ -54,7 +50,7 @@ impl ToolResult {
 /// 单个 tool-call 的执行计划。
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlannedToolCall {
-    /// 参数结构有效，交给②号端口执行。
+    /// 参数结构有效，交给工具端口执行。
     Dispatch(ToolInvocation),
     /// 模型给的 name/arguments 无效；不执行，但失败结果必须回放。
     LocalResult(ToolResult),
