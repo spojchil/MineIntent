@@ -57,7 +57,7 @@ pub enum TurnOutcome {
 }
 
 struct SessionState {
-    /// 跨轮延续的对话段（不含 persona/situation——那两段每轮由①重导出）。
+    /// 跨轮延续的对话段。persona/situation 不在其中，每轮重新获取。
     conversation: Vec<Message>,
     mailbox: Mailbox,
     turn_active: bool,
@@ -337,7 +337,7 @@ mod tests {
             .collect()
     }
 
-    /// ①：persona 静态；situation 带计数器，证明"每轮重导出"。
+    /// persona 静态；situation 带计数器，用于断言每轮重新获取。
     struct CountingPrompt {
         situations: AtomicUsize,
     }
@@ -356,7 +356,7 @@ mod tests {
         }
     }
 
-    /// ④：请求经通道交给测试检视，completion 由测试按需投喂——时序全受控。
+    /// 请求经通道交给测试检视，completion 由测试按需投喂，时序全受控。
     struct ChannelModel {
         requests: mpsc::UnboundedSender<Vec<Message>>,
         completions: Mutex<mpsc::UnboundedReceiver<Result<ModelCompletion, AgentError>>>,
@@ -381,7 +381,7 @@ mod tests {
         }
     }
 
-    /// ②：执行前先通知测试、再等测试放行——制造"工具执行期间"这个注入窗口。
+    /// 执行前先通知测试、再等测试放行，制造"工具执行期间"这个注入窗口。
     struct GatedTools {
         started: mpsc::UnboundedSender<()>,
         gate: Arc<tokio::sync::Semaphore>,

@@ -8,8 +8,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-# 只认公共语言。循环是本模块自己的血肉（从旧 toolloop 重写吸收），
-# 不依赖 toolloop；对 Minecraft、对世界零知识。
+# 只依赖公共契约类型；对 Minecraft、对世界零知识。
 mineintent-contracts.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["sync"] }
