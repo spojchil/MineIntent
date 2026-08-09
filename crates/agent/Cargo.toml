@@ -1,0 +1,21 @@
+[package]
+name = "agent"
+description = "顶层模块：持有一段持续对话的纯对话机器（规格见仓库根 TEMP_顶层模块接口.md）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# 只认公共语言。循环是本模块自己的血肉（从旧 toolloop 重写吸收），
+# 不依赖 toolloop；对 Minecraft、对世界零知识。
+mineintent-contracts.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[lints]
+workspace = true
