@@ -3,6 +3,7 @@ members = [
     "crates/agent",
     "crates/app",
     "crates/backend",
+    "crates/companion",
     "crates/context",
     "crates/contracts",
     "crates/dispatch",

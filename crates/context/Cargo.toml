@@ -9,3 +9,10 @@ publish = false
 [dependencies]
 agent = { path = "../agent" }
 memory = { path = "../memory" }
+render = { path = "../render" }
+screens = { path = "../screens" }
+serde_json = "1"
+world = { path = "../world" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

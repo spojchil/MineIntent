@@ -939,6 +939,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "companion"
+version = "0.0.1"
+dependencies = [
+ "agent",
+ "context",
+ "dispatch",
+ "memory",
+ "screens",
+ "tokio",
+ "world",
+]
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -970,6 +983,11 @@ version = "0.0.1"
 dependencies = [
  "agent",
  "memory",
+ "render",
+ "screens",
+ "serde_json",
+ "tokio",
+ "world",
 ]
 
 [[package]]
