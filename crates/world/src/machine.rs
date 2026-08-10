@@ -17,7 +17,6 @@ use azalea::{
     accept_resource_packs::AcceptResourcePacksPlugin,
     app::{App, AppExit, Plugin, PluginGroup, Update},
     auto_reconnect::AutoReconnectPlugin,
-    auto_respawn::AutoRespawnPlugin,
     bot::DefaultBotPlugins,
     ecs::message::MessageWriter,
     entity::{
@@ -86,6 +85,7 @@ pub(crate) struct Inner {
     stopping: AtomicBool,
     shutdown: Notify,
     tick: AtomicU64,
+    chat_seq: AtomicU64,
     day_time: AtomicU64,
     /// (rain_level, thunder_level)。
     weather: Mutex<(f32, f32)>,
@@ -109,6 +109,7 @@ impl Inner {
             stopping: AtomicBool::new(false),
             shutdown: Notify::new(),
             tick: AtomicU64::new(0),
+            chat_seq: AtomicU64::new(0),
             day_time: AtomicU64::new(0),
             weather: Mutex::new((0.0, 0.0)),
             dimension: Mutex::new("minecraft:overworld".to_owned()),
@@ -116,6 +117,13 @@ impl Inner {
     }
 
     fn publish(&self, snapshot: TickSnapshot) {
+        // 停机后在途回调不得把终态改写回 Ready/Disconnected；
+        // Stopped 相自己（stop 发布的那次）放行。
+        if self.stopping.load(Ordering::Acquire)
+            && !matches!(snapshot.phase, ConnectionPhase::Stopped { .. })
+        {
+            return;
+        }
         *self.latest.write() = Arc::new(snapshot);
         // 通知合并：错过十次只醒一次，醒后读方自己取 latest。
         self.ticked_tx.send_modify(|counter| *counter += 1);
@@ -135,15 +143,13 @@ impl Inner {
         }
     }
 
-    fn push_chat(&self, sender: Option<String>, plain_text: String) {
+    fn push_chat(&self, sender: Option<(String, Option<String>)>, plain_text: String) {
         let entry = ChatEntry {
+            seq: self.chat_seq.fetch_add(1, Ordering::AcqRel),
             tick: self.tick.load(Ordering::Acquire),
             occurred_at: SystemTime::now(),
             source: FactSource::ServerObserved,
-            sender: sender.map(|username| PlayerRef {
-                username,
-                uuid: None,
-            }),
+            sender: sender.map(|(username, uuid)| PlayerRef { username, uuid }),
             content: ChatContent {
                 plain_text,
                 position: Some(ChatPosition::Chat),
@@ -184,14 +190,20 @@ impl Inner {
     }
 
     /// 出站聊天入队；tick 回调里执行。机器已停/断线时立即拒绝。
+    ///
+    /// 检查与插入在同一把 pending 锁内：排空方（断线/停机）同样持这把锁，
+    /// 所以任何入队要么先于排空（被排空如实拒绝），要么后于排空（此时
+    /// 相/停机标志已可见，进不了队列）——没有错过排空的第三种命运。
     fn enqueue_chat(&self, line: String) -> oneshot::Receiver<Result<(), String>> {
         let (ack, receiver) = oneshot::channel();
+        let mut pending = self.pending_chat.lock();
         let phase_ready = matches!(self.latest.read().phase, ConnectionPhase::Ready);
         if self.stopping.load(Ordering::Acquire) || !phase_ready {
+            drop(pending);
             let _ = ack.send(Err("尚未连接到世界，无法发言".to_owned()));
             return receiver;
         }
-        self.pending_chat.lock().push(PendingChat { line, ack });
+        pending.push(PendingChat { line, ack });
         receiver
     }
 
@@ -270,6 +282,8 @@ impl Module {
             .publish_phase(ConnectionPhase::Stopped {
                 reason: reason.to_owned(),
             });
+        // 停机标志先行，再排空：入队与排空同锁，晚到的入队看得见标志。
+        self.inner.fail_all_pending_chat("正在停机");
         let Some(done) = self.done.lock().take() else {
             return Ok(());
         };
@@ -379,9 +393,10 @@ async fn run_swarm(inner: Arc<Inner>, config: ConnectionConfig) {
     };
     let plugins = (
         DefaultPlugins.build(),
+        // v1 保留自动重生：没有任何复活路径时死亡即永久（实盘死在虚空里
+        // 只会一直坠落）。"死亡作为要保持的事实"如何进产品，随死亡处理裁定。
         DefaultBotPlugins
             .build()
-            .disable::<AutoRespawnPlugin>()
             .disable::<AcceptResourcePacksPlugin>()
             .disable::<AutoReconnectPlugin>(),
         MachineShutdownPlugin,
@@ -401,6 +416,10 @@ async fn run_swarm(inner: Arc<Inner>, config: ConnectionConfig) {
         _ = shutdown.shutdown.notified() => {
             // 先让 SwarmBuilder 的 AppExit 路径清理；select 丢弃 start future 后
             // 由本线程 runtime 回收剩余任务。
+            // 已知风险（上游未修）：azalea 在 AppExit 清空 ECS 后，残留事件
+            // 处理可在持 ECS 写锁时重入读锁（username 路径）自死锁。此时本
+            // 线程卡死，Module::stop 的 10 秒合流超时会如实报错；companion
+            // 进程退出时由操作系统回收该线程。嵌入式使用者需自担此泄漏。
         }
     }
 }
@@ -437,7 +456,10 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             }
         }
         Event::Chat(packet) => {
-            inner.push_chat(packet.sender(), packet.content());
+            let sender = packet
+                .sender()
+                .map(|username| (username, packet.sender_uuid().map(|uuid| uuid.to_string())));
+            inner.push_chat(sender, packet.content());
         }
         Event::Packet(packet) => match &*packet {
             ClientboundGamePacket::SetTime(set_time) => {
@@ -741,12 +763,15 @@ mod tests {
     fn chat_window_keeps_at_most_the_vanilla_line_count() {
         let inner = Inner::new();
         for index in 0..150 {
-            inner.push_chat(Some("alice".to_owned()), format!("第 {index} 句"));
+            inner.push_chat(Some(("alice".to_owned(), None)), format!("第 {index} 句"));
         }
         let window = inner.chat_window_now();
         assert_eq!(window.entries.len(), CHAT_WINDOW_LINES);
         assert_eq!(window.entries[0].content.plain_text, "第 50 句");
         assert_eq!(window.entries[99].content.plain_text, "第 149 句");
+        // seq 单调且不随窗口逐出重置：同 tick 多条消息靠它做恰好一次消费。
+        assert_eq!(window.entries[0].seq, 50);
+        assert_eq!(window.entries[99].seq, 149);
     }
 
     #[test]
@@ -773,6 +798,14 @@ mod tests {
         let inner = Inner::new();
         let ticked = inner.ticked_tx.subscribe();
         inner.push_chat(None, "服务器广播".to_owned());
+        // 停机后 Ready 快照不得改写状态。
+        inner.stopping.store(true, Ordering::Release);
+        inner.publish(TickSnapshot::empty(EPOCH, 9, ConnectionPhase::Ready));
+        assert!(
+            !matches!(inner.latest.read().phase, ConnectionPhase::Ready),
+            "停机期间的在途 Ready 快照应被丢弃"
+        );
+        inner.stopping.store(false, Ordering::Release);
         inner.publish_phase(ConnectionPhase::Disconnected {
             reason: "网络断开".to_owned(),
         });

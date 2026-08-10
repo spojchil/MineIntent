@@ -20,9 +20,12 @@ use world::{ConnectionConfig, Module, SnapshotSource};
 
 /// 人设占位（Q01 未裁；正式文本由维护者给出后替换）。
 const PLACEHOLDER_PERSONA: &str = "\
-你是这个 Minecraft 世界里的一位同伴，说中文。你通过工具行动：想说话就用 chat_box\
-（say 发言，history 翻记录），想记住什么就用 remember 改写你的记忆。\
-别人对你说的话会传到你这里；安静时什么都不做也可以。";
+你是这个 Minecraft 世界里的一位同伴，说中文。\
+重要：你直接写出的文字只是内心独白，世界里没有任何人能看到——写\"我告诉了他\"\
+并不会真的告诉任何人。要开口，必须调用工具 chat_box，例如\
+{\"action\":\"say\",\"text\":\"你好\"}；不调用它就等于保持沉默。\
+想记住什么就用 remember 改写你的记忆。别人对你说的话会传到你这里；\
+真的想安静时，不调用任何工具即可。";
 
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_owned())
@@ -107,6 +110,15 @@ async fn main() -> Result<(), String> {
     ];
     let dispatcher =
         Arc::new(Dispatcher::new(providers, occupancy).map_err(|error| error.to_string())?);
+    {
+        use agent::ToolRuntime;
+        let names: Vec<String> = dispatcher
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name.as_str().to_owned())
+            .collect();
+        println!("[组合根] 工具表：{names:?}");
+    }
 
     let model = Arc::new(
         HttpModel::new(HttpModelConfig::new(
@@ -132,29 +144,32 @@ async fn main() -> Result<(), String> {
     ));
 
     // ---- 最小唤醒脚手架：别人对我说话就醒 ----
-    // 游标按 tick 前进；同 tick 的迟到消息可能漏（脚手架级简化，己落位时消除）。
-    let mut chat_cursor: u64 = snapshots.latest().tick;
+    // 游标用聊天 seq（单调、同 tick 多条也不漏）；启动前的旧聊天不消费。
+    let own_key = snapshots.latest().self_state.entity_key.clone();
+    let mut chat_cursor: Option<u64> = snapshots.latest().chat.entries.last().map(|entry| entry.seq);
     println!("[组合根] 开始倾听聊天（Ctrl+C 停机）");
     loop {
         tokio::select! {
             _ = module.ticked() => {
                 let snapshot = snapshots.latest();
-                let fresh: Vec<String> = snapshot
-                    .chat
-                    .entries
-                    .iter()
-                    .filter(|entry| entry.tick > chat_cursor)
-                    .filter_map(|entry| {
-                        let sender = entry.sender.as_ref()?;
-                        if sender.username == username {
-                            return None; // 自己的话不是唤醒理由，防自激。
-                        }
-                        Some(format!("{}: {}", sender.username, entry.content.plain_text))
-                    })
-                    .collect();
-                chat_cursor = chat_cursor.max(
-                    snapshot.chat.entries.iter().map(|entry| entry.tick).max().unwrap_or(chat_cursor),
-                );
+                let mut fresh = Vec::new();
+                for entry in &snapshot.chat.entries {
+                    if chat_cursor.is_some_and(|seen| entry.seq <= seen) {
+                        continue;
+                    }
+                    chat_cursor = Some(entry.seq);
+                    let Some(sender) = entry.sender.as_ref() else { continue };
+                    // 防自激：优先比对稳定 UUID（自身 entity_key 即 UUID），
+                    // 服务器不给 UUID 时退回用户名比较。
+                    let is_self = match &sender.uuid {
+                        Some(uuid) => *uuid == own_key,
+                        None => sender.username == username,
+                    };
+                    if is_self {
+                        continue;
+                    }
+                    fresh.push(format!("{}: {}", sender.username, entry.content.plain_text));
+                }
                 if fresh.is_empty() {
                     continue;
                 }
@@ -162,19 +177,44 @@ async fn main() -> Result<(), String> {
                     .into_iter()
                     .map(|line| InputMessage::text("user", line).into())
                     .collect();
-                match session.enqueue_if_running(MailboxInput::next_model_request(items)).await {
-                    Ok(()) => {}
-                    Err(rejected) => {
-                        // 没有运行在跑：起一轮。轮在后台驱动，脚手架继续听。
-                        let session = session.clone();
-                        let items = rejected.input.items;
-                        tokio::spawn(async move {
-                            if let Err(rejected) = session.start_if_idle(items).await {
-                                eprintln!("[组合根] 唤醒被拒：{:?}", rejected.reason);
+                // 投递到接受为止：闲/忙状态在投递间隙可能翻转（起轮竞态、
+                // 轮刚收尾），单次尝试会把消息丢在地上。
+                println!("[组合根] 唤醒：{} 条新话", items.len());
+                let session = session.clone();
+                tokio::spawn(async move {
+                    let mut items = items;
+                    loop {
+                        match session
+                            .enqueue_if_running(MailboxInput::next_model_request(items))
+                            .await
+                        {
+                            Ok(()) => {
+                                println!("[组合根] 已并入进行中的轮");
+                                return;
                             }
-                        });
+                            Err(rejected) => items = rejected.input.items,
+                        }
+                        match session.start_if_idle(items).await {
+                            Ok(outcome) => {
+                                println!("[组合根] 轮结束:{outcome:?}");
+                                return;
+                            }
+                            Err(rejected) => {
+                                items = rejected.initial_items;
+                                match rejected.reason {
+                                    agent::StartRejectedReason::Busy => {
+                                        // 另一轮刚接手：回到 enqueue 路径重试。
+                                        tokio::task::yield_now().await;
+                                    }
+                                    _ => {
+                                        eprintln!("[组合根] 唤醒被弃：{:?}", rejected.reason);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
                     }
-                }
+                });
             }
             result = tokio::signal::ctrl_c() => {
                 result.map_err(|error| format!("信号监听失败：{error}"))?;
@@ -184,8 +224,19 @@ async fn main() -> Result<(), String> {
         }
     }
 
-    session.stop().await;
-    module.stop("维护者停机").await?;
+    // 停机有界：会话没在限时内收尾也要走世界停机，不让一次悬挂的模型
+    // 请求挡住整个进程退出。
+    if tokio::time::timeout(Duration::from_secs(30), session.stop())
+        .await
+        .is_err()
+    {
+        eprintln!("[组合根] 会话 30 秒内未收尾，继续停机");
+    }
+    if let Err(reason) = module.stop("维护者停机").await {
+        // 已知上游隐患：azalea 停机路径可能卡死机器线程；进程退出由
+        // 操作系统回收，不把它当成组合根自己的失败。
+        eprintln!("[组合根] 世界停机未合流（{reason}），交由进程退出回收");
+    }
     println!("[组合根] 已停机");
     Ok(())
 }

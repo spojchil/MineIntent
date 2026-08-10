@@ -92,7 +92,10 @@ impl ContextStrategy {
     }
 
     /// 从模型回复里取出压缩结论。返回 None = 这次压缩作废（原样保留对话）。
-    fn parse_compaction_reply(reply: &str) -> Option<(Option<String>, String)> {
+    ///
+    /// `memory_full_text` 是必填：缺了它无法证明"值得留的已落盘"，宁可不压
+    /// 也不拿摘要替换没备份过的对话（金律）。无须改动时模型按指令原样交回。
+    fn parse_compaction_reply(reply: &str) -> Option<(String, String)> {
         let start = reply.find('{')?;
         let end = reply.rfind('}')?;
         let value: serde_json::Value = serde_json::from_str(&reply[start..=end]).ok()?;
@@ -100,10 +103,7 @@ impl ContextStrategy {
         if summary.trim().is_empty() {
             return None;
         }
-        let memory_full_text = value
-            .get("memory_full_text")
-            .and_then(|text| text.as_str())
-            .map(str::to_owned);
+        let memory_full_text = value.get("memory_full_text")?.as_str()?.to_owned();
         Some((memory_full_text, summary))
     }
 }
@@ -160,13 +160,21 @@ impl Compaction for ContextStrategy {
             else {
                 return unchanged();
             };
-            if let Some(full_text) = memory_full_text {
-                if self.memory.write(&full_text).is_err() {
-                    // 落盘失败就不丢对话：金律是"落盘否则就丢"，反之亦然。
-                    return unchanged();
-                }
+            // 模型调用期间记忆可能被别的写入方（remember、维护者手改）更新；
+            // 压缩结论基于旧文，覆盖会吃掉新写入——检测到变化就放弃本次压缩。
+            match self.memory.read() {
+                Ok(current) if current == memory_text => {}
+                _ => return unchanged(),
             }
-            vec![InputMessage::text("user", format!("【此前对话的摘要】\n{summary}")).into()]
+            if self.memory.write(&memory_full_text).is_err() {
+                // 落盘失败就不丢对话：金律是"落盘否则就丢"，反之亦然。
+                return unchanged();
+            }
+            vec![InputMessage::text(
+                "user",
+                format!("【我此前的经历记述（同伴第一人称，压缩自更早的对话）】\n{summary}"),
+            )
+            .into()]
         })
     }
 }
@@ -348,6 +356,20 @@ mod tests {
         let original = conversation();
         let compacted = strategy.compact(&original).await;
         assert_eq!(compacted, original);
+        assert_eq!(memory.read().unwrap(), "旧记忆。");
+    }
+
+    #[tokio::test]
+    async fn summary_without_memory_field_does_not_destroy_the_conversation() {
+        // 缺 memory_full_text 无法证明经历已落盘——金律要求放弃本次压缩。
+        let memory = Arc::new(MemoryFile::new(scratch_dir().join("memory.md")));
+        memory.write("旧记忆。").unwrap();
+        let strategy = ContextStrategy::new("人设", memory.clone()).with_model(Arc::new(
+            CannedModel("{\"summary\": \"只有摘要没有记忆。\"}".to_owned()),
+        ));
+
+        let original = conversation();
+        assert_eq!(strategy.compact(&original).await, original);
         assert_eq!(memory.read().unwrap(), "旧记忆。");
     }
 

@@ -51,6 +51,7 @@ fn entity(key: &str, entity_type: &str, x: f64, z: f64) -> EntitySnapshot {
 
 fn chat_entry(tick: u64) -> ChatEntry {
     ChatEntry {
+        seq: tick,
         tick,
         occurred_at: SystemTime::now(),
         source: FactSource::ServerObserved,

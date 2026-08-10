@@ -168,6 +168,9 @@ pub struct PlayerRef {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatEntry {
+    /// 本连接内单调递增的到达序号。tick 在同一游戏刻内可重复，
+    /// 读方要"恰好一次"地消费聊天必须用 seq 做游标，不能用 tick。
+    pub seq: u64,
     pub tick: u64,
     pub occurred_at: Timestamp,
     pub source: FactSource,
