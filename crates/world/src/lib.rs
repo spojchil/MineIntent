@@ -30,6 +30,25 @@ pub const CHAT_WINDOW_LINES: usize = 100;
 pub const SOUND_WINDOW_TICKS: u64 = 60;
 
 /// 一个 tick 的世界快照。"快照"是语义不是深拷贝义务，实现可结构共享。
+impl TickSnapshot {
+    /// 尚未进入世界时的空快照：连接机器的初始状态，测试夹具同用。
+    pub fn empty(epoch: Epoch, tick: u64, phase: ConnectionPhase) -> Self {
+        Self {
+            epoch,
+            tick,
+            captured_at: SystemTime::now(),
+            phase,
+            world_meta: WorldMeta::default(),
+            self_state: SelfState::default(),
+            entities: Vec::new(),
+            players: Vec::new(),
+            chat: Window::default(),
+            sounds: Window::default(),
+            damage: Window::default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TickSnapshot {
     pub epoch: Epoch,
@@ -58,7 +77,7 @@ pub struct TickSnapshot {
 }
 
 /// 世界环境的直译。呈现（时段文案、"下大雨"）归渲染层。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct WorldMeta {
     /// 维度注册名（如 `minecraft:overworld`）。
     pub dimension: String,
@@ -174,7 +193,7 @@ pub struct Vec3Value {
 }
 
 /// 自身状态：玩家实体 ECS 组件的直译，含背包（背包是玩家实体的组件）。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SelfState {
     pub entity_key: String,
     pub username: String,
@@ -211,7 +230,7 @@ pub struct StatusEffect {
     pub duration_ticks: Option<i32>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Inventory {
     pub selected_hotbar_slot: u8,
     pub slots: Vec<InventorySlot>,

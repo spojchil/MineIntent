@@ -11,4 +11,4 @@
 mod chat;
 mod segment;
 
-pub use chat::{ChatBox, ChatDoor, ChatHistory};
+pub use chat::{ChatBox, ChatDoor, ChatHistory, ChatReadMark};

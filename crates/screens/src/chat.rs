@@ -4,9 +4,10 @@
 //! 历史、开、关。说与历史是完整闭环（结束必关屏）；只有显式"开"保持打开。
 //! 发送无客户端限速——频率约束由服务端仲裁，与玩家同规。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use agent::{ContentPart, PortFuture, ToolCall, ToolDefinition, ToolResult};
+use world::SnapshotSource;
 use dispatch::{Domain, Occupancy, ToolClass};
 use serde_json::{json, Value};
 
@@ -23,6 +24,29 @@ pub trait ChatHistory: Send + Sync {
     fn recent(&self, count: usize) -> Vec<String>;
 }
 
+/// 聊天已读水位。未读数 = 聊天窗里 (epoch, tick) 晚于水位的条数（读数在渲染层）；
+/// 本类型只记"上次看到哪"。松语义（维护者裁定）：history 一看整体清零，
+/// 不追每条是否真的读过；重连换 epoch 后整窗算新。
+#[derive(Default)]
+pub struct ChatReadMark {
+    position: StdMutex<(u64, u64)>,
+}
+
+impl ChatReadMark {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mark_read(&self, epoch: u64, tick: u64) {
+        *self.position.lock().expect("已读水位锁中毒") = (epoch, tick);
+    }
+
+    /// (epoch, tick)。初始 (0, 0)：还什么都没看过。
+    pub fn position(&self) -> (u64, u64) {
+        *self.position.lock().expect("已读水位锁中毒")
+    }
+}
+
 const TOOL_NAME: &str = "chat_box";
 
 const USAGE: &str = "聊天框用法：{action:\"say\", text} 按行发送，以 / 开头的行作为命令执行，\
@@ -33,6 +57,8 @@ pub struct ChatBox {
     occupancy: Arc<Occupancy>,
     door: Arc<dyn ChatDoor>,
     history: Arc<dyn ChatHistory>,
+    read_mark: Arc<ChatReadMark>,
+    snapshots: Arc<dyn SnapshotSource>,
 }
 
 impl ChatBox {
@@ -40,11 +66,15 @@ impl ChatBox {
         occupancy: Arc<Occupancy>,
         door: Arc<dyn ChatDoor>,
         history: Arc<dyn ChatHistory>,
+        read_mark: Arc<ChatReadMark>,
+        snapshots: Arc<dyn SnapshotSource>,
     ) -> Self {
         Self {
             occupancy,
             door,
             history,
+            read_mark,
+            snapshots,
         }
     }
 
@@ -137,6 +167,9 @@ impl ChatBox {
         };
         self.occupancy.occupy(Domain::Screen);
         let lines = self.history.recent(count as usize);
+        // 看了就清零：把已读水位推到当前时刻，不追每条是否真的读过。
+        let now = self.snapshots.latest();
+        self.read_mark.mark_read(now.epoch.0, now.tick);
         self.occupancy.release(Domain::Screen);
         ToolResult::success_json(call_id, json!({ "lines": lines }))
     }
@@ -221,10 +254,24 @@ mod tests {
         }
     }
 
+    /// 固定在 (epoch 3, tick 400) 的快照源。
+    struct FixedSnapshots;
+
+    impl SnapshotSource for FixedSnapshots {
+        fn latest(&self) -> Arc<world::TickSnapshot> {
+            Arc::new(world::TickSnapshot::empty(
+                world::Epoch(3),
+                400,
+                world::ConnectionPhase::Ready,
+            ))
+        }
+    }
+
     struct Fixture {
         chat: ChatBox,
         occupancy: Arc<Occupancy>,
         door: Arc<RecordingDoor>,
+        read_mark: Arc<ChatReadMark>,
     }
 
     fn fixture(fail_on_line: Option<usize>) -> Fixture {
@@ -240,11 +287,19 @@ mod tests {
             "乙：在吗".to_owned(),
             "丙：走了".to_owned(),
         ]));
-        let chat = ChatBox::new(occupancy.clone(), door.clone(), history);
+        let read_mark = Arc::new(ChatReadMark::new());
+        let chat = ChatBox::new(
+            occupancy.clone(),
+            door.clone(),
+            history,
+            read_mark.clone(),
+            Arc::new(FixedSnapshots),
+        );
         Fixture {
             chat,
             occupancy,
             door,
+            read_mark,
         }
     }
 
@@ -337,6 +392,26 @@ mod tests {
             json!(["乙：在吗", "丙：走了"])
         );
         assert!(!screen_occupied(&fixture));
+    }
+
+    #[tokio::test]
+    async fn history_advances_the_read_mark_to_now_and_other_verbs_do_not() {
+        let fixture = fixture(None);
+        assert_eq!(fixture.read_mark.position(), (0, 0));
+
+        fixture
+            .chat
+            .call(call(json!({"action": "say", "text": "先说话"})))
+            .await;
+        fixture.chat.call(call(json!({"action": "open"}))).await;
+        fixture.chat.call(call(json!({"action": "close"}))).await;
+        assert_eq!(fixture.read_mark.position(), (0, 0));
+
+        fixture
+            .chat
+            .call(call(json!({"action": "history", "count": 1})))
+            .await;
+        assert_eq!(fixture.read_mark.position(), (3, 400));
     }
 
     #[tokio::test]

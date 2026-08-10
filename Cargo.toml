@@ -8,6 +8,7 @@ members = [
     "crates/dispatch",
     "crates/memory",
     "crates/middle",
+    "crates/render",
     "crates/screens",
     "crates/toolloop",
     "crates/world",
