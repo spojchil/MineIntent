@@ -1205,6 +1205,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dispatch"
+version = "0.0.1"
+dependencies = [
+ "agent",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "dispatch2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2898,6 +2907,7 @@ name = "screens"
 version = "0.0.1"
 dependencies = [
  "agent",
+ "dispatch",
  "serde_json",
  "tokio",
 ]

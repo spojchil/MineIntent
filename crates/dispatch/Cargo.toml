@@ -1,6 +1,6 @@
 [package]
-name = "screens"
-description = "界面互斥域：单槽屏位与聊天框工具"
+name = "dispatch"
+description = "工具编排：供应者注册、按名路由、界面压制，实现内核的整批与增量两条执行路径"
 version = "0.0.1"
 edition = "2021"
 license = "MIT"
@@ -8,8 +8,7 @@ publish = false
 
 [dependencies]
 agent = { path = "../agent" }
-dispatch = { path = "../dispatch" }
-serde_json = "1"
 
 [dev-dependencies]
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt"] }

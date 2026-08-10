@@ -156,6 +156,35 @@ impl ChatBox {
 // MAX_CHAT_UTF16 出现在工具描述与用法文本里；编译期钉住两处一致。
 const _: () = assert!(MAX_CHAT_UTF16 == 256);
 
+/// 注册进编排的身份：身体类、界面域；屏开着即占域。
+impl dispatch::ToolProvider for ChatBox {
+    fn tools(&self) -> Vec<(ToolDefinition, dispatch::ToolClass)> {
+        self.definitions()
+            .into_iter()
+            .map(|definition| {
+                (
+                    definition,
+                    dispatch::ToolClass::Body {
+                        domain: dispatch::Domain::Screen,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn call<'a>(&'a self, call: ToolCall) -> PortFuture<'a, ToolResult> {
+        ChatBox::call(self, call)
+    }
+
+    fn occupying(&self) -> Option<dispatch::Domain> {
+        self.slot.occupied().map(|_| dispatch::Domain::Screen)
+    }
+
+    fn on_batch_abort(&self) {
+        ChatBox::on_batch_abort(self);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex as StdMutex;
