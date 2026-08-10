@@ -69,8 +69,8 @@ pub struct Turn {
 impl Turn {
     /// 构造一个已经通过闭合性校验的运行。
     ///
-    /// 此方法保留原有的便利签名；非法初始记录属于构造契约违例并会 panic。需要处理
-    /// 不受信记录的调用方应使用 [`Turn::try_new`]，以便显式接收校验错误。
+    /// 非法初始记录属于此便利构造器的契约违例并会 panic。需要处理不受信记录的调用方应
+    /// 使用 [`Turn::try_new`]，以便显式接收校验错误。
     pub fn new(run_id: RunId, transcript: Vec<TranscriptItem>) -> Self {
         Self::try_new(run_id, transcript)
             .unwrap_or_else(|error| panic!("初始对话记录不闭合: {error}"))
@@ -101,6 +101,37 @@ impl Turn {
     /// 才会与结果一起进入此前缀。
     pub fn committable_transcript(&self) -> &[TranscriptItem] {
         &self.transcript[..self.committable_len]
+    }
+
+    /// 在请求边界用新的闭合对话替换受保护前缀之后的可提交记录。
+    ///
+    /// 这是驱动器执行轮间压缩的提交点。校验全部完成后才修改状态，因此非法压缩结果不会
+    /// 污染原记录；运行状态、usage 和工具批序号都保持不变。
+    pub(crate) fn replace_committable_suffix(
+        &mut self,
+        protected_prefix_len: usize,
+        replacement: Vec<TranscriptItem>,
+    ) -> Result<(), AgentError> {
+        if !matches!(self.state, TurnState::WaitingBoundary(_)) {
+            return Err(Self::invalid_state("turn_not_waiting_at_request_boundary"));
+        }
+        if self.committable_len != self.transcript.len() {
+            return Err(Self::invalid_state(
+                "request_boundary_has_uncommittable_transcript",
+            ));
+        }
+        if protected_prefix_len > self.committable_len {
+            return Err(Self::invalid_state("protected_prefix_out_of_bounds"));
+        }
+
+        validate_closed_transcript(&replacement)?;
+        let mut candidate = self.transcript[..protected_prefix_len].to_vec();
+        candidate.extend(replacement);
+        validate_closed_transcript(&candidate)?;
+
+        self.transcript = candidate;
+        self.commit_transcript();
+        Ok(())
     }
 
     pub fn next_step(&mut self) -> Result<TurnStep, AgentError> {
@@ -242,8 +273,12 @@ impl Turn {
 
     /// 丢弃一次未完成的模型草稿，并把已经发生的外部事实作为一条正常输入提交。
     ///
-    /// 此方法仅能在等待模型时调用。调用方不得把残缺的模型输出或孤立 `ToolResults`
-    /// 混入消息；恢复回执使用开放 role 的 [`InputMessage`] 表达。
+    /// 此方法仅能在等待模型时调用。即使流中已经完整解析了若干单项工具调用，只要没有得到
+    /// 整个模型响应的成功终态，就不存在可提交的权威 `ModelOutput`。调用方不得截取调用前缀
+    /// 再配上部分或孤立的 `ToolResults`，因为模型原本可能继续生成更多调用。
+    ///
+    /// 恢复回执使用开放 role 的 [`InputMessage`] 表达：它保留运行时确认的已发生或结果
+    /// 未知事实，但不把未完成草稿伪造成一个正常 Assistant/工具轮。
     pub fn recover_model_attempt(&mut self, receipt: InputMessage) -> Result<(), AgentError> {
         if !matches!(self.state, TurnState::WaitingModel) {
             return Err(Self::invalid_state("turn_not_waiting_for_model_recovery"));
@@ -389,6 +424,42 @@ mod tests {
         );
         turn.resume_boundary(vec![InputMessage::text("operator", "revise").into()])
             .unwrap();
+        assert!(matches!(
+            turn.next_step().unwrap(),
+            TurnStep::CallModel { .. }
+        ));
+    }
+
+    #[test]
+    fn request_boundary_can_replace_only_the_committable_suffix() {
+        let base: TranscriptItem = InputMessage::text("system", "base").into();
+        let old: TranscriptItem = InputMessage::text("user", "old history").into();
+        let summary: TranscriptItem = InputMessage::text("user", "summary").into();
+        let mut turn = Turn::new(RunId::new("run-compact"), vec![base.clone(), old.clone()]);
+
+        assert!(turn
+            .replace_committable_suffix(1, vec![summary.clone()])
+            .is_err());
+        assert_eq!(turn.transcript(), &[base.clone(), old.clone()]);
+
+        turn.next_step().unwrap();
+        assert!(turn
+            .replace_committable_suffix(3, vec![summary.clone()])
+            .is_err());
+        assert_eq!(turn.transcript(), &[base.clone(), old]);
+        turn.replace_committable_suffix(1, vec![summary.clone()])
+            .unwrap();
+        assert_eq!(turn.transcript(), &[base.clone(), summary.clone()]);
+
+        let dangling = TranscriptItem::ModelOutput(ModelOutput::calls(vec![ToolCall::new(
+            "dangling",
+            "read",
+            json!({}),
+        )]));
+        assert!(turn.replace_committable_suffix(1, vec![dangling]).is_err());
+        assert_eq!(turn.transcript(), &[base, summary]);
+
+        turn.resume_boundary(Vec::new()).unwrap();
         assert!(matches!(
             turn.next_step().unwrap(),
             TurnStep::CallModel { .. }

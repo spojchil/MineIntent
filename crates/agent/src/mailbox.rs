@@ -79,6 +79,18 @@ impl Mailbox {
         }
     }
 
+    /// 判断指定边界是否有实际记录可投递，但不改变队列。
+    ///
+    /// 完成边界用它把“空队列检查 + 封口”保持在同一次加锁中；只有确实要再请求模型时，
+    /// 驱动器才会先释放锁执行轮间压缩。
+    pub(crate) fn has_deliverable_items(&self, boundary: RequestBoundaryKind) -> bool {
+        self.next_request
+            .iter()
+            .any(|input| !input.items.is_empty())
+            || (boundary == RequestBoundaryKind::BeforeCompletion
+                && self.when_idle.iter().any(|input| !input.items.is_empty()))
+    }
+
     /// 排空操作是信箱的线性化点：检查与清除在一次操作中完成。
     /// 在完成边界，引导输入优先；每类输入内部保持先进先出。
     pub(crate) fn drain(&mut self, boundary: RequestBoundaryKind) -> Vec<TranscriptItem> {
@@ -123,5 +135,17 @@ mod tests {
 
         let final_boundary = mailbox.drain(RequestBoundaryKind::BeforeCompletion);
         assert_eq!(final_boundary, vec![item("operator", "later")]);
+    }
+
+    #[test]
+    fn completion_peek_ignores_empty_envelopes_and_includes_idle_items() {
+        let mut mailbox = Mailbox::default();
+        mailbox.push(MailboxInput::next_model_request(Vec::new()));
+        assert!(!mailbox.has_deliverable_items(RequestBoundaryKind::BeforeModelRequest));
+        assert!(!mailbox.has_deliverable_items(RequestBoundaryKind::BeforeCompletion));
+
+        mailbox.push(MailboxInput::when_idle(vec![item("operator", "later")]));
+        assert!(!mailbox.has_deliverable_items(RequestBoundaryKind::BeforeModelRequest));
+        assert!(mailbox.has_deliverable_items(RequestBoundaryKind::BeforeCompletion));
     }
 }

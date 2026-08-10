@@ -264,7 +264,10 @@ impl ToolCall {
     }
 }
 
-/// 一次调用中传给工具运行时的完整有序批次。
+/// 一次模型响应中的完整有序调用数组。
+///
+/// 默认工具模式把此值通过 `ToolRuntime::dispatch` 一次性交给运行时。增量工具模式已经按
+/// slot 接管同一语义批次，不会再把此值重复交给 `dispatch`；状态机仍用它关联最终完整结果。
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ToolCallBatch {
     pub run_id: RunId,
@@ -273,6 +276,9 @@ pub struct ToolCallBatch {
 }
 
 /// 增量工具运行时接收候选批次时的稳定上下文。
+///
+/// “候选”表示模型响应尚未成功结束：后续可能 `commit` 成为正常工具批，也可能因断流或
+/// 输出不一致而 `abort`。此结构本身不包含调用数组。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolBatchStart {
     pub run_id: RunId,
@@ -281,8 +287,8 @@ pub struct ToolBatchStart {
 
 /// 一个已完整解析、可交给增量工具运行时接管的调用。
 ///
-/// 此结构不表示调用已经执行，也不表示它是批次的最后一项。批次是否已经传输完整由随后
-/// 独立的 `calls_sealed` 操作声明。
+/// “完整”只修饰当前单项调用，不表示整个调用数组完整。此结构也不表示调用已经执行或模型
+/// 响应已经成功；批次是否已经传输完整由随后独立的 `calls_sealed` 操作声明。
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct IncrementalToolCall {
     pub run_id: RunId,
@@ -295,7 +301,8 @@ pub struct IncrementalToolCall {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolBatchAbortReason {
-    /// 模型传输失败、返回 `incomplete`，或在成功终态前结束。
+    /// 模型传输失败、返回 `incomplete`，或在成功终态前结束。即使工具数组已经
+    /// `calls_sealed`，缺少整个响应的成功终态仍属于此原因。
     ModelStreamInterrupted,
     /// 流事件与最终聚合响应不一致，不能安全提交。
     ModelOutputMismatch,
@@ -307,11 +314,12 @@ pub enum ToolBatchAbortReason {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "status", content = "value", rename_all = "snake_case")]
 pub enum AbortedToolCallOutcome {
-    /// 已经获得可信的普通工具结果。
+    /// 已经获得可信的真实工具结果；内核会把它作为恢复事实保留，而不是重新执行该调用。
     Settled(ToolResult),
-    /// 运行时确认该调用尚未开始且以后也不会开始。
+    /// 运行时确认该调用尚未开始且以后也不会开始，因此没有需要告知模型的副作用事实。
     CancelledBeforeStart,
-    /// 调用可能已经产生影响，但运行时无法确定最终结果。
+    /// 调用可能已经产生影响，但运行时无法确定最终结果。实现不得把这种状态降级为
+    /// `CancelledBeforeStart` 或伪造成一个成功结果。
     OutcomeUnknown { summary: String },
 }
 
@@ -327,14 +335,27 @@ pub struct AbortedToolCall {
 ///
 /// `calls` 必须对每个已经传给 `submit` 的 slot 恰好给出一个结论，包括 `submit` 因确认
 /// 不确定而返回 `Err` 的当前调用；返回后不得再执行该批次中的任何工作，也不得再产生
-/// 迟到结果。
+/// 迟到结果。仍在模型流中传输、尚未形成完整 `IncrementalToolCall` 的尾部不属于运行时，
+/// 不应出现在报告中。
+///
+/// 此报告不是整批事务的回滚记录。实现可以在 `submit` 时只缓存，因而全部调用都能确定为
+/// `CancelledBeforeStart`；也可以提前执行并据实报告 `Settled` 或 `OutcomeUnknown`。
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct AbortedToolBatch {
     pub batch_attempt_id: ToolBatchAttemptId,
     pub calls: Vec<AbortedToolCall>,
 }
 
-/// 写入下一次正常模型输入的中断批次执行事实。
+/// 作为普通输入提交的中断批次执行事实。
+///
+/// 模型响应没有成功终态时，内核会丢弃未完成的 `ModelOutput` 草稿，因此不能追加一个没有
+/// 权威调用数组与之配对的普通 `ToolResultBatch`。本回执改以普通 `InputMessage` 告知下一
+/// 次模型请求：哪些已经接管的调用确实完成，哪些可能产生过影响。它不会包含确定未开始的
+/// 调用，也不会把结果未知伪造成成功。
+///
+/// 这是一份事实回执，不是内核自行生成的工具结果。`Settled` 中的结果来自工具运行时。
+/// 提交后它就是普通历史；压缩策略可以像处理其他消息一样概括、替换或删除它，内核不永久
+/// 固定其原文。
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct InterruptedToolBatchReceipt {
     pub batch_attempt_id: ToolBatchAttemptId,
@@ -354,7 +375,9 @@ pub struct InterruptedToolCallReceipt {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "status", content = "value", rename_all = "snake_case")]
 pub enum InterruptedToolCallOutcome {
+    /// 工具运行时确认的真实结果。
     Settled(ToolResult),
+    /// 可能已经发生副作用，但无法确认最终结果。
     OutcomeUnknown { summary: String },
 }
 

@@ -1,11 +1,12 @@
 //! 上下文策略：内核提示端口（`PromptSource`）的实现方。
 //!
-//! 基础上下文只放两样：人设（系统提示词）与记忆全文。两者每轮现拉、
+//! 受保护上下文放两样：人设（系统提示词）与记忆全文。两者每轮现拉、
 //! 永不参与压缩——压缩只碰会话区，位置本身就是豁免。
 //!
-//! 留位（不发明临时形状）：`run_context` 的处境渲染等丙与模块一的
-//! `TickSnapshot` 落位；对话压缩（`Compaction`）等压缩政策裁定后在
-//! 本 crate 补上，届时自持模型依赖并在摘要前把值得留的经历经记忆落盘。
+//! 留位（不发明临时形状）：处境（渲染后的世界快照）等丙与模块一的
+//! `TickSnapshot` 落位后追加在 `base_context` 末尾（稳定前缀之后）；
+//! 对话压缩（`Compaction`）等压缩政策裁定后在本 crate 补上，届时自持
+//! 模型依赖并在摘要前把值得留的经历经记忆落盘。
 
 use std::sync::Arc;
 
@@ -48,10 +49,6 @@ impl PromptSource for ContextStrategy {
         ]
     }
 
-    fn run_context(&self) -> Vec<TranscriptItem> {
-        // 处境（渲染后的世界快照）在此注入；渲染卡丙与模块一，落位前保持为空。
-        Vec::new()
-    }
 }
 
 #[cfg(test)]
@@ -141,12 +138,4 @@ mod tests {
         assert!(!memory_text.contains("还没有记忆"));
     }
 
-    #[test]
-    fn run_context_is_empty_until_situation_rendering_lands() {
-        let strategy = ContextStrategy::new(
-            "人设",
-            Arc::new(MemoryFile::new(scratch_dir().join("memory.md"))),
-        );
-        assert!(strategy.run_context().is_empty());
-    }
 }

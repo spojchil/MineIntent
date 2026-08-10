@@ -25,17 +25,16 @@ use crate::types::{
     ToolResultStatus, TranscriptItem,
 };
 
-const RECOVERY_RECEIPT_MARKER_KEY: &str = "agent.interrupted_tool_batch_receipt";
 const RECOVERY_RECEIPT_KIND: &str = "interrupted_tool_batch_receipt";
 
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
-    /// 当持久化对话记录的序列化大小超过此值时，在运行结束后压缩它。
+    /// 当持久化对话记录的序列化大小超过此值时，在下一模型请求边界或运行收尾压缩它。
     pub compaction_trigger_bytes: usize,
     /// 中断工具批次的执行事实在下一次模型请求中使用的普通输入角色。
     ///
-    /// 默认 `user` 只用于兼容现有协议；内核不赋予该字符串固定语义，应用可按适配器能力
-    /// 改为 `developer`、`operator` 或自定义角色。
+    /// 默认值为 `user`；内核不赋予该字符串固定语义，应用可按适配器能力改为
+    /// `developer`、`operator` 或自定义角色。
     pub interrupted_tool_receipt_role: String,
     /// 单次运行允许从“已有工具执行事实的模型流中断”自动继续的最大次数。
     pub max_interrupted_tool_recoveries: u32,
@@ -700,13 +699,20 @@ impl AgentSession {
 
     async fn drive_run(&self, run_id: RunId) -> TurnOutcome {
         let mut prefix = self.prompt.base_context();
-        prefix.extend(self.prompt.run_context());
         let protected_prefix_len = prefix.len();
         let prior_conversation = self.state.lock().await.conversation.clone();
         prefix.extend(prior_conversation);
 
         let mut turn = Turn::new(run_id.clone(), prefix);
-        let core_outcome = self.drive_steps(&run_id, &mut turn).await;
+        let mut last_compaction_checked_len = None;
+        let core_outcome = self
+            .drive_steps(
+                &run_id,
+                &mut turn,
+                protected_prefix_len,
+                &mut last_compaction_checked_len,
+            )
+            .await;
 
         // 在压缩前关闭本轮运行，使迟到的生产者收到 `Closing`，而不是成功写入已无法投递的输入。
         let undelivered = {
@@ -721,8 +727,13 @@ impl AgentSession {
 
         // 只持久化协议上已经闭合的前缀。工具批尚未完整返回时，模型产生的调用仍属于
         // 运行中的暂存状态，不能进入下一轮的普通会话历史。
+        let committable_len = turn.committable_transcript().len();
         let conversation = turn.committable_transcript()[protected_prefix_len..].to_vec();
-        let conversation = self.maybe_compact(&run_id, conversation).await;
+        let conversation = if last_compaction_checked_len == Some(committable_len) {
+            conversation
+        } else {
+            self.maybe_compact(&run_id, conversation).await
+        };
         let terminal_sequence = {
             let mut state = self.state.lock().await;
             let owns_generation = state
@@ -780,7 +791,13 @@ impl AgentSession {
         }
     }
 
-    async fn drive_steps(&self, run_id: &RunId, turn: &mut Turn) -> CoreOutcome {
+    async fn drive_steps(
+        &self,
+        run_id: &RunId,
+        turn: &mut Turn,
+        protected_prefix_len: usize,
+        last_compaction_checked_len: &mut Option<usize>,
+    ) -> CoreOutcome {
         let mut stats = RunStats::default();
         let mut pending_incremental: Option<PendingIncrementalBatch<'_>> = None;
         loop {
@@ -796,7 +813,9 @@ impl AgentSession {
 
             match step {
                 TurnStep::RequestBoundary { kind } => {
-                    let (items, sealed, drained_sequence, sealed_sequence) = {
+                    // 空完成边界必须在同一次加锁中完成“窥视 + 封口”，否则慢压缩器会扩大
+                    // Open 窗口，让原本应收到 Closing 的迟到输入进入本轮。
+                    let immediate_drain = {
                         let mut state = self.state.lock().await;
                         if state.stopping {
                             if let Some(active) = &mut state.active {
@@ -807,20 +826,43 @@ impl AgentSession {
                             return CoreOutcome::Stopped;
                         }
 
-                        let items = state.mailbox.drain(kind);
-                        let sealed =
-                            kind == RequestBoundaryKind::BeforeCompletion && items.is_empty();
-                        if sealed {
+                        if kind == RequestBoundaryKind::BeforeCompletion
+                            && !state.mailbox.has_deliverable_items(kind)
+                        {
+                            Some(self.drain_boundary_locked(&mut state, run_id, kind))
+                        } else {
+                            None
+                        }
+                    };
+
+                    let (items, sealed, drained_sequence, sealed_sequence) = if let Some(drain) =
+                        immediate_drain
+                    {
+                        drain
+                    } else {
+                        // 不先排空：压缩期间入队的 NextModelRequest 也必须进入紧接着的
+                        // 请求；若此时 stop，队列仍完整地作为 undelivered 归还。
+                        if let Err(error) = self
+                            .maybe_compact_turn(run_id, turn, protected_prefix_len)
+                            .await
+                        {
+                            return CoreOutcome::Failed {
+                                error,
+                                stage: RunStage::Compaction,
+                            };
+                        }
+                        *last_compaction_checked_len = Some(turn.committable_transcript().len());
+
+                        let mut state = self.state.lock().await;
+                        if state.stopping {
                             if let Some(active) = &mut state.active {
                                 if active.id == *run_id {
-                                    // 空队列检查和封闭操作与生产者共用这把锁。
-                                    active.phase = RunPhase::Sealed;
+                                    active.phase = RunPhase::Finalizing;
                                 }
                             }
+                            return CoreOutcome::Stopped;
                         }
-                        let drained_sequence = self.next_event_sequence();
-                        let sealed_sequence = sealed.then(|| self.next_event_sequence());
-                        (items, sealed, drained_sequence, sealed_sequence)
+                        self.drain_boundary_locked(&mut state, run_id, kind)
                     };
 
                     self.emit_lazy(EventKind::BoundaryDrained.metadata(), || {
@@ -1056,6 +1098,10 @@ impl AgentSession {
         reason: ToolBatchAbortReason,
         stats: &mut RunStats,
     ) -> Result<(), CoreOutcome> {
+        // 此处失败的是整个模型 attempt，而不只是当前正在传输的单项调用。即使已经收到 A 的
+        // ToolCallReady，只要 B 仍在传输且响应没有成功终态，就不能把 A 截成权威
+        // ModelOutput 再附加部分 ToolResults。先丢弃模型草稿，再让 runtime 冻结所有已
+        // submit 的完整调用；只有真实完成或结果未知的事实才通过普通恢复输入进入下一轮。
         sink.close();
         self.emit_stream_terminal(
             run_id,
@@ -1125,6 +1171,10 @@ impl AgentSession {
         &self,
         receipt: &InterruptedToolBatchReceipt,
     ) -> Result<InputMessage, AgentError> {
+        // 没有成功的 ModelOutput 就没有可合法关联的普通 ToolResults，因此恢复事实刻意使用
+        // InputMessage，而不是构造一轮看似由模型正式发出的工具调用。后续请求可以结合
+        // 这些事实重新决定尚未确认的工作；它也像其他普通历史一样可被压缩策略改写。这不是
+        // 对原网络流的续传。
         // `ToolResult::metadata` 属于应用内部关联数据，正常协议编码也不会把它交给模型。
         // 恢复回执只携带模型本来就能看到的 status/content，避免意外暴露追踪或凭据字段。
         let mut visible_calls = receipt.calls.clone();
@@ -1146,17 +1196,9 @@ impl AgentSession {
             "calls": calls,
             "unconfirmed_remainder": "discarded"
         });
-        let mut message = InputMessage::new(
+        let message = InputMessage::new(
             self.config.interrupted_tool_receipt_role.clone(),
             vec![ContentPart::json(value)],
-        );
-        // 该标记属于内核持久化元数据，不依赖 role，也不应由协议 adapter 改写。
-        message.provider_data.insert(
-            RECOVERY_RECEIPT_MARKER_KEY.to_owned(),
-            serde_json::json!({
-                "version": 1,
-                "batch_attempt_id": receipt.batch_attempt_id.as_str()
-            }),
         );
         Ok(message)
     }
@@ -1249,6 +1291,9 @@ impl AgentSession {
         run_id: &RunId,
         conversation: Vec<TranscriptItem>,
     ) -> Vec<TranscriptItem> {
+        if conversation.is_empty() {
+            return conversation;
+        }
         let estimated_bytes = serde_json::to_vec(&conversation)
             .map(|encoded| encoded.len())
             .unwrap_or(usize::MAX);
@@ -1269,9 +1314,7 @@ impl AgentSession {
         let compacted = self.compaction.compact(&conversation).await;
         // 压缩是受信端口，但其输出仍不能破坏核心的工具轮闭合不变量。拒绝非法结果时保留
         // 原始对话，避免一次可选优化污染下一次模型请求。
-        let compacted = if validate_closed_transcript(&compacted).is_ok()
-            && preserves_recovery_receipts(&conversation, &compacted)
-        {
+        let compacted = if validate_closed_transcript(&compacted).is_ok() {
             compacted
         } else {
             conversation
@@ -1286,6 +1329,48 @@ impl AgentSession {
             }
         });
         compacted
+    }
+
+    async fn maybe_compact_turn(
+        &self,
+        run_id: &RunId,
+        turn: &mut Turn,
+        protected_prefix_len: usize,
+    ) -> Result<(), AgentError> {
+        let conversation = turn
+            .committable_transcript()
+            .get(protected_prefix_len..)
+            .ok_or_else(|| {
+                AgentError::new(
+                    AgentErrorKind::InvalidState,
+                    "protected_prefix_out_of_bounds",
+                )
+            })?
+            .to_vec();
+        let compacted = self.maybe_compact(run_id, conversation).await;
+        turn.replace_committable_suffix(protected_prefix_len, compacted)
+    }
+
+    /// 在持有 session 状态锁时排空一个边界。完成边界的空队列检查与 `Sealed` 转换因此
+    /// 和生产者的 Open 检查共享同一个线性化点。
+    fn drain_boundary_locked(
+        &self,
+        state: &mut SessionState,
+        run_id: &RunId,
+        kind: RequestBoundaryKind,
+    ) -> (Vec<TranscriptItem>, bool, u64, Option<u64>) {
+        let items = state.mailbox.drain(kind);
+        let sealed = kind == RequestBoundaryKind::BeforeCompletion && items.is_empty();
+        if sealed {
+            if let Some(active) = &mut state.active {
+                if active.id == *run_id {
+                    active.phase = RunPhase::Sealed;
+                }
+            }
+        }
+        let drained_sequence = self.next_event_sequence();
+        let sealed_sequence = sealed.then(|| self.next_event_sequence());
+        (items, sealed, drained_sequence, sealed_sequence)
     }
 
     async fn recover_crashed_driver(&self, run_id: &RunId) -> (Vec<MailboxInput>, u64) {
@@ -1327,23 +1412,6 @@ impl AgentSession {
     fn next_event_sequence(&self) -> u64 {
         self.event_sequence.fetch_add(1, Ordering::Relaxed) + 1
     }
-}
-
-fn is_recovery_receipt(item: &TranscriptItem) -> bool {
-    matches!(
-        item,
-        TranscriptItem::Input(message)
-            if message.provider_data.contains_key(RECOVERY_RECEIPT_MARKER_KEY)
-    )
-}
-
-/// 压缩可以改写普通历史，但不能静默遗忘已经发生的工具副作用。所有带内核标记的恢复
-/// 回执必须按原顺序、原内容出现在压缩结果中。
-fn preserves_recovery_receipts(original: &[TranscriptItem], compacted: &[TranscriptItem]) -> bool {
-    original
-        .iter()
-        .filter(|item| is_recovery_receipt(item))
-        .eq(compacted.iter().filter(|item| is_recovery_receipt(item)))
 }
 
 fn elapsed_ms(started_at: Instant) -> u64 {

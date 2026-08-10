@@ -169,10 +169,6 @@ impl PromptSource for SmokePrompt {
         )
         .into()]
     }
-
-    fn run_context(&self) -> Vec<TranscriptItem> {
-        Vec::new()
-    }
 }
 
 struct SmokeTools {
@@ -242,6 +238,11 @@ impl ToolRuntime for SmokeTools {
 }
 
 /// 示例 runtime 只接管并缓存规范化调用；真正计算要等模型响应成功后的 `commit`。
+///
+/// 因而这里的“增量”只降低调用信息的接管延迟，不提前产生工具副作用。如果 A 已经
+/// `submit`、B 仍在模型流中传输时断流，`abort` 可以把 A 确定为
+/// `CancelledBeforeStart`。需要在 `submit` 阶段提前执行的应用则必须在自己的
+/// `abort` 实现中据实区分已完成、确定未开始和结果未知。
 struct SmokeIncrementalBatch<'a> {
     runtime: &'a SmokeTools,
     batch: ToolBatchStart,
@@ -348,6 +349,7 @@ impl IncrementalToolBatch for SmokeIncrementalBatch<'_> {
     {
         Box::pin(async move {
             // 示例在 commit 获得 gate 前完全不执行，因此每个已 submit 项都能确定为未开始。
+            // 这些取消结论不会被伪装成普通 ToolResults，也无需作为副作用事实进入恢复回执。
             let calls = self
                 .calls
                 .into_values()

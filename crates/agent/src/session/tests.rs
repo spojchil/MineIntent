@@ -66,15 +66,27 @@ fn tool_call_ids(transcript: &[TranscriptItem]) -> Vec<String> {
         .collect()
 }
 
+fn is_recovery_receipt(item: &TranscriptItem) -> bool {
+    matches!(
+        item,
+        TranscriptItem::Input(message)
+            if message.content.iter().any(|part| matches!(
+                part,
+                ContentPart::Json { value }
+                    if value.get("kind").and_then(Value::as_str)
+                        == Some(RECOVERY_RECEIPT_KIND)
+            ))
+    )
+}
+
 struct StaticPrompt;
 
 impl PromptSource for StaticPrompt {
     fn base_context(&self) -> Vec<TranscriptItem> {
-        vec![input("system", "base")]
-    }
-
-    fn run_context(&self) -> Vec<TranscriptItem> {
-        vec![input("developer", "run-context")]
+        vec![
+            input("system", "base"),
+            input("developer", "base-constraint"),
+        ]
     }
 }
 
@@ -103,6 +115,24 @@ impl Compaction for GatedCompaction {
             self.started.send(()).unwrap();
             let _permit = self.gate.acquire().await.unwrap();
             conversation.to_vec()
+        })
+    }
+}
+
+struct GatedSummaryCompaction {
+    started: mpsc::UnboundedSender<Vec<TranscriptItem>>,
+    gate: Arc<Semaphore>,
+}
+
+impl Compaction for GatedSummaryCompaction {
+    fn compact<'a>(
+        &'a self,
+        conversation: &'a [TranscriptItem],
+    ) -> PortFuture<'a, Vec<TranscriptItem>> {
+        Box::pin(async move {
+            self.started.send(conversation.to_vec()).unwrap();
+            let _permit = self.gate.acquire().await.unwrap();
+            vec![input("system", "summary")]
         })
     }
 }
@@ -717,17 +747,16 @@ async fn incremental_runtime_receives_ready_calls_and_seal_before_outer_response
 }
 
 #[tokio::test]
-async fn interrupted_stream_records_settled_fact_before_mailbox_and_compaction_cannot_drop_it() {
+async fn interrupted_stream_records_settled_fact_before_mailbox() {
     let observer = Arc::new(RecordingStreamObserver::default());
     let mut fixture = streaming_fixture(
         1,
         false,
         SessionConfig {
-            compaction_trigger_bytes: 0,
             interrupted_tool_receipt_role: "recovery_fact".to_owned(),
-            max_interrupted_tool_recoveries: 3,
+            ..SessionConfig::default()
         },
-        Arc::new(DroppingRecoveryCompaction),
+        Arc::new(NoCompaction),
         observer.clone(),
     );
     let session = fixture.session.clone();
@@ -831,6 +860,72 @@ async fn interrupted_stream_records_settled_fact_before_mailbox_and_compaction_c
             error_kind: AgentErrorKind::Model
         }
     )));
+}
+
+#[tokio::test]
+async fn compaction_may_drop_an_interrupted_tool_recovery_receipt() {
+    let mut fixture = streaming_fixture(
+        1,
+        false,
+        SessionConfig {
+            compaction_trigger_bytes: 0,
+            ..SessionConfig::default()
+        },
+        Arc::new(DroppingRecoveryCompaction),
+        Arc::new(NoopStreamObserver),
+    );
+    let session = fixture.session.clone();
+    let task = tokio::spawn(async move {
+        session
+            .start_if_idle(vec![input("operator", "forget recovery fact")])
+            .await
+    });
+    fixture.requests.recv().await.unwrap();
+
+    fixture
+        .commands
+        .send(StreamCommand::Event(ModelStreamEvent::ToolCallReady {
+            slot: ToolCallSlot::new(0),
+            call: ToolCall::new("executed-and-forgotten", "read", json!({})),
+        }))
+        .unwrap();
+    fixture.updates.recv().await.unwrap();
+    fixture.updates.recv().await.unwrap();
+    fixture
+        .commands
+        .send(StreamCommand::Fail(AgentError::new(
+            AgentErrorKind::Model,
+            "stream disconnected",
+        )))
+        .unwrap();
+    assert_eq!(
+        fixture.updates.recv().await.unwrap(),
+        IncrementalUpdate::Aborted(ToolBatchAbortReason::ModelStreamInterrupted)
+    );
+
+    let retry = fixture.requests.recv().await.unwrap();
+    assert!(
+        !retry.transcript.iter().any(is_recovery_receipt),
+        "恢复回执是普通消息，压缩策略可以像删除其他历史一样删除它"
+    );
+    assert!(tool_call_ids(&retry.transcript).is_empty());
+
+    fixture
+        .commands
+        .send(StreamCommand::Complete(model_response(ModelOutput::text(
+            "recovered",
+        ))))
+        .unwrap();
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        TurnOutcome::Completed { output, .. } if output.text_content() == "recovered"
+    ));
+    assert!(!fixture
+        .session
+        .conversation()
+        .await
+        .iter()
+        .any(is_recovery_receipt));
 }
 
 #[tokio::test]
@@ -1263,7 +1358,7 @@ async fn complete_tool_array_is_forwarded_once_and_steering_waits_for_it() {
     let first = fixture.requests.recv().await.unwrap();
     assert_eq!(
         visible_texts(&first.transcript),
-        vec!["base", "run-context", "go"]
+        vec!["base", "base-constraint", "go"]
     );
     fixture
         .responses
@@ -1507,7 +1602,7 @@ async fn steering_arriving_during_final_model_call_reopens_the_run() {
     let second = fixture.requests.recv().await.unwrap();
     assert_eq!(
         visible_texts(&second.transcript),
-        vec!["base", "run-context", "draft", "candidate", "revise"]
+        vec!["base", "base-constraint", "draft", "candidate", "revise"]
     );
     fixture
         .responses
@@ -1708,6 +1803,256 @@ async fn independently_closed_mailbox_segments_compose_even_when_ids_repeat() {
         task.await.unwrap().unwrap(),
         TurnOutcome::Completed { output, .. } if output.text_content() == "done"
     ));
+}
+
+#[tokio::test]
+async fn compaction_between_tool_rounds_replaces_history_before_draining_mailbox() {
+    let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+    let (response_tx, response_rx) = mpsc::unbounded_channel();
+    let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
+    let tool_gate = Arc::new(Semaphore::new(0));
+    let (compaction_tx, mut compaction_rx) = mpsc::unbounded_channel();
+    let compaction_gate = Arc::new(Semaphore::new(0));
+    let session = Arc::new(AgentSession::new(
+        Arc::new(StaticPrompt),
+        Arc::new(GatedBatchRuntime {
+            batches: batch_tx,
+            gate: tool_gate.clone(),
+            dispatches: AtomicUsize::new(0),
+        }),
+        Arc::new(GatedSummaryCompaction {
+            started: compaction_tx,
+            gate: compaction_gate.clone(),
+        }),
+        Arc::new(ChannelModel {
+            requests: request_tx,
+            responses: Mutex::new(response_rx),
+        }),
+        SessionConfig {
+            compaction_trigger_bytes: 0,
+            ..SessionConfig::default()
+        },
+    ));
+
+    let running = session.clone();
+    let task =
+        tokio::spawn(async move { running.start_if_idle(vec![input("operator", "go")]).await });
+    let first = request_rx.recv().await.unwrap();
+    assert_eq!(
+        visible_texts(&first.transcript),
+        ["base", "base-constraint", "go"]
+    );
+    response_tx
+        .send(Ok(model_response(ModelOutput::calls(vec![ToolCall::new(
+            "compact-call",
+            "read",
+            json!({"path": "before-summary"}),
+        )]))))
+        .unwrap();
+    batch_rx.recv().await.unwrap();
+    tool_gate.add_permits(1);
+
+    let pre_compaction = compaction_rx.recv().await.unwrap();
+    assert_eq!(visible_texts(&pre_compaction), ["go"]);
+    assert_eq!(tool_call_ids(&pre_compaction), ["compact-call"]);
+    assert!(pre_compaction
+        .iter()
+        .any(|item| matches!(item, TranscriptItem::ToolResults(_))));
+    assert!(!visible_texts(&pre_compaction).contains(&"base".to_owned()));
+    assert!(!visible_texts(&pre_compaction).contains(&"base-constraint".to_owned()));
+
+    session
+        .enqueue_if_running(MailboxInput::next_model_request(vec![input(
+            "developer",
+            "during-compaction",
+        )]))
+        .await
+        .unwrap();
+    compaction_gate.add_permits(1);
+
+    let second = request_rx.recv().await.unwrap();
+    assert_eq!(
+        visible_texts(&second.transcript),
+        ["base", "base-constraint", "summary", "during-compaction"]
+    );
+    assert!(tool_call_ids(&second.transcript).is_empty());
+    response_tx
+        .send(Ok(model_response(ModelOutput::text("done"))))
+        .unwrap();
+
+    let final_compaction = compaction_rx.recv().await.unwrap();
+    assert_eq!(
+        visible_texts(&final_compaction),
+        ["summary", "during-compaction", "done"]
+    );
+    assert!(!visible_texts(&final_compaction).contains(&"base".to_owned()));
+    assert!(!visible_texts(&final_compaction).contains(&"base-constraint".to_owned()));
+    compaction_gate.add_permits(1);
+
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        TurnOutcome::Completed { output, .. } if output.text_content() == "done"
+    ));
+    assert_eq!(visible_texts(&session.conversation().await), ["summary"]);
+}
+
+#[tokio::test]
+async fn completion_follow_up_compacts_before_the_reopened_model_request() {
+    let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+    let (response_tx, response_rx) = mpsc::unbounded_channel();
+    let (batch_tx, _batch_rx) = mpsc::unbounded_channel();
+    let (compaction_tx, mut compaction_rx) = mpsc::unbounded_channel();
+    let compaction_gate = Arc::new(Semaphore::new(0));
+    let session = Arc::new(AgentSession::new(
+        Arc::new(StaticPrompt),
+        Arc::new(GatedBatchRuntime {
+            batches: batch_tx,
+            gate: Arc::new(Semaphore::new(0)),
+            dispatches: AtomicUsize::new(0),
+        }),
+        Arc::new(GatedSummaryCompaction {
+            started: compaction_tx,
+            gate: compaction_gate.clone(),
+        }),
+        Arc::new(ChannelModel {
+            requests: request_tx,
+            responses: Mutex::new(response_rx),
+        }),
+        SessionConfig {
+            compaction_trigger_bytes: 0,
+            ..SessionConfig::default()
+        },
+    ));
+
+    let running = session.clone();
+    let task =
+        tokio::spawn(async move { running.start_if_idle(vec![input("operator", "go")]).await });
+    request_rx.recv().await.unwrap();
+    session
+        .enqueue_if_running(MailboxInput::when_idle(vec![input(
+            "operator",
+            "follow-up",
+        )]))
+        .await
+        .unwrap();
+    response_tx
+        .send(Ok(model_response(ModelOutput::text("candidate"))))
+        .unwrap();
+
+    let pre_compaction = compaction_rx.recv().await.unwrap();
+    assert_eq!(visible_texts(&pre_compaction), ["go", "candidate"]);
+    assert!(!visible_texts(&pre_compaction).contains(&"base".to_owned()));
+    assert!(!visible_texts(&pre_compaction).contains(&"base-constraint".to_owned()));
+    session
+        .enqueue_if_running(MailboxInput::next_model_request(vec![input(
+            "developer",
+            "during-compaction",
+        )]))
+        .await
+        .unwrap();
+    session
+        .enqueue_if_running(MailboxInput::when_idle(vec![input(
+            "operator",
+            "late-idle",
+        )]))
+        .await
+        .unwrap();
+    compaction_gate.add_permits(1);
+
+    let second = request_rx.recv().await.unwrap();
+    assert_eq!(
+        visible_texts(&second.transcript),
+        [
+            "base",
+            "base-constraint",
+            "summary",
+            "during-compaction",
+            "follow-up",
+            "late-idle"
+        ]
+    );
+    response_tx
+        .send(Ok(model_response(ModelOutput::text("done"))))
+        .unwrap();
+
+    let final_compaction = compaction_rx.recv().await.unwrap();
+    assert_eq!(
+        visible_texts(&final_compaction),
+        [
+            "summary",
+            "during-compaction",
+            "follow-up",
+            "late-idle",
+            "done"
+        ]
+    );
+    compaction_gate.add_permits(1);
+
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        TurnOutcome::Completed { output, .. } if output.text_content() == "done"
+    ));
+}
+
+#[tokio::test]
+async fn stop_during_boundary_compaction_returns_the_undrained_mailbox() {
+    let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+    let (response_tx, response_rx) = mpsc::unbounded_channel();
+    let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
+    let tool_gate = Arc::new(Semaphore::new(0));
+    let (compaction_tx, mut compaction_rx) = mpsc::unbounded_channel();
+    let compaction_gate = Arc::new(Semaphore::new(0));
+    let session = Arc::new(AgentSession::new(
+        Arc::new(StaticPrompt),
+        Arc::new(GatedBatchRuntime {
+            batches: batch_tx,
+            gate: tool_gate.clone(),
+            dispatches: AtomicUsize::new(0),
+        }),
+        Arc::new(GatedSummaryCompaction {
+            started: compaction_tx,
+            gate: compaction_gate.clone(),
+        }),
+        Arc::new(ChannelModel {
+            requests: request_tx,
+            responses: Mutex::new(response_rx),
+        }),
+        SessionConfig {
+            compaction_trigger_bytes: 0,
+            ..SessionConfig::default()
+        },
+    ));
+
+    let running = session.clone();
+    let task =
+        tokio::spawn(async move { running.start_if_idle(vec![input("operator", "go")]).await });
+    request_rx.recv().await.unwrap();
+    response_tx
+        .send(Ok(model_response(ModelOutput::calls(vec![ToolCall::new(
+            "compact-before-stop",
+            "read",
+            json!({}),
+        )]))))
+        .unwrap();
+    batch_rx.recv().await.unwrap();
+    tool_gate.add_permits(1);
+    compaction_rx.recv().await.unwrap();
+
+    let pending = MailboxInput::next_model_request(vec![input("developer", "undelivered")]);
+    session.enqueue_if_running(pending.clone()).await.unwrap();
+    let release_gate = compaction_gate.clone();
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        release_gate.add_permits(1);
+    });
+    session.stop().await;
+
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        TurnOutcome::Stopped { undelivered } if undelivered == vec![pending]
+    ));
+    assert!(request_rx.try_recv().is_err());
+    assert!(compaction_rx.try_recv().is_err());
 }
 
 #[tokio::test]
