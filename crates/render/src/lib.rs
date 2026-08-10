@@ -216,27 +216,8 @@ impl WindowTick for world::ChatEntry {
     }
 }
 
-/// 把角度收进 [−180, 180)，等价于原版 `Mth.wrapDegrees`。
-///
-/// 原版和 azalea 都不归一化 yaw：一直往同一个方向转会累加出 −10313 这样的值。
-/// 给人或模型看的角度必须先过这里——非有限数原样返回，缺陷不伪装成像样的角度。
-pub fn wrap_degrees(value: f64) -> f64 {
-    if !value.is_finite() {
-        return value;
-    }
-    let mut wrapped = value % 360.0;
-    if wrapped >= 180.0 {
-        wrapped -= 360.0;
-    }
-    if wrapped < -180.0 {
-        wrapped += 360.0;
-    }
-    if wrapped == 0.0 {
-        0.0
-    } else {
-        wrapped
-    }
-}
+// 角度归一化随视口内核迁入 world；此处再导出维持渲染层的调用面。
+pub use world::wrap_degrees;
 
 /// 原版昼夜时钟到时段词。锚点：0 日出、6000 正午、12000 日落、18000 午夜。
 fn day_period_word(day_time: u64) -> &'static str {

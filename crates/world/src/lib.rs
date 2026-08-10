@@ -11,8 +11,38 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
+mod block;
+mod viewport;
+
+pub use block::*;
+pub use viewport::*;
+
 /// 挂钟时刻，取证用。
 pub type Timestamp = SystemTime;
+
+/// 把角度收进 [−180, 180)，等价于原版 `Mth.wrapDegrees`。
+///
+/// 原版和 azalea 都不归一化 yaw：一直往同一个方向转会累加。内部三角函数
+/// 是周期的无所谓；给人或模型看的角度必须先过这里。非有限数原样返回，
+/// 缺陷不伪装成一个像样的角度。
+pub fn wrap_degrees(value: f64) -> f64 {
+    if !value.is_finite() {
+        return value;
+    }
+    let mut wrapped = value % 360.0;
+    if wrapped >= 180.0 {
+        wrapped -= 360.0;
+    }
+    if wrapped < -180.0 {
+        wrapped += 360.0;
+    }
+    // −0.0 与 0.0 是同一个朝向，显示出来却像有区别。
+    if wrapped == 0.0 {
+        0.0
+    } else {
+        wrapped
+    }
+}
 
 /// 连接纪元。重连必换纪元；`(epoch, tick)` 成对单调。
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
