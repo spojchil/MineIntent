@@ -11,6 +11,7 @@ members = [
     "crates/memory",
     "crates/middle",
     "crates/motion",
+    "crates/perception",
     "crates/render",
     "crates/screens",
     "crates/toolloop",

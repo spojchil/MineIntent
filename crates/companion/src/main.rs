@@ -14,9 +14,12 @@ use agent::adapters::http::{HttpModel, HttpModelConfig, Protocol};
 use agent::{AgentSession, InputMessage, MailboxInput, SessionConfig};
 use context::ContextStrategy;
 use dispatch::{Dispatcher, Occupancy, ToolProvider};
+use hand::{HandDoor, HandTools};
 use memory::{MemoryFile, MemoryTools};
+use motion::{MotionDoor, MotionTools};
+use perception::{PerceptionTools, ViewportDoor};
 use screens::{ChatBox, ChatDoor, ChatHistory, ChatReadMark};
-use world::{ConnectionConfig, Module, SnapshotSource};
+use world::{ConnectionConfig, DoorCommand, Module, SnapshotSource};
 
 /// 人设占位（Q01 未裁；正式文本由维护者给出后替换）。
 const PLACEHOLDER_PERSONA: &str = "\
@@ -55,6 +58,109 @@ struct ModuleChatHistory(Arc<Module>);
 impl ChatHistory for ModuleChatHistory {
     fn recent(&self, count: usize) -> Vec<String> {
         self.0.recent_chat(count)
+    }
+}
+
+/// 运动门：动词直译为接入模块的写口命令。
+struct ModuleMotionDoor(Arc<Module>);
+
+impl MotionDoor for ModuleMotionDoor {
+    fn go_to<'a>(&'a self, target: [f64; 3]) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::GoTo(target)).await })
+    }
+    fn forward<'a>(&'a self, blocks: f64) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::Forward(blocks)).await })
+    }
+    fn stop<'a>(&'a self) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::StopMoving).await })
+    }
+    fn jump<'a>(&'a self) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::Jump).await })
+    }
+    fn sneak<'a>(&'a self, on: bool) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::Sneak(on)).await })
+    }
+    fn sprint<'a>(&'a self, on: bool) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::Sprint(on)).await })
+    }
+    fn look_at<'a>(&'a self, target: [f64; 3]) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::LookAt(target)).await })
+    }
+    fn face<'a>(&'a self, yaw: f64, pitch: f64) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::Face { yaw, pitch }).await })
+    }
+}
+
+/// 手门：同上。
+struct ModuleHandDoor(Arc<Module>);
+
+impl HandDoor for ModuleHandDoor {
+    fn attack<'a>(&'a self, entity_key: &'a str) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            self.0
+                .execute(DoorCommand::Attack {
+                    entity_key: entity_key.to_owned(),
+                })
+                .await
+        })
+    }
+    fn mine<'a>(&'a self, block: [i32; 3]) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::Mine(block)).await })
+    }
+    fn use_on_block<'a>(&'a self, block: [i32; 3]) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::UseOnBlock(block)).await })
+    }
+    fn use_on_entity<'a>(&'a self, entity_key: &'a str) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            self.0
+                .execute(DoorCommand::UseOnEntity {
+                    entity_key: entity_key.to_owned(),
+                })
+                .await
+        })
+    }
+    fn use_item<'a>(&'a self) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::UseItem).await })
+    }
+    fn release<'a>(&'a self) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::ReleaseHand).await })
+    }
+    fn drop_item<'a>(&'a self, whole_stack: bool) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::DropItem { whole_stack }).await })
+    }
+    fn swap_offhand<'a>(&'a self) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::SwapOffhand).await })
+    }
+    fn select_slot<'a>(&'a self, slot: u8) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::SelectSlot(slot)).await })
+    }
+}
+
+/// 视口门：投影是纯 CPU 重活，放阻塞池，不占用异步线程。
+struct ModuleViewportDoor(Arc<Module>);
+
+impl ViewportDoor for ModuleViewportDoor {
+    fn scan<'a>(&'a self) -> agent::PortFuture<'a, Result<world::ViewportProjection, String>> {
+        let module = self.0.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || module.scan(&world::ViewportOptions::default()))
+                .await
+                .map_err(|error| format!("视口投影任务失败：{error}"))?
+        })
+    }
+
+    fn scan_directed<'a>(
+        &'a self,
+        positions: Vec<[i32; 3]>,
+    ) -> agent::PortFuture<'a, Result<world::DirectedProjection, String>> {
+        let module = self.0.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                module.scan_directed(&positions, &world::ViewportOptions::default())
+            })
+            .await
+            .map_err(|error| format!("视口投影任务失败：{error}"))?
+        })
     }
 }
 
@@ -107,6 +213,11 @@ async fn main() -> Result<(), String> {
             snapshots.clone(),
         )),
         Arc::new(MemoryTools::new(memory_file.clone())),
+        Arc::new(MotionTools::new(Arc::new(ModuleMotionDoor(module.clone())))),
+        Arc::new(HandTools::new(Arc::new(ModuleHandDoor(module.clone())))),
+        Arc::new(PerceptionTools::new(Arc::new(ModuleViewportDoor(
+            module.clone(),
+        )))),
     ];
     let dispatcher =
         Arc::new(Dispatcher::new(providers, occupancy).map_err(|error| error.to_string())?);

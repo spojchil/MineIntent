@@ -33,6 +33,11 @@ use azalea::{
     Client, DefaultPlugins, Event,
 };
 use azalea::ecs::system::Res;
+use azalea::physics::collision::BlockWithShape;
+use azalea::pathfinder::goals::BlockPosGoal;
+use azalea::pathfinder::PathfinderClientExt;
+use azalea::protocol::packets::game::s_player_action;
+use azalea::{BlockPos, SprintDirection, WalkDirection};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::{oneshot, watch, Notify};
 
@@ -71,8 +76,35 @@ impl ConnectionConfig {
     }
 }
 
-struct PendingChat {
-    line: String,
+/// 写口动词：中间层各门的意图汇成一条队列，tick 回调内执行
+/// （ECS 只在客户端事件回调里触碰，不跨线程直写）。
+#[derive(Clone, Debug)]
+pub enum DoorCommand {
+    /// 一行聊天；`/` 开头由 azalea 按原版语义路由为命令。
+    Chat(String),
+    GoTo([f64; 3]),
+    /// 朝当前面向直走 N 格（化归为寻路目标，机械终止交给寻路器）。
+    Forward(f64),
+    StopMoving,
+    Jump,
+    Sneak(bool),
+    Sprint(bool),
+    LookAt([f64; 3]),
+    Face { yaw: f64, pitch: f64 },
+    Attack { entity_key: String },
+    Mine([i32; 3]),
+    UseOnBlock([i32; 3]),
+    UseOnEntity { entity_key: String },
+    UseItem,
+    /// 松手：停止挖掘并松开使用中的物品。
+    ReleaseHand,
+    DropItem { whole_stack: bool },
+    SwapOffhand,
+    SelectSlot(u8),
+}
+
+struct PendingCommand {
+    command: DoorCommand,
     ack: oneshot::Sender<Result<(), String>>,
 }
 
@@ -81,7 +113,12 @@ pub(crate) struct Inner {
     latest: RwLock<Arc<TickSnapshot>>,
     ticked_tx: watch::Sender<u64>,
     chat_window: Mutex<VecDeque<ChatEntry>>,
-    pending_chat: Mutex<Vec<PendingChat>>,
+    pending: Mutex<Vec<PendingCommand>>,
+    /// 一次性跳跃的复位标记：跳跃布尔保持一整 tick 后放开。
+    jump_reset: AtomicBool,
+    /// azalea 世界模型句柄（Spawn 登记）。方块读取走它的读锁，
+    /// 可在任意线程进行——世界模型不是 ECS。
+    world_handle: Mutex<Option<Arc<RwLock<azalea::world::World>>>>,
     stopping: AtomicBool,
     shutdown: Notify,
     tick: AtomicU64,
@@ -105,7 +142,9 @@ impl Inner {
             ))),
             ticked_tx,
             chat_window: Mutex::new(VecDeque::new()),
-            pending_chat: Mutex::new(Vec::new()),
+            pending: Mutex::new(Vec::new()),
+            jump_reset: AtomicBool::new(false),
+            world_handle: Mutex::new(None),
             stopping: AtomicBool::new(false),
             shutdown: Notify::new(),
             tick: AtomicU64::new(0),
@@ -189,26 +228,26 @@ impl Inner {
         }
     }
 
-    /// 出站聊天入队；tick 回调里执行。机器已停/断线时立即拒绝。
+    /// 写口动词入队；tick 回调里执行。机器已停/断线时立即拒绝。
     ///
     /// 检查与插入在同一把 pending 锁内：排空方（断线/停机）同样持这把锁，
     /// 所以任何入队要么先于排空（被排空如实拒绝），要么后于排空（此时
     /// 相/停机标志已可见，进不了队列）——没有错过排空的第三种命运。
-    fn enqueue_chat(&self, line: String) -> oneshot::Receiver<Result<(), String>> {
+    fn enqueue_command(&self, command: DoorCommand) -> oneshot::Receiver<Result<(), String>> {
         let (ack, receiver) = oneshot::channel();
-        let mut pending = self.pending_chat.lock();
+        let mut pending = self.pending.lock();
         let phase_ready = matches!(self.latest.read().phase, ConnectionPhase::Ready);
         if self.stopping.load(Ordering::Acquire) || !phase_ready {
             drop(pending);
-            let _ = ack.send(Err("尚未连接到世界，无法发言".to_owned()));
+            let _ = ack.send(Err("尚未连接到世界，无法行动".to_owned()));
             return receiver;
         }
-        pending.push(PendingChat { line, ack });
+        pending.push(PendingCommand { command, ack });
         receiver
     }
 
     fn fail_all_pending_chat(&self, reason: &str) {
-        for pending in self.pending_chat.lock().drain(..) {
+        for pending in self.pending.lock().drain(..) {
             let _ = pending.ack.send(Err(reason.to_owned()));
         }
     }
@@ -299,12 +338,86 @@ impl Module {
         let _ = receiver.changed().await;
     }
 
-    /// 聊天出站：一行 = 一次原版输入循环，`/` 开头由 azalea 按原版语义路由为命令。
-    pub async fn send_chat_line(&self, line: &str) -> Result<(), String> {
-        let receiver = self.inner.enqueue_chat(line.to_owned());
+    /// 执行一个写口动词：入队，tick 内执行，回执执行结论。
+    pub async fn execute(&self, command: DoorCommand) -> Result<(), String> {
+        let receiver = self.inner.enqueue_command(command);
         receiver
             .await
             .unwrap_or_else(|_| Err("连接已结束".to_owned()))
+    }
+
+    /// 聊天出站：一行 = 一次原版输入循环，`/` 开头由 azalea 按原版语义路由为命令。
+    pub async fn send_chat_line(&self, line: &str) -> Result<(), String> {
+        self.execute(DoorCommand::Chat(line.to_owned())).await
+    }
+
+    /// 全景视口投影：用最新快照的姿态与实体，方块走世界模型读锁
+    /// （非 ECS，可在任意线程调用；计算量大，调用方自行放阻塞池）。
+    pub fn scan(&self, options: &crate::ViewportOptions) -> Result<crate::ViewportProjection, String> {
+        let snapshot = self.latest();
+        if !matches!(snapshot.phase, ConnectionPhase::Ready) {
+            return Err("尚未连接到世界，无法观察".to_owned());
+        }
+        let world = self
+            .inner
+            .world_handle
+            .lock()
+            .clone()
+            .ok_or_else(|| "世界模型尚未就绪".to_owned())?;
+        let world = world.read();
+        let pose = crate::viewport::Pose {
+            position: snapshot.self_state.position,
+            yaw: snapshot.self_state.yaw,
+            pitch: snapshot.self_state.pitch,
+        };
+        crate::viewport::project_with_reader(
+            &pose,
+            &snapshot.entities,
+            crate::viewport::WorldReader::new(
+                |position| probe_block_from_world(&world, position),
+                |position| read_block_from_world(&world, position),
+            ),
+            options,
+            || Ok(()),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// 定向视口投影：约束同 [`Module::scan`]。
+    pub fn scan_directed(
+        &self,
+        positions: &[[i32; 3]],
+        options: &crate::ViewportOptions,
+    ) -> Result<crate::DirectedProjection, String> {
+        let snapshot = self.latest();
+        if !matches!(snapshot.phase, ConnectionPhase::Ready) {
+            return Err("尚未连接到世界，无法观察".to_owned());
+        }
+        let world = self
+            .inner
+            .world_handle
+            .lock()
+            .clone()
+            .ok_or_else(|| "世界模型尚未就绪".to_owned())?;
+        let world = world.read();
+        let bounds = crate::WorldHeightBounds::new(world.chunks.min_y(), world.chunks.height());
+        let pose = crate::viewport::Pose {
+            position: snapshot.self_state.position,
+            yaw: snapshot.self_state.yaw,
+            pitch: snapshot.self_state.pitch,
+        };
+        crate::viewport::project_directed_with_reader(
+            &pose,
+            positions,
+            crate::viewport::WorldReader::new(
+                |position| probe_block_from_world(&world, position),
+                |position| read_block_from_world(&world, position),
+            ),
+            options,
+            bounds,
+            || Ok(()),
+        )
+        .map_err(|error| error.to_string())
     }
 
     /// 聊天窗读取：最近 count 条，旧在前新在后。
@@ -451,6 +564,7 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                 .flatten()
                 .unwrap_or_else(|| "minecraft:overworld".to_owned());
             *inner.dimension.lock() = dimension;
+            *inner.world_handle.lock() = Some(bot.world());
             if let Some(snapshot) = assemble_snapshot(inner, &bot) {
                 inner.publish(snapshot);
             }
@@ -484,11 +598,15 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
         }
         Event::Tick => {
             inner.tick.fetch_add(1, Ordering::AcqRel);
-            // 出站聊天在 ECS 回调里执行：不跨线程触碰客户端。
-            let pending: Vec<PendingChat> = inner.pending_chat.lock().drain(..).collect();
-            for pending_chat in pending {
-                bot.chat(&pending_chat.line);
-                let _ = pending_chat.ack.send(Ok(()));
+            // 一次性跳跃：跳跃布尔保持了一整 tick，现在放开。
+            if inner.jump_reset.swap(false, Ordering::AcqRel) {
+                bot.set_jumping(false);
+            }
+            // 写口动词在 ECS 回调里执行：不跨线程触碰客户端。
+            let pending: Vec<PendingCommand> = inner.pending.lock().drain(..).collect();
+            for pending_command in pending {
+                let outcome = run_command(inner, &bot, pending_command.command);
+                let _ = pending_command.ack.send(outcome);
             }
             if let Some(snapshot) = assemble_snapshot(inner, &bot) {
                 inner.publish(snapshot);
@@ -730,6 +848,266 @@ fn canonical_registry_name(name: &str) -> String {
     name.strip_prefix("minecraft:").unwrap_or(name).to_owned()
 }
 
+/// 在 tick 回调内执行一个写口动词。Err 是机器的如实拒绝，原文回到工具面。
+fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> Result<(), String> {
+    match command {
+        DoorCommand::Chat(line) => {
+            bot.chat(&line);
+            Ok(())
+        }
+        DoorCommand::GoTo([x, y, z]) => {
+            bot.start_goto(BlockPosGoal(BlockPos::new(
+                x.floor() as i32,
+                y.floor() as i32,
+                z.floor() as i32,
+            )));
+            Ok(())
+        }
+        DoorCommand::Forward(blocks) => {
+            // 直走化归为寻路目标：终止条件（到达/受阻）交给寻路器。
+            let (position, yaw) = bot
+                .try_query_self::<(&Position, &LookDirection), _>(|(position, look)| {
+                    ((position.x, position.y, position.z), f64::from(look.y_rot()))
+                })
+                .map_err(|_| "读不到自身位置".to_owned())?;
+            let yaw = yaw.to_radians();
+            let target = BlockPos::new(
+                (position.0 + (-yaw.sin()) * blocks).floor() as i32,
+                position.1.floor() as i32,
+                (position.2 + (-yaw.cos()) * blocks).floor() as i32,
+            );
+            bot.start_goto(BlockPosGoal(target));
+            Ok(())
+        }
+        DoorCommand::StopMoving => {
+            bot.stop_pathfinding();
+            bot.walk(WalkDirection::None);
+            Ok(())
+        }
+        DoorCommand::Jump => {
+            bot.set_jumping(true);
+            inner.jump_reset.store(true, Ordering::Release);
+            Ok(())
+        }
+        DoorCommand::Sneak(on) => {
+            bot.set_crouching(on);
+            Ok(())
+        }
+        DoorCommand::Sprint(on) => {
+            if on {
+                bot.sprint(SprintDirection::Forward);
+            } else {
+                // v1 简化：停疾跑=停下。原版疾跑是移动修饰符，细化随运动打磨。
+                bot.walk(WalkDirection::None);
+            }
+            Ok(())
+        }
+        DoorCommand::LookAt([x, y, z]) => {
+            bot.look_at(azalea::Vec3 { x, y, z });
+            Ok(())
+        }
+        DoorCommand::Face { yaw, pitch } => {
+            bot.set_direction(yaw as f32, pitch as f32);
+            Ok(())
+        }
+        DoorCommand::Attack { entity_key } => {
+            let entity = find_entity_by_key(bot, &entity_key)
+                .ok_or_else(|| format!("附近没有 {entity_key} 这个实体"))?;
+            bot.attack(entity);
+            Ok(())
+        }
+        DoorCommand::Mine([x, y, z]) => {
+            bot.start_mining(BlockPos::new(x, y, z));
+            Ok(())
+        }
+        DoorCommand::UseOnBlock([x, y, z]) => {
+            bot.block_interact(BlockPos::new(x, y, z));
+            Ok(())
+        }
+        DoorCommand::UseOnEntity { entity_key } => {
+            let entity = find_entity_by_key(bot, &entity_key)
+                .ok_or_else(|| format!("附近没有 {entity_key} 这个实体"))?;
+            bot.entity_interact(entity);
+            Ok(())
+        }
+        DoorCommand::UseItem => {
+            bot.start_use_item();
+            Ok(())
+        }
+        DoorCommand::ReleaseHand => {
+            bot.left_click_mine(false);
+            bot.write_packet(s_player_action::ServerboundPlayerAction {
+                action: s_player_action::Action::ReleaseUseItem,
+                pos: BlockPos::new(0, 0, 0),
+                direction: Default::default(),
+                seq: 0,
+            });
+            Ok(())
+        }
+        DoorCommand::DropItem { whole_stack } => {
+            bot.write_packet(s_player_action::ServerboundPlayerAction {
+                action: if whole_stack {
+                    s_player_action::Action::DropAllItems
+                } else {
+                    s_player_action::Action::DropItem
+                },
+                pos: BlockPos::new(0, 0, 0),
+                direction: Default::default(),
+                seq: 0,
+            });
+            Ok(())
+        }
+        DoorCommand::SwapOffhand => {
+            bot.write_packet(s_player_action::ServerboundPlayerAction {
+                action: s_player_action::Action::SwapItemWithOffhand,
+                pos: BlockPos::new(0, 0, 0),
+                direction: Default::default(),
+                seq: 0,
+            });
+            Ok(())
+        }
+        DoorCommand::SelectSlot(slot) => {
+            bot.set_selected_hotbar_slot(slot);
+            Ok(())
+        }
+    }
+}
+
+/// 按快照里的实体键（`{epoch}:{协议id}`）找回 ECS 实体。
+fn find_entity_by_key(bot: &Client, entity_key: &str) -> Option<azalea::ecs::entity::Entity> {
+    let protocol_id: i32 = entity_key.strip_prefix("1:")?.parse().ok()?;
+    let mut ecs = bot.ecs.write();
+    let mut query = ecs.query::<(
+        azalea::ecs::entity::Entity,
+        &azalea::core::entity_id::MinecraftEntityId,
+        &LoadedBy,
+    )>();
+    query
+        .iter(&ecs)
+        .find(|(_, id, loaded_by)| ***id == protocol_id && loaded_by.contains(&bot.entity))
+        .map(|(entity, _, _)| entity)
+}
+
+// ---- 方块读取面（迁自旧 backend）：视口双通道读取器的世界侧实现 ----
+
+/// `BlockProbe::Loaded` 的两位，按 `state_id` 预先算好。整张表首次使用时
+/// 算一遍（`BlockStateIntegerRepr` 是 u16，表最大 64 KiB），之后每次探测
+/// 是一次数组下标，零分配。
+fn probe_table() -> &'static [(bool, bool)] {
+    static TABLE: std::sync::OnceLock<Box<[(bool, bool)]>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        (0..=azalea::block::BlockState::MAX_STATE)
+            .map(|state_id| {
+                let Ok(state) = azalea::block::BlockState::try_from(state_id) else {
+                    // 不该发生：迭代范围就是合法区间。按最保守的"有东西且
+                    // 不透光"处理，宁可少报可见块也不误报。
+                    return (true, false);
+                };
+                let block: Box<dyn azalea::block::BlockTrait> = Box::from(state);
+                let name = block.id();
+                (
+                    !crate::is_air_name(name),
+                    transparent_hint(name, state.outline_shape()),
+                )
+            })
+            .collect()
+    })
+}
+
+fn transparent_hint(name: &str, outline_shape: &azalea::physics::collision::VoxelShape) -> bool {
+    // 26.1 的方块注册表没有暴露 transparent 布尔；对常见全体积透明块按名
+    // 提示，其余非完整轮廓按保守的"可能透光"处理。
+    let named_transparent = crate::is_air_name(name)
+        || name.contains("glass")
+        || name.ends_with("leaves")
+        || name == "water"
+        || name == "lava"
+        || name == "powder_snow";
+    named_transparent || !is_full_cube(outline_shape)
+}
+
+fn is_full_cube(shape: &azalea::physics::collision::VoxelShape) -> bool {
+    let boxes = shape.to_aabbs();
+    boxes.len() == 1
+        && boxes[0].min.x == 0.0
+        && boxes[0].min.y == 0.0
+        && boxes[0].min.z == 0.0
+        && boxes[0].max.x == 1.0
+        && boxes[0].max.y == 1.0
+        && boxes[0].max.z == 1.0
+}
+
+/// 热路径探针：不建 DTO，一次表下标。
+fn probe_block_from_world(
+    world: &azalea::world::World,
+    position: crate::BlockPosition,
+) -> crate::BlockProbe {
+    let block_position = BlockPos::new(position.x, position.y, position.z);
+    let y = i64::from(position.y);
+    let min_y = i64::from(world.chunks.min_y());
+    let max_y_exclusive = min_y + i64::from(world.chunks.height());
+    if y < min_y || y >= max_y_exclusive {
+        return crate::BlockProbe::OutOfWorld;
+    }
+    let Some(state) = world.get_block_state(block_position) else {
+        return crate::BlockProbe::Unloaded;
+    };
+    let (visible, transparent_hint) = probe_table()[usize::from(state.id())];
+    crate::BlockProbe::Loaded {
+        visible,
+        transparent_hint,
+    }
+}
+
+/// 完整 DTO 读取：只在要把方块交给读方时调用。
+fn read_block_from_world(
+    world: &azalea::world::World,
+    position: crate::BlockPosition,
+) -> crate::BlockReadResult {
+    let block_position = BlockPos::new(position.x, position.y, position.z);
+    let y = i64::from(position.y);
+    let min_y = i64::from(world.chunks.min_y());
+    let max_y_exclusive = min_y + i64::from(world.chunks.height());
+    if y < min_y || y >= max_y_exclusive {
+        return crate::BlockReadResult::OutOfWorld;
+    }
+    let Some(state) = world.get_block_state(block_position) else {
+        return crate::BlockReadResult::Unloaded;
+    };
+    let block: Box<dyn azalea::block::BlockTrait> = Box::from(state);
+    let collision_shape = state.collision_shape();
+    let collision_shapes: Vec<[f64; 6]> = collision_shape
+        .to_aabbs()
+        .into_iter()
+        .map(|aabb| {
+            [
+                aabb.min.x, aabb.min.y, aabb.min.z, aabb.max.x, aabb.max.y, aabb.max.z,
+            ]
+        })
+        .collect();
+    let properties = block
+        .property_map()
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
+    let bounding_box = if collision_shapes.is_empty() {
+        crate::BlockBoundingBox::Empty
+    } else {
+        crate::BlockBoundingBox::Block
+    };
+    crate::BlockReadResult::Loaded {
+        block: crate::BlockSnapshot {
+            position,
+            name: block.id().to_owned(),
+            state_id: u32::from(state.id()),
+            properties,
+            collision_shapes,
+            transparent_hint: transparent_hint(block.id(), state.outline_shape()),
+            bounding_box,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -819,9 +1197,9 @@ mod tests {
     #[tokio::test]
     async fn chat_enqueued_before_ready_is_rejected_immediately() {
         let inner = Inner::new();
-        let receiver = inner.enqueue_chat("你好".to_owned());
+        let receiver = inner.enqueue_command(DoorCommand::Chat("你好".to_owned()));
         let outcome = receiver.await.expect("ack 应送达");
         assert!(outcome.is_err());
-        assert!(inner.pending_chat.lock().is_empty());
+        assert!(inner.pending.lock().is_empty());
     }
 }

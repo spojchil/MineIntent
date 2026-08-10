@@ -10,6 +10,9 @@ publish = false
 agent = { path = "../agent", features = ["openai"] }
 context = { path = "../context" }
 dispatch = { path = "../dispatch" }
+hand = { path = "../hand" }
+motion = { path = "../motion" }
+perception = { path = "../perception" }
 memory = { path = "../memory" }
 screens = { path = "../screens" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }

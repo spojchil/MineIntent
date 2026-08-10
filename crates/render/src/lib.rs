@@ -184,6 +184,128 @@ pub fn render_inventory(snap: &TickSnapshot) -> String {
     format!("手持：{held}。背包：{}。", items.join("、"))
 }
 
+/// 视口全景的呈现：同名方块聚合（数量+最近位置），实体逐个列出。
+/// 近距截断是临时政策（⑥），聚合是其非临时方向的第一步。
+pub fn render_viewport(projection: &world::ViewportProjection) -> String {
+    let mut lines = Vec::new();
+    let pose = &projection.pose;
+    lines.push(format!(
+        "视角：位于 ({:.1}, {:.1}, {:.1})，面朝 {}°（俯仰 {}°）。",
+        pose.position[0], pose.position[1], pose.position[2], pose.yaw_degrees, pose.pitch_degrees
+    ));
+    if let Some(block) = &projection.looked_at_block {
+        lines.push(format!(
+            "准星对着：{} ({}, {}, {})。",
+            block.name, block.position[0], block.position[1], block.position[2]
+        ));
+    }
+    if let Some(block) = &projection.standing_on_block {
+        lines.push(format!("脚下踩着：{}。", block.name));
+    }
+
+    if projection.visible_entities.items.is_empty() {
+        lines.push("视野里没有实体。".to_owned());
+    } else {
+        let entities: Vec<String> = projection
+            .visible_entities
+            .items
+            .iter()
+            .map(|entity| {
+                let label = match &entity.player {
+                    Some(player) => format!("玩家 {player}"),
+                    None => entity.entity_type.clone(),
+                };
+                format!(
+                    "{label}（{:.0}, {:.0}, {:.0}）",
+                    entity.position[0], entity.position[1], entity.position[2]
+                )
+            })
+            .collect();
+        let mut line = format!("视野里的实体：{}", entities.join("；"));
+        if projection.visible_entities.truncated {
+            line.push_str("；更远处还有");
+        }
+        line.push('。');
+        lines.push(line);
+    }
+
+    if projection.visible_blocks.blocks.is_empty() {
+        lines.push("视野里没有可见方块（可能都被挡住或未加载）。".to_owned());
+    } else {
+        // 同名聚合：数量 + 最近一处坐标（列表本身按距离从近到远）。
+        let mut groups: Vec<(&str, usize, [i32; 3])> = Vec::new();
+        for block in &projection.visible_blocks.blocks {
+            match groups.iter_mut().find(|(name, ..)| *name == block.name) {
+                Some((_, count, _)) => *count += 1,
+                None => groups.push((&block.name, 1, block.position)),
+            }
+        }
+        let described: Vec<String> = groups
+            .into_iter()
+            .map(|(name, count, [x, y, z])| {
+                if count > 1 {
+                    format!("{name} ×{count}（最近 {x},{y},{z}）")
+                } else {
+                    format!("{name}（{x},{y},{z}）")
+                }
+            })
+            .collect();
+        let mut line = format!("可见方块：{}", described.join("；"));
+        if projection.visible_blocks.truncated {
+            line.push_str("；更远处已截断");
+        }
+        line.push('。');
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+/// 定向查看结果的呈现：逐坐标报可见/不可见与原因。
+pub fn render_directed(projection: &world::DirectedProjection) -> String {
+    let mut lines = Vec::new();
+    for seen in &projection.seen {
+        lines.push(format!(
+            "({}, {}, {})：看得见，是 {}。",
+            seen.at[0], seen.at[1], seen.at[2], seen.name
+        ));
+    }
+    for unseen in &projection.unseen {
+        let mut reasons = Vec::new();
+        for why in &unseen.why {
+            reasons.push(match why {
+                world::DirectedWhy::OutsideFov => "在视野外".to_owned(),
+                world::DirectedWhy::TooFar => match (unseen.distance, unseen.max) {
+                    (Some(distance), Some(max)) => {
+                        format!("太远（{distance:.0} 格，上限 {max:.0}）")
+                    }
+                    _ => "太远".to_owned(),
+                },
+                world::DirectedWhy::Occluded => match &unseen.by {
+                    Some(occluder) => format!(
+                        "被 {}（{}, {}, {}）挡住",
+                        occluder.name, occluder.at[0], occluder.at[1], occluder.at[2]
+                    ),
+                    None => "被挡住".to_owned(),
+                },
+                world::DirectedWhy::ChunkNotLoaded => "那片区域尚未加载".to_owned(),
+                world::DirectedWhy::OutOfWorld => "超出世界高度".to_owned(),
+            });
+        }
+        lines.push(format!(
+            "({}, {}, {})：看不见——{}。",
+            unseen.at[0],
+            unseen.at[1],
+            unseen.at[2],
+            reasons.join("，")
+        ));
+    }
+    if lines.is_empty() {
+        "（没有要查看的目标。）".to_owned()
+    } else {
+        lines.join("\n")
+    }
+}
+
 /// 聊天未读数：窗内晚于已读水位的条数。纪元不同则整窗算新。
 pub fn unread_chat_count(snap: &TickSnapshot, chat_read: (u64, u64)) -> usize {
     let (read_epoch, read_tick) = chat_read;

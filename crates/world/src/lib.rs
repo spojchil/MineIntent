@@ -18,7 +18,7 @@ mod viewport;
 
 pub use block::*;
 #[cfg(feature = "azalea")]
-pub use machine::{ConnectionConfig, Module};
+pub use machine::{ConnectionConfig, DoorCommand, Module};
 pub use viewport::*;
 
 /// 挂钟时刻，取证用。
