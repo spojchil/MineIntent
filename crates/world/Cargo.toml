@@ -6,4 +6,11 @@ edition = "2021"
 license = "MIT"
 publish = false
 
+[features]
+# 连接机器(azalea 接入)。纯类型消费者不开此 feature,不拖 bevy 编译。
+azalea = ["dep:azalea", "dep:tokio", "dep:parking_lot"]
+
 [dependencies]
+azalea = { workspace = true, optional = true, features = ["packet-event"] }
+parking_lot = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"], optional = true }

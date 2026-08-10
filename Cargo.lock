@@ -4047,6 +4047,11 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "world"
 version = "0.0.1"
+dependencies = [
+ "azalea",
+ "parking_lot",
+ "tokio",
+]
 
 [[package]]
 name = "writeable"

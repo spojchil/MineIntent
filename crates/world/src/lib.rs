@@ -12,9 +12,13 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 mod block;
+#[cfg(feature = "azalea")]
+mod machine;
 mod viewport;
 
 pub use block::*;
+#[cfg(feature = "azalea")]
+pub use machine::{ConnectionConfig, Module};
 pub use viewport::*;
 
 /// 挂钟时刻，取证用。
