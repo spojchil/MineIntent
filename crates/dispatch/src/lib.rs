@@ -25,11 +25,14 @@ pub enum ToolClass {
     Body { domain: Domain },
 }
 
-/// 身体互斥域。手（攻击/挖掘/使用）是否独立成域，随工具表裁定扩展。
+/// 身体互斥域。2026-08-10 客户端考证裁定：手（攻击/挖掘/使用三态彼此互斥）
+/// 独立成域，与移动正交；朝向独立于移动（寻路与挖掘期间由各自任务牵引）。
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Domain {
     Screen,
     Movement,
+    Facing,
+    Hand,
 }
 
 /// 互斥域占用账本。工具模块在自己的状态转换处调用 occupy/release；

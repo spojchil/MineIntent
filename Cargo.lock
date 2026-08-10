@@ -1577,6 +1577,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hand"
+version = "0.0.1"
+dependencies = [
+ "agent",
+ "dispatch",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2172,6 +2182,16 @@ dependencies = [
  "smallvec",
  "tagptr",
  "uuid",
+]
+
+[[package]]
+name = "motion"
+version = "0.0.1"
+dependencies = [
+ "agent",
+ "dispatch",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
