@@ -40,8 +40,8 @@ pub struct TickSnapshot {
     /// 连接状态是状态，活在快照里。
     pub phase: ConnectionPhase,
 
-    /// 环境事实：原版玩家不开 F3 就被动感知的那部分（天色、天气、身在哪个维度）。
-    /// F3 才看得到的档案数（Day #、群系）不在这里，走感知的信息工具。
+    /// 环境事实里的热门部分：维度、天色、天气每轮都与行为相关，进轮末帧。
+    /// 冷门档案数（Day #、群系）不在这里，走感知的信息工具按需查。
     pub world_meta: WorldMeta,
 
     pub self_state: SelfState,
