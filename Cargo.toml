@@ -5,6 +5,7 @@ members = [
     "crates/backend",
     "crates/contracts",
     "crates/middle",
+    "crates/screens",
     "crates/toolloop",
 ]
 resolver = "2"
