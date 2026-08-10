@@ -1,0 +1,11 @@
+[package]
+name = "context"
+description = "上下文策略：实现内核提示端口，组装人设与记忆；处境渲染与对话压缩随后续模块落位"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+agent = { path = "../agent" }
+memory = { path = "../memory" }
