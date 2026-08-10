@@ -40,6 +40,10 @@ pub struct TickSnapshot {
     /// 连接状态是状态，活在快照里。
     pub phase: ConnectionPhase,
 
+    /// 环境事实：原版玩家不开 F3 就被动感知的那部分（天色、天气、身在哪个维度）。
+    /// F3 才看得到的档案数（Day #、群系）不在这里，走感知的信息工具。
+    pub world_meta: WorldMeta,
+
     pub self_state: SelfState,
     pub entities: Vec<EntitySnapshot>,
     /// tab 表的状态形式。
@@ -51,6 +55,20 @@ pub struct TickSnapshot {
     /// ⚠ 拟含，随关注清单（唤醒判据）裁定收尾。
     /// 尺寸约束与 chat 同理：关注类窗口 ≥ 最长一轮时长，不得抄声音的 60 tick。
     pub damage: Window<DamageEntry>,
+}
+
+/// 世界环境的直译。呈现（时段文案、"下大雨"）归渲染层。
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorldMeta {
+    /// 维度注册名（如 `minecraft:overworld`）。
+    pub dimension: String,
+    /// 世界时钟原始值：`% 24000` 是一天内时刻（轮末帧的时段），
+    /// `/ 24000` 是天数（信息工具的 Day #）——一个事实，两种呈现。
+    pub day_time: u64,
+    /// 雨强度 0..1（原版客户端的过渡值直译）。
+    pub rain_level: f32,
+    /// 雷暴强度 0..1。
+    pub thunder_level: f32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
