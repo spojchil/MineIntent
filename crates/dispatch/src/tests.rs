@@ -1,29 +1,20 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::Mutex as StdMutex;
 
 use agent::{RunId, ToolBatchAttemptId, ToolBatchId};
 use serde_json::json;
 
 use super::*;
 
-/// 记录调用顺序的假供应者；可配置类别与占域状态。
+/// 记录调用顺序的假供应者。
 struct FakeProvider {
     name: &'static str,
     class: ToolClass,
-    log: Arc<Mutex<Vec<String>>>,
-    occupying: Arc<AtomicBool>,
-    aborted: Arc<AtomicUsize>,
+    log: Arc<StdMutex<Vec<String>>>,
 }
 
 impl FakeProvider {
-    fn new(name: &'static str, class: ToolClass, log: Arc<Mutex<Vec<String>>>) -> Arc<Self> {
-        Arc::new(Self {
-            name,
-            class,
-            log,
-            occupying: Arc::new(AtomicBool::new(false)),
-            aborted: Arc::new(AtomicUsize::new(0)),
-        })
+    fn new(name: &'static str, class: ToolClass, log: Arc<StdMutex<Vec<String>>>) -> Arc<Self> {
+        Arc::new(Self { name, class, log })
     }
 }
 
@@ -41,48 +32,39 @@ impl ToolProvider for FakeProvider {
             ToolResult::success_json(call.id, json!({"tool": self.name}))
         })
     }
-
-    fn occupying(&self) -> Option<Domain> {
-        if self.occupying.load(Ordering::SeqCst) {
-            Some(Domain::Screen)
-        } else {
-            None
-        }
-    }
-
-    fn on_batch_abort(&self) {
-        self.aborted.fetch_add(1, Ordering::SeqCst);
-    }
 }
 
 struct Fixture {
     dispatcher: Dispatcher,
-    log: Arc<Mutex<Vec<String>>>,
-    screen: Arc<FakeProvider>,
+    log: Arc<StdMutex<Vec<String>>>,
+    occupancy: Arc<Occupancy>,
 }
 
 fn fixture() -> Fixture {
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let screen = FakeProvider::new(
-        "chat_box",
-        ToolClass::Body {
-            domain: Domain::Screen,
-        },
-        log.clone(),
-    );
-    let movement = FakeProvider::new(
-        "go_to",
-        ToolClass::Body {
-            domain: Domain::Movement,
-        },
-        log.clone(),
-    );
-    let inner = FakeProvider::new("remember", ToolClass::Free, log.clone());
-    let dispatcher = Dispatcher::new(vec![screen.clone(), movement, inner]).unwrap();
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let occupancy = Arc::new(Occupancy::new());
+    let providers: Vec<Arc<dyn ToolProvider>> = vec![
+        FakeProvider::new(
+            "chat_box",
+            ToolClass::Body {
+                domain: Domain::Screen,
+            },
+            log.clone(),
+        ),
+        FakeProvider::new(
+            "go_to",
+            ToolClass::Body {
+                domain: Domain::Movement,
+            },
+            log.clone(),
+        ),
+        FakeProvider::new("remember", ToolClass::Free, log.clone()),
+    ];
+    let dispatcher = Dispatcher::new(providers, occupancy.clone()).unwrap();
     Fixture {
         dispatcher,
         log,
-        screen,
+        occupancy,
     }
 }
 
@@ -103,6 +85,15 @@ fn start() -> ToolBatchStart {
 
 fn call(id: &str, name: &str) -> ToolCall {
     ToolCall::new(id, name, json!({}))
+}
+
+fn incremental_call(slot: u32, id: &str, name: &str) -> agent::IncrementalToolCall {
+    agent::IncrementalToolCall {
+        run_id: RunId::new("run-1"),
+        batch_attempt_id: ToolBatchAttemptId::new("run-1/attempt/1"),
+        slot: ToolCallSlot::new(slot),
+        call: call(id, name),
+    }
 }
 
 #[tokio::test]
@@ -126,9 +117,9 @@ async fn batch_executes_in_order_and_unknown_tool_is_a_normal_failure() {
 }
 
 #[tokio::test]
-async fn open_screen_suppresses_other_body_domains_but_not_free_or_screen() {
+async fn occupied_screen_suppresses_other_body_domains_but_not_free_or_screen() {
     let fixture = fixture();
-    fixture.screen.occupying.store(true, Ordering::SeqCst);
+    fixture.occupancy.occupy(Domain::Screen);
 
     let results = fixture
         .dispatcher
@@ -144,7 +135,7 @@ async fn open_screen_suppresses_other_body_domains_but_not_free_or_screen() {
     assert_eq!(results.results[1].status, agent::ToolResultStatus::Success);
     assert_eq!(results.results[2].status, agent::ToolResultStatus::Success);
 
-    fixture.screen.occupying.store(false, Ordering::SeqCst);
+    fixture.occupancy.release(Domain::Screen);
     let released = fixture
         .dispatcher
         .dispatch(batch(vec![call("d", "go_to")]))
@@ -163,25 +154,11 @@ async fn incremental_submit_executes_immediately_and_commit_returns_in_slot_orde
         .unwrap()
         .expect("编排应接管增量批");
 
-    run.submit(agent::IncrementalToolCall {
-        run_id: RunId::new("run-1"),
-        batch_attempt_id: ToolBatchAttemptId::new("run-1/attempt/1"),
-        slot: ToolCallSlot::new(0),
-        call: call("a", "remember"),
-    })
-    .await
-    .unwrap();
+    run.submit(incremental_call(0, "a", "remember")).await.unwrap();
     // 尚未封口、尚未 commit，第一个调用已经执行——层级 2 的核心断言。
     assert_eq!(*fixture.log.lock().unwrap(), vec!["remember"]);
 
-    run.submit(agent::IncrementalToolCall {
-        run_id: RunId::new("run-1"),
-        batch_attempt_id: ToolBatchAttemptId::new("run-1/attempt/1"),
-        slot: ToolCallSlot::new(1),
-        call: call("b", "go_to"),
-    })
-    .await
-    .unwrap();
+    run.submit(incremental_call(1, "b", "go_to")).await.unwrap();
     run.calls_sealed(2).await.unwrap();
 
     let results = run.commit().await.unwrap();
@@ -191,23 +168,18 @@ async fn incremental_submit_executes_immediately_and_commit_returns_in_slot_orde
 }
 
 #[tokio::test]
-async fn abort_reports_every_submitted_call_as_settled_and_broadcasts_rollback() {
+async fn abort_reports_every_submitted_call_as_settled_and_leaves_occupancy_untouched() {
     let fixture = fixture();
+    // 屏在上一批就开着；本批中断不得动它——回执已把执行事实告知模型。
+    fixture.occupancy.occupy(Domain::Screen);
+
     let mut run = fixture
         .dispatcher
         .begin_incremental(start())
         .await
         .unwrap()
         .unwrap();
-
-    run.submit(agent::IncrementalToolCall {
-        run_id: RunId::new("run-1"),
-        batch_attempt_id: ToolBatchAttemptId::new("run-1/attempt/1"),
-        slot: ToolCallSlot::new(0),
-        call: call("a", "chat_box"),
-    })
-    .await
-    .unwrap();
+    run.submit(incremental_call(0, "a", "chat_box")).await.unwrap();
 
     let report = run
         .abort(ToolBatchAbortReason::ModelStreamInterrupted)
@@ -220,12 +192,12 @@ async fn abort_reports_every_submitted_call_as_settled_and_broadcasts_rollback()
         report.calls[0].outcome,
         AbortedToolCallOutcome::Settled(_)
     ));
-    assert_eq!(fixture.screen.aborted.load(Ordering::SeqCst), 1);
+    assert!(fixture.occupancy.is_occupied(Domain::Screen));
 }
 
 #[test]
 fn duplicate_tool_names_fail_at_registration() {
-    let log = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::new(StdMutex::new(Vec::new()));
     let first = FakeProvider::new("chat_box", ToolClass::Free, log.clone());
     let second = FakeProvider::new(
         "chat_box",
@@ -234,7 +206,7 @@ fn duplicate_tool_names_fail_at_registration() {
         },
         log,
     );
-    let error = Dispatcher::new(vec![first, second])
+    let error = Dispatcher::new(vec![first, second], Arc::new(Occupancy::new()))
         .err()
         .expect("重名注册必须失败");
     assert!(error.summary.contains("chat_box"));

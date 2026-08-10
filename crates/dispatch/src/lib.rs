@@ -1,15 +1,15 @@
 //! 工具编排：内核工具端口的唯一实现方。
 //!
-//! 工具模块作为供应者注册进来；本层按名路由、按批内顺序逐个执行，
-//! 唯一的跨域规则是界面压制（屏开着时拒绝其他身体域的调用）。
-//! 域内互斥由各供应者自己的结构保证，不在本层。
+//! 工具模块作为供应者注册进来；本层按名路由、按批内顺序逐个执行。
+//! 互斥域的占用账本（[`Occupancy`]）归本层持有——工具模块只做状态转换
+//! （开屏占域、关屏释放），谁占着什么、要不要压制由编排裁决。
+//! 唯一的跨域规则：界面域被占时拒绝其他身体域的调用。
 //!
-//! 整批与增量两条路径共用同一个执行函数：增量路径在调用封口送达时
-//! 立即执行，中断时已执行的调用全部给出确定结论——执行在进程内同步
-//! 完成，"结果不明"在本实现中不可达。
+//! 中断不回滚：执行同步于 submit，不存在半执行的调用；已执行调用的
+//! 效果（含占域转换）经由内核的中断回执告知模型，占用账本保持真实状态。
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use agent::{
     AbortedToolBatch, AbortedToolCall, AbortedToolCallOutcome, AgentError, IncrementalToolBatch,
@@ -26,10 +26,35 @@ pub enum ToolClass {
 }
 
 /// 身体互斥域。手（攻击/挖掘/使用）是否独立成域，随工具表裁定扩展。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Domain {
     Screen,
     Movement,
+}
+
+/// 互斥域占用账本。工具模块在自己的状态转换处调用 occupy/release；
+/// 压制判断只发生在编排内部。
+#[derive(Default)]
+pub struct Occupancy {
+    occupied: Mutex<HashSet<Domain>>,
+}
+
+impl Occupancy {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn occupy(&self, domain: Domain) {
+        self.occupied.lock().expect("占用账本锁中毒").insert(domain);
+    }
+
+    pub fn release(&self, domain: Domain) {
+        self.occupied.lock().expect("占用账本锁中毒").remove(&domain);
+    }
+
+    pub fn is_occupied(&self, domain: Domain) -> bool {
+        self.occupied.lock().expect("占用账本锁中毒").contains(&domain)
+    }
 }
 
 /// 工具供应者：工具模块注册进编排的身份。
@@ -37,14 +62,6 @@ pub trait ToolProvider: Send + Sync {
     fn tools(&self) -> Vec<(ToolDefinition, ToolClass)>;
 
     fn call<'a>(&'a self, call: ToolCall) -> PortFuture<'a, ToolResult>;
-
-    /// 本供应者当前占用的互斥域。界面模块在屏开着时返回 `Some(Screen)`。
-    fn occupying(&self) -> Option<Domain> {
-        None
-    }
-
-    /// 批中断时的无痕回滚钩（界面模块：关屏）。
-    fn on_batch_abort(&self) {}
 }
 
 /// 注册期错误：工具名冲突在组合根构造时就失败，不留到运行时。
@@ -65,10 +82,14 @@ pub struct Dispatcher {
     providers: Vec<Arc<dyn ToolProvider>>,
     /// 工具名 → (供应者下标, 类别)。
     routes: HashMap<ToolName, (usize, ToolClass)>,
+    occupancy: Arc<Occupancy>,
 }
 
 impl Dispatcher {
-    pub fn new(providers: Vec<Arc<dyn ToolProvider>>) -> Result<Self, RegistrationError> {
+    pub fn new(
+        providers: Vec<Arc<dyn ToolProvider>>,
+        occupancy: Arc<Occupancy>,
+    ) -> Result<Self, RegistrationError> {
         let mut routes = HashMap::new();
         for (index, provider) in providers.iter().enumerate() {
             for (definition, class) in provider.tools() {
@@ -79,7 +100,11 @@ impl Dispatcher {
                 }
             }
         }
-        Ok(Self { providers, routes })
+        Ok(Self {
+            providers,
+            routes,
+            occupancy,
+        })
     }
 
     async fn execute_one(&self, call: ToolCall) -> ToolResult {
@@ -91,7 +116,7 @@ impl Dispatcher {
         };
 
         if let ToolClass::Body { domain } = class {
-            if *domain != Domain::Screen && self.screen_occupied() {
+            if *domain != Domain::Screen && self.occupancy.is_occupied(Domain::Screen) {
                 return ToolResult::failure(
                     call.id,
                     "有界面开着，无法移动或与世界交互；先关闭界面再行动",
@@ -99,18 +124,6 @@ impl Dispatcher {
             }
         }
         self.providers[*provider_index].call(call).await
-    }
-
-    fn screen_occupied(&self) -> bool {
-        self.providers
-            .iter()
-            .any(|provider| provider.occupying() == Some(Domain::Screen))
-    }
-
-    fn broadcast_abort(&self) {
-        for provider in &self.providers {
-            provider.on_batch_abort();
-        }
     }
 }
 
@@ -194,6 +207,7 @@ impl<'a> IncrementalToolBatch for IncrementalRun<'a> {
         Box::pin(async move {
             // 执行同步于 submit：凡已提交必已执行，结论全部确定。
             // CancelledBeforeStart 与 OutcomeUnknown 在进程内实现中不可达。
+            // 占用账本不回滚——已执行的开屏是回执里的既成事实，账本保持真实。
             let calls = self
                 .executed
                 .into_iter()
@@ -203,7 +217,6 @@ impl<'a> IncrementalToolBatch for IncrementalRun<'a> {
                     outcome: AbortedToolCallOutcome::Settled(result),
                 })
                 .collect();
-            self.dispatcher.broadcast_abort();
             Ok(AbortedToolBatch {
                 batch_attempt_id: self.start.batch_attempt_id,
                 calls,

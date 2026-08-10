@@ -7,10 +7,10 @@
 use std::sync::Arc;
 
 use agent::{ContentPart, PortFuture, ToolCall, ToolDefinition, ToolResult};
+use dispatch::{Domain, Occupancy, ToolClass};
 use serde_json::{json, Value};
 
 use crate::segment::{plan_lines, MAX_CHAT_UTF16};
-use crate::{OpenScreen, ScreenSlot};
 
 /// 模块一写表面的窄化：一行 = 一次原版输入循环。
 /// 以 `/` 开头的行由实现方路由为命令包（ChatScreen 同语义），其余走聊天包。
@@ -30,14 +30,22 @@ const USAGE: &str = "聊天框用法：{action:\"say\", text} 按行发送，以
 {action:\"open\", describe?} 打开并保持聊天框；{action:\"close\"} 关闭。";
 
 pub struct ChatBox {
-    slot: Arc<ScreenSlot>,
+    occupancy: Arc<Occupancy>,
     door: Arc<dyn ChatDoor>,
     history: Arc<dyn ChatHistory>,
 }
 
 impl ChatBox {
-    pub fn new(slot: Arc<ScreenSlot>, door: Arc<dyn ChatDoor>, history: Arc<dyn ChatHistory>) -> Self {
-        Self { slot, door, history }
+    pub fn new(
+        occupancy: Arc<Occupancy>,
+        door: Arc<dyn ChatDoor>,
+        history: Arc<dyn ChatHistory>,
+    ) -> Self {
+        Self {
+            occupancy,
+            door,
+            history,
+        }
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -95,11 +103,6 @@ impl ChatBox {
         })
     }
 
-    /// 批中断时由编排调用：开着的屏"想了想又算了"，无痕关闭。
-    pub fn on_batch_abort(&self) {
-        self.slot.replace(None);
-    }
-
     async fn say(&self, call_id: agent::ToolCallId, text: Option<&Value>) -> ToolResult {
         let Some(text) = text.and_then(Value::as_str) else {
             return ToolResult::failure(call_id, "say 需要字符串参数 text；请改写调用");
@@ -109,10 +112,10 @@ impl ChatBox {
             Err(reason) => return ToolResult::failure(call_id, reason),
         };
 
-        self.slot.replace(Some(OpenScreen::Chat));
+        self.occupancy.occupy(Domain::Screen);
         for (index, line) in lines.iter().enumerate() {
             if let Err(reason) = self.door.send_chat(line).await {
-                self.slot.replace(None);
+                self.occupancy.release(Domain::Screen);
                 return ToolResult {
                     call_id,
                     status: agent::ToolResultStatus::Error,
@@ -124,7 +127,7 @@ impl ChatBox {
                 };
             }
         }
-        self.slot.replace(None);
+        self.occupancy.release(Domain::Screen);
         ToolResult::success_json(call_id, json!({ "sent_lines": lines.len() }))
     }
 
@@ -132,14 +135,14 @@ impl ChatBox {
         let Some(count) = count.and_then(Value::as_u64).filter(|count| *count > 0) else {
             return ToolResult::failure(call_id, "history 需要正整数参数 count；请改写调用");
         };
-        self.slot.replace(Some(OpenScreen::Chat));
+        self.occupancy.occupy(Domain::Screen);
         let lines = self.history.recent(count as usize);
-        self.slot.replace(None);
+        self.occupancy.release(Domain::Screen);
         ToolResult::success_json(call_id, json!({ "lines": lines }))
     }
 
     fn open(&self, call_id: agent::ToolCallId, describe: Option<&Value>) -> ToolResult {
-        self.slot.replace(Some(OpenScreen::Chat));
+        self.occupancy.occupy(Domain::Screen);
         let mut payload = json!({ "state": "open" });
         if describe.and_then(Value::as_bool) == Some(true) {
             payload["usage"] = Value::String(USAGE.to_owned());
@@ -148,7 +151,7 @@ impl ChatBox {
     }
 
     fn close(&self, call_id: agent::ToolCallId) -> ToolResult {
-        self.slot.replace(None);
+        self.occupancy.release(Domain::Screen);
         ToolResult::success_json(call_id, json!({ "state": "closed" }))
     }
 }
@@ -156,16 +159,16 @@ impl ChatBox {
 // MAX_CHAT_UTF16 出现在工具描述与用法文本里；编译期钉住两处一致。
 const _: () = assert!(MAX_CHAT_UTF16 == 256);
 
-/// 注册进编排的身份：身体类、界面域；屏开着即占域。
+/// 注册进编排的身份：身体类、界面域。
 impl dispatch::ToolProvider for ChatBox {
-    fn tools(&self) -> Vec<(ToolDefinition, dispatch::ToolClass)> {
+    fn tools(&self) -> Vec<(ToolDefinition, ToolClass)> {
         self.definitions()
             .into_iter()
             .map(|definition| {
                 (
                     definition,
-                    dispatch::ToolClass::Body {
-                        domain: dispatch::Domain::Screen,
+                    ToolClass::Body {
+                        domain: Domain::Screen,
                     },
                 )
             })
@@ -174,14 +177,6 @@ impl dispatch::ToolProvider for ChatBox {
 
     fn call<'a>(&'a self, call: ToolCall) -> PortFuture<'a, ToolResult> {
         ChatBox::call(self, call)
-    }
-
-    fn occupying(&self) -> Option<dispatch::Domain> {
-        self.slot.occupied().map(|_| dispatch::Domain::Screen)
-    }
-
-    fn on_batch_abort(&self) {
-        ChatBox::on_batch_abort(self);
     }
 }
 
@@ -196,7 +191,7 @@ mod tests {
     struct RecordingDoor {
         sent: StdMutex<Vec<String>>,
         occupied_at_send: StdMutex<Vec<bool>>,
-        slot: Arc<ScreenSlot>,
+        occupancy: Arc<Occupancy>,
         fail_on_line: Option<usize>,
     }
 
@@ -210,7 +205,7 @@ mod tests {
                 self.occupied_at_send
                     .lock()
                     .unwrap()
-                    .push(self.slot.occupied() == Some(OpenScreen::Chat));
+                    .push(self.occupancy.is_occupied(Domain::Screen));
                 self.sent.lock().unwrap().push(line.to_owned());
                 Ok(())
             })
@@ -228,16 +223,16 @@ mod tests {
 
     struct Fixture {
         chat: ChatBox,
-        slot: Arc<ScreenSlot>,
+        occupancy: Arc<Occupancy>,
         door: Arc<RecordingDoor>,
     }
 
     fn fixture(fail_on_line: Option<usize>) -> Fixture {
-        let slot = Arc::new(ScreenSlot::new());
+        let occupancy = Arc::new(Occupancy::new());
         let door = Arc::new(RecordingDoor {
             sent: StdMutex::new(Vec::new()),
             occupied_at_send: StdMutex::new(Vec::new()),
-            slot: slot.clone(),
+            occupancy: occupancy.clone(),
             fail_on_line,
         });
         let history = Arc::new(FixedHistory(vec![
@@ -245,8 +240,12 @@ mod tests {
             "乙：在吗".to_owned(),
             "丙：走了".to_owned(),
         ]));
-        let chat = ChatBox::new(slot.clone(), door.clone(), history);
-        Fixture { chat, slot, door }
+        let chat = ChatBox::new(occupancy.clone(), door.clone(), history);
+        Fixture {
+            chat,
+            occupancy,
+            door,
+        }
     }
 
     fn call(arguments: Value) -> ToolCall {
@@ -260,8 +259,12 @@ mod tests {
         }
     }
 
+    fn screen_occupied(fixture: &Fixture) -> bool {
+        fixture.occupancy.is_occupied(Domain::Screen)
+    }
+
     #[tokio::test]
-    async fn say_sends_lines_in_order_holds_slot_and_closes_after() {
+    async fn say_sends_lines_in_order_holds_screen_and_releases_after() {
         let fixture = fixture(None);
         let result = fixture
             .chat
@@ -271,13 +274,13 @@ mod tests {
         assert_eq!(result.status, agent::ToolResultStatus::Success);
         assert_eq!(json_payload(&result)["sent_lines"], 2);
         assert_eq!(*fixture.door.sent.lock().unwrap(), vec!["到了", "/help"]);
-        // 发送期间聊天屏占槽，结束后必关。
+        // 发送期间界面域占用，结束后必释放。
         assert_eq!(*fixture.door.occupied_at_send.lock().unwrap(), vec![true, true]);
-        assert_eq!(fixture.slot.occupied(), None);
+        assert!(!screen_occupied(&fixture));
     }
 
     #[tokio::test]
-    async fn say_failure_reports_progress_and_releases_slot() {
+    async fn say_failure_reports_progress_and_releases_screen() {
         let fixture = fixture(Some(1));
         let result = fixture
             .chat
@@ -286,11 +289,11 @@ mod tests {
 
         assert_eq!(result.status, agent::ToolResultStatus::Error);
         assert_eq!(json_payload(&result)["sent_lines"], 1);
-        assert_eq!(fixture.slot.occupied(), None);
+        assert!(!screen_occupied(&fixture));
     }
 
     #[tokio::test]
-    async fn say_rejects_blank_text_without_touching_the_slot() {
+    async fn say_rejects_blank_text_without_touching_occupancy() {
         let fixture = fixture(None);
         let result = fixture
             .chat
@@ -299,11 +302,11 @@ mod tests {
 
         assert_eq!(result.status, agent::ToolResultStatus::Error);
         assert!(fixture.door.sent.lock().unwrap().is_empty());
-        assert_eq!(fixture.slot.occupied(), None);
+        assert!(!screen_occupied(&fixture));
     }
 
     #[tokio::test]
-    async fn open_keeps_the_screen_and_say_still_closes_at_the_end() {
+    async fn open_keeps_the_screen_and_say_still_releases_at_the_end() {
         let fixture = fixture(None);
         let opened = fixture
             .chat
@@ -311,17 +314,17 @@ mod tests {
             .await;
         assert_eq!(json_payload(&opened)["state"], "open");
         assert!(json_payload(&opened)["usage"].as_str().unwrap().contains("聊天框用法"));
-        assert_eq!(fixture.slot.occupied(), Some(OpenScreen::Chat));
+        assert!(screen_occupied(&fixture));
 
         fixture
             .chat
             .call(call(json!({"action": "say", "text": "嗯"})))
             .await;
-        assert_eq!(fixture.slot.occupied(), None);
+        assert!(!screen_occupied(&fixture));
     }
 
     #[tokio::test]
-    async fn history_returns_recent_lines_and_ends_closed() {
+    async fn history_returns_recent_lines_and_ends_released() {
         let fixture = fixture(None);
         fixture.chat.call(call(json!({"action": "open"}))).await;
         let result = fixture
@@ -333,18 +336,18 @@ mod tests {
             json_payload(&result)["lines"],
             json!(["乙：在吗", "丙：走了"])
         );
-        assert_eq!(fixture.slot.occupied(), None);
+        assert!(!screen_occupied(&fixture));
     }
 
     #[tokio::test]
-    async fn close_is_idempotent_and_abort_releases_an_open_screen() {
+    async fn close_is_idempotent() {
         let fixture = fixture(None);
         let closed = fixture.chat.call(call(json!({"action": "close"}))).await;
         assert_eq!(json_payload(&closed)["state"], "closed");
 
         fixture.chat.call(call(json!({"action": "open"}))).await;
-        fixture.chat.on_batch_abort();
-        assert_eq!(fixture.slot.occupied(), None);
+        fixture.chat.call(call(json!({"action": "close"}))).await;
+        assert!(!screen_occupied(&fixture));
     }
 
     #[tokio::test]
