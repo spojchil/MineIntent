@@ -1,0 +1,9 @@
+[package]
+name = "world"
+description = "模块一·原版连接与感知：tick 快照类型与快照源接口（连接机器随后落位）"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
