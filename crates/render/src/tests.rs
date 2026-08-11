@@ -218,3 +218,46 @@ fn wrap_degrees_matches_the_vanilla_half_open_range() {
     assert!(wrap_degrees(f64::NAN).is_nan());
     assert!(wrap_degrees(-0.0).is_sign_positive());
 }
+
+#[test]
+fn job_entries_render_each_outcome_in_world_language() {
+    let entry = |outcome| world::JobEntry {
+        seq: 1,
+        tick: 100,
+        occurred_at: SystemTime::now(),
+        job: world::JobKind::MoveTo {
+            destination: [10, 64, -3],
+        },
+        outcome,
+    };
+    assert_eq!(
+        render_job_entry(&entry(world::JobOutcome::Arrived)),
+        "你到达了目的地 (10, 64, -3)。"
+    );
+    assert!(render_job_entry(&entry(world::JobOutcome::PathEnded)).contains("没能到达"));
+    assert!(render_job_entry(&entry(world::JobOutcome::Stalled)).contains("卡住"));
+    assert_eq!(
+        render_job_entry(&entry(world::JobOutcome::Stopped)),
+        "你停下了移动。"
+    );
+    assert!(render_job_entry(&entry(world::JobOutcome::Replaced)).contains("顶替"));
+}
+
+#[test]
+fn damage_entries_say_the_drop_and_death_without_inventing_causes() {
+    let entry = world::DamageEntry {
+        seq: 2,
+        tick: 100,
+        occurred_at: SystemTime::now(),
+        health_before: 17.0,
+        health_after: 13.5,
+        cause: None,
+    };
+    assert_eq!(render_damage_entry(&entry), "你受到了伤害，生命从 17 降到 13.5。");
+
+    let fatal = world::DamageEntry {
+        health_after: 0.0,
+        ..entry
+    };
+    assert!(render_damage_entry(&fatal).ends_with("你死了。"));
+}

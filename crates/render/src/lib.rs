@@ -306,6 +306,41 @@ pub fn render_directed(projection: &world::DirectedProjection) -> String {
     }
 }
 
+/// 任务变化的通知措辞。哪些值得投递是己的判据，这里只管怎么说。
+pub fn render_job_entry(entry: &world::JobEntry) -> String {
+    let world::JobKind::MoveTo {
+        destination: [x, y, z],
+    } = &entry.job;
+    match entry.outcome {
+        world::JobOutcome::Arrived => format!("你到达了目的地 ({x}, {y}, {z})。"),
+        world::JobOutcome::Replaced => "先前的移动被新的目标顶替了。".to_owned(),
+        world::JobOutcome::Stopped => "你停下了移动。".to_owned(),
+        world::JobOutcome::PathEnded => {
+            format!("你没能到达 ({x}, {y}, {z})——路走到了尽头，目的地过不去。")
+        }
+        world::JobOutcome::Stalled => {
+            format!("你在前往 ({x}, {y}, {z}) 的路上卡住了一阵子，一直没有进展。")
+        }
+    }
+}
+
+/// 受伤的通知措辞。伤因缺席（服务端不给）时不编。
+pub fn render_damage_entry(entry: &world::DamageEntry) -> String {
+    let mut line = format!(
+        "你受到了伤害，生命从 {} 降到 {}",
+        trim_number(f64::from(entry.health_before)),
+        trim_number(f64::from(entry.health_after))
+    );
+    if let Some(cause) = &entry.cause {
+        line.push_str(&format!("（{}）", cause.0));
+    }
+    line.push('。');
+    if entry.health_after <= 0.0 {
+        line.push_str("你死了。");
+    }
+    line
+}
+
 /// 聊天未读数：窗内晚于已读水位的条数。纪元不同则整窗算新。
 pub fn unread_chat_count(snap: &TickSnapshot, chat_read: (u64, u64)) -> usize {
     let (read_epoch, read_tick) = chat_read;

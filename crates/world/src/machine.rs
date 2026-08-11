@@ -1,7 +1,8 @@
 //! 接入模块的连接机器：azalea 客户端的生命周期、tick 快照循环与聊天面。
 //!
 //! v1 范围：重连政策固定 `Never`（断线=Disconnected 相，不换纪元）；
-//! 声音/伤害窗暂空（生产者随后落位）；写口只有聊天（运动/手随后）。
+//! 声音窗暂空（生产者随后落位）。伤害窗每 tick 由生命对比生产；
+//! 移动 job 追踪产出 jobs 窗（到达/顶替/停止/走完未达/卡住）。
 //!
 //! 线程模型：机器独占一个线程（tokio current_thread + LocalSet，azalea 需要），
 //! 对外全部经共享状态交流——快照 latest-wins、聊天出站走队列在 tick 内执行
@@ -35,17 +36,29 @@ use azalea::{
 use azalea::ecs::system::Res;
 use azalea::physics::collision::BlockWithShape;
 use azalea::pathfinder::goals::BlockPosGoal;
-use azalea::pathfinder::PathfinderClientExt;
+use azalea::pathfinder::{ExecutingPath, Pathfinder, PathfinderClientExt};
 use azalea::protocol::packets::game::s_player_action;
 use azalea::{BlockPos, SprintDirection, WalkDirection};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::{oneshot, watch, Notify};
 
 use crate::{
-    ChatContent, ChatEntry, ChatPosition, ConnectionPhase, EntitySnapshot, Epoch, ExperienceState,
-    FactSource, Inventory, InventorySlot, PlayerListEntry, PlayerRef, SelfState, SnapshotSource,
-    TickSnapshot, Vec3Value, Window, WorldMeta, CHAT_WINDOW_LINES,
+    ChatContent, ChatEntry, ChatPosition, ConnectionPhase, DamageEntry, EntitySnapshot, Epoch,
+    ExperienceState, FactSource, Inventory, InventorySlot, JobEntry, JobKind, JobOutcome,
+    PlayerListEntry, PlayerRef, SelfState, SnapshotSource, TickSnapshot, Vec3Value, Window,
+    WorldMeta, CHAT_WINDOW_LINES,
 };
+
+/// 伤害窗条目上限。关注类窗口 ≥ 最长一轮时长；伤害事件稀疏，按条数封顶即可。
+const DAMAGE_WINDOW_ENTRIES: usize = 100;
+/// 任务窗条目上限。
+const JOBS_WINDOW_ENTRIES: usize = 32;
+/// 移动 job 起步宽限：下令后寻路器要过几个调度周期才可见（GotoEvent 是
+/// Bevy 消息，跨 schedule 投递）；宽限内不判终局。
+const MOVEMENT_ARM_GRACE_TICKS: u64 = 100;
+/// 卡住通知阈值：与 azalea 自己的补路超时同量级（它 3–7 秒就会自救，
+/// 超过 10 秒还没推进说明自救也没起色，值得让模型知道）。
+const MOVEMENT_STALL_TICKS: usize = 200;
 
 /// 连接配置。v1 只有离线身份、重连固定 Never。
 #[derive(Clone, Debug)]
@@ -108,11 +121,89 @@ struct PendingCommand {
     ack: oneshot::Sender<Result<(), String>>,
 }
 
+/// 在途的移动任务（单意图槽）。终局判定按 azalea 寻路器的可观察状态：
+/// 成功到达时它把 goal 置 None（execute/mod.rs 目标达成分支）；走完未达时
+/// ExecutingPath 移除但 goal 留 Some。我们自己下的停止/顶替在命令处就地标注。
+struct MovementJob {
+    destination: [i32; 3],
+    started_tick: u64,
+    /// 见过寻路器活动（计算中/执行中/goal 已挂）后才允许判终局，
+    /// 避开 GotoEvent 尚未被调度的起步窗口。
+    armed: bool,
+    /// 卡住通知只发一次。
+    stall_notified: bool,
+}
+
+/// 移动 job 轮询的行动结论（纯函数，可单测）。
+#[derive(Debug, PartialEq, Eq)]
+enum MovementPollStep {
+    /// 保持现状（含宽限期内等待）。
+    Keep,
+    /// 寻路器已可见，进入武装状态。
+    Arm,
+    /// 任务终局：出窗并清槽。
+    End(JobOutcome),
+    /// 卡住通知（任务继续）。
+    Stall,
+}
+
+/// 判定表输入：本 tick 的全部可观察事实。
+/// `goal_some`/`calculating`/`executing` 是寻路器三个状态位；
+/// `at_destination` = 自身所在方块 == 目的地（站在目的地时空路径也算到达）；
+/// `grace_exceeded` = 起步宽限已过；`stalled_long` = 无推进 tick 数超阈值。
+#[derive(Clone, Copy, Debug, Default)]
+struct MovementPoll {
+    armed: bool,
+    goal_some: bool,
+    calculating: bool,
+    executing: bool,
+    at_destination: bool,
+    grace_exceeded: bool,
+    stalled_long: bool,
+    stall_notified: bool,
+}
+
+fn movement_poll_step(poll: MovementPoll) -> MovementPollStep {
+    if !poll.armed {
+        if poll.goal_some || poll.calculating || poll.executing {
+            return MovementPollStep::Arm;
+        }
+        if poll.grace_exceeded {
+            // 出发都没出发（消息丢失等罕见情形）——按走完未达收束，不装作还在走。
+            return MovementPollStep::End(JobOutcome::PathEnded);
+        }
+        return MovementPollStep::Keep;
+    }
+    if !poll.calculating && !poll.executing {
+        if !poll.goal_some {
+            // 只有寻路器的目标达成分支会在无外停时清 goal。
+            return MovementPollStep::End(JobOutcome::Arrived);
+        }
+        // goal 还挂着但执行已停：走完未达（不可达/局部路径尽头）。
+        // 站在目的地上的空路径情形按到达算——goal.success 的判据就是方块相等。
+        return MovementPollStep::End(if poll.at_destination {
+            JobOutcome::Arrived
+        } else {
+            JobOutcome::PathEnded
+        });
+    }
+    if poll.executing && poll.stalled_long && !poll.stall_notified {
+        return MovementPollStep::Stall;
+    }
+    MovementPollStep::Keep
+}
+
 /// 机器与外界的共享面。纯状态转换都在这里，可脱离 azalea 单测。
 pub(crate) struct Inner {
     latest: RwLock<Arc<TickSnapshot>>,
     ticked_tx: watch::Sender<u64>,
     chat_window: Mutex<VecDeque<ChatEntry>>,
+    damage_window: Mutex<VecDeque<DamageEntry>>,
+    jobs_window: Mutex<VecDeque<JobEntry>>,
+    /// 上一 tick 的生命值；下降即产伤害条目。None = 尚无基线（首帧不产）。
+    last_health: Mutex<Option<f64>>,
+    /// 在途移动任务（单意图槽）。
+    movement_job: Mutex<Option<MovementJob>>,
     pending: Mutex<Vec<PendingCommand>>,
     /// 一次性跳跃的复位标记：跳跃布尔保持一整 tick 后放开。
     jump_reset: AtomicBool,
@@ -122,7 +213,9 @@ pub(crate) struct Inner {
     stopping: AtomicBool,
     shutdown: Notify,
     tick: AtomicU64,
-    chat_seq: AtomicU64,
+    /// 全部事实窗共用的单调到达序号（聊天/伤害/任务）：
+    /// 跨窗可比先后，各窗游标互不干扰。
+    fact_seq: AtomicU64,
     day_time: AtomicU64,
     /// (rain_level, thunder_level)。
     weather: Mutex<(f32, f32)>,
@@ -142,13 +235,17 @@ impl Inner {
             ))),
             ticked_tx,
             chat_window: Mutex::new(VecDeque::new()),
+            damage_window: Mutex::new(VecDeque::new()),
+            jobs_window: Mutex::new(VecDeque::new()),
+            last_health: Mutex::new(None),
+            movement_job: Mutex::new(None),
             pending: Mutex::new(Vec::new()),
             jump_reset: AtomicBool::new(false),
             world_handle: Mutex::new(None),
             stopping: AtomicBool::new(false),
             shutdown: Notify::new(),
             tick: AtomicU64::new(0),
-            chat_seq: AtomicU64::new(0),
+            fact_seq: AtomicU64::new(0),
             day_time: AtomicU64::new(0),
             weather: Mutex::new((0.0, 0.0)),
             dimension: Mutex::new("minecraft:overworld".to_owned()),
@@ -168,11 +265,13 @@ impl Inner {
         self.ticked_tx.send_modify(|counter| *counter += 1);
     }
 
-    /// 非就绪相的快照：连接事实 + 聊天窗（窗是机器的记忆，不随相清空）。
+    /// 非就绪相的快照：连接事实 + 各事实窗（窗是机器的记忆，不随相清空）。
     fn publish_phase(&self, phase: ConnectionPhase) {
         let mut snapshot =
             TickSnapshot::empty(EPOCH, self.tick.load(Ordering::Acquire), phase);
         snapshot.chat = self.chat_window_now();
+        snapshot.damage = self.damage_window_now();
+        snapshot.jobs = self.jobs_window_now();
         self.publish(snapshot);
     }
 
@@ -182,9 +281,85 @@ impl Inner {
         }
     }
 
+    fn damage_window_now(&self) -> Window<DamageEntry> {
+        Window {
+            entries: self.damage_window.lock().iter().cloned().collect(),
+        }
+    }
+
+    fn jobs_window_now(&self) -> Window<JobEntry> {
+        Window {
+            entries: self.jobs_window.lock().iter().cloned().collect(),
+        }
+    }
+
+    /// 生命对比产伤害条目。回升（治疗/重生）只更新基线，不产条目。
+    ///
+    /// 由 `ClientboundSetHealth` 包驱动，不做每 tick 采样：自动重生把
+    /// 死亡瞬间的 14→0→20 压进一个 tick 里，采样会整个错过 0（实测发生），
+    /// 而每次 SetHealth 包都是一次权威变化，原版客户端也以它为准。
+    fn track_health(&self, health: f64) {
+        let mut last = self.last_health.lock();
+        let previous = last.replace(health);
+        let Some(previous) = previous else { return };
+        // 阈值挡住浮点噪声；真实伤害最小半颗心（1.0）。
+        if health < previous - 0.01 {
+            let entry = DamageEntry {
+                seq: self.fact_seq.fetch_add(1, Ordering::AcqRel),
+                tick: self.tick.load(Ordering::Acquire),
+                occurred_at: SystemTime::now(),
+                health_before: previous as f32,
+                health_after: health as f32,
+                // SetHealth 不携带伤因；有伤因的事件源落位后再填。
+                cause: None,
+            };
+            let mut window = self.damage_window.lock();
+            window.push_back(entry);
+            while window.len() > DAMAGE_WINDOW_ENTRIES {
+                window.pop_front();
+            }
+        }
+    }
+
+    fn push_job(&self, destination: [i32; 3], outcome: JobOutcome) {
+        let entry = JobEntry {
+            seq: self.fact_seq.fetch_add(1, Ordering::AcqRel),
+            tick: self.tick.load(Ordering::Acquire),
+            occurred_at: SystemTime::now(),
+            job: JobKind::MoveTo { destination },
+            outcome,
+        };
+        let mut window = self.jobs_window.lock();
+        window.push_back(entry);
+        while window.len() > JOBS_WINDOW_ENTRIES {
+            window.pop_front();
+        }
+    }
+
+    /// 移动任务开槽：旧任务被顶替即出窗。
+    fn begin_movement_job(&self, destination: [i32; 3]) {
+        let mut slot = self.movement_job.lock();
+        if let Some(job) = slot.take() {
+            self.push_job(job.destination, JobOutcome::Replaced);
+        }
+        *slot = Some(MovementJob {
+            destination,
+            started_tick: self.tick.load(Ordering::Acquire),
+            armed: false,
+            stall_notified: false,
+        });
+    }
+
+    /// 停止动词：在途任务如实出窗。没任务时不是错误。
+    fn end_movement_job_stopped(&self) {
+        if let Some(job) = self.movement_job.lock().take() {
+            self.push_job(job.destination, JobOutcome::Stopped);
+        }
+    }
+
     fn push_chat(&self, sender: Option<(String, Option<String>)>, plain_text: String) {
         let entry = ChatEntry {
-            seq: self.chat_seq.fetch_add(1, Ordering::AcqRel),
+            seq: self.fact_seq.fetch_add(1, Ordering::AcqRel),
             tick: self.tick.load(Ordering::Acquire),
             occurred_at: SystemTime::now(),
             source: FactSource::ServerObserved,
@@ -586,6 +761,9 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             ClientboundGamePacket::GameEvent(game_event) => {
                 inner.apply_game_event(game_event.event, game_event.param);
             }
+            ClientboundGamePacket::SetHealth(set_health) => {
+                inner.track_health(f64::from(set_health.health));
+            }
             _ => {}
         },
         Event::Disconnect(reason) => {
@@ -608,11 +786,72 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                 let outcome = run_command(inner, &bot, pending_command.command);
                 let _ = pending_command.ack.send(outcome);
             }
+            poll_movement_job(inner, &bot);
             if let Some(snapshot) = assemble_snapshot(inner, &bot) {
                 inner.publish(snapshot);
             }
         }
         _ => {}
+    }
+}
+
+/// 移动 job 每 tick 轮询：读寻路器三个状态位与自身方块位，
+/// 交给纯判定表（`movement_poll_step`），只在这里落副作用。
+fn poll_movement_job(inner: &Inner, bot: &Client) {
+    let mut slot = inner.movement_job.lock();
+    let Some(job) = slot.as_mut() else { return };
+
+    let Ok((pathfinder, stall_ticks, block_pos)) = bot
+        .try_query_self::<(Option<&Pathfinder>, Option<&ExecutingPath>, &Position), _>(
+            |(pathfinder, executing, position)| {
+                (
+                    pathfinder.map(|p| (p.goal.is_some(), p.is_calculating)),
+                    executing.map(|e| e.ticks_since_last_node_reached),
+                    [
+                        position.x.floor() as i32,
+                        position.y.floor() as i32,
+                        position.z.floor() as i32,
+                    ],
+                )
+            },
+        )
+    else {
+        return;
+    };
+    let (goal_some, calculating) = pathfinder.unwrap_or((false, false));
+    let step = movement_poll_step(MovementPoll {
+        armed: job.armed,
+        goal_some,
+        calculating,
+        executing: stall_ticks.is_some(),
+        at_destination: block_pos == job.destination,
+        grace_exceeded: inner
+            .tick
+            .load(Ordering::Acquire)
+            .saturating_sub(job.started_tick)
+            > MOVEMENT_ARM_GRACE_TICKS,
+        stalled_long: stall_ticks.is_some_and(|ticks| ticks > MOVEMENT_STALL_TICKS),
+        stall_notified: job.stall_notified,
+    });
+    match step {
+        MovementPollStep::Keep => {}
+        MovementPollStep::Arm => job.armed = true,
+        MovementPollStep::Stall => {
+            job.stall_notified = true;
+            let destination = job.destination;
+            drop(slot);
+            inner.push_job(destination, JobOutcome::Stalled);
+        }
+        MovementPollStep::End(outcome) => {
+            let job = slot.take().expect("上面刚借到 Some");
+            drop(slot);
+            if outcome == JobOutcome::PathEnded {
+                // goal 还挂在寻路器上（走完未达不清 goal）；清掉僵尸目标，
+                // 避免下次判定被旧 goal 干扰。
+                bot.stop_pathfinding();
+            }
+            inner.push_job(job.destination, outcome);
+        }
     }
 }
 
@@ -681,9 +920,10 @@ fn assemble_snapshot(inner: &Inner, bot: &Client) -> Option<TickSnapshot> {
         entities: capture_entities(bot),
         players: capture_players(bot),
         chat: inner.chat_window_now(),
-        // 声音/伤害窗：生产者未落位，先空。
+        // 声音窗：生产者未落位，先空。
         sounds: Window::default(),
-        damage: Window::default(),
+        damage: inner.damage_window_now(),
+        jobs: inner.jobs_window_now(),
     })
 }
 
@@ -856,10 +1096,12 @@ fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> Result<(), 
             Ok(())
         }
         DoorCommand::GoTo([x, y, z]) => {
+            let destination = [x.floor() as i32, y.floor() as i32, z.floor() as i32];
+            inner.begin_movement_job(destination);
             bot.start_goto(BlockPosGoal(BlockPos::new(
-                x.floor() as i32,
-                y.floor() as i32,
-                z.floor() as i32,
+                destination[0],
+                destination[1],
+                destination[2],
             )));
             Ok(())
         }
@@ -876,10 +1118,12 @@ fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> Result<(), 
                 position.1.floor() as i32,
                 (position.2 + (-yaw.cos()) * blocks).floor() as i32,
             );
+            inner.begin_movement_job([target.x, target.y, target.z]);
             bot.start_goto(BlockPosGoal(target));
             Ok(())
         }
         DoorCommand::StopMoving => {
+            inner.end_movement_job_stopped();
             bot.stop_pathfinding();
             bot.walk(WalkDirection::None);
             Ok(())
@@ -1150,6 +1394,135 @@ mod tests {
         // seq 单调且不随窗口逐出重置：同 tick 多条消息靠它做恰好一次消费。
         assert_eq!(window.entries[0].seq, 50);
         assert_eq!(window.entries[99].seq, 149);
+    }
+
+    #[test]
+    fn health_drop_produces_damage_entry_and_recovery_does_not() {
+        let inner = Inner::new();
+        inner.track_health(20.0); // 基线，不产条目
+        inner.track_health(20.0); // 不变
+        inner.track_health(13.5); // 下降
+        inner.track_health(17.0); // 治疗回升
+        inner.track_health(17.0 - 0.001); // 浮点噪声，不产
+        inner.track_health(0.0); // 致死一击
+
+        let window = inner.damage_window_now();
+        assert_eq!(window.entries.len(), 2);
+        assert_eq!(window.entries[0].health_before, 20.0);
+        assert_eq!(window.entries[0].health_after, 13.5);
+        assert_eq!(window.entries[1].health_after, 0.0);
+        // seq 与聊天同源单调。
+        assert!(window.entries[0].seq < window.entries[1].seq);
+    }
+
+    #[test]
+    fn movement_job_replacement_and_stop_are_recorded() {
+        let inner = Inner::new();
+        inner.begin_movement_job([10, 64, -3]);
+        inner.begin_movement_job([20, 64, 5]); // 顶替
+        inner.end_movement_job_stopped(); // 停止
+        inner.end_movement_job_stopped(); // 没任务时不是事件
+
+        let window = inner.jobs_window_now();
+        let outcomes: Vec<JobOutcome> =
+            window.entries.iter().map(|entry| entry.outcome).collect();
+        assert_eq!(outcomes, vec![JobOutcome::Replaced, JobOutcome::Stopped]);
+        assert_eq!(
+            window.entries[0].job,
+            JobKind::MoveTo {
+                destination: [10, 64, -3]
+            }
+        );
+    }
+
+    /// 判定表全景：armed 前后各态的行动结论。
+    #[test]
+    fn movement_poll_step_covers_the_observable_states() {
+        use MovementPollStep as Step;
+        let poll = MovementPoll::default;
+        // 起步宽限内：寻路器不可见→等待；可见→武装。
+        assert_eq!(movement_poll_step(poll()), Step::Keep);
+        assert_eq!(
+            movement_poll_step(MovementPoll {
+                calculating: true,
+                ..poll()
+            }),
+            Step::Arm
+        );
+        assert_eq!(
+            movement_poll_step(MovementPoll {
+                goal_some: true,
+                ..poll()
+            }),
+            Step::Arm
+        );
+        // 宽限耗尽还没起步：按走完未达收束。
+        assert_eq!(
+            movement_poll_step(MovementPoll {
+                grace_exceeded: true,
+                ..poll()
+            }),
+            Step::End(JobOutcome::PathEnded)
+        );
+        // 武装后：goal 清空且不在算不在走 = 寻路器宣告到达。
+        assert_eq!(
+            movement_poll_step(MovementPoll {
+                armed: true,
+                ..poll()
+            }),
+            Step::End(JobOutcome::Arrived)
+        );
+        // goal 还挂着但停了：不在目的地=走完未达；在目的地=空路径到达。
+        assert_eq!(
+            movement_poll_step(MovementPoll {
+                armed: true,
+                goal_some: true,
+                ..poll()
+            }),
+            Step::End(JobOutcome::PathEnded)
+        );
+        assert_eq!(
+            movement_poll_step(MovementPoll {
+                armed: true,
+                goal_some: true,
+                at_destination: true,
+                ..poll()
+            }),
+            Step::End(JobOutcome::Arrived)
+        );
+        // 执行中：正常走→保持；久无推进→通知一次，此后沉默。
+        let walking = MovementPoll {
+            armed: true,
+            goal_some: true,
+            executing: true,
+            ..poll()
+        };
+        assert_eq!(movement_poll_step(walking), Step::Keep);
+        assert_eq!(
+            movement_poll_step(MovementPoll {
+                stalled_long: true,
+                ..walking
+            }),
+            Step::Stall
+        );
+        assert_eq!(
+            movement_poll_step(MovementPoll {
+                stalled_long: true,
+                stall_notified: true,
+                ..walking
+            }),
+            Step::Keep
+        );
+        // 重算中（部分路径续算）不是终局。
+        assert_eq!(
+            movement_poll_step(MovementPoll {
+                armed: true,
+                goal_some: true,
+                calculating: true,
+                ..poll()
+            }),
+            Step::Keep
+        );
     }
 
     #[test]

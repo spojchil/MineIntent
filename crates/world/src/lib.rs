@@ -79,6 +79,7 @@ impl TickSnapshot {
             chat: Window::default(),
             sounds: Window::default(),
             damage: Window::default(),
+            jobs: Window::default(),
         }
     }
 }
@@ -105,9 +106,11 @@ pub struct TickSnapshot {
     // ── 时间窗：原版客户端本来就养、azalea 不给的 ──────────────
     pub chat: Window<ChatEntry>,
     pub sounds: Window<SoundEntry>,
-    /// ⚠ 拟含，随关注清单（唤醒判据）裁定收尾。
     /// 尺寸约束与 chat 同理：关注类窗口 ≥ 最长一轮时长，不得抄声音的 60 tick。
     pub damage: Window<DamageEntry>,
+    /// 后台任务（寻路等）的变化事实。窗装全部事件（顶替/停止也是事实）；
+    /// 哪些值得唤醒是己的第二个判据，不在这里裁。
+    pub jobs: Window<JobEntry>,
 }
 
 /// 世界环境的直译。呈现（时段文案、"下大雨"）归渲染层。
@@ -215,11 +218,46 @@ pub struct DamageCause(pub String);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DamageEntry {
+    /// 与 ChatEntry.seq 同源的单调到达序号；恰好一次消费用它做游标。
+    pub seq: u64,
     pub tick: u64,
     pub occurred_at: Timestamp,
     pub health_before: f32,
     pub health_after: f32,
     pub cause: Option<DamageCause>,
+}
+
+/// 后台任务变化的事实条目。
+#[derive(Clone, Debug, PartialEq)]
+pub struct JobEntry {
+    /// 与 ChatEntry.seq 同源的单调到达序号。
+    pub seq: u64,
+    pub tick: u64,
+    pub occurred_at: Timestamp,
+    pub job: JobKind,
+    pub outcome: JobOutcome,
+}
+
+/// 任务身份。v1 只有移动；挖掘等持续任务随后加入。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JobKind {
+    /// 寻路移动（go_to 与 forward 共用——forward 化归为寻路目标）。
+    MoveTo { destination: [i32; 3] },
+}
+
+/// 任务变化。Stalled 不是终局：任务还在跑，只是值得知道。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JobOutcome {
+    /// 寻路器宣告目标达成。
+    Arrived,
+    /// 被新的移动意图顶替（单意图槽语义）。
+    Replaced,
+    /// 被 stop 动词停下。
+    Stopped,
+    /// 路走到了尽头但目标未达成（不可达、局部路径尽头）。
+    PathEnded,
+    /// 卡住：较长时间没有推进（寻路器还在自救，任务未结束）。
+    Stalled,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

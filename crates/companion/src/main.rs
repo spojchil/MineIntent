@@ -254,11 +254,16 @@ async fn main() -> Result<(), String> {
         SessionConfig::default(),
     ));
 
-    // ---- 最小唤醒脚手架：别人对我说话就醒 ----
-    // 游标用聊天 seq（单调、同 tick 多条也不漏）；启动前的旧聊天不消费。
+    // ---- 最小唤醒脚手架：别人对我说话、受伤、移动任务有果就醒 ----
+    // 游标用事实 seq（单调、同 tick 多条也不漏）；启动前的旧事实不消费。
+    // 窗装全部事件，投什么由这里的判据挑：顶替/停止是模型自己下的令，不吵它。
     let own_key = snapshots.latest().self_state.entity_key.clone();
-    let mut chat_cursor: Option<u64> = snapshots.latest().chat.entries.last().map(|entry| entry.seq);
-    println!("[组合根] 开始倾听聊天（Ctrl+C 停机）");
+    let boot = snapshots.latest();
+    let mut chat_cursor: Option<u64> = boot.chat.entries.last().map(|entry| entry.seq);
+    let mut damage_cursor: Option<u64> = boot.damage.entries.last().map(|entry| entry.seq);
+    let mut job_cursor: Option<u64> = boot.jobs.entries.last().map(|entry| entry.seq);
+    drop(boot);
+    println!("[组合根] 开始倾听聊天与通知（Ctrl+C 停机）");
     loop {
         tokio::select! {
             _ = module.ticked() => {
@@ -280,6 +285,28 @@ async fn main() -> Result<(), String> {
                         continue;
                     }
                     fresh.push(format!("{}: {}", sender.username, entry.content.plain_text));
+                }
+                for entry in &snapshot.damage.entries {
+                    if damage_cursor.is_some_and(|seen| entry.seq <= seen) {
+                        continue;
+                    }
+                    damage_cursor = Some(entry.seq);
+                    fresh.push(render::render_damage_entry(entry));
+                }
+                for entry in &snapshot.jobs.entries {
+                    if job_cursor.is_some_and(|seen| entry.seq <= seen) {
+                        continue;
+                    }
+                    job_cursor = Some(entry.seq);
+                    // 到达/走不到/卡住值得醒；顶替与停止是模型自己的动作回声。
+                    if matches!(
+                        entry.outcome,
+                        world::JobOutcome::Arrived
+                            | world::JobOutcome::PathEnded
+                            | world::JobOutcome::Stalled
+                    ) {
+                        fresh.push(render::render_job_entry(entry));
+                    }
                 }
                 if fresh.is_empty() {
                     continue;

@@ -949,6 +949,7 @@ dependencies = [
  "memory",
  "motion",
  "perception",
+ "render",
  "screens",
  "tokio",
  "world",
