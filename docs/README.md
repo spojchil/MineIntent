@@ -5,15 +5,11 @@
 | 任务 | 阅读路径 |
 |---|---|
 | 判断产品方向 | [产品](./产品.md)；若文字不清楚或彼此冲突，询问维护者 |
-| 运行当前代码 | [运行指南](./guides/run.md) |
+| 构建与运行 | [workspace 指南](./guides/rust-workspace.md) |
 | 检查、测试或验证 | [验证指南](./guides/validation.md) |
 | 理解当前实现 | [当前实现结构](./architecture.md)，再阅读其中链接的代码产生方 |
 | 追溯历史 | [历史来源与旧路径迁移表](./history/index.md)，再进入不可变 commit、Issue 或 PR |
 | 了解原版客户端能力范围（P04 参考） | [Minecraft Java 客户端能力全景](./minecraft-client-capability-panorama.md) |
-| 构建或运行 Rust 移植 | [Rust workspace 指南](./guides/rust-workspace.md) |
-| 了解 Rust 树当前的欠账与复杂处 | [Rust 分支代码梳理](./rust-code-audit.md) |
-| 重梳架构 / 查模块真实接口 | [模块接口清单：被消费的表面](./module-interfaces.md) |
-| 了解删掉 panic 捕获后的真实崩溃形态 | [实盘观测](./no-panic-live-run.md) |
 | 动后台 job / 事件通道 / 自身受伤前 | [后台 job 模型：讨论记录与前置调查](./background-job-design-notes.md) |
 | 裁决「空闲时什么该唤醒同伴」 | [唤醒判据：裁决材料](./wake-criterion-decision.md) |
 | 准备贡献 | [贡献流程](../CONTRIBUTING.md) |
@@ -24,15 +20,12 @@
 |---|---|---|
 | [`产品.md`](./产品.md) | 产品判断与由其导出的候选架构 | 以文件内每条文字的状态为准 |
 | 带“提案接受”标签的 GitHub Issue | 已接受提案入口 | 是否具有同等权威，以 `产品.md` 的 G03 状态为准 |
-| [`docs/architecture.md`](./architecture.md) | 绑定到指定版本的当前实现说明 | 无 |
-| [`docs/guides/run.md`](./guides/run.md) | 安装、配置、运行和排障 | 无 |
+| [`docs/architecture.md`](./architecture.md) | 绑定到指定分支的当前实现说明 | 无 |
 | [`docs/guides/validation.md`](./guides/validation.md) | 检查、测试和验证边界 | 无 |
-| [`docs/guides/rust-workspace.md`](./guides/rust-workspace.md) | Rust 移植的构建、运行、环境变量与开发者模式 | 无 |
+| [`docs/guides/rust-workspace.md`](./guides/rust-workspace.md) | 构建、运行、配置与已知越界 | 无 |
 | [`docs/history/index.md`](./history/index.md) | 历史证据和旧路径导航 | 无 |
 | [`docs/minecraft-client-capability-panorama.md`](./minecraft-client-capability-panorama.md) | 原版客户端能力调研基线（26.1.2/775），P04 的参考材料 | 无 |
-| [`docs/rust-code-audit.md`](./rust-code-audit.md) | Rust 树的代码梳理：重复、死代码、复杂处，以及与产品条目的可核对差距 | 无 |
-| [`docs/module-interfaces.md`](./module-interfaces.md) | 每条 crate 边界上实际被消费的类型与函数，与名义 pub 的差距 | 无 |
-| [`docs/no-panic-live-run.md`](./no-panic-live-run.md) | 删空 panic 捕获后的四轮实盘观测与栈证据 | 无 |
+| [`docs/history/`](./history/) | 已删实现的说明、审计与实盘证据；正文不复制回活文档 | 无 |
 | [`docs/background-job-design-notes.md`](./background-job-design-notes.md) | 后台 job 模型的讨论记录、azalea 能力调查与待决清单 | 无 |
 | [`docs/wake-criterion-decision.md`](./wake-criterion-decision.md) | 唤醒判据的现状、封闭候选集、约束与互斥选项，供维护者裁决 | 无 |
 | [`README.md`](../README.md) | 项目导航和最短启动 | 无 |

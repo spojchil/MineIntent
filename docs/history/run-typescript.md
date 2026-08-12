@@ -1,5 +1,9 @@
 # 运行当前原型
 
+> **历史文档。** TypeScript 原型的安装与运行。那套代码在本分支已删除，仍保留在 `main`。
+> Rust 侧的构建与运行见 [workspace 指南](../guides/rust-workspace.md)。
+
+
 > 本页只描述当前代码怎样安装、配置和运行，不定义产品。当前实现结构和已知偏差见
 > [架构说明](../architecture.md)。
 
@@ -141,4 +145,4 @@ JVM 与内存设置在 `mcserver/mc-config.json`。不要把最大内存设为�
 
 ### 下一步
 
-运行自动化或 Paper 检查见[验证指南](./validation.md)。
+运行自动化或 Paper 检查见[验证指南](../guides/validation.md)。

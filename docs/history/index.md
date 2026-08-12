@@ -77,8 +77,8 @@
 | [`docs/architecture/minecraft-backend.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/architecture/minecraft-backend.md) | 当前事实看[架构页](../architecture.md)，旧设计看快照 |
 | [`docs/architecture/target-system.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/architecture/target-system.md) | 产品看[产品](../产品.md)，实现看[架构页](../architecture.md) |
 | [`docs/architecture/ui-context.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/architecture/ui-context.md) | 当前事实看[架构页](../architecture.md)，旧设计看快照 |
-| [`docs/current-status.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/current-status.md) | [当前实现结构](../architecture.md)与[运行指南](../guides/run.md) |
-| [`docs/guides/model-interface.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/guides/model-interface.md) | 模型边界看[架构页](../architecture.md)，配置看[运行指南](../guides/run.md) |
+| [`docs/current-status.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/current-status.md) | [当前实现结构](../architecture.md)与[运行指南](./run-typescript.md) |
+| [`docs/guides/model-interface.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/guides/model-interface.md) | 模型边界看[架构页](../architecture.md)，配置看[运行指南](./run-typescript.md) |
 | [`docs/decisions/0001-use-mineflayer-as-initial-backend.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/decisions/0001-use-mineflayer-as-initial-backend.md) | 当前事实看[架构页](../architecture.md)，旧理由看快照 |
 | [`docs/decisions/0002-event-driven-companion-runtime.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/decisions/0002-event-driven-companion-runtime.md) | 当前事实看[架构页](../architecture.md)，旧理由看快照 |
 | [`docs/decisions/0003-separate-mind-and-action-runtime.md`](https://github.com/spojchil/MineIntent/blob/46bcd4d28630421a4199f0857b973818f1569f92/docs/decisions/0003-separate-mind-and-action-runtime.md) | 当前事实看[架构页](../architecture.md)，旧理由看快照 |
@@ -127,9 +127,9 @@
 |---|---|---|
 | `PRODUCT_CONSTITUTION.md` | [`产品.md`](../产品.md) | [`fac8c654` 原文](https://github.com/spojchil/MineIntent/blob/fac8c654b223ce429659c655cf703b1eefc2953a/PRODUCT_CONSTITUTION.md) |
 | `docs/source-index.md` | 本页 | [`fac8c654` 原文](https://github.com/spojchil/MineIntent/blob/fac8c654b223ce429659c655cf703b1eefc2953a/docs/source-index.md) |
-| `docs/guides/companion-prototype.md` | [`docs/guides/run.md`](../guides/run.md) | [`fac8c654` 原文](https://github.com/spojchil/MineIntent/blob/fac8c654b223ce429659c655cf703b1eefc2953a/docs/guides/companion-prototype.md) |
+| `docs/guides/companion-prototype.md` | [`docs/guides/run.md`](./run-typescript.md) | [`fac8c654` 原文](https://github.com/spojchil/MineIntent/blob/fac8c654b223ce429659c655cf703b1eefc2953a/docs/guides/companion-prototype.md) |
 | `docs/guides/paper-integration.md` | [`docs/guides/validation.md`](../guides/validation.md) | [`fac8c654` 原文](https://github.com/spojchil/MineIntent/blob/fac8c654b223ce429659c655cf703b1eefc2953a/docs/guides/paper-integration.md) |
-| `src/companion/` | [`src/participant/`](../../src/participant/) | [`e2d1f89` 原路径](https://github.com/spojchil/MineIntent/tree/e2d1f89/src/companion) |
+| `src/companion/` | [`src/participant/`](https://github.com/spojchil/MineIntent/blob/main/src/participant/) | [`e2d1f89` 原路径](https://github.com/spojchil/MineIntent/tree/e2d1f89/src/companion) |
 | `产品.md`（仓库根） | [`docs/产品.md`](../产品.md) | [`e37ffe7` 原路径](https://github.com/spojchil/MineIntent/blob/e37ffe7/产品.md) |
 | `产品待澄清问题.md` | 已移出仓库（转维护者本地 `*.local.*` 文件；2026-07-31 基线整体确认后仅余历史价值） | [`e37ffe7` 原文](https://github.com/spojchil/MineIntent/blob/e37ffe7/产品待澄清问题.md) |
 | 施工仓库 `MineIntent-backend-rs`（本地） | [`crates/`](../../crates/) | 完整施工历史（含 60+ 份施工过程文档、逐切片进度日志、决策台账与中期更新）保留在本仓库的 [`archive/rust-port-wip`](https://github.com/spojchil/MineIntent/tree/archive/rust-port-wip) 分支；该分支与 `main` 无共同祖先，只作证据查阅，不合并 |

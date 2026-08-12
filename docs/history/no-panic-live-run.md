@@ -1,5 +1,9 @@
 # 删掉全部 panic 捕获之后的实盘观测
 
+> **历史文档。** 本文的四轮实盘跑的是旧栈（`mineintent-app`），那套代码已删除。
+> 它记录的崩溃形态与结论仍是 panic 处置规则的证据来源。
+
+
 > 分支：`experiment/no-panic-live`（= Rust 树尖 `refactor/collapse-concurrency`
 > + 云端实验 `bf32aac` + 本次删掉最后 8 处）。
 >

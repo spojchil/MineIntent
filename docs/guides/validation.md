@@ -1,124 +1,76 @@
 # 验证当前实现
 
-> 本页说明每项检查能提供什么证据，以及它不能证明什么。验证结果不产生产品权威。
+> 本页说明每项检查能提供什么证据，以及**它不能证明什么**。验证结果不产生产品权威。
+>
+> TypeScript 原型的验证方式（pnpm / Paper 集成工作流）随那条线留在 `main`，
+> 说明见[历史](../history/run-typescript.md)。
 
 ## 快速检查
 
 ```sh
-corepack pnpm check
-corepack pnpm check:docs
-corepack pnpm test
-corepack pnpm test:agent
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets --no-fail-fast
 ```
 
-如果 `test:agent` 使用的 `python` 命令不可用，可以直接运行：
-
-```sh
-python3 -m unittest discover -s agent-service -p 'test_*.py'
-```
-
-| 命令 | 覆盖范围 | 不证明什么 |
+| 命令 | 覆盖范围 | **不证明什么** |
 |---|---|---|
-| `corepack pnpm check` | TypeScript 类型检查 | 运行行为正确 |
-| `corepack pnpm check:docs` | Markdown 本地链接、越界链接和旧仓库名检查 | 文档内容准确、完整或仍然新鲜 |
-| `corepack pnpm test` | Node/TypeScript 单元与契约测试 | 真实 Minecraft 或模型体验 |
-| `corepack pnpm test:agent` | Python Agent Service 单元测试 | 真实供应商兼容性或游戏闭环 |
+| `cargo fmt --all --check` | 格式一致 | 任何行为 |
+| `cargo clippy … -D warnings` | 静态检查，无整体放行的 lint | 逻辑正确 |
+| `cargo test --workspace` | 单元与契约测试 | 真实 Minecraft 或真实模型下的行为 |
 
-这些检查都不会启动 Minecraft。
+**这些检查都不会启动 Minecraft，也不会调用真实模型。**
 
-## 隔离的 Paper 集成测试
-
-`test:paper:ci` 会复制专用模板，在临时世界副本中运行，然后删除副本。它仍具有破坏性前置动作；模板必须是
-专用于测试、允许被完整删除的目录，不得有未授权玩家在线。
-
-### 覆盖范围
-
-当前场景验证：
-
-- Minecraft Backend 连接、死亡、重生和服务端重启后的重连。
-- 独立 Mineflayer 测试 Bot 的移动，以及清除控制状态后的停止。
-- 测试 Bot 挖掘、方块消失和物品进入背包。
-- 超时、清理、隔离副本和诊断 artifact。
-
-它不启动 Python Agent Service，不调用真实模型，也不验证聊天、关系、记忆或当前模型工具循环。
-
-### 本地运行
-
-POSIX shell：
+### 内核必须能脱离 azalea 构建
 
 ```sh
-MC_JAVA=/path/to/java \
-MC_SERVER_JAR=/path/to/paper.jar \
-MC_SERVER_TEMPLATE=/path/to/disposable-template \
-MC_EULA=true \
-corepack pnpm test:paper:ci
+cargo test -p agent --all-targets                    # 零项目依赖的循环内核
+cargo test -p world --all-targets                    # 不开 azalea feature：纯类型层
+cargo test -p render -p context -p dispatch          # 纯函数与策略层
 ```
 
-PowerShell：
+`world` 的 `azalea` feature 关掉时不拖 bevy 编译；`Inner` 的状态转换测试
+（`machine/state.rs`）与移动判定表（`machine/movement.rs`）都能脱离 azalea 跑。
+这不是可选项——它是「纯状态转换可单测」这条设计的验收方式。
 
-```powershell
-$env:MC_JAVA = 'C:\path\to\java.exe'
-$env:MC_SERVER_JAR = 'C:\path\to\paper.jar'
-$env:MC_SERVER_TEMPLATE = 'C:\path\to\disposable-template'
-$env:MC_EULA = 'true'
-corepack pnpm test:paper:ci
-```
+## 真实模型端点冒烟
 
-可选变量包括 `MC_PORT`、`MC_USERNAME` 和 `MC_ARTIFACTS_DIR`。运行副本默认位于
-`.artifacts/paper/<runId>/server`。
-
-如果 `MC_SERVER_TEMPLATE` 中没有 `world/level.dat`，初始化流程会递归删除该模板目录后重新生成基准世界。
-绝不能把它指向重要世界、仓库或通用服务器目录，也不要使用硬链接复制 region 文件。
-
-## 旧 Windows 直连测试
-
-```powershell
-corepack pnpm test:paper
-```
-
-这条路径直接调用 `mcserver/mc.ps1`，只支持 Windows，并直接修改 `mcserver/` 管理的当前世界：它会清除测试 Bot、
-传送维度并重启服务端。只能在一次性或已备份的世界中使用，最好无人在线。
-
-可用 `MC_HOST`、`MC_PORT`、`MC_USERNAME` 和 `MC_OBSERVER_USERNAMES` 调整连接。检测到不在
-`MC_OBSERVER_USERNAMES` 中的玩家时，测试会拒绝继续。无论测试前服务端是否运行，清理完成后服务端都会保持运行。
-
-## GitHub Actions
-
-`Paper Integration` 是手动触发的工作流，互斥运行且单次上限 15 分钟：
+`agent` 的 `protocol-smoke` 用**同一套场景**打三个真实服务商入口，验证三套 wire
+协议行为一致。需要密钥，不进 CI。
 
 ```sh
-gh workflow run "Paper Integration"
-gh run watch
+export MODEL_API_KEY="$(cat /path/to/key)"
+export MODEL_NAME=... MODEL_CHAT_ENDPOINT=... MODEL_RESPONSES_ENDPOINT=... MODEL_ANTHROPIC_ENDPOINT=...
+cargo run -p agent --example protocol_smoke --features all-adapters
 ```
 
-它要求带以下标签的 self-hosted runner：
+它证明协议适配器能与真实端点往返；**不证明**同伴在游戏里的行为。
 
-```text
-self-hosted, Linux, ARM64, mineintent, paper-ci
+## 纵向验收
+
+`scripts/gate-b-vertical.sh` 跑 Paper 实服 + 全栈 + 假人作说话方。
+
+```sh
+MINEINTENT_ACCEPT_EULA=true ./scripts/gate-b-vertical.sh
 ```
 
-仓库 Actions Variables：
+⚠ **脚本绝不代替使用者同意 Mojang 条款**——`MINEINTENT_ACCEPT_EULA` 必须由
+运行者自己设置，这是有意的。
 
-| 名称 | 用途 |
-|---|---|
-| `PAPER_CI_NODE_BIN` | Node 与 pnpm 所在目录 |
-| `PAPER_CI_NPM_REGISTRY` | runner 使用的 npm registry |
-| `PAPER_CI_JAVA` | Java 21 可执行文件 |
-| `PAPER_CI_JAR` | Paper 1.21.1 JAR |
-| `PAPER_CI_TEMPLATE` | 专用、可删除的基准世界目录 |
-
-运行摘要、JSONL 和服务端日志作为 artifact 保留 14 天；世界运行副本在清理阶段删除。
+> 该脚本写于旧栈时期，接的是已删除的 `mineintent-app`。**当前不可用**，
+> 需按 `companion` 的配置重写后才能再作为验收手段。
 
 ## 当前尚缺的验证
 
-当前没有可重复的“当前 Agent + 真实模型 + Paper”纵向验收。绿色 Paper workflow 不能被描述为产品闭环已经通过。
+1. **纵向验收脚本失效**（见上）。当前只有手工实盘：进服 / 对话 / `remember`
+   落盘 / 重启记忆延续 / 受伤唤醒 / 死亡复活后应答 / `go_to` 到达汇报，
+   逐条记在提交说明里，没有可重复的脚本。
+2. **`companion` 零测试**。380 行组合根里有唤醒重试、自激防护（按 UUID 比对）
+   与聊天游标——纵切逻辑没有任何自动覆盖。
+3. **观测面未经生产使用**。`agent` 的 `Observer` / `StreamObserver`
+   在本仓库零处接线，只有单元测试走过。
 
-未来的纵向验证至少应保存：
-
-- 每次模型请求收到的消息列表；
-- 工具调用；
-- 工具处理后采样的观察；
-- 失败与清理结果；
-- 使用的代码提交和模型标识。
+未来的纵向验证至少应保存：每次模型请求的消息列表、工具调用、调用后采样的
+观察、失败与清理结果、使用的提交与模型标识。
 
 保存或分享证据前必须脱敏密钥、私人聊天、模型 reasoning 和世界数据。

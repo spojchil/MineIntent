@@ -52,7 +52,7 @@ pub fn stop_sound(&mut self, _p: &ClientboundStopSound) {}      // :1587
 
 ### 2.3 死锁：是 azalea 的缺陷，上游未修
 
-见[实盘观测](./no-panic-live-run.md) §2。结论：
+见[实盘观测](./history/no-panic-live-run.md) §2。结论：
 `swarm/builder.rs:555` 取 ECS 写锁，`:560` / `:580` 在该作用域内调 `username()`
 取同一把 `parking_lot::RwLock` 的读锁——不可重入，当场自锁。上游 `6249c29` 一字未改。
 
@@ -137,7 +137,7 @@ opencode：`shell` 同步带超时，`task` 异步。
 
 推论：动作工具变 job 之后只是入队、必然很快，**「1 tick」的瓶颈自始至终只有 `view`**。
 `visible_blocks` 最坏扫 65×65×41 ≈ 17 万体素、每个体素还要射线
-（见[代码梳理](./rust-code-audit.md) §8.3）。所以先测它——结果在 §4.5。
+（见[代码梳理](./history/rust-code-audit.md) §8.3）。所以先测它——结果在 §4.5。
 
 ### 4.5 测了：单次 `view` 是 30~38 ms，一刻是 50 ms
 

@@ -8,8 +8,7 @@ MineIntent 是一个把 AI 接入 Minecraft Java Edition 世界的实验项目�
 | 你要做什么 | 从这里开始 |
 |---|---|
 | 判断项目为什么存在、应当成为什么 | [产品](./docs/产品.md) |
-| 运行当前原型 | [运行指南](./docs/guides/run.md) |
-| 构建或运行 Rust 移植（进行中） | [Rust workspace 指南](./docs/guides/rust-workspace.md) |
+| 构建与运行 | [workspace 指南](./docs/guides/rust-workspace.md) |
 | 运行检查或 Paper 集成验证 | [验证指南](./docs/guides/validation.md) |
 | 理解当前代码如何组成 | [当前实现结构](./docs/architecture.md) |
 | 贡献代码或文档 | [贡献流程](./CONTRIBUTING.md) |
@@ -18,30 +17,28 @@ MineIntent 是一个把 AI 接入 Minecraft Java Edition 世界的实验项目�
 
 ## 最短启动
 
-需要 Node.js 22+、Corepack、Python 3.9+、可连接的 Minecraft Java 1.21.1 服务器，以及支持标准工具调用的
-OpenAI-compatible Chat Completions 模型接口。
+需要 Rust nightly 工具链（`rust-toolchain.toml` 已钉，azalea 的 bevy 依赖要求）、
+可连接的 **Paper 26.1.2**（协议 775）服务器，以及一个 OpenAI 兼容的模型接口。
 
 ```sh
-corepack pnpm install --frozen-lockfile
-cp .env.example .env
+export MINEINTENT_MODEL_API_KEY_FILE=/path/to/api-key   # 密钥只走文件路径
+cargo run -p companion
 ```
 
-编辑 `.env` 后，在两个终端分别运行：
+默认连 `127.0.0.1:25565`，用户名 `companion`。`Ctrl+C` 停机。
+完整配置、模型接入与已知越界见 [workspace 指南](./docs/guides/rust-workspace.md)。
 
-```sh
-python3 agent-service/server.py
-```
+## 两条平行的线
 
-```sh
-corepack pnpm start
-```
+本仓库有两条**从未合并**的实现线：
 
-Windows PowerShell 可用 `Copy-Item .env.example .env` 代替 `cp`。配置、敏感数据和排障说明见
-[运行指南](./docs/guides/run.md)。
+| 线 | 在哪 | 状态 |
+|---|---|---|
+| **Rust 单进程**（本分支） | `crates/`，`companion` 是唯一可执行 | 目标 Paper 26.1.2 |
+| **TypeScript + Python 原型** | `main` 分支 | 目标 MC 1.21.1，移植期的行为 oracle |
 
-> 仓库里另有一套进行中的全 Rust 单进程实现（`crates/`，目标 Paper 26.1.2）。
-> 它尚未接管运行，上面的启动方式仍是当前可用的原型；
-> Rust 侧的构建与运行见 [Rust workspace 指南](./docs/guides/rust-workspace.md)。
+TS 原型的说明与运行方式移入了
+[历史](./docs/history/architecture-typescript.md)——代码本身仍完整保留在 `main`。
 
 ## 许可证
 

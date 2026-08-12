@@ -1,118 +1,106 @@
-# MineIntent Rust workspace（MC 26.1）
+# workspace 指南（MC 26.1）
 
 MineIntent 的全 Rust 单进程实现。目标服务端 **Paper 26.1.2 / 协议号 775**。
+结构见[架构说明](../architecture.md)。
 
 | crate | 职责 |
 |---|---|
-| [`crates/contracts`](../../crates/contracts) | Agent、capability、Information 与 Minecraft backend 的严格进程内契约与 wire DTO |
-| [`crates/backend`](../../crates/backend) | 自有协议后端：连接生命周期、命令与观察、full/directed 视口原子投影（[为什么依赖 fork](../../crates/backend/README.md)） |
-| [`crates/middle`](../../crates/middle) | Agent 循环、capability registry 与派发、Information provider、记忆、语音、Participant runtime |
-| [`crates/app`](../../crates/app) | 组合根：装配上述三层与模型 provider，产出可执行的 `mineintent` |
+| [`crates/world`](../../crates/world) | 接入 azalea、tick 快照、视口内核、方块读取 |
+| [`crates/render`](../../crates/render) | 快照 → 模型可读文字（全纯函数） |
+| [`crates/perception`](../../crates/perception) | 主动看：`scan` |
+| [`crates/screens`](../../crates/screens) | 界面互斥域：`chat_box` |
+| [`crates/motion`](../../crates/motion) / [`hand`](../../crates/hand) | 位移朝向 / 攻挖用 |
+| [`crates/memory`](../../crates/memory) | 单文件长期记忆：`remember` |
+| [`crates/context`](../../crates/context) | 提示装配与压缩策略 |
+| [`crates/dispatch`](../../crates/dispatch) | 工具编排与互斥域账本 |
+| [`crates/agent`](../../crates/agent) | 模型—工具循环内核（零项目依赖，镜像 [toolturn](https://github.com/spojchil/toolturn)） |
+| [`crates/companion`](../../crates/companion) | 组合根，唯一可执行 |
 
 ## 构建与运行
 
 ```bash
 cargo build --workspace
 cargo test --workspace --all-targets
+cargo run -p companion
 ```
+
+**工具链**：`rust-toolchain.toml` 钉 nightly，理由是 azalea 0.16 及其 bevy
+依赖需要 nightly 特性。除 `world` 之外的 crate 本身不需要——`agent` 在
+stable 上就能构建（toolturn 仓库的 CI 跑的就是 stable）。
 
 ## 配置
 
-优先级从高到低：**环境变量 → `.env` → `mineintent.toml` → 内置默认**。
-形状参考生态惯例（如 atuin：TOML 文件叠加带前缀的环境变量）。
-
-`mineintent.toml`（工作目录下，或用 `MINEINTENT_CONFIG` 指定路径）：
-
-```toml
-[minecraft]
-host = "127.0.0.1"
-port = 25565
-username = "MineIntentBot"
-world_id = "local-world"
-
-[model]
-provider = "responses"          # scripted = 确定性假模型
-# 密钥只放路径，不放密钥本身
-api_key_file = "/path/to/api-key"
-# endpoint = "https://api.deepseek.com/responses"
-# model = "deepseek-v4-flash"
-# reasoning_effort = "none"     # none | low | medium | high
-```
-
-对应的环境变量（覆盖文件值）：
+全部走环境变量。**密钥只从文件路径读**，不进命令行、不进日志。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `MINEINTENT_MC_HOST` / `MINEINTENT_MC_PORT` | `127.0.0.1` / `25565` | 目标服务器 |
-| `MINEINTENT_MC_USERNAME` | `MineIntentBot` | 离线身份（本版本只支持 offline） |
-| `MINEINTENT_WORLD_ID` | `local-world` | 世界标识，进入 scope 与 journal |
-| `MINEINTENT_DATA_DIR` | `.mineintent` | 记忆、journal 与调试产物目录 |
-| `MINEINTENT_MODEL` | `scripted` | `scripted` 或 `responses` |
-| `MINEINTENT_MODEL_API_KEY` / `_FILE` | 无 | 密钥本身，或密钥文件路径 |
-| `MINEINTENT_MODEL_ENDPOINT` / `_NAME` / `_REASONING_EFFORT` | 见上 | 覆盖模型接入参数 |
-| `MINEINTENT_CONFIG` | `./mineintent.toml` | 配置文件路径 |
-| `MINEINTENT_DEBUG` | 关 | 见下节 |
-| `MINEINTENT_LOG` / `RUST_LOG` | 见下节 | 分级日志过滤器（EnvFilter 语法） |
-| `MINEINTENT_MAX_RUNTIME_SECS` | 无 | 到时按正常停机路径退出，供无人值守验收 |
-
-**密钥只从环境变量或文件路径读，不从配置文件读**——配置文件是要进版本库的。
-
-启动：
+| `MINEINTENT_HOST` / `MINEINTENT_PORT` | `127.0.0.1` / `25565` | 目标服务器 |
+| `MINEINTENT_USERNAME` | `companion` | 离线身份（本版本只支持 offline） |
+| `MINEINTENT_MEMORY_FILE` | `companion-memory.md` | 长期记忆文件 |
+| `MINEINTENT_PERSONA_FILE` | 内置占位 | 人设全文；Q01 未裁前是占位文本 |
+| `MINEINTENT_MODEL_API_KEY_FILE` | 无 | **推荐**：密钥文件路径 |
+| `MODEL_API_KEY` | 无 | 退路：密钥本身（会进 shell 历史，不推荐） |
+| `MODEL_ENDPOINT` | DeepSeek chat/completions | 完整 endpoint，含协议路径 |
+| `MODEL_NAME` | `deepseek-chat` | 模型名 |
 
 ```bash
-cargo run -p mineintent-app --bin mineintent
+MINEINTENT_MODEL_API_KEY_FILE=/path/to/key cargo run -p companion
 ```
+
+`Ctrl+C` 停机：先收尾会话（30 秒上限），再停世界。
 
 ## 模型接入
 
-provider 按**协议形状**分层，不按供应商：`crates/app/src/model/responses.rs`
-对接 OpenAI 系的 `/responses` 协议，DeepSeek 只是当前用这个形状的一家，
-换供应商改配置即可。chat/completions 形状已随 `deepseek-chat` 退役一并移除。
+按**协议形状**分层，不按供应商。`agent` 的 adapters 提供三套：
 
-provider 内部把 Responses 的 `instructions + input[]` / `output[]` 与
-Agent 状态机认的 `message { content, tool_calls }` 互转，
-因此新增供应商不会波及上层。
+| feature | 协议 |
+|---|---|
+| `openai` | OpenAI Chat Completions + Responses |
+| `anthropic` | Anthropic Messages |
+| `all-adapters` | 以上全部 |
 
-## 开发者模式
+组合根当前用 `Protocol::openai_chat()`，DeepSeek 只是当前用这个形状的一家。
+远端默认要求 HTTPS（明文只自动放行 loopback），wire 日志默认关闭，
+开启后只记 body、从不记 header。
 
-`MINEINTENT_DEBUG=1` 打开后，数据目录下会出现：
-
-- `dev.log`：装配、生命周期心跳、每轮模型请求与响应摘要、故障流；
-- `model-io/`：每轮模型请求与响应的**原文**。
-
-它与 journal 分工不同：journal 是产品事实的持久记录（有 schema、要迁移），
-dev.log 是排障用的过程记录，不承诺格式稳定，默认关闭。排障先看它。
-
-## 分级日志
-
-排障输出走 `tracing`，写 stderr，用 `MINEINTENT_LOG`（其次 `RUST_LOG`）过滤，
-标准 EnvFilter 语法：
+三套协议的一致性由 `agent` 的 `protocol-smoke` 示例打真实端点验证：
 
 ```bash
-MINEINTENT_LOG="warn,mineintent_middle=debug" cargo run -p mineintent-app
+cargo run -p agent --example protocol_smoke --features all-adapters
 ```
 
-默认 `warn` 加本项目三个 crate 到 `info`——azalea/bevy 在 debug 级别每 tick
-都有输出，默认放开会淹掉要看的东西。
+## 唤醒
 
-**它和 journal 是两条不同的通道**：日志按 severity 分级、可丢弃、格式不承诺
-稳定；journal 按事实类型定名、有 schema、要迁移（OTel OTEP-0202 对 events 与
-logs 的区分同理）。所以高频的队列摄入量不进 journal，只按类型计数，停机时
-在日志里出一条总账。
+当前是**脚手架**，不是判据：组合根只做「别人对我说话就醒」，外加受伤与
+移动任务终局。正式判据未裁，材料在[唤醒判据](../wake-criterion-decision.md)。
+
+游标用单调 `seq` 而非 tick——同一游戏刻内可能有多条事实，要「恰好一次」
+消费必须用 seq。启动前的历史存量不消费。
 
 ## 事实来源边界
 
-- `commanded`：后端主动发出的聊天、视角、移动与停止动作。
-- `client_predicted`：Azalea 客户端物理采样与 Tick 快照，**不当作服务端事实**。
-- `server_observed`：服务端协议事件（含筛选后的位置修正包）与 Spawn/Death 边界快照。
+`FactSource` 三分：
 
-快照事件的 `source` 只约束该次事件内的事实边界：Tick 快照里的本地姿态可能是预测值，
-必须结合来源读取。死亡不会自动重生——重生是同伴自己的 `respawn` 工具调用；
-自动重连与资源包接受保持关闭，均须上层明确决定。
+- `Commanded`：我们下令产生的；
+- `ClientPredicted`：客户端本地推导/配音，**不当作服务端事实**；
+- `ServerObserved`：服务端明示。
+
+伤害窗由 `ClientboundSetHealth` 包驱动，不做每 tick 采样——自动重生会把
+死亡瞬间的 `14→0→20` 压进一个 tick，采样会整个错过 0（实测发生）。
+
+v1 保留 azalea 的自动重生（没有任何复活路径时死亡即永久）；
+自动重连与资源包接受保持关闭。
 
 ## 视口
 
-`visibleBlocks` 是 `[BlockInfo, x, y, z]` 整数体素并按距离排序；`BlockInfo` 无视觉属性时
-是方块名字符串，有属性时是名称加白名单属性的对象。`visibleEntities` 最近优先、有限并带
-`truncated`。未加载方块让相关可见性射线保守失败，不会被当作空气。`directed` 最多接收
-16 个唯一世界坐标，逐坐标返回 seen 或闭合的 unseen 原因。
+`scan` 不带参数是环视当前朝向的整个视野（视锥 + 遮挡）；带 `at` 是定向确认
+指定坐标，最多 16 个唯一坐标，逐坐标返回可见或闭合的不可见原因。
+
+未加载方块让相关可见性射线**保守失败**，不会被当作空气。
+
+投影是纯 CPU 重活，组合根放 `spawn_blocking`，不占异步线程。
+
+## 已知越界
+
+寻路器在**整个已加载世界模型**上做 A\*，隐含泄露同伴未看见地形的可通行性，
+越过视口纪律。收敛方案随高级移动打磨裁定。

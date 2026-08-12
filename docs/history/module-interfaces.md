@@ -1,5 +1,9 @@
 # 模块接口清单：被消费的表面
 
+> **历史文档。** 本文清点的是旧栈五个 crate 边界上被消费的表面，那些 crate 已删除。
+> 结论里仍成立的一条是方法本身：**`pub` 声明在本仓库不可信**，要看实际被谁消费。
+
+
 > 无产品权威。绑定分支 `experiment/no-panic-live`（提取自 `ebd463c` 后的工作树，
 > 2026-08-08）。结构变化时按 `AGENTS.md` 约定更新或标为历史。
 >
@@ -154,7 +158,7 @@ app 无库出口（`main.rs` + `bin/fake_player.rs` 两个可执行）。它的�
 | `contracts` V3/V4 | 两代协议类型 | 活的只有 V2 | 同上 |
 | `backend::{viewport,snapshot,runtime,protocol}` 的 pub | crate 外可见 | 仅 crate 内 + tests + example 消费 | 若维持 facade 是唯一门，可收窄为 `pub(crate)`，让编译器守住 §2 的结论 |
 | `ParticipantRuntime::*_for_test` ×5 | 与生产方法同一 pub 面 | 仅测试 | `#[cfg(test)]` 或 feature 门 |
-| 四层事件队列 | 每层各有 pub 面 | 一条事件穿四层（[代码梳理](./rust-code-audit.md) §3） | job 模型改造顺手拆环（[job 讨论](./background-job-design-notes.md) §4.3） |
+| 四层事件队列 | 每层各有 pub 面 | 一条事件穿四层（[代码梳理](./rust-code-audit.md) §3） | job 模型改造顺手拆环（[job 讨论](../background-job-design-notes.md) §4.3） |
 
 ## 7. 一句话读法
 
