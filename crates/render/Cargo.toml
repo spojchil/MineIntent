@@ -8,3 +8,6 @@ publish = false
 
 [dependencies]
 world = { path = "../world" }
+
+[lints]
+workspace = true

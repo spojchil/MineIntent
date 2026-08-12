@@ -52,11 +52,17 @@ impl Occupancy {
     }
 
     pub fn release(&self, domain: Domain) {
-        self.occupied.lock().expect("占用账本锁中毒").remove(&domain);
+        self.occupied
+            .lock()
+            .expect("占用账本锁中毒")
+            .remove(&domain);
     }
 
     pub fn is_occupied(&self, domain: Domain) -> bool {
-        self.occupied.lock().expect("占用账本锁中毒").contains(&domain)
+        self.occupied
+            .lock()
+            .expect("占用账本锁中毒")
+            .contains(&domain)
     }
 }
 
@@ -96,7 +102,10 @@ impl Dispatcher {
         let mut routes = HashMap::new();
         for (index, provider) in providers.iter().enumerate() {
             for (definition, class) in provider.tools() {
-                if routes.insert(definition.name.clone(), (index, class)).is_some() {
+                if routes
+                    .insert(definition.name.clone(), (index, class))
+                    .is_some()
+                {
                     return Err(RegistrationError {
                         summary: format!("工具名重复注册：{}", definition.name.as_str()),
                     });
@@ -114,7 +123,10 @@ impl Dispatcher {
         let Some((provider_index, class)) = self.routes.get(&call.name) else {
             return ToolResult::failure(
                 call.id,
-                format!("没有名为 {} 的工具；请改用工具列表中的名字", call.name.as_str()),
+                format!(
+                    "没有名为 {} 的工具；请改用工具列表中的名字",
+                    call.name.as_str()
+                ),
             );
         };
 
@@ -195,7 +207,11 @@ impl<'a> IncrementalToolBatch for IncrementalRun<'a> {
         Self: 'b,
     {
         Box::pin(async move {
-            let results = self.executed.into_iter().map(|(_, result)| result).collect();
+            let results = self
+                .executed
+                .into_iter()
+                .map(|(_, result)| result)
+                .collect();
             Ok(ToolResultBatch { results })
         })
     }

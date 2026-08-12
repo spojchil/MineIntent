@@ -112,10 +112,9 @@ impl HandTools {
             }
         };
         match outcome {
-            Ok(()) => ToolResult::success_json(
-                call_id,
-                json!({ "accepted": action.unwrap_or_default() }),
-            ),
+            Ok(()) => {
+                ToolResult::success_json(call_id, json!({ "accepted": action.unwrap_or_default() }))
+            }
             Err(reason) => ToolResult::failure(call_id, reason),
         }
     }
@@ -127,10 +126,7 @@ fn read_block(value: Option<&Value>) -> Result<[i32; 3], String> {
         .map(|array| array.iter().filter_map(Value::as_i64).collect());
     match coords {
         Some(coords)
-            if coords.len() == 3
-                && coords
-                    .iter()
-                    .all(|axis| i32::try_from(*axis).is_ok()) =>
+            if coords.len() == 3 && coords.iter().all(|axis| i32::try_from(*axis).is_ok()) =>
         {
             Ok([coords[0] as i32, coords[1] as i32, coords[2] as i32])
         }

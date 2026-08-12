@@ -38,11 +38,17 @@ fn describe(menu: &azalea::inventory::Menu, index: usize) -> String {
     }
 }
 
-async fn handle(bot: Client, event: Event, state: ProbeState) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn handle(
+    bot: Client,
+    event: Event,
+    state: ProbeState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Event::Tick = event {
         let tick = state.ticks.fetch_add(1, Ordering::AcqRel) + 1;
         let armed_now = state.clicked_at.load(Ordering::Acquire);
-        if tick % 100 == 0 || (armed_now != 0 && tick + 10 >= armed_now && tick <= armed_now + 10) {
+        if tick.is_multiple_of(100)
+            || (armed_now != 0 && tick + 10 >= armed_now && tick <= armed_now + 10)
+        {
             let menu = bot.menu();
             println!(
                 "[tick {tick}] 格10={} | 格20={} | 格36(快捷0)={}",

@@ -88,7 +88,10 @@ impl ContextStrategy {
         let situation = self.situation.as_ref()?;
         let snapshot = situation.snapshots.latest();
         let text = render::render_situation(&snapshot, situation.chat_read.position());
-        Some(InputMessage::text("system", format!("【当前处境】\n{text}")))
+        Some(InputMessage::text(
+            "system",
+            format!("【当前处境】\n{text}"),
+        ))
     }
 
     /// 从模型回复里取出压缩结论。返回 None = 这次压缩作废（原样保留对话）。
@@ -142,9 +145,7 @@ impl Compaction for ContextStrategy {
             )
             .into()];
             transcript.extend(conversation.iter().cloned());
-            transcript.push(
-                InputMessage::text("user", "请按上面的规则输出压缩 JSON。").into(),
-            );
+            transcript.push(InputMessage::text("user", "请按上面的规则输出压缩 JSON。").into());
 
             let Ok(response) = model
                 .complete(ModelRequest {
@@ -237,10 +238,14 @@ mod tests {
         let strategy = ContextStrategy::new("人设", memory.clone());
 
         memory.write("第一轮的记忆").unwrap();
-        assert!(text_of(&strategy.base_context()[1]).1.contains("第一轮的记忆"));
+        assert!(text_of(&strategy.base_context()[1])
+            .1
+            .contains("第一轮的记忆"));
 
         std::fs::write(dir.join("memory.md"), "维护者手改的记忆").unwrap();
-        assert!(text_of(&strategy.base_context()[1]).1.contains("维护者手改的记忆"));
+        assert!(text_of(&strategy.base_context()[1])
+            .1
+            .contains("维护者手改的记忆"));
     }
 
     #[test]

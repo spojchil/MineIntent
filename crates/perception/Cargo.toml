@@ -15,3 +15,6 @@ world = { path = "../world" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

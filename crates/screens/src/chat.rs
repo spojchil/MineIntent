@@ -7,9 +7,9 @@
 use std::sync::{Arc, Mutex as StdMutex};
 
 use agent::{ContentPart, PortFuture, ToolCall, ToolDefinition, ToolResult};
-use world::SnapshotSource;
 use dispatch::{Domain, Occupancy, ToolClass};
 use serde_json::{json, Value};
+use world::SnapshotSource;
 
 use crate::segment::{plan_lines, MAX_CHAT_UTF16};
 
@@ -108,8 +108,7 @@ impl ChatBox {
             }),
         );
         definition.description = Some(
-            "聊天框。说话、执行命令、翻聊天记录都在这里；打开期间无法移动或与世界交互。"
-                .to_owned(),
+            "聊天框。说话、执行命令、翻聊天记录都在这里；打开期间无法移动或与世界交互。".to_owned(),
         );
         vec![definition]
     }
@@ -330,7 +329,10 @@ mod tests {
         assert_eq!(json_payload(&result)["sent_lines"], 2);
         assert_eq!(*fixture.door.sent.lock().unwrap(), vec!["到了", "/help"]);
         // 发送期间界面域占用，结束后必释放。
-        assert_eq!(*fixture.door.occupied_at_send.lock().unwrap(), vec![true, true]);
+        assert_eq!(
+            *fixture.door.occupied_at_send.lock().unwrap(),
+            vec![true, true]
+        );
         assert!(!screen_occupied(&fixture));
     }
 
@@ -368,7 +370,10 @@ mod tests {
             .call(call(json!({"action": "open", "describe": true})))
             .await;
         assert_eq!(json_payload(&opened)["state"], "open");
-        assert!(json_payload(&opened)["usage"].as_str().unwrap().contains("聊天框用法"));
+        assert!(json_payload(&opened)["usage"]
+            .as_str()
+            .unwrap()
+            .contains("聊天框用法"));
         assert!(screen_occupied(&fixture));
 
         fixture

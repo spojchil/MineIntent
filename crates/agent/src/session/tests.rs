@@ -427,6 +427,103 @@ impl ToolRuntime for GatedBatchRuntime {
     }
 }
 
+/// 永不收敛的模型：每次都只发一个工具调用，运行因此永远不会走到 `Done`。
+#[derive(Default)]
+struct NeverSettlingModel {
+    requests: AtomicUsize,
+}
+
+impl Model for NeverSettlingModel {
+    fn complete<'a>(
+        &'a self,
+        _request: ModelRequest,
+    ) -> PortFuture<'a, Result<ModelResponse, AgentError>> {
+        Box::pin(async move {
+            let index = self.requests.fetch_add(1, Ordering::SeqCst);
+            Ok(model_response(ModelOutput::calls(vec![ToolCall::new(
+                format!("call-{index}"),
+                "read",
+                json!({}),
+            )])))
+        })
+    }
+}
+
+/// 立即成功的工具运行时：把「循环不收敛」这件事单独暴露出来。
+struct ImmediateRuntime;
+
+impl ToolRuntime for ImmediateRuntime {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition::new(
+            "read",
+            json!({"type": "object", "additionalProperties": true}),
+        )]
+    }
+
+    fn dispatch<'a>(
+        &'a self,
+        batch: ToolCallBatch,
+    ) -> PortFuture<'a, Result<ToolResultBatch, AgentError>> {
+        Box::pin(async move {
+            Ok(ToolResultBatch {
+                results: batch
+                    .calls
+                    .iter()
+                    .map(|call| ToolResult::success_json(call.id.clone(), json!({})))
+                    .collect(),
+            })
+        })
+    }
+}
+
+/// 每轮都发工具调用的模型会让运行无限继续；上限在请求发出**之前**拦住它。
+///
+/// 上下文长度不构成兜底：`Compaction` 的存在意义就是让对话永远停在阈值以下，
+/// 所以「撞窗口然后报错」这条自然刹车在本内核里不会发生。
+#[tokio::test]
+async fn model_request_limit_stops_a_run_that_never_settles() {
+    let model = Arc::new(NeverSettlingModel::default());
+    let session = Arc::new(AgentSession::new(
+        Arc::new(StaticPrompt),
+        Arc::new(ImmediateRuntime),
+        Arc::new(NoCompaction),
+        model.clone(),
+        SessionConfig {
+            max_model_requests_per_run: Some(3),
+            ..SessionConfig::default()
+        },
+    ));
+
+    let outcome = session
+        .start_if_idle(vec![input("user", "go")])
+        .await
+        .unwrap();
+
+    match outcome {
+        TurnOutcome::Failed { error, .. } => {
+            assert_eq!(error.kind, AgentErrorKind::InvalidState);
+            assert_eq!(error.summary, "model_request_limit_exceeded");
+        }
+        other => panic!("期望 Failed，得到 {other:?}"),
+    }
+    // 恰好三次：第四次在发出之前被拦住。
+    assert_eq!(model.requests.load(Ordering::SeqCst), 3);
+}
+
+/// `None` 表示显式放弃上限；内核不替应用做这个决定。
+#[tokio::test]
+async fn model_request_limit_can_be_disabled() {
+    let config = SessionConfig {
+        max_model_requests_per_run: None,
+        ..SessionConfig::default()
+    };
+    assert!(config.max_model_requests_per_run.is_none());
+    assert_eq!(
+        SessionConfig::default().max_model_requests_per_run,
+        Some(32)
+    );
+}
+
 #[derive(Default)]
 struct FailingBatchRuntime {
     dispatches: AtomicUsize,
@@ -2262,8 +2359,40 @@ impl StreamObserver for PanicObserveStreamObserver {
     }
 }
 
+/// 计数型 observer：既统计被调次数，也在指定次数之后 panic。
+struct CountingPanicObserver {
+    enabled_calls: AtomicUsize,
+    observe_calls: AtomicUsize,
+    panic_on_observe: bool,
+}
+
+impl CountingPanicObserver {
+    fn new(panic_on_observe: bool) -> Self {
+        Self {
+            enabled_calls: AtomicUsize::new(0),
+            observe_calls: AtomicUsize::new(0),
+            panic_on_observe,
+        }
+    }
+}
+
+impl Observer for CountingPanicObserver {
+    fn enabled(&self, _metadata: EventMetadata) -> bool {
+        self.enabled_calls.fetch_add(1, Ordering::SeqCst);
+        if !self.panic_on_observe {
+            panic!("enabled panic")
+        }
+        true
+    }
+
+    fn observe(&self, _event: &AgentEvent) {
+        self.observe_calls.fetch_add(1, Ordering::SeqCst);
+        panic!("observe panic")
+    }
+}
+
 #[test]
-fn observer_filter_and_writer_panics_are_isolated_and_build_is_lazy() {
+fn observer_filter_panic_is_isolated_and_build_stays_lazy() {
     let mut fixture = fixture();
     let session = Arc::get_mut(&mut fixture.session).unwrap();
     session.observer = Arc::new(PanicEnabledObserver);
@@ -2275,18 +2404,32 @@ fn observer_filter_and_writer_panics_are_isolated_and_build_is_lazy() {
             run_id: RunId::new("run-test"),
         }
     });
+    // `enabled` panic 不得让惰性构造被求值——事件载荷可能很贵，也可能含敏感内容。
     assert!(!built.load(Ordering::SeqCst));
+}
 
+#[test]
+fn observer_writer_panic_is_isolated_after_build() {
+    let mut fixture = fixture();
+    let session = Arc::get_mut(&mut fixture.session).unwrap();
     session.observer = Arc::new(PanicObserveObserver);
+    let built = AtomicBool::new(false);
     session.emit_lazy(EventKind::RunStopped.metadata(), || {
         built.store(true, Ordering::SeqCst);
         AgentEvent::RunStopped {
-            sequence: 2,
+            sequence: 1,
             run_id: RunId::new("run-test"),
         }
     });
     assert!(built.load(Ordering::SeqCst));
+}
 
+#[test]
+fn stream_observer_panics_are_isolated() {
+    // 每个 panic 实现各用一个 session：panic 会置毒，同一 session 上换实现
+    // 只会被跳过（见 `a_panicking_observer_is_poisoned_and_never_called_again`）。
+    let mut enabled_fixture = fixture();
+    let session = Arc::get_mut(&mut enabled_fixture.session).unwrap();
     session.stream_observer = Arc::new(PanicEnabledStreamObserver);
     session.emit_stream_delta(
         &RunId::new("run-stream"),
@@ -2296,6 +2439,9 @@ fn observer_filter_and_writer_panics_are_isolated_and_build_is_lazy() {
             delta: "sensitive".to_owned(),
         },
     );
+
+    let mut observe_fixture = fixture();
+    let session = Arc::get_mut(&mut observe_fixture.session).unwrap();
     session.stream_observer = Arc::new(PanicObserveStreamObserver);
     session.emit_stream_terminal(
         &RunId::new("run-stream"),
@@ -2304,6 +2450,36 @@ fn observer_filter_and_writer_panics_are_isolated_and_build_is_lazy() {
             error_kind: AgentErrorKind::Model,
         },
     );
+}
+
+/// 一个 panic 过的观测实现此后不再被调用。
+///
+/// 不置毒并不会更安全：同一个坏实现会在每个事件上重犯，把 stderr 淹掉
+/// （`catch_unwind` 不抑制 panic 输出），并让每个事件白付一次 unwind。
+#[test]
+fn a_panicking_observer_is_poisoned_and_never_called_again() {
+    for panic_on_observe in [false, true] {
+        let observer = Arc::new(CountingPanicObserver::new(panic_on_observe));
+        let mut poison_fixture = fixture();
+        let session = Arc::get_mut(&mut poison_fixture.session).unwrap();
+        session.observer = observer.clone();
+
+        for sequence in 1..=5 {
+            session.emit_lazy(EventKind::RunStopped.metadata(), || {
+                AgentEvent::RunStopped {
+                    sequence,
+                    run_id: RunId::new("run-test"),
+                }
+            });
+        }
+
+        // 第一次调用就 panic 并置毒，其后四次连 enabled 都不问。
+        assert_eq!(observer.enabled_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            observer.observe_calls.load(Ordering::SeqCst),
+            usize::from(panic_on_observe)
+        );
+    }
 }
 
 #[derive(Default)]

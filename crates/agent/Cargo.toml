@@ -31,3 +31,6 @@ name = "protocol_smoke"
 path = "examples/protocol-smoke/main.rs"
 test = true
 required-features = ["all-adapters"]
+
+[lints]
+workspace = true

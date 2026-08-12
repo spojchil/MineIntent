@@ -274,12 +274,36 @@ enum RayOutcome {
 }
 
 const FACE_NORMALS: [Point3; 6] = [
-    Point3 { x: 1.0, y: 0.0, z: 0.0 },
-    Point3 { x: -1.0, y: 0.0, z: 0.0 },
-    Point3 { x: 0.0, y: 1.0, z: 0.0 },
-    Point3 { x: 0.0, y: -1.0, z: 0.0 },
-    Point3 { x: 0.0, y: 0.0, z: 1.0 },
-    Point3 { x: 0.0, y: 0.0, z: -1.0 },
+    Point3 {
+        x: 1.0,
+        y: 0.0,
+        z: 0.0,
+    },
+    Point3 {
+        x: -1.0,
+        y: 0.0,
+        z: 0.0,
+    },
+    Point3 {
+        x: 0.0,
+        y: 1.0,
+        z: 0.0,
+    },
+    Point3 {
+        x: 0.0,
+        y: -1.0,
+        z: 0.0,
+    },
+    Point3 {
+        x: 0.0,
+        y: 0.0,
+        z: 1.0,
+    },
+    Point3 {
+        x: 0.0,
+        y: 0.0,
+        z: -1.0,
+    },
 ];
 
 // ---- 定向投影结果 ----
@@ -375,9 +399,7 @@ pub struct DirectedProjection {
 impl DirectedProjection {
     pub fn validate(&self) -> Result<(), String> {
         if self.seen.len().saturating_add(self.unseen.len()) > MAX_DIRECTED_VIEW_POSITIONS {
-            return Err(format!(
-                "定向结果最多 {MAX_DIRECTED_VIEW_POSITIONS} 个位置"
-            ));
+            return Err(format!("定向结果最多 {MAX_DIRECTED_VIEW_POSITIONS} 个位置"));
         }
         let mut coordinates = std::collections::HashSet::new();
         for item in &self.seen {
@@ -406,7 +428,11 @@ pub fn validate_directed_positions(positions: &[[i32; 3]]) -> Result<(), String>
         ));
     }
     let mut unique = std::collections::HashSet::with_capacity(positions.len());
-    if positions.iter().copied().all(|position| unique.insert(position)) {
+    if positions
+        .iter()
+        .copied()
+        .all(|position| unique.insert(position))
+    {
         Ok(())
     } else {
         Err("定向观察位置不得重复".to_owned())
@@ -480,8 +506,10 @@ where
     };
     let axes = view_axes(pose.yaw, pose.pitch);
     let standing_on_block = standing_on_block(&mut reader, pose, &mut checkpoint)?;
-    let looked_at_block = raycast_looked_at_block(&mut reader, eye, pose, options, &mut checkpoint)?;
-    let visible_entities = visible_entities(&mut reader, entities, eye, axes, options, &mut checkpoint)?;
+    let looked_at_block =
+        raycast_looked_at_block(&mut reader, eye, pose, options, &mut checkpoint)?;
+    let visible_entities =
+        visible_entities(&mut reader, entities, eye, axes, options, &mut checkpoint)?;
     let visible_blocks = visible_blocks(&mut reader, pose, eye, axes, options, &mut checkpoint)?;
 
     Ok(ViewportProjection {
@@ -1395,14 +1423,46 @@ fn box_intersects_frustum(
 fn box_corners(bounds: AxisAlignedBox) -> [Point3; 8] {
     let AxisAlignedBox { min, max } = bounds;
     [
-        Point3 { x: min.x, y: min.y, z: min.z },
-        Point3 { x: min.x, y: min.y, z: max.z },
-        Point3 { x: min.x, y: max.y, z: min.z },
-        Point3 { x: min.x, y: max.y, z: max.z },
-        Point3 { x: max.x, y: min.y, z: min.z },
-        Point3 { x: max.x, y: min.y, z: max.z },
-        Point3 { x: max.x, y: max.y, z: min.z },
-        Point3 { x: max.x, y: max.y, z: max.z },
+        Point3 {
+            x: min.x,
+            y: min.y,
+            z: min.z,
+        },
+        Point3 {
+            x: min.x,
+            y: min.y,
+            z: max.z,
+        },
+        Point3 {
+            x: min.x,
+            y: max.y,
+            z: min.z,
+        },
+        Point3 {
+            x: min.x,
+            y: max.y,
+            z: max.z,
+        },
+        Point3 {
+            x: max.x,
+            y: min.y,
+            z: min.z,
+        },
+        Point3 {
+            x: max.x,
+            y: min.y,
+            z: max.z,
+        },
+        Point3 {
+            x: max.x,
+            y: max.y,
+            z: min.z,
+        },
+        Point3 {
+            x: max.x,
+            y: max.y,
+            z: max.z,
+        },
     ]
 }
 

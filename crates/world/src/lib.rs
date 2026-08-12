@@ -132,9 +132,13 @@ pub enum ConnectionPhase {
     Connecting,
     Ready,
     /// 断线如实：原因原文保留。重连成功 = 新纪元的新快照，不是本状态消失。
-    Disconnected { reason: String },
+    Disconnected {
+        reason: String,
+    },
     /// stop 之后的终态。
-    Stopped { reason: String },
+    Stopped {
+        reason: String,
+    },
 }
 
 /// 时间窗。条目按 tick 升序；逐出 = 各自的原版常量，无其他政策。

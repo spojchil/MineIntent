@@ -132,7 +132,10 @@ fn nearby_lists_players_individually_and_aggregates_same_type_mobs() {
     ];
 
     let text = render_nearby(&snap);
-    assert_eq!(text, "附近：玩家 Alice（3 格·北）；zombie ×2（最近 6 格·东）。");
+    assert_eq!(
+        text,
+        "附近：玩家 Alice（3 格·北）；zombie ×2（最近 6 格·东）。"
+    );
 }
 
 #[test]
@@ -152,7 +155,10 @@ fn unread_chat_counts_entries_after_the_mark_and_resets_across_epochs() {
 
     let text = render_situation(&snap, (1, 80));
     assert!(text.contains("聊天有 1 条新消息。"), "{text}");
-    assert!(!render_situation(&snap, (1, 95)).contains("聊天"), "清零后不提聊天");
+    assert!(
+        !render_situation(&snap, (1, 95)).contains("聊天"),
+        "清零后不提聊天"
+    );
 }
 
 #[test]
@@ -253,7 +259,10 @@ fn damage_entries_say_the_drop_and_death_without_inventing_causes() {
         health_after: 13.5,
         cause: None,
     };
-    assert_eq!(render_damage_entry(&entry), "你受到了伤害，生命从 17 降到 13.5。");
+    assert_eq!(
+        render_damage_entry(&entry),
+        "你受到了伤害，生命从 17 降到 13.5。"
+    );
 
     let fatal = world::DamageEntry {
         health_after: 0.0,

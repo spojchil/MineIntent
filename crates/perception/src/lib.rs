@@ -38,11 +38,12 @@ impl PerceptionTools {
         };
         match arguments.get("at") {
             None => match self.door.scan().await {
-                Ok(projection) => {
-                    ToolResult::success(call_id, vec![agent::ContentPart::text(
-                        render::render_viewport(&projection),
-                    )])
-                }
+                Ok(projection) => ToolResult::success(
+                    call_id,
+                    vec![agent::ContentPart::text(render::render_viewport(
+                        &projection,
+                    ))],
+                ),
                 Err(reason) => ToolResult::failure(call_id, reason),
             },
             Some(at) => {
@@ -184,7 +185,11 @@ mod tests {
         let ok = tools.call(call(json!({"at": [[1, 64, -3]]}))).await;
         assert_eq!(ok.status, ToolResultStatus::Success);
 
-        for bad in [json!({"at": []}), json!({"at": [[1, 2]]}), json!({"at": "x"})] {
+        for bad in [
+            json!({"at": []}),
+            json!({"at": [[1, 2]]}),
+            json!({"at": "x"}),
+        ] {
             let result = tools.call(call(json!({"at": bad["at"]}))).await;
             assert_eq!(result.status, ToolResultStatus::Error, "{bad}");
         }

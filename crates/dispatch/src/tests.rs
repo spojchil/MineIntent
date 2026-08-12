@@ -154,7 +154,9 @@ async fn incremental_submit_executes_immediately_and_commit_returns_in_slot_orde
         .unwrap()
         .expect("编排应接管增量批");
 
-    run.submit(incremental_call(0, "a", "remember")).await.unwrap();
+    run.submit(incremental_call(0, "a", "remember"))
+        .await
+        .unwrap();
     // 尚未封口、尚未 commit，第一个调用已经执行——层级 2 的核心断言。
     assert_eq!(*fixture.log.lock().unwrap(), vec!["remember"]);
 
@@ -179,7 +181,9 @@ async fn abort_reports_every_submitted_call_as_settled_and_leaves_occupancy_unto
         .await
         .unwrap()
         .unwrap();
-    run.submit(incremental_call(0, "a", "chat_box")).await.unwrap();
+    run.submit(incremental_call(0, "a", "chat_box"))
+        .await
+        .unwrap();
 
     let report = run
         .abort(ToolBatchAbortReason::ModelStreamInterrupted)

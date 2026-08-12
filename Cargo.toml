@@ -1,20 +1,15 @@
 [workspace]
 members = [
     "crates/agent",
-    "crates/app",
-    "crates/backend",
     "crates/companion",
     "crates/context",
-    "crates/contracts",
     "crates/dispatch",
     "crates/hand",
     "crates/memory",
-    "crates/middle",
     "crates/motion",
     "crates/perception",
     "crates/render",
     "crates/screens",
-    "crates/toolloop",
     "crates/world",
 ]
 resolver = "2"
@@ -27,43 +22,34 @@ repository = "https://github.com/spojchil/MineIntent"
 publish = false
 
 [workspace.dependencies]
-mineintent-backend = { path = "crates/backend" }
-mineintent-contracts = { path = "crates/contracts" }
-mineintent-middle = { path = "crates/middle" }
-# 领域无关的模型—工具循环。名字不带 mineintent 是有意的：它不该知道自己在哪个项目里。
-toolloop = { path = "crates/toolloop" }
-
 # 自有 fork：为每次 join 尝试铸不可变 AttemptToken 并支持 pre-Init 精确取消。
-# 补丁内容与理由见 crates/backend/README.md；rev 钉死，升级须同时更新该说明。
+# rev 钉死，升级须同时更新 crates/world/README.md 的说明。
+#
+# packet-event 在此统一开启，而不是只由 world 单独要求。理由是 Cargo 对同一
+# 次编译中的 feature 取并集：分开声明只会让「构建口径不同、azalea 编出来的
+# 东西也不同」，`-p world` 与 `--workspace` 得到两套指纹，来回切就整棵重编。
+# 现在只有一个消费者，统一声明既真实又省事。
 azalea = { git = "https://github.com/spojchil/azalea", rev = "d0cc847fa3c9e0d448e42b9636c7bd8684c5aa08", default-features = false, features = [
     "log",
+    "packet-event",
 ] }
-chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 parking_lot = "0.12"
-ryu = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.11"
-thiserror = "2"
-# 排障日志：分级 + 按模块过滤。与 journal 分工不同——journal 是产品事实的
-# 持久记录，这里是可丢弃的过程记录（OTel OTEP-0202 的 severity/name 之分）。
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1" }
-uuid = { version = "1", features = ["serde", "v4"] }
 
-# 发版配置：目标是可分发的单文件，同时保住两条产品行为。
+# 发版配置：目标是可分发的单文件。
 [profile.release]
 # 跨 crate 内联：bevy/azalea 的泛型与小函数极多，整体 LTO 收益最大。
 lto = "fat"
 # 单编译单元换取更好的跨模块优化；构建变慢，分发体积与运行时更优。
 codegen-units = 1
-# 去符号表与调试信息：体积的大头。排障靠开发者模式的 dev.log 与 journal，
-# 不依赖发版二进制里的符号（需要栈回溯时用 debug 构建复现）。
+# 去符号表与调试信息：体积的大头。需要栈回溯时用 debug 构建复现。
 strip = "symbols"
-# 显式保留 unwind：工具与模型 provider 的 panic 由 catch_unwind 捕获并转成
-# 结构化失败（agent/driver.rs），这是产品行为。改 abort 会让一次工具 panic
-# 直接杀掉整个同伴进程。
+# 显式保留默认 unwind。agent 内核在观测器旁路用 catch_unwind 隔离使用者的
+# 观测实现（只读旁路，不改状态）；改成 abort 会让那处隔离静默失效，
+# 成为一段永不执行的代码。工具与模型 provider 的 panic 不走捕获——它们由
+# 任务边界接成 JoinError 走失败流。
 panic = "unwind"
 # 不用 opt-level="z"：ECS 每秒 20 tick 的热路径对吞吐敏感，
 # 拿运行时性能换几 MB 体积不划算。
@@ -76,15 +62,3 @@ unsafe_code = "deny"
 [workspace.lints.clippy]
 # 与既有代码风格一致：字符串字面量统一 to_owned。
 str_to_string = "warn"
-
-# 以下四类是已登记的结构性欠账，逐条写明理由而不是整体静音：
-# BackendError/AgentError 是宽结构化错误枚举，Err 变体体积大是有意选择——
-# 调用方按 code 分类处理需要这些字段；装箱是改公开 API 的重构，
-# 留待移植完成、wire 冻结解除时统一处理。
-result_large_err = "allow"
-large_enum_variant = "allow"
-# 准入类函数需要同时携带 client/epoch/命令身份/世代/completion，
-# 参数多是「同一准入点必须看到全部身份」的直接后果，拆开反而制造不一致窗口。
-too_many_arguments = "allow"
-# 契约层的返回类型直接映射 wire 形状，抽 type 别名会让读者多跳一层。
-type_complexity = "allow"

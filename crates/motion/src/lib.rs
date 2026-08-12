@@ -136,7 +136,10 @@ fn settle(
     arguments: &serde_json::Map<String, Value>,
     outcome: Result<(), String>,
 ) -> ToolResult {
-    let action = arguments.get("action").and_then(Value::as_str).unwrap_or("");
+    let action = arguments
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     match outcome {
         Ok(()) => ToolResult::success_json(call_id, json!({ "accepted": action })),
         Err(reason) => ToolResult::failure(call_id, reason),
@@ -293,14 +296,23 @@ mod tests {
     async fn every_action_reaches_the_door_with_its_arguments() {
         let (tools, door) = tools(false);
         for (tool, arguments) in [
-            (MOTION_TOOL, json!({"action": "go_to", "target": [1.0, 64.0, -3.5]})),
+            (
+                MOTION_TOOL,
+                json!({"action": "go_to", "target": [1.0, 64.0, -3.5]}),
+            ),
             (MOTION_TOOL, json!({"action": "forward", "blocks": 3})),
             (MOTION_TOOL, json!({"action": "stop"})),
             (MOTION_TOOL, json!({"action": "jump"})),
             (MOTION_TOOL, json!({"action": "sneak", "on": true})),
             (MOTION_TOOL, json!({"action": "sprint", "on": false})),
-            (LOOK_TOOL, json!({"action": "look_at", "target": [0, 70, 0]})),
-            (LOOK_TOOL, json!({"action": "face", "yaw": -90.0, "pitch": 45.0})),
+            (
+                LOOK_TOOL,
+                json!({"action": "look_at", "target": [0, 70, 0]}),
+            ),
+            (
+                LOOK_TOOL,
+                json!({"action": "face", "yaw": -90.0, "pitch": 45.0}),
+            ),
         ] {
             let result = tools.call(call(tool, arguments)).await;
             assert_eq!(result.status, ToolResultStatus::Success);
@@ -328,7 +340,10 @@ mod tests {
             (MOTION_TOOL, json!({"action": "forward", "blocks": -1})),
             (MOTION_TOOL, json!({"action": "sneak"})),
             (MOTION_TOOL, json!({"action": "dance"})),
-            (LOOK_TOOL, json!({"action": "face", "yaw": 0.0, "pitch": 120.0})),
+            (
+                LOOK_TOOL,
+                json!({"action": "face", "yaw": 0.0, "pitch": 120.0}),
+            ),
             (LOOK_TOOL, json!({"action": "look_at"})),
         ] {
             let result = tools.call(call(tool, arguments.clone())).await;

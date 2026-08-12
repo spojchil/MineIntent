@@ -1,7 +1,7 @@
 //! 围绕无 I/O `Turn` 的并发会话驱动器。
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -38,6 +38,15 @@ pub struct SessionConfig {
     pub interrupted_tool_receipt_role: String,
     /// 单次运行允许从“已有工具执行事实的模型流中断”自动继续的最大次数。
     pub max_interrupted_tool_recoveries: u32,
+    /// 单次运行允许发出的模型请求数上限；`None` 表示不设限。
+    ///
+    /// 一个每轮都发出工具调用的模型会让运行无限继续下去，每圈一次真实的模型请求。
+    /// 上下文长度**不构成兜底**：[`Compaction`] 存在的意义正是让对话永远停在阈值
+    /// 以下，因此撞窗口这条自然刹车在本内核里不会发生。
+    ///
+    /// 计数只包含真正发给 [`Model`] 的请求。超限时运行以
+    /// `model_request_limit_exceeded` 失败，已经写入的对话与工具事实保持不变。
+    pub max_model_requests_per_run: Option<u32>,
 }
 
 impl Default for SessionConfig {
@@ -46,6 +55,10 @@ impl Default for SessionConfig {
             compaction_trigger_bytes: 256 * 1024,
             interrupted_tool_receipt_role: "user".to_owned(),
             max_interrupted_tool_recoveries: 3,
+            // 同类内核的默认值在 10~50 之间（max_turns / max_iterations /
+            // recursion_limit / request_limit）。取偏宽的一档：内核不该替应用
+            // 决定「几轮算够」，但也不该默认让它无界。
+            max_model_requests_per_run: Some(32),
         }
     }
 }
@@ -506,10 +519,31 @@ pub struct AgentSession {
     model: Arc<dyn Model>,
     observer: Arc<dyn Observer>,
     stream_observer: Arc<dyn StreamObserver>,
+    /// 观测实现 panic 后置位，此后不再调用它。见 [`AgentSession::poison`]。
+    observer_poisoned: AtomicBool,
+    stream_observer_poisoned: AtomicBool,
     config: SessionConfig,
     event_sequence: AtomicU64,
     state: Mutex<SessionState>,
     run_ended: Notify,
+}
+
+/// 观测实现 panic 之后的一次性处置：置毒并出声一次，此后彻底跳过它。
+///
+/// 报的**不是**「发生了 panic」——`catch_unwind` 并不抑制 panic 输出，默认钩子
+/// 在展开之前就已经把消息和位置打到 stderr 了。报的是「因此该观测端已被停用」：
+/// 这一条从 panic 消息里读不出来，而它造成的后果（此后收不到任何事件）与使用者
+/// 主动 `enabled() -> false` 完全无法区分。
+///
+/// 置毒的理由是同一个坏实现会在每个事件上重犯：不置毒不会更安全，只会把 stderr
+/// 淹掉，并让每个事件白付一次 unwind 的代价。
+fn poison(flag: &AtomicBool, which: &str) {
+    if !flag.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "toolturn: {which} panicked; this observer is now disabled for the rest of the \
+             session and will receive no further events"
+        );
+    }
 }
 
 impl AgentSession {
@@ -527,6 +561,8 @@ impl AgentSession {
             model,
             observer: Arc::new(NoopObserver),
             stream_observer: Arc::new(NoopStreamObserver),
+            observer_poisoned: AtomicBool::new(false),
+            stream_observer_poisoned: AtomicBool::new(false),
             config,
             event_sequence: AtomicU64::new(0),
             state: Mutex::new(SessionState::default()),
@@ -890,6 +926,19 @@ impl AgentSession {
                     }
                 }
                 TurnStep::CallModel { transcript } => {
+                    // 上限在请求发出**之前**判定：超限时这一次请求不该发生，
+                    // 已经写入的对话与工具事实原样保留。
+                    if let Some(limit) = self.config.max_model_requests_per_run {
+                        if stats.model_requests >= u64::from(limit) {
+                            return CoreOutcome::Failed {
+                                error: AgentError::new(
+                                    AgentErrorKind::InvalidState,
+                                    "model_request_limit_exceeded",
+                                ),
+                                stage: RunStage::Model,
+                            };
+                        }
+                    }
                     stats.model_requests = stats.model_requests.saturating_add(1);
                     let request_index = stats.model_requests;
                     let definitions = self.tools.definitions();
@@ -1089,6 +1138,11 @@ impl AgentSession {
         }
     }
 
+    // `CoreOutcome` 的最大变体是 `Completed`（≥192 字节），而本函数的 Err 位置
+    // 只可能构造 `Failed`——那个大变体在这里永远不会出现。`CoreOutcome` 是驱动器
+    // 内部的控制流类型，不跨 API 边界；装箱换来的是每条失败路径一次堆分配，
+    // 买到的是一个这里不存在的问题。
+    #[allow(clippy::result_large_err)]
     async fn resolve_failed_model_attempt(
         &self,
         run_id: &RunId,
@@ -1230,10 +1284,18 @@ impl AgentSession {
         build: impl FnOnce() -> ModelStreamObservation,
     ) {
         // 高频观察端完全独立于工具控制路径；过滤或 panic 不能丢失 CallReady/Seal。
-        let enabled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if self.stream_observer_poisoned.load(Ordering::Relaxed) {
+            return;
+        }
+        let enabled = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.stream_observer.enabled()
-        }))
-        .unwrap_or(false);
+        })) {
+            Ok(enabled) => enabled,
+            Err(_) => {
+                poison(&self.stream_observer_poisoned, "StreamObserver::enabled");
+                return;
+            }
+        };
         if !enabled {
             return;
         }
@@ -1243,9 +1305,13 @@ impl AgentSession {
             request_index,
             payload: build(),
         };
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.stream_observer.observe(&event);
-        }));
+        }))
+        .is_err()
+        {
+            poison(&self.stream_observer_poisoned, "StreamObserver::observe");
+        }
     }
 
     fn emit_tool_calls_sealed(
@@ -1394,19 +1460,31 @@ impl AgentSession {
 
     fn emit_lazy(&self, metadata: EventMetadata, build: impl FnOnce() -> AgentEvent) {
         // 观测器的过滤和写入故障都不能破坏状态机或把 session 卡在 Busy。
-        let enabled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if self.observer_poisoned.load(Ordering::Relaxed) {
+            return;
+        }
+        let enabled = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.observer.enabled(metadata)
-        }))
-        .unwrap_or(false);
+        })) {
+            Ok(enabled) => enabled,
+            Err(_) => {
+                poison(&self.observer_poisoned, "Observer::enabled");
+                return;
+            }
+        };
         if !enabled {
             return;
         }
 
         let event = build();
         debug_assert_eq!(event.metadata(), metadata);
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.observer.observe(&event);
-        }));
+        }))
+        .is_err()
+        {
+            poison(&self.observer_poisoned, "Observer::observe");
+        }
     }
 
     fn next_event_sequence(&self) -> u64 {

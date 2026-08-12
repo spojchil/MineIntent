@@ -12,3 +12,6 @@ agent = { path = "../agent" }
 [dev-dependencies]
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

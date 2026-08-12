@@ -14,6 +14,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use azalea::ecs::system::Res;
+use azalea::pathfinder::goals::BlockPosGoal;
+use azalea::pathfinder::{ExecutingPath, Pathfinder, PathfinderClientExt};
+use azalea::physics::collision::BlockWithShape;
+use azalea::protocol::packets::game::s_player_action;
 use azalea::{
     accept_resource_packs::AcceptResourcePacksPlugin,
     app::{App, AppExit, Plugin, PluginGroup, Update},
@@ -33,11 +38,6 @@ use azalea::{
     world::WorldName,
     Client, DefaultPlugins, Event,
 };
-use azalea::ecs::system::Res;
-use azalea::physics::collision::BlockWithShape;
-use azalea::pathfinder::goals::BlockPosGoal;
-use azalea::pathfinder::{ExecutingPath, Pathfinder, PathfinderClientExt};
-use azalea::protocol::packets::game::s_player_action;
 use azalea::{BlockPos, SprintDirection, WalkDirection};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::{oneshot, watch, Notify};
@@ -103,15 +103,24 @@ pub enum DoorCommand {
     Sneak(bool),
     Sprint(bool),
     LookAt([f64; 3]),
-    Face { yaw: f64, pitch: f64 },
-    Attack { entity_key: String },
+    Face {
+        yaw: f64,
+        pitch: f64,
+    },
+    Attack {
+        entity_key: String,
+    },
     Mine([i32; 3]),
     UseOnBlock([i32; 3]),
-    UseOnEntity { entity_key: String },
+    UseOnEntity {
+        entity_key: String,
+    },
     UseItem,
     /// 松手：停止挖掘并松开使用中的物品。
     ReleaseHand,
-    DropItem { whole_stack: bool },
+    DropItem {
+        whole_stack: bool,
+    },
     SwapOffhand,
     SelectSlot(u8),
 }
@@ -267,8 +276,7 @@ impl Inner {
 
     /// 非就绪相的快照：连接事实 + 各事实窗（窗是机器的记忆，不随相清空）。
     fn publish_phase(&self, phase: ConnectionPhase) {
-        let mut snapshot =
-            TickSnapshot::empty(EPOCH, self.tick.load(Ordering::Acquire), phase);
+        let mut snapshot = TickSnapshot::empty(EPOCH, self.tick.load(Ordering::Acquire), phase);
         snapshot.chat = self.chat_window_now();
         snapshot.damage = self.damage_window_now();
         snapshot.jobs = self.jobs_window_now();
@@ -470,9 +478,7 @@ impl Module {
                 ConnectionPhase::Disconnected { reason } => {
                     return Err(format!("连接失败：{reason}"))
                 }
-                ConnectionPhase::Stopped { reason } => {
-                    return Err(format!("连接已停止：{reason}"))
-                }
+                ConnectionPhase::Stopped { reason } => return Err(format!("连接已停止：{reason}")),
                 ConnectionPhase::Connecting => {}
             }
             tokio::select! {
@@ -492,10 +498,9 @@ impl Module {
     pub async fn stop(&self, reason: &str) -> Result<(), String> {
         self.inner.stopping.store(true, Ordering::Release);
         self.inner.shutdown.notify_waiters();
-        self.inner
-            .publish_phase(ConnectionPhase::Stopped {
-                reason: reason.to_owned(),
-            });
+        self.inner.publish_phase(ConnectionPhase::Stopped {
+            reason: reason.to_owned(),
+        });
         // 停机标志先行，再排空：入队与排空同锁，晚到的入队看得见标志。
         self.inner.fail_all_pending_chat("正在停机");
         let Some(done) = self.done.lock().take() else {
@@ -528,7 +533,10 @@ impl Module {
 
     /// 全景视口投影：用最新快照的姿态与实体，方块走世界模型读锁
     /// （非 ECS，可在任意线程调用；计算量大，调用方自行放阻塞池）。
-    pub fn scan(&self, options: &crate::ViewportOptions) -> Result<crate::ViewportProjection, String> {
+    pub fn scan(
+        &self,
+        options: &crate::ViewportOptions,
+    ) -> Result<crate::ViewportProjection, String> {
         let snapshot = self.latest();
         if !matches!(snapshot.phase, ConnectionPhase::Ready) {
             return Err("尚未连接到世界，无法观察".to_owned());
@@ -801,8 +809,8 @@ fn poll_movement_job(inner: &Inner, bot: &Client) {
     let mut slot = inner.movement_job.lock();
     let Some(job) = slot.as_mut() else { return };
 
-    let Ok((pathfinder, stall_ticks, block_pos)) = bot
-        .try_query_self::<(Option<&Pathfinder>, Option<&ExecutingPath>, &Position), _>(
+    let Ok((pathfinder, stall_ticks, block_pos)) =
+        bot.try_query_self::<(Option<&Pathfinder>, Option<&ExecutingPath>, &Position), _>(
             |(pathfinder, executing, position)| {
                 (
                     pathfinder.map(|p| (p.goal.is_some(), p.is_calculating)),
@@ -1109,7 +1117,10 @@ fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> Result<(), 
             // 直走化归为寻路目标：终止条件（到达/受阻）交给寻路器。
             let (position, yaw) = bot
                 .try_query_self::<(&Position, &LookDirection), _>(|(position, look)| {
-                    ((position.x, position.y, position.z), f64::from(look.y_rot()))
+                    (
+                        (position.x, position.y, position.z),
+                        f64::from(look.y_rot()),
+                    )
                 })
                 .map_err(|_| "读不到自身位置".to_owned())?;
             let yaw = yaw.to_radians();
@@ -1424,8 +1435,7 @@ mod tests {
         inner.end_movement_job_stopped(); // 没任务时不是事件
 
         let window = inner.jobs_window_now();
-        let outcomes: Vec<JobOutcome> =
-            window.entries.iter().map(|entry| entry.outcome).collect();
+        let outcomes: Vec<JobOutcome> = window.entries.iter().map(|entry| entry.outcome).collect();
         assert_eq!(outcomes, vec![JobOutcome::Replaced, JobOutcome::Stopped]);
         assert_eq!(
             window.entries[0].job,
@@ -1562,7 +1572,9 @@ mod tests {
         });
 
         let latest = inner.latest.read().clone();
-        assert!(matches!(&latest.phase, ConnectionPhase::Disconnected { reason } if reason == "网络断开"));
+        assert!(
+            matches!(&latest.phase, ConnectionPhase::Disconnected { reason } if reason == "网络断开")
+        );
         assert_eq!(latest.chat.entries.len(), 1);
         assert!(ticked.has_changed().unwrap());
     }

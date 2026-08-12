@@ -110,7 +110,10 @@ impl HandDoor for ModuleHandDoor {
     fn use_on_block<'a>(&'a self, block: [i32; 3]) -> agent::PortFuture<'a, Result<(), String>> {
         Box::pin(async move { self.0.execute(DoorCommand::UseOnBlock(block)).await })
     }
-    fn use_on_entity<'a>(&'a self, entity_key: &'a str) -> agent::PortFuture<'a, Result<(), String>> {
+    fn use_on_entity<'a>(
+        &'a self,
+        entity_key: &'a str,
+    ) -> agent::PortFuture<'a, Result<(), String>> {
         Box::pin(async move {
             self.0
                 .execute(DoorCommand::UseOnEntity {
@@ -172,7 +175,10 @@ async fn main() -> Result<(), String> {
         .parse()
         .map_err(|error| format!("MINEINTENT_PORT 无效：{error}"))?;
     let username = env_or("MINEINTENT_USERNAME", "companion");
-    let endpoint = env_or("MODEL_ENDPOINT", "https://api.deepseek.com/chat/completions");
+    let endpoint = env_or(
+        "MODEL_ENDPOINT",
+        "https://api.deepseek.com/chat/completions",
+    );
     let model_name = env_or("MODEL_NAME", "deepseek-chat");
     let memory_path = env_or("MINEINTENT_MEMORY_FILE", "companion-memory.md");
     let persona = match std::env::var("MINEINTENT_PERSONA_FILE") {

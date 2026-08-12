@@ -142,12 +142,14 @@ pub fn render_nearby(snap: &TickSnapshot) -> String {
     for (type_word, members) in groups {
         let nearest = members
             .iter()
-            .min_by(|a, b| {
-                distance_between(this, a).total_cmp(&distance_between(this, b))
-            })
+            .min_by(|a, b| distance_between(this, a).total_cmp(&distance_between(this, b)))
             .expect("组内至少一个成员");
         let distance = distance_between(this, nearest);
-        let place = format!("{} 格·{}", distance.round() as i64, bearing_word(this, nearest));
+        let place = format!(
+            "{} 格·{}",
+            distance.round() as i64,
+            bearing_word(this, nearest)
+        );
         let text = if members.len() > 1 {
             format!("{type_word} ×{}（最近 {place}）", members.len())
         } else {
