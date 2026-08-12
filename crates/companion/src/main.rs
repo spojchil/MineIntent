@@ -21,6 +21,10 @@ use perception::{PerceptionTools, ViewportDoor};
 use screens::{ChatBox, ChatDoor, ChatHistory, ChatReadMark};
 use world::{ConnectionConfig, DoorCommand, Module, SnapshotSource};
 
+mod wake;
+
+use wake::{SelfIdentity, WakeCursors};
+
 /// 人设占位（Q01 未裁；正式文本由维护者给出后替换）。
 const PLACEHOLDER_PERSONA: &str = "\
 你是这个 Minecraft 世界里的一位同伴，说中文。\
@@ -261,59 +265,18 @@ async fn main() -> Result<(), String> {
     ));
 
     // ---- 最小唤醒脚手架：别人对我说话、受伤、移动任务有果就醒 ----
-    // 游标用事实 seq（单调、同 tick 多条也不漏）；启动前的旧事实不消费。
-    // 窗装全部事件，投什么由这里的判据挑：顶替/停止是模型自己下的令，不吵它。
+    // 判据本身是纯函数，在 `wake` 里，带单测；这里只负责取快照与投递。
     let own_key = snapshots.latest().self_state.entity_key.clone();
-    let boot = snapshots.latest();
-    let mut chat_cursor: Option<u64> = boot.chat.entries.last().map(|entry| entry.seq);
-    let mut damage_cursor: Option<u64> = boot.damage.entries.last().map(|entry| entry.seq);
-    let mut job_cursor: Option<u64> = boot.jobs.entries.last().map(|entry| entry.seq);
-    drop(boot);
+    let mut cursors = WakeCursors::resume_from(&snapshots.latest());
     println!("[组合根] 开始倾听聊天与通知（Ctrl+C 停机）");
     loop {
         tokio::select! {
             _ = module.ticked() => {
                 let snapshot = snapshots.latest();
-                let mut fresh = Vec::new();
-                for entry in &snapshot.chat.entries {
-                    if chat_cursor.is_some_and(|seen| entry.seq <= seen) {
-                        continue;
-                    }
-                    chat_cursor = Some(entry.seq);
-                    let Some(sender) = entry.sender.as_ref() else { continue };
-                    // 防自激：优先比对稳定 UUID（自身 entity_key 即 UUID），
-                    // 服务器不给 UUID 时退回用户名比较。
-                    let is_self = match &sender.uuid {
-                        Some(uuid) => *uuid == own_key,
-                        None => sender.username == username,
-                    };
-                    if is_self {
-                        continue;
-                    }
-                    fresh.push(format!("{}: {}", sender.username, entry.content.plain_text));
-                }
-                for entry in &snapshot.damage.entries {
-                    if damage_cursor.is_some_and(|seen| entry.seq <= seen) {
-                        continue;
-                    }
-                    damage_cursor = Some(entry.seq);
-                    fresh.push(render::render_damage_entry(entry));
-                }
-                for entry in &snapshot.jobs.entries {
-                    if job_cursor.is_some_and(|seen| entry.seq <= seen) {
-                        continue;
-                    }
-                    job_cursor = Some(entry.seq);
-                    // 到达/走不到/卡住值得醒；顶替与停止是模型自己的动作回声。
-                    if matches!(
-                        entry.outcome,
-                        world::JobOutcome::Arrived
-                            | world::JobOutcome::PathEnded
-                            | world::JobOutcome::Stalled
-                    ) {
-                        fresh.push(render::render_job_entry(entry));
-                    }
-                }
+                let fresh = cursors.collect(
+                    &snapshot,
+                    SelfIdentity { entity_key: &own_key, username: &username },
+                );
                 if fresh.is_empty() {
                     continue;
                 }
