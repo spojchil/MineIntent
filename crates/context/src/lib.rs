@@ -16,8 +16,8 @@ use memory::MemoryFile;
 use screens::ChatReadMark;
 use world::SnapshotSource;
 
-/// 压缩指令：要求模型同时交回记忆增补与对话摘要。
-const COMPACTION_INSTRUCTIONS: &str = "\
+/// 压缩指令：要求模型同时交回记忆增补与对话摘要。公开以便模型可见面导出评审。
+pub const COMPACTION_INSTRUCTIONS: &str = "\
 你在为一个 Minecraft 世界里的同伴压缩对话历史。下面是它的长期记忆全文与将被
 压缩的对话。请输出一个 JSON 对象，恰好两个字段：
 {\"memory_full_text\": \"更新后的记忆完整全文\", \"summary\": \"对话摘要\"}
@@ -28,6 +28,9 @@ const COMPACTION_INSTRUCTIONS: &str = "\
   哪些事做到一半。工具调用的机械细节可以丢，正在进行的意图不能丢。
 - 世界状态（位置、血量、天色等）不要写入摘要——下一轮会重新看到。
 只输出这个 JSON 对象，不要其他文字。";
+
+/// 压缩摘要在新对话里的包裹头。公开以便模型可见面导出评审。
+pub const SUMMARY_PREFIX: &str = "【我此前的经历记述（同伴第一人称，压缩自更早的对话）】";
 
 pub struct ContextStrategy {
     persona: String,
@@ -171,11 +174,7 @@ impl Compaction for ContextStrategy {
                 // 落盘失败就不丢对话：金律是"落盘否则就丢"，反之亦然。
                 return unchanged();
             }
-            vec![InputMessage::text(
-                "user",
-                format!("【我此前的经历记述（同伴第一人称，压缩自更早的对话）】\n{summary}"),
-            )
-            .into()]
+            vec![InputMessage::text("user", format!("{SUMMARY_PREFIX}\n{summary}")).into()]
         })
     }
 }

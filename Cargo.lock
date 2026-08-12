@@ -951,6 +951,7 @@ dependencies = [
  "perception",
  "render",
  "screens",
+ "serde_json",
  "tokio",
  "world",
 ]
