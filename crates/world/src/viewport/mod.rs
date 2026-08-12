@@ -10,6 +10,14 @@ use std::{cmp::Ordering, collections::HashMap, f64::consts::PI};
 use crate::block::{is_air_name, BlockPosition, BlockProbe, BlockReadResult};
 use crate::{wrap_degrees, EntitySnapshot, Vec3Value};
 
+mod geometry;
+
+use geometry::{
+    add, box_intersects_frustum, box_visibility_samples, compare_candidate, distance_to_box, dot,
+    inside_frustum, length, normalize, point_inside_box, round_one, round_position, same_voxel,
+    scale, section_of, subtract, view_axes, AxisAlignedBox, Point3, ViewAxes, FACE_NORMALS,
+};
+
 /// 投影期间读世界的两条通道。
 ///
 /// 分成两层是因为量出来的成本分布：一次全量投影要问十几万次「这一格挡不挡
@@ -43,7 +51,7 @@ where
 
 /// 第一人称眼睛高度。
 pub const EYE_HEIGHT: f64 = 1.62;
-const SECTION_SIZE: i32 = 16;
+pub(crate) const SECTION_SIZE: i32 = 16;
 const RAY_STEP: f64 = 0.25;
 const FACE_EPSILON: f64 = 0.01;
 const DEFAULT_VERTICAL_HALF_ANGLE: f64 = 35.0 * PI / 180.0;
@@ -218,33 +226,6 @@ pub struct ViewportProjection {
     pub visible_blocks: VisibleBlocksResult,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct Point3 {
-    x: f64,
-    y: f64,
-    z: f64,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ViewAxes {
-    right: Point3,
-    up: Point3,
-    forward: Point3,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct AxisAlignedBox {
-    min: Point3,
-    max: Point3,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CameraPoint {
-    depth: f64,
-    right: f64,
-    up: f64,
-}
-
 #[derive(Clone, Copy, Debug)]
 enum BlockCell {
     Loaded,
@@ -272,39 +253,6 @@ enum RayOutcome {
     Clear,
     Unloaded,
 }
-
-const FACE_NORMALS: [Point3; 6] = [
-    Point3 {
-        x: 1.0,
-        y: 0.0,
-        z: 0.0,
-    },
-    Point3 {
-        x: -1.0,
-        y: 0.0,
-        z: 0.0,
-    },
-    Point3 {
-        x: 0.0,
-        y: 1.0,
-        z: 0.0,
-    },
-    Point3 {
-        x: 0.0,
-        y: -1.0,
-        z: 0.0,
-    },
-    Point3 {
-        x: 0.0,
-        y: 0.0,
-        z: 1.0,
-    },
-    Point3 {
-        x: 0.0,
-        y: 0.0,
-        z: -1.0,
-    },
-];
 
 // ---- 定向投影结果 ----
 
@@ -797,32 +745,6 @@ where
         }
     }
     Ok(DirectedRayOutcome::Clear)
-}
-
-fn view_axes(yaw_degrees: f64, pitch_degrees: f64) -> ViewAxes {
-    // 角度制输入（azalea LookDirection 同单位），内部转弧度。
-    let yaw = yaw_degrees.to_radians();
-    let pitch = pitch_degrees.to_radians();
-    let forward = Point3 {
-        x: -yaw.sin() * pitch.cos(),
-        y: pitch.sin(),
-        z: -yaw.cos() * pitch.cos(),
-    };
-    let level = Point3 {
-        x: -yaw.sin(),
-        y: 0.0,
-        z: -yaw.cos(),
-    };
-    let right = Point3 {
-        x: -level.z,
-        y: 0.0,
-        z: level.x,
-    };
-    ViewAxes {
-        right,
-        up: cross(right, forward),
-        forward,
-    }
 }
 
 fn standing_on_block<P, F, C>(
@@ -1381,214 +1303,6 @@ where
     })
 }
 
-fn inside_frustum(axes: ViewAxes, delta: Point3, options: &ViewportOptions) -> bool {
-    let depth = dot(delta, axes.forward);
-    depth > 0.0
-        && dot(delta, axes.right).abs() <= depth * options.horizontal_half_angle.tan()
-        && dot(delta, axes.up).abs() <= depth * options.vertical_half_angle.tan()
-}
-
-fn box_intersects_frustum(
-    axes: ViewAxes,
-    eye: Point3,
-    bounds: AxisAlignedBox,
-    options: &ViewportOptions,
-) -> bool {
-    let tan_horizontal = options.horizontal_half_angle.tan();
-    let tan_vertical = options.vertical_half_angle.tan();
-    let corners = box_corners(bounds).map(|corner| {
-        let delta = subtract(corner, eye);
-        CameraPoint {
-            depth: dot(delta, axes.forward),
-            right: dot(delta, axes.right),
-            up: dot(delta, axes.up),
-        }
-    });
-    let outside_depth = corners.iter().all(|point| point.depth <= 0.0);
-    let outside_left = corners
-        .iter()
-        .all(|point| point.right < -point.depth * tan_horizontal);
-    let outside_right = corners
-        .iter()
-        .all(|point| point.right > point.depth * tan_horizontal);
-    let outside_bottom = corners
-        .iter()
-        .all(|point| point.up < -point.depth * tan_vertical);
-    let outside_top = corners
-        .iter()
-        .all(|point| point.up > point.depth * tan_vertical);
-    !(outside_depth || outside_left || outside_right || outside_bottom || outside_top)
-}
-
-fn box_corners(bounds: AxisAlignedBox) -> [Point3; 8] {
-    let AxisAlignedBox { min, max } = bounds;
-    [
-        Point3 {
-            x: min.x,
-            y: min.y,
-            z: min.z,
-        },
-        Point3 {
-            x: min.x,
-            y: min.y,
-            z: max.z,
-        },
-        Point3 {
-            x: min.x,
-            y: max.y,
-            z: min.z,
-        },
-        Point3 {
-            x: min.x,
-            y: max.y,
-            z: max.z,
-        },
-        Point3 {
-            x: max.x,
-            y: min.y,
-            z: min.z,
-        },
-        Point3 {
-            x: max.x,
-            y: min.y,
-            z: max.z,
-        },
-        Point3 {
-            x: max.x,
-            y: max.y,
-            z: min.z,
-        },
-        Point3 {
-            x: max.x,
-            y: max.y,
-            z: max.z,
-        },
-    ]
-}
-
-fn box_visibility_samples(bounds: AxisAlignedBox) -> Vec<Point3> {
-    let xs = axis_samples(bounds.min.x, bounds.max.x, [0.05, 0.5, 0.95]);
-    let ys = axis_samples(bounds.min.y, bounds.max.y, [0.15, 0.5, 0.85]);
-    let zs = axis_samples(bounds.min.z, bounds.max.z, [0.05, 0.5, 0.95]);
-    let mut points = Vec::with_capacity(27);
-    for x in xs {
-        for y in ys {
-            for z in zs {
-                points.push(Point3 { x, y, z });
-            }
-        }
-    }
-    points
-}
-
-fn axis_samples(minimum: f64, maximum: f64, fractions: [f64; 3]) -> [f64; 3] {
-    fractions.map(|fraction| minimum + (maximum - minimum) * fraction)
-}
-
-fn point_inside_box(point: Point3, bounds: AxisAlignedBox) -> bool {
-    point.x >= bounds.min.x
-        && point.x <= bounds.max.x
-        && point.y >= bounds.min.y
-        && point.y <= bounds.max.y
-        && point.z >= bounds.min.z
-        && point.z <= bounds.max.z
-}
-
-fn distance_to_box(point: Point3, bounds: AxisAlignedBox) -> f64 {
-    let dx = (bounds.min.x - point.x)
-        .max(0.0)
-        .max(point.x - bounds.max.x);
-    let dy = (bounds.min.y - point.y)
-        .max(0.0)
-        .max(point.y - bounds.max.y);
-    let dz = (bounds.min.z - point.z)
-        .max(0.0)
-        .max(point.z - bounds.max.z);
-    (dx * dx + dy * dy + dz * dz).sqrt()
-}
-
-fn section_of(value: i32) -> i32 {
-    value.div_euclid(SECTION_SIZE)
-}
-
-fn compare_candidate(left: &(f64, BlockPosition), right: &(f64, BlockPosition)) -> Ordering {
-    left.0
-        .partial_cmp(&right.0)
-        .unwrap_or(Ordering::Equal)
-        .then_with(|| left.1.x.cmp(&right.1.x))
-        .then_with(|| left.1.y.cmp(&right.1.y))
-        .then_with(|| left.1.z.cmp(&right.1.z))
-}
-
-fn cross(left: Point3, right: Point3) -> Point3 {
-    Point3 {
-        x: left.y * right.z - left.z * right.y,
-        y: left.z * right.x - left.x * right.z,
-        z: left.x * right.y - left.y * right.x,
-    }
-}
-
-fn add(left: Point3, right: Point3) -> Point3 {
-    Point3 {
-        x: left.x + right.x,
-        y: left.y + right.y,
-        z: left.z + right.z,
-    }
-}
-
-fn scale(value: Point3, factor: f64) -> Point3 {
-    Point3 {
-        x: value.x * factor,
-        y: value.y * factor,
-        z: value.z * factor,
-    }
-}
-
-fn subtract(left: Point3, right: Point3) -> Point3 {
-    Point3 {
-        x: left.x - right.x,
-        y: left.y - right.y,
-        z: left.z - right.z,
-    }
-}
-
-fn dot(left: Point3, right: Point3) -> f64 {
-    left.x * right.x + left.y * right.y + left.z * right.z
-}
-
-fn length(value: Point3) -> f64 {
-    dot(value, value).sqrt()
-}
-
-fn normalize(value: Point3, magnitude: f64) -> Point3 {
-    Point3 {
-        x: value.x / magnitude,
-        y: value.y / magnitude,
-        z: value.z / magnitude,
-    }
-}
-
-fn same_voxel(left: &BlockPosition, right: &BlockPosition) -> bool {
-    left.x == right.x && left.y == right.y && left.z == right.z
-}
-
-fn round_position(position: Point3) -> [f64; 3] {
-    [
-        round_one(position.x),
-        round_one(position.y),
-        round_one(position.z),
-    ]
-}
-
-fn round_one(value: f64) -> f64 {
-    let rounded = (value * 10.0).round() / 10.0;
-    if rounded == 0.0 {
-        0.0
-    } else {
-        rounded
-    }
-}
-
 #[cfg(test)]
-#[path = "viewport_tests.rs"]
+#[path = "../viewport_tests.rs"]
 mod tests;
