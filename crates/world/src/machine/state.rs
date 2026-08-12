@@ -17,11 +17,16 @@ use tokio::sync::{oneshot, watch, Notify};
 
 use super::door::{DoorCommand, PendingCommand};
 use super::movement::MovementJob;
-use super::{DAMAGE_WINDOW_ENTRIES, JOBS_WINDOW_ENTRIES};
+use super::{DAMAGE_WINDOW_ENTRIES, INVENTORY_WINDOW_ENTRIES, JOBS_WINDOW_ENTRIES};
 use crate::{
     ChatContent, ChatEntry, ChatPosition, ConnectionPhase, DamageEntry, Epoch, FactSource,
-    JobEntry, JobKind, JobOutcome, PlayerRef, TickSnapshot, Window, WorldMeta, CHAT_WINDOW_LINES,
+    InventoryChangeEntry, JobEntry, JobKind, JobOutcome, PlayerRef, TickSnapshot, Window,
+    WorldMeta, CHAT_WINDOW_LINES,
 };
+
+/// 预期回声的时限：swap/丢弃后这么多 tick 内，同格的 SetSlot 视为自己
+/// 动作的回声（Commanded）。服务器确认通常一两个 tick 内到达。
+const EXPECTED_SLOT_TICKS: u64 = 40;
 
 /// 机器与外界的共享面。纯状态转换都在这里，可脱离 azalea 单测。
 pub(crate) struct Inner {
@@ -34,6 +39,9 @@ pub(crate) struct Inner {
     pub(super) last_health: Mutex<Option<f64>>,
     /// 在途移动任务（单意图槽）。
     pub(super) movement_job: Mutex<Option<MovementJob>>,
+    pub(super) inventory_window: Mutex<VecDeque<InventoryChangeEntry>>,
+    /// 预期会变的格位（我们刚 swap/丢弃过）：(菜单号, 失效 tick)。
+    pub(super) expected_slots: Mutex<Vec<(u16, u64)>>,
     pub(super) pending: Mutex<Vec<PendingCommand>>,
     /// 一次性跳跃的复位标记：跳跃布尔保持一整 tick 后放开。
     pub(super) jump_reset: AtomicBool,
@@ -69,6 +77,8 @@ impl Inner {
             jobs_window: Mutex::new(VecDeque::new()),
             last_health: Mutex::new(None),
             movement_job: Mutex::new(None),
+            inventory_window: Mutex::new(VecDeque::new()),
+            expected_slots: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
             jump_reset: AtomicBool::new(false),
             world_handle: Mutex::new(None),
@@ -101,6 +111,7 @@ impl Inner {
         snapshot.chat = self.chat_window_now();
         snapshot.damage = self.damage_window_now();
         snapshot.jobs = self.jobs_window_now();
+        snapshot.inventory_changes = self.inventory_window_now();
         self.publish(snapshot);
     }
 
@@ -119,6 +130,55 @@ impl Inner {
     pub(super) fn jobs_window_now(&self) -> Window<JobEntry> {
         Window {
             entries: self.jobs_window.lock().iter().cloned().collect(),
+        }
+    }
+
+    pub(super) fn inventory_window_now(&self) -> Window<InventoryChangeEntry> {
+        Window {
+            entries: self.inventory_window.lock().iter().cloned().collect(),
+        }
+    }
+
+    /// 标记这些菜单格即将因我们的动作而变：时限内的 SetSlot 算回声。
+    pub(super) fn mark_expected_slots(&self, slots: &[u16]) {
+        let until = self.tick.load(Ordering::Acquire) + EXPECTED_SLOT_TICKS;
+        let mut expected = self.expected_slots.lock();
+        for &slot in slots {
+            expected.push((slot, until));
+        }
+    }
+
+    /// 容器 0 的格位变化入窗（ContainerSetSlot 包直译）。
+    /// 在预期时限内的格标 Commanded（自己动作的回声），其余 ServerObserved。
+    pub(super) fn push_inventory_change(
+        &self,
+        slot: u16,
+        item_name: Option<String>,
+        count: u32,
+    ) {
+        let tick = self.tick.load(Ordering::Acquire);
+        let source = {
+            let mut expected = self.expected_slots.lock();
+            expected.retain(|(_, until)| *until >= tick);
+            if expected.iter().any(|(expected_slot, _)| *expected_slot == slot) {
+                FactSource::Commanded
+            } else {
+                FactSource::ServerObserved
+            }
+        };
+        let entry = InventoryChangeEntry {
+            seq: self.fact_seq.fetch_add(1, Ordering::AcqRel),
+            tick,
+            occurred_at: SystemTime::now(),
+            source,
+            slot,
+            item_name,
+            count,
+        };
+        let mut window = self.inventory_window.lock();
+        window.push_back(entry);
+        while window.len() > INVENTORY_WINDOW_ENTRIES {
+            window.pop_front();
         }
     }
 

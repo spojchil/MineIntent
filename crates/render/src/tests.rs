@@ -188,7 +188,8 @@ fn inventory_shows_held_item_and_full_list() {
     snap.self_state.inventory.selected_hotbar_slot = 0;
     snap.self_state.inventory.slots = vec![
         InventorySlot {
-            slot: 0,
+            // 快照格号是菜单协议号：选中快捷格 0 = 菜单 36（格 0 是合成结果）。
+            slot: 36,
             item_name: "iron_sword".to_owned(),
             count: 1,
             metadata: None,
@@ -269,4 +270,61 @@ fn damage_entries_say_the_drop_and_death_without_inventing_causes() {
         ..entry
     };
     assert!(render_damage_entry(&fatal).ends_with("你死了。"));
+}
+
+#[test]
+fn player_menu_lists_sections_by_protocol_slot() {
+    let mut snap = snapshot();
+    snap.self_state.inventory.selected_hotbar_slot = 2;
+    snap.self_state.inventory.slots = vec![
+        InventorySlot {
+            slot: 6,
+            item_name: "iron_chestplate".to_owned(),
+            count: 1,
+            metadata: None,
+            durability_used: None,
+        },
+        InventorySlot {
+            slot: 10,
+            item_name: "diamond".to_owned(),
+            count: 3,
+            metadata: None,
+            durability_used: None,
+        },
+        InventorySlot {
+            slot: 38,
+            item_name: "bread".to_owned(),
+            count: 7,
+            metadata: None,
+            durability_used: None,
+        },
+    ];
+    let text = render_player_menu(&snap);
+    assert!(text.contains("盔甲·头/胸/腿/脚（5-8）：6=iron_chestplate ×1"), "{text}");
+    assert!(text.contains("主背包（9-35）：10=diamond ×3"), "{text}");
+    assert!(text.contains("快捷栏（36-44）：38=bread ×7"), "{text}");
+    assert!(text.contains("随身合成（1-4）：空"), "{text}");
+    assert!(text.contains("手持的是快捷栏格 38（bread ×7）"), "{text}");
+}
+
+#[test]
+fn inventory_changes_name_the_slot_and_call_out_the_craft_result() {
+    let entry = world::InventoryChangeEntry {
+        seq: 1,
+        tick: 10,
+        occurred_at: SystemTime::now(),
+        source: world::FactSource::ServerObserved,
+        slot: 12,
+        item_name: Some("oak_planks".to_owned()),
+        count: 4,
+    };
+    assert_eq!(render_inventory_change(&entry), "物品栏格 12 出现了 oak_planks ×4。");
+
+    let emptied = world::InventoryChangeEntry {
+        slot: 0,
+        item_name: None,
+        count: 0,
+        ..entry
+    };
+    assert_eq!(render_inventory_change(&emptied), "合成结果格（0）变空了。");
 }

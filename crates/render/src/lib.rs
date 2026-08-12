@@ -172,10 +172,12 @@ pub fn render_inventory(snap: &TickSnapshot) -> String {
     if inventory.slots.is_empty() {
         return "背包是空的。".to_owned();
     }
+    // 快照格号是菜单协议号：快捷栏在 36-44，选中格 0-8 要先换算。
+    let held_menu_slot = 36 + u32::from(inventory.selected_hotbar_slot);
     let held = inventory
         .slots
         .iter()
-        .find(|slot| slot.slot == u32::from(inventory.selected_hotbar_slot))
+        .find(|slot| slot.slot == held_menu_slot)
         .map(|slot| slot.item_name.as_str())
         .unwrap_or("空手");
     let items: Vec<String> = inventory
@@ -184,6 +186,72 @@ pub fn render_inventory(snap: &TickSnapshot) -> String {
         .map(|slot| format!("{} ×{}", slot.item_name, slot.count))
         .collect();
     format!("手持：{held}。背包：{}。", items.join("、"))
+}
+
+/// 物品栏屏全景：46 格按分区列出（协议号即格号），空格不逐一点名。
+/// 用法说明归 screens（操作信息），这里只呈现内容。
+pub fn render_player_menu(snap: &TickSnapshot) -> String {
+    let inventory = &snap.self_state.inventory;
+    let item_at = |slot: u32| -> Option<String> {
+        inventory
+            .slots
+            .iter()
+            .find(|entry| entry.slot == slot)
+            .map(|entry| format!("{} ×{}", entry.item_name, entry.count))
+    };
+    let section = |name: &str, range: std::ops::RangeInclusive<u32>| -> String {
+        let filled: Vec<String> = range
+            .clone()
+            .filter_map(|slot| item_at(slot).map(|text| format!("{slot}={text}")))
+            .collect();
+        if filled.is_empty() {
+            format!("{name}（{}-{}）：空", range.start(), range.end())
+        } else {
+            format!(
+                "{name}（{}-{}）：{}",
+                range.start(),
+                range.end(),
+                filled.join("、")
+            )
+        }
+    };
+    let held_menu_slot = 36 + u32::from(inventory.selected_hotbar_slot);
+    let mut lines = vec![
+        match item_at(0) {
+            Some(item) => format!("合成结果（0）：{item}"),
+            None => "合成结果（0）：空".to_owned(),
+        },
+        section("随身合成", 1..=4),
+        section("盔甲·头/胸/腿/脚", 5..=8),
+        section("主背包", 9..=35),
+        section("快捷栏", 36..=44),
+        match item_at(45) {
+            Some(item) => format!("副手（45）：{item}"),
+            None => "副手（45）：空".to_owned(),
+        },
+        format!(
+            "手持的是快捷栏格 {held_menu_slot}{}。",
+            item_at(held_menu_slot)
+                .map(|item| format!("（{item}）"))
+                .unwrap_or_else(|| "（空手）".to_owned())
+        ),
+    ];
+    lines.retain(|line| !line.is_empty());
+    lines.join("\n")
+}
+
+/// 物品栏格位变化的通知措辞。合成结果格单独点名（维护者裁定：它的出现
+/// 也算预期之外的变化）。
+pub fn render_inventory_change(entry: &world::InventoryChangeEntry) -> String {
+    let place = if entry.slot == 0 {
+        "合成结果格（0）".to_owned()
+    } else {
+        format!("物品栏格 {} ", entry.slot)
+    };
+    match &entry.item_name {
+        Some(name) => format!("{place}出现了 {name} ×{}。", entry.count),
+        None => format!("{place}变空了。"),
+    }
 }
 
 /// 视口全景的呈现：同名方块聚合（数量+最近位置），实体逐个列出。

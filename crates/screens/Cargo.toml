@@ -9,6 +9,8 @@ publish = false
 [dependencies]
 agent = { path = "../agent" }
 dispatch = { path = "../dispatch" }
+parking_lot = { workspace = true }
+render = { path = "../render" }
 serde_json = "1"
 world = { path = "../world" }
 

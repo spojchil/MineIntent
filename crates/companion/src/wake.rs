@@ -10,7 +10,7 @@
 //! 三个窗共用一条单调 `seq`，所以三个游标互不干扰，且「同一 tick 内多条」
 //! 不会漏——tick 会重复，seq 不会。
 
-use world::{DamageEntry, JobEntry, JobOutcome, TickSnapshot};
+use world::{DamageEntry, FactSource, InventoryChangeEntry, JobEntry, JobOutcome, TickSnapshot};
 
 /// 三个窗各自的消费位置。启动时置于窗尾，不消费启动前的存量。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -18,6 +18,7 @@ pub struct WakeCursors {
     chat: Option<u64>,
     damage: Option<u64>,
     jobs: Option<u64>,
+    inventory: Option<u64>,
 }
 
 impl WakeCursors {
@@ -27,13 +28,25 @@ impl WakeCursors {
             chat: snapshot.chat.entries.last().map(|entry| entry.seq),
             damage: snapshot.damage.entries.last().map(|entry| entry.seq),
             jobs: snapshot.jobs.entries.last().map(|entry| entry.seq),
+            inventory: snapshot
+                .inventory_changes
+                .entries
+                .last()
+                .map(|entry| entry.seq),
         }
     }
 
     /// 自身身份，用于防自激。
     ///
     /// `entity_key` 是自身 UUID；服务端不给发言者 UUID 时退回用户名比较。
-    pub fn collect(&mut self, snapshot: &TickSnapshot, own: SelfIdentity<'_>) -> Vec<String> {
+    /// `inventory_open`：物品栏屏开着才投递库存变化（维护者裁定——
+    /// 「打开物品栏时有预期之外的格子变化，也有通知」；关着时不吵）。
+    pub fn collect(
+        &mut self,
+        snapshot: &TickSnapshot,
+        own: SelfIdentity<'_>,
+        inventory_open: bool,
+    ) -> Vec<String> {
         let mut lines = Vec::new();
 
         for entry in &snapshot.chat.entries {
@@ -63,6 +76,16 @@ impl WakeCursors {
         for entry in &snapshot.jobs.entries {
             if advance(&mut self.jobs, entry.seq) && wakes_on(entry.outcome) {
                 lines.push(render_job(entry));
+            }
+        }
+
+        for entry in &snapshot.inventory_changes.entries {
+            // 游标先推进（含屏关着时错过的条目——过了就是过了，不回放）。
+            if advance(&mut self.inventory, entry.seq)
+                && inventory_open
+                && wakes_on_inventory(entry)
+            {
+                lines.push(render_inventory_change(entry));
             }
         }
 
@@ -97,6 +120,16 @@ fn wakes_on(outcome: JobOutcome) -> bool {
         outcome,
         JobOutcome::Arrived | JobOutcome::PathEnded | JobOutcome::Stalled
     )
+}
+
+/// 哪些库存变化值得通知：预期之外的（ServerObserved）。
+/// 自己 swap/丢弃的回声（Commanded）不吵——模型刚收到过工具回执。
+fn wakes_on_inventory(entry: &InventoryChangeEntry) -> bool {
+    entry.source == FactSource::ServerObserved
+}
+
+fn render_inventory_change(entry: &InventoryChangeEntry) -> String {
+    render::render_inventory_change(entry)
 }
 
 fn render_damage(entry: &DamageEntry) -> String {
@@ -184,7 +217,7 @@ mod tests {
         };
         let mut cursors = WakeCursors::resume_from(&snap);
 
-        assert!(cursors.collect(&snap, identity()).is_empty());
+        assert!(cursors.collect(&snap, identity(), false).is_empty());
     }
 
     #[test]
@@ -204,7 +237,7 @@ mod tests {
             ],
         };
 
-        let lines = cursors.collect(&snap, identity());
+        let lines = cursors.collect(&snap, identity(), false);
 
         assert_eq!(lines, vec!["companion: 冒名者说的".to_owned()]);
     }
@@ -220,7 +253,7 @@ mod tests {
             ],
         };
 
-        let lines = cursors.collect(&snap, identity());
+        let lines = cursors.collect(&snap, identity(), false);
 
         assert_eq!(lines, vec!["alice: 别人说的".to_owned()]);
     }
@@ -233,7 +266,7 @@ mod tests {
             entries: vec![system_chat(1, "服务器将在 5 分钟后重启")],
         };
 
-        assert!(cursors.collect(&snap, identity()).is_empty());
+        assert!(cursors.collect(&snap, identity(), false).is_empty());
     }
 
     #[test]
@@ -244,12 +277,12 @@ mod tests {
             entries: vec![chat(1, "companion", Some(OWN_UUID), "我说的")],
         };
 
-        assert!(cursors.collect(&snap, identity()).is_empty());
+        assert!(cursors.collect(&snap, identity(), false).is_empty());
         // 再来一帧：同一条不该被重新检查——否则它会在整个窗口存活期里
         // 每 tick 复检一次。
         snap.chat.entries.push(chat(2, "alice", None, "后来的"));
         assert_eq!(
-            cursors.collect(&snap, identity()),
+            cursors.collect(&snap, identity(), false),
             vec!["alice: 后来的".to_owned()]
         );
     }
@@ -261,12 +294,12 @@ mod tests {
         snap.chat = Window {
             entries: vec![chat(1, "alice", None, "第一句")],
         };
-        assert_eq!(cursors.collect(&snap, identity()).len(), 1);
-        assert!(cursors.collect(&snap, identity()).is_empty());
+        assert_eq!(cursors.collect(&snap, identity(), false).len(), 1);
+        assert!(cursors.collect(&snap, identity(), false).is_empty());
 
         snap.chat.entries.push(chat(2, "alice", None, "第二句"));
-        assert_eq!(cursors.collect(&snap, identity()).len(), 1);
-        assert!(cursors.collect(&snap, identity()).is_empty());
+        assert_eq!(cursors.collect(&snap, identity(), false).len(), 1);
+        assert!(cursors.collect(&snap, identity(), false).is_empty());
     }
 
     #[test]
@@ -284,7 +317,7 @@ mod tests {
         };
 
         // 顶替与停止是模型自己下的令的回声，不该把它自己吵醒。
-        assert_eq!(cursors.collect(&snap, identity()).len(), 3);
+        assert_eq!(cursors.collect(&snap, identity(), false).len(), 3);
     }
 
     #[test]
@@ -302,9 +335,40 @@ mod tests {
             entries: vec![job(3, JobOutcome::Arrived)],
         };
 
-        let lines = cursors.collect(&snap, identity());
+        let lines = cursors.collect(&snap, identity(), false);
 
         assert_eq!(lines.len(), 3, "三个窗各出一条：{lines:?}");
-        assert!(cursors.collect(&snap, identity()).is_empty());
+        assert!(cursors.collect(&snap, identity(), false).is_empty());
+    }
+
+    fn inventory_change(seq: u64, slot: u16, source: FactSource) -> world::InventoryChangeEntry {
+        world::InventoryChangeEntry {
+            seq,
+            tick: seq,
+            occurred_at: std::time::SystemTime::UNIX_EPOCH,
+            source,
+            slot,
+            item_name: Some("oak_planks".to_owned()),
+            count: 4,
+        }
+    }
+
+    #[test]
+    fn inventory_changes_wake_only_when_open_and_only_unexpected_ones() {
+        let mut snap = snapshot();
+        let mut cursors = WakeCursors::default();
+        snap.inventory_changes = Window {
+            entries: vec![inventory_change(1, 3, FactSource::ServerObserved)],
+        };
+        // 屏关着：不投递，但游标推进（过了就是过了，不回放）。
+        assert!(cursors.collect(&snap, identity(), false).is_empty());
+        assert!(cursors.collect(&snap, identity(), true).is_empty());
+
+        // 屏开着：预期之外的投递，自己动作的回声（Commanded）不吵。
+        snap.inventory_changes.entries.push(inventory_change(2, 10, FactSource::Commanded));
+        snap.inventory_changes.entries.push(inventory_change(3, 0, FactSource::ServerObserved));
+        let lines = cursors.collect(&snap, identity(), true);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("合成结果格"), "{lines:?}");
     }
 }

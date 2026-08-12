@@ -180,6 +180,41 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             ClientboundGamePacket::SetHealth(set_health) => {
                 inner.track_health(f64::from(set_health.health));
             }
+            // 容器 0 = 玩家物品栏。格位变化直译入窗；是回声还是意外由
+            // 预期标记判定（state.rs），投不投由消费方裁。
+            ClientboundGamePacket::ContainerSetSlot(set_slot) if set_slot.container_id == 0 => {
+                {
+                    let (item_name, count) = if set_slot.item_stack.is_empty() {
+                        (None, 0)
+                    } else {
+                        (
+                            Some(super::capture::canonical_registry_name(
+                                &set_slot.item_stack.kind().to_string(),
+                            )),
+                            set_slot.item_stack.count() as u32,
+                        )
+                    };
+                    inner.push_inventory_change(set_slot.slot, item_name, count);
+                }
+            }
+            // /give、拾取等对玩家背包的更新走专用包（不经容器 0 的 SetSlot）。
+            // 它的 slot 是背包索引（0-8 快捷、9-35 主背包、36-39 盔甲脚→头、
+            // 40 副手），换算成菜单协议号后同窗入账。
+            ClientboundGamePacket::SetPlayerInventory(set_inventory) => {
+                if let Some(menu_slot) = inventory_index_to_menu_slot(set_inventory.slot) {
+                    let (item_name, count) = if set_inventory.contents.is_empty() {
+                        (None, 0)
+                    } else {
+                        (
+                            Some(super::capture::canonical_registry_name(
+                                &set_inventory.contents.kind().to_string(),
+                            )),
+                            set_inventory.contents.count() as u32,
+                        )
+                    };
+                    inner.push_inventory_change(menu_slot, item_name, count);
+                }
+            }
             _ => {}
         },
         Event::Disconnect(reason) => {
@@ -208,5 +243,17 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             }
         }
         _ => {}
+    }
+}
+
+/// 背包索引 → 玩家物品栏屏的菜单协议号。
+/// 背包索引是 `SetPlayerInventory` 与 `/item container.N` 的编号空间。
+fn inventory_index_to_menu_slot(index: u32) -> Option<u16> {
+    match index {
+        0..=8 => Some(36 + index as u16),  // 快捷栏
+        9..=35 => Some(index as u16),      // 主背包（两个编号空间重合）
+        36..=39 => Some(8 - (index as u16 - 36)), // 盔甲：36脚→8 … 39头→5
+        40 => Some(45),                    // 副手
+        _ => None,
     }
 }

@@ -8,7 +8,9 @@
 
 use std::sync::atomic::Ordering;
 
+use azalea::container::ContainerHandleRef;
 use azalea::entity::{LoadedBy, LookDirection, Position};
+use azalea::inventory::operations::{ClickOperation, SwapClick, ThrowClick};
 use azalea::pathfinder::goals::BlockPosGoal;
 use azalea::pathfinder::PathfinderClientExt;
 use azalea::protocol::packets::game::s_player_action;
@@ -51,6 +53,14 @@ pub enum DoorCommand {
     },
     SwapOffhand,
     SelectSlot(u8),
+    /// 交换物品栏两格（菜单协议号 0-45）。任意两格经快捷栏中转三包同 tick
+    /// 完成（实测原子，见 swap_probe）；一侧在快捷栏/副手则原生一包。
+    SwapSlots {
+        a: u16,
+        b: u16,
+    },
+    /// 丢弃整格（屏内 Ctrl+Q 语义）。
+    ThrowSlot(u16),
 }
 
 pub(super) struct PendingCommand {
@@ -187,6 +197,75 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             bot.set_selected_hotbar_slot(slot);
             Ok(())
         }
+        DoorCommand::SwapSlots { a, b } => {
+            let clicks = plan_swap(a, b)?;
+            let mut touched = vec![a, b];
+            // 三连包经快捷格 0 中转（菜单号 36）——它也会短暂变动再复位。
+            if clicks.len() > 1 {
+                touched.push(TEMP_HOTBAR_MENU_SLOT);
+            }
+            inner.mark_expected_slots(&touched);
+            let handle = ContainerHandleRef::new(0, bot.clone());
+            for click in clicks {
+                handle.click(ClickOperation::Swap(click));
+            }
+            Ok(())
+        }
+        DoorCommand::ThrowSlot(slot) => {
+            if slot > MAX_MENU_SLOT {
+                return Err(format!("格号 {slot} 超出物品栏范围（0-{MAX_MENU_SLOT}）"));
+            }
+            inner.mark_expected_slots(&[slot]);
+            ContainerHandleRef::new(0, bot.clone())
+                .click(ClickOperation::Throw(ThrowClick::All { slot }));
+            Ok(())
+        }
+    }
+}
+
+/// 玩家物品栏屏的最大菜单号（45=副手）。
+const MAX_MENU_SLOT: u16 = 45;
+/// 三连包中转用的快捷栏按钮（0-8 任选；轮换必复位，不要求为空）。
+const TEMP_HOTBAR_BUTTON: u8 = 0;
+/// 中转快捷格对应的菜单号。
+const TEMP_HOTBAR_MENU_SLOT: u16 = 36;
+
+/// 把「交换菜单格 a、b」翻译成 SWAP 点击序列（纯函数，可单测）。
+///
+/// 协议的 SWAP 模式只能拿任意格对快捷栏（按钮 0-8）或副手（按钮 40）换：
+/// - 一侧是快捷栏（菜单 36-44）或副手（菜单 45）→ 原生一包；
+/// - 两侧都不是 → 经快捷格 0 三步轮换：a↔0、b↔0、a↔0，同 tick 三包
+///   （实测原子且中转格必复位，见 examples/swap_probe.rs）。
+pub(super) fn plan_swap(a: u16, b: u16) -> Result<Vec<SwapClick>, String> {
+    if a > MAX_MENU_SLOT || b > MAX_MENU_SLOT {
+        return Err(format!("格号超出物品栏范围（0-{MAX_MENU_SLOT}）：{a}、{b}"));
+    }
+    if a == b {
+        return Err("两个格号相同，没有可交换的".to_owned());
+    }
+    let swap_with = |source: u16, button: u8| SwapClick {
+        source_slot: source,
+        target_slot: button,
+    };
+    if let Some(button) = swap_button(b) {
+        return Ok(vec![swap_with(a, button)]);
+    }
+    if let Some(button) = swap_button(a) {
+        return Ok(vec![swap_with(b, button)]);
+    }
+    Ok(vec![
+        swap_with(a, TEMP_HOTBAR_BUTTON),
+        swap_with(b, TEMP_HOTBAR_BUTTON),
+        swap_with(a, TEMP_HOTBAR_BUTTON),
+    ])
+}
+
+/// 菜单号能否直接充当 SWAP 的目标按钮：快捷栏 36-44 → 0-8，副手 45 → 40。
+fn swap_button(menu_slot: u16) -> Option<u8> {
+    match menu_slot {
+        36..=44 => Some((menu_slot - 36) as u8),
+        45 => Some(40),
+        _ => None,
     }
 }
 
@@ -206,4 +285,33 @@ pub(super) fn find_entity_by_key(
         .iter(&ecs)
         .find(|(_, id, loaded_by)| ***id == protocol_id && loaded_by.contains(&bot.entity))
         .map(|(entity, _, _)| entity)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn swap_plans_follow_the_protocol_swap_constraints() {
+        // 一侧在快捷栏：原生一包，按钮 = 菜单号 − 36。
+        let plan = plan_swap(10, 38).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!((plan[0].source_slot, plan[0].target_slot), (10, 2));
+        // 副手按钮 40；快捷栏在 a 侧同样一包。
+        let plan = plan_swap(45, 20).unwrap();
+        assert_eq!((plan[0].source_slot, plan[0].target_slot), (20, 40));
+        let plan = plan_swap(44, 5).unwrap();
+        assert_eq!((plan[0].source_slot, plan[0].target_slot), (5, 8));
+        // 两侧都不在快捷栏/副手：经快捷格 0 三步轮换。
+        let plan = plan_swap(10, 20).unwrap();
+        let steps: Vec<(u16, u8)> = plan
+            .iter()
+            .map(|click| (click.source_slot, click.target_slot))
+            .collect();
+        assert_eq!(steps, vec![(10, 0), (20, 0), (10, 0)]);
+        // 越界与同格拒绝。
+        assert!(plan_swap(46, 0).is_err());
+        assert!(plan_swap(0, 99).is_err());
+        assert!(plan_swap(7, 7).is_err());
+    }
 }

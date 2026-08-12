@@ -34,6 +34,8 @@ use self::state::Inner;
 const DAMAGE_WINDOW_ENTRIES: usize = 100;
 /// 任务窗条目上限。
 const JOBS_WINDOW_ENTRIES: usize = 32;
+/// 物品栏变化窗条目上限。
+const INVENTORY_WINDOW_ENTRIES: usize = 64;
 /// 移动 job 起步宽限：下令后寻路器要过几个调度周期才可见（GotoEvent 是
 /// Bevy 消息，跨 schedule 投递）；宽限内不判终局。
 const MOVEMENT_ARM_GRACE_TICKS: u64 = 100;

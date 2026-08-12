@@ -9,6 +9,8 @@
 //! （ServerboundContainerClose）在本模块内扩展。
 
 mod chat;
+mod inventory;
 mod segment;
 
 pub use chat::{ChatBox, ChatDoor, ChatHistory, ChatReadMark};
+pub use inventory::{InventoryDoor, InventoryScreen, ScreenKind, ScreenState, DISCARD_SLOT};

@@ -93,6 +93,7 @@ pub(super) fn assemble_snapshot(inner: &Inner, bot: &Client) -> Option<TickSnaps
         sounds: Window::default(),
         damage: inner.damage_window_now(),
         jobs: inner.jobs_window_now(),
+        inventory_changes: inner.inventory_window_now(),
     })
 }
 
@@ -253,6 +254,6 @@ fn capture_entities(bot: &Client) -> Vec<EntitySnapshot> {
 }
 
 /// azalea 注册名规范化：剥 `minecraft:` 前缀，与旧契约同法。
-fn canonical_registry_name(name: &str) -> String {
+pub(super) fn canonical_registry_name(name: &str) -> String {
     name.strip_prefix("minecraft:").unwrap_or(name).to_owned()
 }

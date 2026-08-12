@@ -11,6 +11,7 @@ use dispatch::{Domain, Occupancy, ToolClass};
 use serde_json::{json, Value};
 use world::SnapshotSource;
 
+use crate::inventory::{ScreenKind, ScreenState};
 use crate::segment::{plan_lines, MAX_CHAT_UTF16};
 
 /// 模块一写表面的窄化：一行 = 一次原版输入循环。
@@ -55,6 +56,7 @@ const USAGE: &str = "聊天框用法：{action:\"say\", text} 按行发送，以
 
 pub struct ChatBox {
     occupancy: Arc<Occupancy>,
+    state: Arc<ScreenState>,
     door: Arc<dyn ChatDoor>,
     history: Arc<dyn ChatHistory>,
     read_mark: Arc<ChatReadMark>,
@@ -64,6 +66,7 @@ pub struct ChatBox {
 impl ChatBox {
     pub fn new(
         occupancy: Arc<Occupancy>,
+        state: Arc<ScreenState>,
         door: Arc<dyn ChatDoor>,
         history: Arc<dyn ChatHistory>,
         read_mark: Arc<ChatReadMark>,
@@ -71,11 +74,19 @@ impl ChatBox {
     ) -> Self {
         Self {
             occupancy,
+            state,
             door,
             history,
             read_mark,
             snapshots,
         }
+    }
+
+    /// 跨屏互斥：别的屏开着时聊天动词如实拒绝（原版一次只有一个屏）。
+    fn claim_chat_screen(&self) -> Result<(), String> {
+        self.state
+            .open(ScreenKind::Chat)
+            .map_err(|existing| format!("{}开着，先关闭它再用聊天框", super::inventory::kind_word(existing)))
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -140,10 +151,14 @@ impl ChatBox {
             Ok(lines) => lines,
             Err(reason) => return ToolResult::failure(call_id, reason),
         };
+        if let Err(reason) = self.claim_chat_screen() {
+            return ToolResult::failure(call_id, reason);
+        }
 
         self.occupancy.occupy(Domain::Screen);
         for (index, line) in lines.iter().enumerate() {
             if let Err(reason) = self.door.send_chat(line).await {
+                self.state.close(ScreenKind::Chat);
                 self.occupancy.release(Domain::Screen);
                 return ToolResult {
                     call_id,
@@ -156,6 +171,7 @@ impl ChatBox {
                 };
             }
         }
+        self.state.close(ScreenKind::Chat);
         self.occupancy.release(Domain::Screen);
         ToolResult::success_json(call_id, json!({ "sent_lines": lines.len() }))
     }
@@ -164,16 +180,23 @@ impl ChatBox {
         let Some(count) = count.and_then(Value::as_u64).filter(|count| *count > 0) else {
             return ToolResult::failure(call_id, "history 需要正整数参数 count；请改写调用");
         };
+        if let Err(reason) = self.claim_chat_screen() {
+            return ToolResult::failure(call_id, reason);
+        }
         self.occupancy.occupy(Domain::Screen);
         let lines = self.history.recent(count as usize);
         // 看了就清零：把已读水位推到当前时刻，不追每条是否真的读过。
         let now = self.snapshots.latest();
         self.read_mark.mark_read(now.epoch.0, now.tick);
+        self.state.close(ScreenKind::Chat);
         self.occupancy.release(Domain::Screen);
         ToolResult::success_json(call_id, json!({ "lines": lines }))
     }
 
     fn open(&self, call_id: agent::ToolCallId, describe: Option<&Value>) -> ToolResult {
+        if let Err(reason) = self.claim_chat_screen() {
+            return ToolResult::failure(call_id, reason);
+        }
         self.occupancy.occupy(Domain::Screen);
         let mut payload = json!({ "state": "open" });
         if describe.and_then(Value::as_bool) == Some(true) {
@@ -183,6 +206,7 @@ impl ChatBox {
     }
 
     fn close(&self, call_id: agent::ToolCallId) -> ToolResult {
+        self.state.close(ScreenKind::Chat);
         self.occupancy.release(Domain::Screen);
         ToolResult::success_json(call_id, json!({ "state": "closed" }))
     }
@@ -289,6 +313,7 @@ mod tests {
         let read_mark = Arc::new(ChatReadMark::new());
         let chat = ChatBox::new(
             occupancy.clone(),
+            Arc::new(ScreenState::new()),
             door.clone(),
             history,
             read_mark.clone(),

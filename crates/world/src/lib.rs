@@ -80,6 +80,7 @@ impl TickSnapshot {
             sounds: Window::default(),
             damage: Window::default(),
             jobs: Window::default(),
+            inventory_changes: Window::default(),
         }
     }
 }
@@ -111,6 +112,10 @@ pub struct TickSnapshot {
     /// 后台任务（寻路等）的变化事实。窗装全部事件（顶替/停止也是事实）；
     /// 哪些值得唤醒是己的第二个判据，不在这里裁。
     pub jobs: Window<JobEntry>,
+    /// 物品栏格位变化的事实（容器 0 的 ContainerSetSlot 包直译）。
+    /// 窗装全部变化；自己动作的回声标 Commanded，预期之外标 ServerObserved，
+    /// 投不投、开屏才投——判据在消费方。
+    pub inventory_changes: Window<InventoryChangeEntry>,
 }
 
 /// 世界环境的直译。呈现（时段文案、"下大雨"）归渲染层。
@@ -262,6 +267,24 @@ pub enum JobOutcome {
     PathEnded,
     /// 卡住：较长时间没有推进（寻路器还在自救，任务未结束）。
     Stalled,
+}
+
+/// 物品栏格位变化：菜单协议号（0-45）上的内容更替。
+#[derive(Clone, Debug, PartialEq)]
+pub struct InventoryChangeEntry {
+    /// 与 ChatEntry.seq 同源的单调到达序号。
+    pub seq: u64,
+    pub tick: u64,
+    pub occurred_at: Timestamp,
+    /// Commanded=我们 swap/丢弃动作的预期回声；ServerObserved=预期之外
+    /// （拾取入包、合成结果格出现、外部给予等）。
+    pub source: FactSource,
+    /// 菜单协议号。玩家物品栏屏：0 合成结果、1-4 随身合成、5-8 盔甲、
+    /// 9-35 主背包、36-44 快捷栏、45 副手。
+    pub slot: u16,
+    /// 变化后的内容；None = 变空。
+    pub item_name: Option<String>,
+    pub count: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

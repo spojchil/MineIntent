@@ -18,7 +18,7 @@ use hand::{HandDoor, HandTools};
 use memory::{MemoryFile, MemoryTools};
 use motion::{MotionDoor, MotionTools};
 use perception::{PerceptionTools, ViewportDoor};
-use screens::{ChatBox, ChatDoor, ChatHistory, ChatReadMark};
+use screens::{ChatBox, ChatDoor, ChatHistory, ChatReadMark, InventoryDoor, InventoryScreen, ScreenKind, ScreenState};
 use world::{ConnectionConfig, DoorCommand, Module, SnapshotSource};
 
 mod wake;
@@ -143,6 +143,18 @@ impl HandDoor for ModuleHandDoor {
     }
 }
 
+/// 物品栏门：交换与丢弃直译为写口命令。
+struct ModuleInventoryDoor(Arc<Module>);
+
+impl InventoryDoor for ModuleInventoryDoor {
+    fn swap_slots<'a>(&'a self, a: u16, b: u16) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::SwapSlots { a, b }).await })
+    }
+    fn throw_slot<'a>(&'a self, slot: u16) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::ThrowSlot(slot)).await })
+    }
+}
+
 /// 视口门：投影是纯 CPU 重活，放阻塞池，不占用异步线程。
 struct ModuleViewportDoor(Arc<Module>);
 
@@ -210,6 +222,7 @@ async fn main() -> Result<(), String> {
 
     // ---- 中间层装配 ----
     let occupancy = Arc::new(Occupancy::new());
+    let screen_state = Arc::new(ScreenState::new());
     let read_mark = Arc::new(ChatReadMark::new());
     let memory_file = Arc::new(MemoryFile::new(memory_path));
     let snapshots: Arc<dyn SnapshotSource> = module.clone();
@@ -217,9 +230,16 @@ async fn main() -> Result<(), String> {
     let providers: Vec<Arc<dyn ToolProvider>> = vec![
         Arc::new(ChatBox::new(
             occupancy.clone(),
+            screen_state.clone(),
             Arc::new(ModuleChatDoor(module.clone())),
             Arc::new(ModuleChatHistory(module.clone())),
             read_mark.clone(),
+            snapshots.clone(),
+        )),
+        Arc::new(InventoryScreen::new(
+            occupancy.clone(),
+            screen_state.clone(),
+            Arc::new(ModuleInventoryDoor(module.clone())),
             snapshots.clone(),
         )),
         Arc::new(MemoryTools::new(memory_file.clone())),
@@ -276,6 +296,8 @@ async fn main() -> Result<(), String> {
                 let fresh = cursors.collect(
                     &snapshot,
                     SelfIdentity { entity_key: &own_key, username: &username },
+                    // 库存变化只在物品栏开着时投递（维护者裁定）。
+                    screen_state.current() == Some(ScreenKind::Inventory),
                 );
                 if fresh.is_empty() {
                     continue;
