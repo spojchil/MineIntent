@@ -75,3 +75,84 @@ impl BlockProbe {
 pub fn is_air_name(name: &str) -> bool {
     matches!(name, "air" | "cave_air" | "void_air")
 }
+
+/// 模型可见的跨方块视觉属性白名单（承旧线 contracts BlockInfo，逐字迁入）。
+///
+/// 这是「玩家能从方块外观/朝向读到」的状态集合，而不是协议状态全集。尤其不
+/// 包含树叶 `distance`/`persistent` 等内部维护属性；新增或删除属性必须同步登记。
+pub const VISIBLE_BLOCK_PROPERTY_NAMES: &[&str] = &[
+    "age",
+    "attached",
+    "attachment",
+    "axis",
+    "bites",
+    "bottom",
+    "candles",
+    "conditional",
+    "delay",
+    "disarmed",
+    "east",
+    "east_wall",
+    "enabled",
+    "face",
+    "facing",
+    "half",
+    "hanging",
+    "hinge",
+    "honey_level",
+    "in_wall",
+    "instrument",
+    "layers",
+    "level",
+    "lit",
+    "locked",
+    "mode",
+    "moisture",
+    "north",
+    "north_wall",
+    "occupied",
+    "open",
+    "orientation",
+    "part",
+    "pickles",
+    "powered",
+    "rotation",
+    "shape",
+    "short",
+    "signal_fire",
+    "snowy",
+    "stage",
+    "triggered",
+    "unstable",
+    "up",
+    "vertical_direction",
+    "vine_end",
+    "wall",
+    "waterlogged",
+    "west",
+    "west_wall",
+];
+
+pub fn is_visible_block_property(name: &str) -> bool {
+    VISIBLE_BLOCK_PROPERTY_NAMES.contains(&name)
+}
+
+/// 模型可见的方块标签：名称 + 白名单属性，原版方块状态语法
+/// `furnace[facing=north,lit=true]`；无白名单属性时就是裸名称。
+/// 全量/定向/增量三种模式与增量身份判断统一用它——同一种语言。
+pub fn visible_block_label(
+    name: &str,
+    properties: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let mut visible = properties
+        .iter()
+        .filter(|(key, _)| is_visible_block_property(key))
+        .peekable();
+    if visible.peek().is_none() {
+        return name.to_owned();
+    }
+    let inner: Vec<String> = visible
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    format!("{name}[{}]", inner.join(","))
+}

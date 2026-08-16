@@ -195,12 +195,18 @@ impl perception::ViewportDoor for NoDoor {
                 world::BlockChange::Changed {
                     at: [6, 72, 3],
                     was: world::BlockFact {
-                        name: "oak_log".to_owned(),
-                        properties: Default::default(),
+                        name: "furnace".to_owned(),
+                        properties: std::collections::BTreeMap::from([
+                            ("facing".to_owned(), "north".to_owned()),
+                            ("lit".to_owned(), "false".to_owned()),
+                        ]),
                     },
                     now: world::BlockFact {
-                        name: "campfire".to_owned(),
-                        properties: Default::default(),
+                        name: "furnace".to_owned(),
+                        properties: std::collections::BTreeMap::from([
+                            ("facing".to_owned(), "north".to_owned()),
+                            ("lit".to_owned(), "true".to_owned()),
+                        ]),
                     },
                 },
                 world::BlockChange::Vanished {

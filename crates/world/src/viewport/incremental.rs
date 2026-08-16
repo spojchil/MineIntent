@@ -46,6 +46,11 @@ impl BlockFact {
     }
 }
 
+/// 事实的模型可见标签（身份判据）：名称+白名单视觉属性。
+fn visible_label(fact: &BlockFact) -> String {
+    crate::block::visible_block_label(&fact.name, &fact.properties)
+}
+
 /// 方块记忆：位置 → 最后所见。只记非空气；空气=没有条目。
 #[derive(Clone, Debug, Default)]
 pub struct BlockMemory {
@@ -168,14 +173,16 @@ pub fn diff(
                 at: block.position,
                 fact: now,
             }),
-            // 身份=名称，与全量呈现同一种语言（维护者裁定）。属性仍随吸收
-            // 进记忆，但不参与差异：模型面的呈现全都不含属性，比出属性差
-            // 只会产出两行一模一样的 +/-。
-            Some(was) if was.name != now.name => changes.push(BlockChange::Changed {
-                at: block.position,
-                was: was.clone(),
-                now,
-            }),
+            // 身份=模型可见标签（名称+白名单视觉属性），与全量/定向同一种
+            // 语言（承旧线 BlockInfo）。白名单外的协议属性不参与差异——
+            // 比出来也只会是两行字面相同的 +/-。
+            Some(was) if visible_label(was) != visible_label(&now) => {
+                changes.push(BlockChange::Changed {
+                    at: block.position,
+                    was: was.clone(),
+                    now,
+                })
+            }
             Some(_) => {}
         }
     }
@@ -253,6 +260,36 @@ mod tests {
         );
     }
 
+    /// 身份=名称+白名单视觉属性：熔炉燃灭算变化，白名单外的协议属性不算。
+    #[test]
+    fn visible_state_changes_diff_but_protocol_properties_do_not() {
+        let lit = |value: &str| ViewportBlock {
+            name: "furnace".to_owned(),
+            properties: BTreeMap::from([("lit".to_owned(), value.to_owned())]),
+            position: [0, 64, 0],
+        };
+        let mut memory = BlockMemory::new();
+        memory.absorb_visible(&[lit("false")]);
+        // 燃起来了：白名单属性变 → Changed。
+        let changes = diff(&memory, &[lit("true")], |_| true, |_| false);
+        assert_eq!(changes.len(), 1);
+        assert!(
+            matches!(&changes[0], BlockChange::Changed { was, now, .. }
+                if was.properties["lit"] == "false" && now.properties["lit"] == "true"),
+            "{changes:?}"
+        );
+        // 白名单外的协议属性（如树叶 distance）变化：沉默。
+        let internal = |value: &str| ViewportBlock {
+            name: "oak_leaves".to_owned(),
+            properties: BTreeMap::from([("distance".to_owned(), value.to_owned())]),
+            position: [1, 70, 0],
+        };
+        let mut leaves = BlockMemory::new();
+        leaves.absorb_visible(&[internal("1")]);
+        let silent = diff(&leaves, &[internal("3")], |_| true, |_| false);
+        assert!(silent.is_empty(), "{silent:?}");
+    }
+
     /// 消失要亲眼可证：探针说空才报，说不清就沉默保留记忆。
     #[test]
     fn vanished_needs_eyewitness_proof_of_emptiness() {
@@ -326,7 +363,9 @@ mod tests {
     /// 吸收：可见集 upsert，定向见空销账，看不见不动。
     #[test]
     fn absorption_upserts_seen_and_erases_witnessed_empties() {
-        use crate::viewport::{DirectedProjection, DirectedSeenBlock, DirectedUnseenBlock, DirectedWhy};
+        use crate::viewport::{
+            DirectedProjection, DirectedSeenBlock, DirectedUnseenBlock, DirectedWhy,
+        };
 
         let mut memory = BlockMemory::new();
         memory.absorb_visible(&[block([0, 64, 0], "stone"), block([9, 64, 9], "air")]);

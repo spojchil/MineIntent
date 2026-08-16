@@ -300,7 +300,10 @@ fn player_menu_lists_sections_by_protocol_slot() {
         },
     ];
     let text = render_player_menu(&snap);
-    assert!(text.contains("盔甲·头/胸/腿/脚（5-8）：6=iron_chestplate ×1"), "{text}");
+    assert!(
+        text.contains("盔甲·头/胸/腿/脚（5-8）：6=iron_chestplate ×1"),
+        "{text}"
+    );
     assert!(text.contains("主背包（9-35）：10=diamond ×3"), "{text}");
     assert!(text.contains("快捷栏（36-44）：38=bread ×7"), "{text}");
     assert!(text.contains("随身合成（1-4）：空"), "{text}");
@@ -319,7 +322,10 @@ fn inventory_changes_name_the_slot_and_call_out_the_craft_result() {
         item_name: Some("oak_planks".to_owned()),
         count: 4,
     };
-    assert_eq!(render_inventory_change(&entry), "物品栏格 12 出现了 oak_planks ×4。");
+    assert_eq!(
+        render_inventory_change(&entry),
+        "物品栏格 12 出现了 oak_planks ×4。"
+    );
 
     let emptied = world::InventoryChangeEntry {
         slot: 0,
@@ -441,7 +447,13 @@ fn furnace_menu_listing_names_the_three_working_slots() {
         assert!(text.contains("原料（0）：raw_iron ×3"), "{kind}: {text}");
         assert!(text.contains("燃料（1）：coal ×2"), "{kind}: {text}");
         assert!(text.contains("成品（2）：空"), "{kind}: {text}");
-        assert!(text.contains("主背包（3-29）：10=bread ×5"), "{kind}: {text}");
-        assert!(text.contains("快捷栏（30-38）：31=stick ×4"), "{kind}: {text}");
+        assert!(
+            text.contains("主背包（3-29）：10=bread ×5"),
+            "{kind}: {text}"
+        );
+        assert!(
+            text.contains("快捷栏（30-38）：31=stick ×4"),
+            "{kind}: {text}"
+        );
     }
 }

@@ -370,11 +370,17 @@ pub fn render_viewport(projection: &world::ViewportProjection) -> String {
     if let Some(block) = &projection.looked_at_block {
         lines.push(format!(
             "准星对着：{} ({}, {}, {})。",
-            block.name, block.position[0], block.position[1], block.position[2]
+            world::visible_block_label(&block.name, &block.properties),
+            block.position[0],
+            block.position[1],
+            block.position[2]
         ));
     }
     if let Some(block) = &projection.standing_on_block {
-        lines.push(format!("脚下踩着：{}。", block.name));
+        lines.push(format!(
+            "脚下踩着：{}。",
+            world::visible_block_label(&block.name, &block.properties)
+        ));
     }
 
     if projection.visible_entities.items.is_empty() {
@@ -406,21 +412,23 @@ pub fn render_viewport(projection: &world::ViewportProjection) -> String {
     if projection.visible_blocks.blocks.is_empty() {
         lines.push("视野里没有可见方块（可能都被挡住或未加载）。".to_owned());
     } else {
-        // 同名聚合：数量 + 最近一处坐标（列表本身按距离从近到远）。
-        let mut groups: Vec<(&str, usize, [i32; 3])> = Vec::new();
+        // 同标签聚合：数量 + 最近一处坐标（列表本身按距离从近到远）。
+        // 标签=名称+白名单视觉属性——燃着与熄着的熔炉是两组，远处可辨。
+        let mut groups: Vec<(String, usize, [i32; 3])> = Vec::new();
         for block in &projection.visible_blocks.blocks {
-            match groups.iter_mut().find(|(name, ..)| *name == block.name) {
+            let label = world::visible_block_label(&block.name, &block.properties);
+            match groups.iter_mut().find(|(seen, ..)| *seen == label) {
                 Some((_, count, _)) => *count += 1,
-                None => groups.push((&block.name, 1, block.position)),
+                None => groups.push((label, 1, block.position)),
             }
         }
         let described: Vec<String> = groups
             .into_iter()
-            .map(|(name, count, [x, y, z])| {
+            .map(|(label, count, [x, y, z])| {
                 if count > 1 {
-                    format!("{name} ×{count}（最近 {x},{y},{z}）")
+                    format!("{label} ×{count}（最近 {x},{y},{z}）")
                 } else {
-                    format!("{name}（{x},{y},{z}）")
+                    format!("{label}（{x},{y},{z}）")
                 }
             })
             .collect();
@@ -437,22 +445,32 @@ pub fn render_viewport(projection: &world::ViewportProjection) -> String {
 /// 增量查看结果的呈现：git 式 diff（维护者裁定）。
 ///
 /// 基线是记忆整体，不是「上一次报告」——比较不带时间性。每行是一个
-/// 五元组 (±, x, y, z, 方块名)：`+` 该事实进入所见，`-` 该事实不再成立；
-/// 同格换方块 = 一撤一立两行，与 git 同法。末注保住「缺席≠没有」语义。
+/// 五元组 (±, x, y, z, 方块状态)：第四元不止名称，是名称+白名单视觉属性
+/// （`furnace[facing=north,lit=true]`）——远处即可分辨熔炉燃灭，状态变化
+/// 也能一撤一立显出来；`+` 该事实进入所见，`-` 该事实不再成立，与 git 同法。
+/// 末注保住「缺席≠没有」语义。
 pub fn render_block_changes(changes: &[world::BlockChange]) -> String {
-    let quad = |at: &[i32; 3], name: &str| format!("({}, {}, {}, {name})", at[0], at[1], at[2]);
+    let quad = |at: &[i32; 3], fact: &world::BlockFact| {
+        format!(
+            "({}, {}, {}, {})",
+            at[0],
+            at[1],
+            at[2],
+            world::visible_block_label(&fact.name, &fact.properties)
+        )
+    };
     let mut lines = Vec::new();
     for change in changes {
         match change {
             world::BlockChange::Appeared { at, fact } => {
-                lines.push(format!("+ {}", quad(at, &fact.name)));
+                lines.push(format!("+ {}", quad(at, fact)));
             }
             world::BlockChange::Changed { at, was, now } => {
-                lines.push(format!("- {}", quad(at, &was.name)));
-                lines.push(format!("+ {}", quad(at, &now.name)));
+                lines.push(format!("- {}", quad(at, was)));
+                lines.push(format!("+ {}", quad(at, now)));
             }
             world::BlockChange::Vanished { at, was } => {
-                lines.push(format!("- {}", quad(at, &was.name)));
+                lines.push(format!("- {}", quad(at, was)));
             }
         }
     }
@@ -478,7 +496,10 @@ pub fn render_directed(projection: &world::DirectedProjection) -> String {
         } else {
             lines.push(format!(
                 "({}, {}, {})：看得见，是 {}。",
-                seen.at[0], seen.at[1], seen.at[2], seen.name
+                seen.at[0],
+                seen.at[1],
+                seen.at[2],
+                world::visible_block_label(&seen.name, &seen.properties)
             ));
         }
     }

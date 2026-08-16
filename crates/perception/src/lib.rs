@@ -56,10 +56,7 @@ impl PerceptionTools {
         };
         let changes_mode = matches!(arguments.get("changes"), Some(Value::Bool(true)));
         if changes_mode && arguments.get("at").is_some() {
-            return ToolResult::failure(
-                call_id,
-                "changes 与 at 一次只能用一种模式；请改写调用",
-            );
+            return ToolResult::failure(call_id, "changes 与 at 一次只能用一种模式；请改写调用");
         }
         if changes_mode {
             // 记忆的 diff 与推进都在门后同一把锁内完成，这里只管呈现。
@@ -147,7 +144,7 @@ impl ToolProvider for PerceptionTools {
                     },
                     "changes": {
                         "type": "boolean",
-                        "description": "可选：把当前视野与你已见过的对比，git 式只报差异行（+ 新成立、- 不再成立，每行 (x, y, z, 方块名)），比环视省得多。没列出的坐标不代表没东西；想确认具体位置用 at。与 at 互斥"
+                        "description": "可选：把当前视野与你已见过的对比，git 式只报差异行（+ 新成立、- 不再成立，每行 (x, y, z, 方块状态)——状态含可见属性如 furnace[lit=true]），比环视省得多。没列出的坐标不代表没东西；想确认具体位置用 at。与 at 互斥"
                     }
                 },
                 "additionalProperties": false

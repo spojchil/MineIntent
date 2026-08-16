@@ -634,33 +634,45 @@ mod tests {
     fn merge_pours_into_same_item_respecting_the_stack_cap() {
         let geometry = player_menu_geometry();
         // 装得下：拿起 + 倒入两包。
-        let plan =
-            plan_move(ends(10, 20, Some((8, 64)), Some(40), true), None, &geometry).unwrap();
+        let plan = plan_move(ends(10, 20, Some((8, 64)), Some(40), true), None, &geometry).unwrap();
         assert_eq!(plan.len(), 2);
         // 装不下全部：倒到满，余量放回（三包）。
-        let plan =
-            plan_move(ends(10, 20, Some((30, 64)), Some(50), true), None, &geometry).unwrap();
+        let plan = plan_move(
+            ends(10, 20, Some((30, 64)), Some(50), true),
+            None,
+            &geometry,
+        )
+        .unwrap();
         assert_eq!(plan.len(), 3);
         // 指定 count：右键逐个倒。
-        let plan =
-            plan_move(ends(10, 20, Some((8, 64)), Some(40), true), Some(2), &geometry).unwrap();
+        let plan = plan_move(
+            ends(10, 20, Some((8, 64)), Some(40), true),
+            Some(2),
+            &geometry,
+        )
+        .unwrap();
         assert_eq!(plan.len(), 4);
         // 目标已满 / count 超过剩余空间：如实拒绝。
         assert!(plan_move(ends(10, 20, Some((8, 64)), Some(64), true), None, &geometry).is_err());
-        assert!(
-            plan_move(ends(10, 20, Some((30, 64)), Some(60), true), Some(5), &geometry).is_err()
-        );
+        assert!(plan_move(
+            ends(10, 20, Some((30, 64)), Some(60), true),
+            Some(5),
+            &geometry
+        )
+        .is_err());
     }
 
     #[test]
     fn different_items_only_do_whole_exchange() {
         let geometry = player_menu_geometry();
-        let plan =
-            plan_move(ends(10, 20, Some((8, 64)), Some(3), false), None, &geometry).unwrap();
+        let plan = plan_move(ends(10, 20, Some((8, 64)), Some(3), false), None, &geometry).unwrap();
         assert_eq!(plan.len(), 3, "两侧都不在快捷栏：三包中转对调");
-        assert!(
-            plan_move(ends(10, 20, Some((8, 64)), Some(3), false), Some(2), &geometry).is_err()
-        );
+        assert!(plan_move(
+            ends(10, 20, Some((8, 64)), Some(3), false),
+            Some(2),
+            &geometry
+        )
+        .is_err());
     }
 
     #[test]

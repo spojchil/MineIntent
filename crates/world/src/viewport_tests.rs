@@ -184,8 +184,14 @@ fn changes_mode_reports_appearance_silence_vanish_and_ignores_whats_behind() {
 
     // 首看：空记忆 → 石头是新看到。
     let mut memory = BlockMemory::new();
-    let first = project_changes(&pose(0.0), &memory, fixture_read, &options(), world_bounds())
-        .expect("fixture options should be valid");
+    let first = project_changes(
+        &pose(0.0),
+        &memory,
+        fixture_read,
+        &options(),
+        world_bounds(),
+    )
+    .expect("fixture options should be valid");
     assert_eq!(first.len(), 1);
     assert!(
         matches!(&first[0], BlockChange::Appeared { at, fact } if *at == [0, 2, -1] && fact.name == "stone"),
@@ -194,8 +200,14 @@ fn changes_mode_reports_appearance_silence_vanish_and_ignores_whats_behind() {
 
     // 推进后同景再看：无话可说。
     memory.apply(&first);
-    let silent = project_changes(&pose(0.0), &memory, fixture_read, &options(), world_bounds())
-        .expect("fixture options should be valid");
+    let silent = project_changes(
+        &pose(0.0),
+        &memory,
+        fixture_read,
+        &options(),
+        world_bounds(),
+    )
+    .expect("fixture options should be valid");
     assert!(silent.is_empty(), "{silent:?}");
 
     // 石头被移走（世界全空）：亲眼可证 → 没了。
