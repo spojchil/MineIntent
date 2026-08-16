@@ -159,30 +159,25 @@ impl WireCodec for AnthropicMessagesCodec {
 }
 
 fn decode_messages_response(value: Value) -> Result<ModelResponse, AgentError> {
+    if value
+        .get("type")
+        .is_some_and(|kind| kind.as_str() != Some("message"))
+    {
+        return Err(model_error("anthropic_messages_response_type_not_message"));
+    }
+    if value
+        .get("role")
+        .is_some_and(|role| role.as_str() != Some("assistant"))
+    {
+        return Err(model_error(
+            "anthropic_messages_response_role_not_assistant",
+        ));
+    }
     let blocks = value
         .get("content")
         .and_then(Value::as_array)
         .ok_or_else(|| model_error("anthropic_messages_missing_content"))?;
-    let mut content = Vec::new();
-    let mut tool_calls = Vec::new();
-
-    for block in blocks {
-        match block.get("type").and_then(Value::as_str) {
-            Some("text") => {
-                let text = block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| model_error("anthropic_messages_text_missing_value"))?;
-                content.push(ContentPart::text(text));
-            }
-            Some("tool_use") => tool_calls.push(decode_tool_use(block)?),
-            Some(kind) => content.push(ContentPart::Opaque {
-                kind: format!("anthropic.messages.{kind}"),
-                data: block.clone(),
-            }),
-            None => return Err(model_error("anthropic_messages_content_missing_type")),
-        }
-    }
+    let (content, tool_calls) = decode_content_blocks(blocks)?;
 
     let stop_reason = value.get("stop_reason").cloned();
     let reason = stop_reason
@@ -190,7 +185,7 @@ fn decode_messages_response(value: Value) -> Result<ModelResponse, AgentError> {
         .and_then(Value::as_str)
         .ok_or_else(|| model_error("anthropic_messages_missing_stop_reason"))?;
     match reason {
-        "end_turn" | "tool_use" | "stop_sequence" | "refusal" => {}
+        "end_turn" | "tool_use" | "stop_sequence" | "refusal" | "pause_turn" => {}
         "max_tokens" | "model_context_window_exceeded" => {
             return Err(model_error(format!(
                 "anthropic_messages_unsuccessful_stop_reason:{reason}"
@@ -203,7 +198,7 @@ fn decode_messages_response(value: Value) -> Result<ModelResponse, AgentError> {
     // 本地工具调用与终止原因必须双向一致，不能凭缺失或意外的 tool_use 推断完整工具批。
     match (tool_calls.is_empty(), reason) {
         (false, "tool_use") => {}
-        (true, "end_turn" | "stop_sequence" | "refusal") => {}
+        (true, "end_turn" | "stop_sequence" | "refusal" | "pause_turn") => {}
         (false, _) => {
             return Err(model_error(
                 "anthropic_messages_tool_calls_without_tool_use_stop",
@@ -261,9 +256,60 @@ fn decode_messages_response(value: Value) -> Result<ModelResponse, AgentError> {
     })
 }
 
+fn decode_content_blocks(
+    blocks: &[Value],
+) -> Result<(Vec<ContentPart>, Vec<ToolCall>), AgentError> {
+    let mut content = Vec::new();
+    let mut tool_calls = Vec::new();
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                let text = block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| model_error("anthropic_messages_text_missing_value"))?;
+                content.push(ContentPart::text(text));
+            }
+            Some("tool_use") => tool_calls.push(decode_tool_use(block)?),
+            // tool_result 是 user 输入块；把它藏进 raw assistant 内容会绕过规范工具闭包。
+            Some("tool_result") => {
+                return Err(model_error(
+                    "anthropic_messages_tool_result_in_model_output",
+                ));
+            }
+            Some(kind) => content.push(ContentPart::Opaque {
+                kind: format!("anthropic.messages.{kind}"),
+                data: block.clone(),
+            }),
+            None => return Err(model_error("anthropic_messages_content_missing_type")),
+        }
+    }
+    Ok((content, tool_calls))
+}
+
+/// 块在流式事件里属于哪一类段。
+///
+/// 在 `content_block_start` 判定一次并记下来，之后 delta 用它校验、stop 用它封口。
+/// 不能在 start 和 stop 各自重读 `block["type"]`：那个字段在 delta 期间会被
+/// `append_string_field` 改写，两处判断可能不一致；也必须有东西拦住
+/// 「thinking_delta 落在 text 块上」，否则会发出 `TextStart → ReasoningDelta → TextEnd`
+/// 这种不成对的序列。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockSegment {
+    /// 正文块，只接受 `text_delta`。
+    Text,
+    /// 推理块（`thinking` 与 `redacted_thinking`），接受 `thinking_delta` 与 `signature_delta`。
+    Reasoning,
+    /// 工具输入块（`tool_use` 与 `server_tool_use`），只接受 `input_json_delta`。
+    ToolInput,
+    /// 其他块类型：不发段事件，也不接受上面任何一种已知增量。
+    Other,
+}
+
 struct MessageBlockDraft {
     block: Value,
     input_json: String,
+    segment: BlockSegment,
     tool_slot: Option<ToolCallSlot>,
     stopped: bool,
 }
@@ -330,6 +376,22 @@ impl MessagesStreamDecoder {
             ));
         }
         if message
+            .get("type")
+            .is_some_and(|kind| kind.as_str() != Some("message"))
+        {
+            return Err(model_error(
+                "anthropic_messages_stream_start_type_not_message",
+            ));
+        }
+        if message
+            .get("role")
+            .is_some_and(|role| role.as_str() != Some("assistant"))
+        {
+            return Err(model_error(
+                "anthropic_messages_stream_start_role_not_assistant",
+            ));
+        }
+        if message
             .get("content")
             .and_then(Value::as_array)
             .is_some_and(|content| !content.is_empty())
@@ -354,7 +416,14 @@ impl MessagesStreamDecoder {
             .get("content_block")
             .cloned()
             .ok_or_else(|| model_error("anthropic_messages_stream_block_start_missing_block"))?;
-        let tool_slot = if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+        let block_type = block.get("type").and_then(Value::as_str);
+        let segment = match block_type {
+            Some("text") => BlockSegment::Text,
+            Some("thinking" | "redacted_thinking") => BlockSegment::Reasoning,
+            Some("tool_use" | "server_tool_use") => BlockSegment::ToolInput,
+            _ => BlockSegment::Other,
+        };
+        let tool_slot = if block_type == Some("tool_use") {
             let slot = ToolCallSlot::new(self.next_tool_slot);
             self.next_tool_slot = self
                 .next_tool_slot
@@ -364,16 +433,23 @@ impl MessagesStreamDecoder {
         } else {
             None
         };
+        // Anthropic 的块索引天然就是「同一次响应内标识一段内容」的稳定值，直接用作 part_index。
+        let opened = match segment {
+            BlockSegment::Text => Some(ModelStreamEvent::TextStart { part_index: index }),
+            BlockSegment::Reasoning => Some(ModelStreamEvent::ReasoningStart { part_index: index }),
+            BlockSegment::ToolInput | BlockSegment::Other => None,
+        };
         self.blocks.insert(
             index,
             MessageBlockDraft {
                 block,
                 input_json: String::new(),
+                segment,
                 tool_slot,
                 stopped: false,
             },
         );
-        Ok(StreamDecode::events(Vec::new()))
+        Ok(StreamDecode::events(opened.into_iter().collect()))
     }
 
     fn content_block_delta(&mut self, value: &Value) -> Result<StreamDecode, AgentError> {
@@ -394,6 +470,20 @@ impl MessagesStreamDecoder {
             .get("type")
             .and_then(Value::as_str)
             .ok_or_else(|| model_error("anthropic_messages_stream_delta_missing_type"))?;
+        // 增量必须落在相容的块上。否则会发出不成对的段事件，而且
+        // `append_string_field` 还会往块里塞一个它不该有的字段，污染回放用的 provider_data。
+        let compatible = match kind {
+            "text_delta" | "citations_delta" => draft.segment == BlockSegment::Text,
+            "thinking_delta" | "signature_delta" => draft.segment == BlockSegment::Reasoning,
+            "input_json_delta" => draft.segment == BlockSegment::ToolInput,
+            // 未知增量类型直接忽略，保持对新协议特性的前向兼容。
+            _ => true,
+        };
+        if !compatible {
+            return Err(model_error(
+                "anthropic_messages_stream_delta_type_incompatible_with_block",
+            ));
+        }
         match kind {
             "text_delta" => {
                 let text = string_allow_empty(
@@ -413,11 +503,6 @@ impl MessagesStreamDecoder {
                 Ok(StreamDecode::events(events))
             }
             "input_json_delta" => {
-                if draft.tool_slot.is_none() {
-                    return Err(model_error(
-                        "anthropic_messages_stream_input_delta_for_non_tool_block",
-                    ));
-                }
                 let partial = string_allow_empty(
                     delta,
                     "partial_json",
@@ -433,7 +518,15 @@ impl MessagesStreamDecoder {
                     "anthropic_messages_stream_thinking_delta_missing_value",
                 )?;
                 append_string_field(&mut draft.block, "thinking", thinking)?;
-                Ok(StreamDecode::events(Vec::new()))
+                let events = if thinking.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![ModelStreamEvent::ReasoningDelta {
+                        part_index: index,
+                        delta: thinking.to_owned(),
+                    }]
+                };
+                Ok(StreamDecode::events(events))
             }
             "signature_delta" => {
                 let signature = string_allow_empty(
@@ -442,6 +535,16 @@ impl MessagesStreamDecoder {
                     "anthropic_messages_stream_signature_delta_missing_value",
                 )?;
                 append_string_field(&mut draft.block, "signature", signature)?;
+                Ok(StreamDecode::events(Vec::new()))
+            }
+            "citations_delta" => {
+                // 官方五类 delta 之一，只作用于 text 块：把 `citation` 依次追加到块的
+                // `citations` 数组。它不产生观测事件，但 `message_stop` 完全从这些草稿重建
+                // 最终 content，不写进去就意味着流式回放丢引用。
+                let citation = delta.get("citation").cloned().ok_or_else(|| {
+                    model_error("anthropic_messages_stream_citations_delta_missing_citation")
+                })?;
+                append_array_field(&mut draft.block, "citations", citation)?;
                 Ok(StreamDecode::events(Vec::new()))
             }
             _ => Ok(StreamDecode::events(Vec::new())),
@@ -460,10 +563,6 @@ impl MessagesStreamDecoder {
             ));
         }
         draft.stopped = true;
-        let Some(slot) = draft.tool_slot else {
-            return Ok(StreamDecode::events(Vec::new()));
-        };
-
         if !draft.input_json.is_empty() {
             let input = serde_json::from_str(&draft.input_json).map_err(|error| {
                 model_error(format!(
@@ -472,6 +571,21 @@ impl MessagesStreamDecoder {
             })?;
             draft.block["input"] = input;
         }
+        let Some(slot) = draft.tool_slot else {
+            // server_tool_use 由 Anthropic 执行；它需要原样进入 pause_turn 的续请求，但
+            // 绝不能作为本地函数调用发布。正文与推理块在这里封口。
+            //
+            // 用开始时记下的 segment，不重读 `block["type"]`：那个字段在 delta 期间被
+            // `append_string_field` 写过，重读就可能和开始时的判断不一致。
+            let closed = match draft.segment {
+                BlockSegment::Text => Some(ModelStreamEvent::TextEnd { part_index: index }),
+                BlockSegment::Reasoning => {
+                    Some(ModelStreamEvent::ReasoningEnd { part_index: index })
+                }
+                BlockSegment::ToolInput | BlockSegment::Other => None,
+            };
+            return Ok(StreamDecode::events(closed.into_iter().collect()));
+        };
         let call = decode_tool_use(&draft.block)?;
         if self.ready_calls.insert(slot, call.clone()).is_some() {
             return Err(model_error(
@@ -543,7 +657,7 @@ impl MessagesStreamDecoder {
         }
         if !matches!(
             stop_reason.as_str(),
-            "end_turn" | "tool_use" | "stop_sequence" | "refusal"
+            "end_turn" | "tool_use" | "stop_sequence" | "refusal" | "pause_turn"
         ) {
             return Err(model_error(
                 "anthropic_messages_stream_unsupported_stop_reason",
@@ -551,7 +665,7 @@ impl MessagesStreamDecoder {
         }
         match (self.ready_calls.is_empty(), stop_reason.as_str()) {
             (false, "tool_use") => {}
-            (true, "end_turn" | "stop_sequence" | "refusal") => {}
+            (true, "end_turn" | "stop_sequence" | "refusal" | "pause_turn") => {}
             (false, _) => {
                 return Err(model_error(
                     "anthropic_messages_stream_tool_calls_without_tool_use_stop",
@@ -636,6 +750,28 @@ fn append_string_field(value: &mut Value, field: &str, delta: &str) -> Result<()
     }
 }
 
+fn append_array_field(value: &mut Value, field: &str, item: Value) -> Result<(), AgentError> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| model_error("anthropic_messages_stream_block_not_object"))?;
+    let target = object
+        .entry(field)
+        .or_insert_with(|| Value::Array(Vec::new()));
+    // `content_block_start` 里 `citations` 可能是 null：那是「还没有」，不是「不是数组」。
+    if target.is_null() {
+        *target = Value::Array(Vec::new());
+    }
+    match target {
+        Value::Array(target) => {
+            target.push(item);
+            Ok(())
+        }
+        _ => Err(model_error(format!(
+            "anthropic_messages_stream_block_{field}_not_array"
+        ))),
+    }
+}
+
 fn encode_conversation(
     transcript: &[TranscriptItem],
     role_mappings: &BTreeMap<String, String>,
@@ -663,12 +799,16 @@ fn encode_conversation(
                 }
             },
             TranscriptItem::ModelOutput(output) => {
-                let blocks = output
-                    .provider_data
-                    .get(RAW_CONTENT_KEY)
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_else(|| canonical_assistant_blocks(output));
+                let blocks = match output.provider_data.get(RAW_CONTENT_KEY) {
+                    Some(raw) => {
+                        let raw = raw.as_array().ok_or_else(|| {
+                            model_error("anthropic_messages_raw_content_not_array")
+                        })?;
+                        validate_raw_content(output, raw)?;
+                        raw.clone()
+                    }
+                    None => canonical_assistant_blocks(output),
+                };
                 push_message(&mut messages, "assistant", blocks)?;
             }
             TranscriptItem::ToolResults(batch) => {
@@ -690,6 +830,20 @@ fn encode_conversation(
         }
     }
     Ok((system, messages))
+}
+
+fn validate_raw_content(output: &ModelOutput, raw: &[Value]) -> Result<(), AgentError> {
+    let (content, calls) = decode_content_blocks(raw)?;
+    let calls_match = calls.len() == output.tool_calls.len()
+        && calls.iter().zip(&output.tool_calls).all(|(left, right)| {
+            left.id == right.id && left.name == right.name && left.arguments == right.arguments
+        });
+    if content != output.content || !calls_match {
+        return Err(model_error(
+            "anthropic_messages_raw_content_canonical_mismatch",
+        ));
+    }
+    Ok(())
 }
 
 fn wire_role<'a>(

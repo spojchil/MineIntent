@@ -306,41 +306,29 @@ async fn main() -> Result<(), String> {
                     .into_iter()
                     .map(|line| InputMessage::text("user", line).into())
                     .collect();
-                // 投递到接受为止：闲/忙状态在投递间隙可能翻转（起轮竞态、
-                // 轮刚收尾），单次尝试会把消息丢在地上。
+                // 新内核的 enqueue 一步完成「并入进行中的轮」或「叫醒空闲会话」，
+                // 旧的闲/忙两步竞态窗口已在内核里闭合，不再需要投递重试循环。
                 println!("[组合根] 唤醒：{} 条新话", items.len());
                 let session = session.clone();
                 tokio::spawn(async move {
-                    let mut items = items;
-                    loop {
-                        match session
-                            .enqueue_if_running(MailboxInput::next_model_request(items))
-                            .await
-                        {
-                            Ok(()) => {
-                                println!("[组合根] 已并入进行中的轮");
-                                return;
-                            }
-                            Err(rejected) => items = rejected.input.items,
+                    match session
+                        .enqueue(MailboxInput::next_model_request(items))
+                        .await
+                    {
+                        Ok(agent::Enqueued::Started(handle)) => {
+                            println!("[组合根] 轮结束:{:?}", handle.join().await);
                         }
-                        match session.start_if_idle(items).await {
-                            Ok(outcome) => {
-                                println!("[组合根] 轮结束:{outcome:?}");
-                                return;
-                            }
-                            Err(rejected) => {
-                                items = rejected.initial_items;
-                                match rejected.reason {
-                                    agent::StartRejectedReason::Busy => {
-                                        // 另一轮刚接手：回到 enqueue 路径重试。
-                                        tokio::task::yield_now().await;
-                                    }
-                                    _ => {
-                                        eprintln!("[组合根] 唤醒被弃：{:?}", rejected.reason);
-                                        return;
-                                    }
-                                }
-                            }
+                        Ok(agent::Enqueued::Pending) => {
+                            println!("[组合根] 已并入进行中的轮");
+                        }
+                        Ok(agent::Enqueued::Held(reason)) => {
+                            // 收下了但暂时无人来取（例如需要对账或续跑）；内容留在信箱，
+                            // 下一次运行的首个边界会排空。
+                            eprintln!("[组合根] 唤醒被搁置：{reason:?}");
+                        }
+                        Ok(other) => eprintln!("[组合根] 未预期的投递结局：{other:?}"),
+                        Err(rejected) => {
+                            eprintln!("[组合根] 唤醒被拒：{:?}", rejected.reason);
                         }
                     }
                 });
@@ -354,8 +342,10 @@ async fn main() -> Result<(), String> {
     }
 
     // 停机有界：会话没在限时内收尾也要走世界停机，不让一次悬挂的模型
-    // 请求挡住整个进程退出。
-    if tokio::time::timeout(Duration::from_secs(30), session.stop())
+    // 请求挡住整个进程退出。先关自动启动挡住新唤醒，再取消在跑的轮并等它收尾。
+    session.set_auto_start(false).await;
+    session.cancel_run().await;
+    if tokio::time::timeout(Duration::from_secs(30), session.wait_until_idle())
         .await
         .is_err()
     {

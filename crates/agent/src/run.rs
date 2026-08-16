@@ -12,6 +12,7 @@ use crate::types::{
     ToolResultBatch, TranscriptItem,
 };
 
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestBoundaryKind {
     /// 初始请求边界，或完整工具结果批次之后的边界。
@@ -21,6 +22,7 @@ pub enum RequestBoundaryKind {
 }
 
 /// 要求驱动器执行的下一项操作。
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq)]
 pub enum TurnStep {
     RequestBoundary {
@@ -91,6 +93,85 @@ impl Turn {
             usage: None,
             state: TurnState::NeedBoundary(Boundary::ModelRequest),
         })
+    }
+
+    /// 从持久 checkpoint 的“下一次模型请求前”边界恢复。
+    pub(crate) fn restore_before_model(
+        run_id: RunId,
+        transcript: Vec<TranscriptItem>,
+        tool_batch_sequence: u64,
+        usage: Option<ModelUsage>,
+    ) -> Result<Self, AgentError> {
+        let mut turn = Self::try_new(run_id, transcript)?;
+        turn.tool_batch_seq = tool_batch_sequence;
+        turn.usage = usage;
+        Ok(turn)
+    }
+
+    /// 从模型已成功结束、但完成边界尚未封口的 checkpoint 恢复。
+    pub(crate) fn restore_before_completion(
+        run_id: RunId,
+        transcript: Vec<TranscriptItem>,
+        output: ModelOutput,
+        tool_batch_sequence: u64,
+        usage: Option<ModelUsage>,
+    ) -> Result<Self, AgentError> {
+        if !output.tool_calls.is_empty() {
+            return Err(Self::invalid_state(
+                "completion_checkpoint_contains_tool_calls",
+            ));
+        }
+        let mut turn = Self::try_new(run_id, transcript)?;
+        turn.tool_batch_seq = tool_batch_sequence;
+        turn.usage = usage;
+        turn.state = TurnState::NeedBoundary(Boundary::Completion(output));
+        Ok(turn)
+    }
+
+    /// 从权威模型输出已经形成、工具结果尚未全部写回的 checkpoint 恢复。
+    pub(crate) fn restore_tool_batch(
+        run_id: RunId,
+        mut transcript: Vec<TranscriptItem>,
+        output: ModelOutput,
+        batch_id: ToolBatchId,
+        tool_batch_sequence: u64,
+        usage: Option<ModelUsage>,
+    ) -> Result<Self, AgentError> {
+        validate_closed_transcript(&transcript)?;
+        if output.tool_calls.is_empty() {
+            return Err(Self::invalid_state("tool_checkpoint_has_no_calls"));
+        }
+        let mut turn = Self::try_new(run_id.clone(), transcript.clone())?;
+        turn.claim_call_ids(&output)?;
+        let batch = ToolCallBatch {
+            run_id,
+            batch_id,
+            calls: output.tool_calls.clone(),
+        };
+        transcript.push(TranscriptItem::ModelOutput(output));
+        turn.transcript = transcript;
+        turn.tool_batch_seq = tool_batch_sequence;
+        turn.usage = usage;
+        turn.state = TurnState::NeedTools(batch);
+        Ok(turn)
+    }
+
+    pub(crate) const fn tool_batch_sequence(&self) -> u64 {
+        self.tool_batch_seq
+    }
+
+    /// 停在完成边界时，那份等着提交的最终输出。持久化投影用它写 `BeforeCompletion`。
+    pub(crate) fn pending_completion_output(&self) -> Option<&ModelOutput> {
+        match &self.state {
+            TurnState::NeedBoundary(Boundary::Completion(output))
+            | TurnState::WaitingBoundary(Boundary::Completion(output))
+            | TurnState::Done(output) => Some(output),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn usage(&self) -> Option<&ModelUsage> {
+        self.usage.as_ref()
     }
 
     pub fn transcript(&self) -> &[TranscriptItem] {
@@ -236,9 +317,11 @@ impl Turn {
         }
 
         if let Some(usage) = response.usage {
-            self.usage
-                .get_or_insert_with(ModelUsage::default)
-                .merge(&usage);
+            if let Some(total) = &mut self.usage {
+                total.merge(&usage);
+            } else {
+                self.usage = Some(usage);
+            }
         }
 
         let output = response.output;
@@ -253,7 +336,13 @@ impl Turn {
         if let Err(error) = self.claim_call_ids(&output) {
             return self.fail(error);
         }
-        self.tool_batch_seq = self.tool_batch_seq.saturating_add(1);
+        let Some(next_tool_batch_sequence) = self.tool_batch_seq.checked_add(1) else {
+            return self.fail(AgentError::new(
+                AgentErrorKind::BudgetExceeded,
+                "tool_batch_sequence_exhausted",
+            ));
+        };
+        self.tool_batch_seq = next_tool_batch_sequence;
         let batch_id = batch_attempt_id.map(ToolBatchId::from).unwrap_or_else(|| {
             ToolBatchId::new(format!(
                 "{}/tools/{}",
@@ -280,10 +369,17 @@ impl Turn {
     /// 恢复回执使用开放 role 的 [`InputMessage`] 表达：它保留运行时确认的已发生或结果
     /// 未知事实，但不把未完成草稿伪造成一个正常 Assistant/工具轮。
     pub fn recover_model_attempt(&mut self, receipt: InputMessage) -> Result<(), AgentError> {
-        if !matches!(self.state, TurnState::WaitingModel) {
+        if !matches!(
+            self.state,
+            TurnState::WaitingModel | TurnState::NeedTools(_) | TurnState::WaitingTools(_)
+        ) {
             return Err(Self::invalid_state("turn_not_waiting_for_model_recovery"));
         }
 
+        // 工具阶段的中断：模型说完了，但这一批工具没有拿到完整结果。带调用的 `ModelOutput`
+        // 只有配上完整的 `ToolResults` 才可提交，所以它此刻仍是草稿——一起丢掉，
+        // 用回执交代已经发生的事实。
+        self.transcript.truncate(self.committable_len);
         self.transcript.push(TranscriptItem::Input(receipt));
         self.commit_transcript();
         // 恢复事实先写入；随后仍经过正常请求边界，使已在信箱中的输入排在回执之后。

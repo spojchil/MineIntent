@@ -325,21 +325,32 @@ impl Model for HttpModel {
                 if received_bytes > self.max_response_bytes {
                     return Err(model_error("transport_response_too_large"));
                 }
+                let mut completed = None;
                 for event in parser.push(&chunk)? {
                     event_sequence += 1;
                     self.log_stream_event(request_sequence, event_sequence, &event);
                     if let Some(response) = emit_decoded(decoder.as_mut(), event, sink).await? {
-                        return Ok(response);
+                        completed = Some(response);
                     }
+                }
+                // 必须先消费本次 parser 已经产出的全部事件。否则与协议终态位于同一
+                // HTTP chunk 的尾随事件会被静默丢弃，decoder 的 after-terminal 校验永远
+                // 没有机会执行。
+                if let Some(response) = completed {
+                    return Ok(response);
                 }
             }
 
+            let mut completed = None;
             for event in parser.finish()? {
                 event_sequence += 1;
                 self.log_stream_event(request_sequence, event_sequence, &event);
                 if let Some(response) = emit_decoded(decoder.as_mut(), event, sink).await? {
-                    return Ok(response);
+                    completed = Some(response);
                 }
+            }
+            if let Some(response) = completed {
+                return Ok(response);
             }
             decoder.finish_eof()?;
             Err(model_error("transport_stream_ended_without_terminal_event"))
@@ -792,10 +803,7 @@ mod tests {
         )
         .unwrap();
         let error = model
-            .complete(ModelRequest {
-                transcript: Vec::new(),
-                function_tools: Vec::new(),
-            })
+            .complete(ModelRequest::test(Vec::new(), Vec::new()))
             .await
             .unwrap_err();
 
@@ -831,10 +839,7 @@ mod tests {
         .unwrap();
 
         let error = model
-            .complete(ModelRequest {
-                transcript: Vec::new(),
-                function_tools: Vec::new(),
-            })
+            .complete(ModelRequest::test(Vec::new(), Vec::new()))
             .await
             .unwrap_err();
         unavailable_thread.join().unwrap();
@@ -870,10 +875,7 @@ mod tests {
         .unwrap();
 
         let error = model
-            .complete(ModelRequest {
-                transcript: Vec::new(),
-                function_tools: Vec::new(),
-            })
+            .complete(ModelRequest::test(Vec::new(), Vec::new()))
             .await
             .unwrap_err();
         server_thread.join().unwrap();
@@ -921,13 +923,7 @@ mod tests {
         .unwrap();
         let mut sink = RecordingSink::default();
         let response = model
-            .complete_stream(
-                ModelRequest {
-                    transcript: Vec::new(),
-                    function_tools: Vec::new(),
-                },
-                &mut sink,
-            )
+            .complete_stream(ModelRequest::test(Vec::new(), Vec::new()), &mut sink)
             .await
             .unwrap();
         server_thread.join().unwrap();
@@ -936,15 +932,23 @@ mod tests {
         assert_eq!(response.output.tool_calls[0].id.as_str(), "call_http");
         assert!(matches!(
             &sink.events[0],
-            ModelStreamEvent::TextDelta { part_index: 0, delta } if delta == "你好"
+            ModelStreamEvent::TextStart { part_index: 0 }
         ));
         assert!(matches!(
             &sink.events[1],
+            ModelStreamEvent::TextDelta { part_index: 0, delta } if delta == "你好"
+        ));
+        assert!(matches!(
+            &sink.events[2],
             ModelStreamEvent::ToolCallReady { slot, call }
                 if slot.get() == 0 && call.id.as_str() == "call_http"
         ));
+        assert!(matches!(
+            &sink.events[3],
+            ModelStreamEvent::TextEnd { part_index: 0 }
+        ));
         assert_eq!(
-            sink.events[2],
+            sink.events[4],
             ModelStreamEvent::ToolCallsSealed { call_count: 1 }
         );
     }
@@ -979,13 +983,7 @@ mod tests {
         .unwrap();
         let mut sink = RecordingSink::default();
         let error = model
-            .complete_stream(
-                ModelRequest {
-                    transcript: Vec::new(),
-                    function_tools: Vec::new(),
-                },
-                &mut sink,
-            )
+            .complete_stream(ModelRequest::test(Vec::new(), Vec::new()), &mut sink)
             .await
             .unwrap_err();
         server_thread.join().unwrap();
@@ -996,5 +994,42 @@ mod tests {
             [ModelStreamEvent::ToolCallReady { slot, call }]
                 if slot.get() == 0 && call.id.as_str() == "call_0"
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(feature = "openai")]
+    async fn rejects_an_event_trailing_a_terminal_in_the_same_http_chunk() {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_address = server.local_addr().unwrap();
+        let server_thread = thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            let _request = read_http_request(&mut stream);
+            let body = concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"forged tail\"},\"finish_reason\":null}]}\n\n",
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
+        let model = HttpModel::new(HttpModelConfig::new(
+            format!("http://{server_address}/v1/chat/completions"),
+            "header-key",
+            "test-model",
+            Protocol::openai_chat(),
+        ))
+        .unwrap();
+        let mut sink = RecordingSink::default();
+        let error = model
+            .complete_stream(ModelRequest::test(Vec::new(), Vec::new()), &mut sink)
+            .await
+            .unwrap_err();
+        server_thread.join().unwrap();
+        assert_eq!(error.summary, "openai_chat_event_after_done");
     }
 }

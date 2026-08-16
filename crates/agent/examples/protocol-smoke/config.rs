@@ -4,20 +4,32 @@ use std::env;
 use std::io;
 use std::time::Duration;
 
-use agent::adapters::http::WireLogPolicy;
-use agent::LevelFilter;
+use midturn::adapters::http::WireLogPolicy;
+use midturn::{JsonObject, LevelFilter};
+use serde_json::Value;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 90;
 const USAGE: &str =
     "cargo run --example protocol_smoke --features all-adapters -- [chat|responses|anthropic|all]";
 
-/// 冒烟示例可选择的协议；与携带请求选项的公共 [`agent::adapters::http::Protocol`]
+/// 冒烟示例可选择的协议；与携带请求选项的公共 [`midturn::adapters::http::Protocol`]
 /// 分开保存，便于作为 endpoint 配置的稳定键。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SmokeProtocol {
     OpenAiChat,
     OpenAiResponses,
     AnthropicMessages,
+}
+
+/// OpenAI-compatible Chat 端点使用的输出 token 字段。
+///
+/// 许多兼容端点仍接收 `max_tokens`；部分推理模型则只接收
+/// `max_completion_tokens`。值由 harness 统一设为小上限，不从 JSON 扩展中读取。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ChatTokenField {
+    #[default]
+    MaxTokens,
+    MaxCompletionTokens,
 }
 
 impl SmokeProtocol {
@@ -36,7 +48,12 @@ pub(crate) struct SmokeConfig {
     pub(crate) model: String,
     pub(crate) level: LevelFilter,
     pub(crate) timeout: Duration,
+    /// 两次模型请求之间的最小间隔。有些服务商按分钟限速（Kimi 实测连续第 4 个请求
+    /// 就 429），冒烟一趟要发 4 次；这是应用层的节流，内核不管这个。
+    pub(crate) min_request_gap: Duration,
     pub(crate) wire_log: WireLogPolicy,
+    pub(crate) chat_fields: JsonObject,
+    pub(crate) chat_token_field: ChatTokenField,
     pub(crate) protocols: Vec<SmokeProtocol>,
     endpoints: Vec<(SmokeProtocol, String)>,
 }
@@ -53,6 +70,14 @@ impl SmokeConfig {
         let endpoints = parse_selected_endpoints(&protocols, |protocol| {
             read_required_env(endpoint_variable(protocol))
         })?;
+        let (chat_fields, chat_token_field) = if protocols.contains(&SmokeProtocol::OpenAiChat) {
+            parse_chat_configuration(
+                read_optional_env("MODEL_CHAT_FIELDS_JSON")?.as_deref(),
+                read_optional_env("MODEL_CHAT_TOKEN_FIELD")?.as_deref(),
+            )?
+        } else {
+            (JsonObject::new(), ChatTokenField::default())
+        };
         let timeout_secs = match env::var("MODEL_TIMEOUT_SECS") {
             Ok(value) => parse_timeout(&value)?,
             Err(env::VarError::NotPresent) => DEFAULT_TIMEOUT_SECS,
@@ -61,12 +86,23 @@ impl SmokeConfig {
             }
         };
 
+        let min_request_gap = match env::var("MODEL_MIN_GAP_MS") {
+            Ok(value) => Duration::from_millis(parse_millis(&value)?),
+            Err(env::VarError::NotPresent) => Duration::ZERO,
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(invalid_input("MODEL_MIN_GAP_MS 必须是有效的 UTF-8 整数"));
+            }
+        };
+
         Ok(Self {
             api_key,
             model,
             level,
             timeout: Duration::from_secs(timeout_secs),
+            min_request_gap,
             wire_log,
+            chat_fields,
+            chat_token_field,
             protocols,
             endpoints,
         })
@@ -140,6 +176,46 @@ fn read_required_env(name: &str) -> Result<String, io::Error> {
     }
 }
 
+fn read_optional_env(name: &str) -> Result<Option<String>, io::Error> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(invalid_input(format!("{name} 必须是有效的 UTF-8 字符串")))
+        }
+    }
+}
+
+fn parse_chat_configuration(
+    fields_json: Option<&str>,
+    token_field: Option<&str>,
+) -> Result<(JsonObject, ChatTokenField), io::Error> {
+    let fields = match fields_json {
+        None => JsonObject::new(),
+        Some(source) => serde_json::from_str::<Value>(source)
+            .map_err(|_| invalid_input("MODEL_CHAT_FIELDS_JSON 必须是有效的 JSON object"))?
+            .as_object()
+            .cloned()
+            .ok_or_else(|| invalid_input("MODEL_CHAT_FIELDS_JSON 必须是 JSON object"))?,
+    };
+    if fields.contains_key("max_tokens") || fields.contains_key("max_completion_tokens") {
+        return Err(invalid_input(
+            "MODEL_CHAT_FIELDS_JSON 不得设置 token 上限；请使用 MODEL_CHAT_TOKEN_FIELD",
+        ));
+    }
+
+    let token_field = match token_field.unwrap_or("max_tokens") {
+        "max_tokens" => ChatTokenField::MaxTokens,
+        "max_completion_tokens" => ChatTokenField::MaxCompletionTokens,
+        _ => {
+            return Err(invalid_input(
+                "MODEL_CHAT_TOKEN_FIELD 必须是 max_tokens 或 max_completion_tokens",
+            ));
+        }
+    };
+    Ok((fields, token_field))
+}
+
 fn parse_level(value: &str) -> Result<LevelFilter, io::Error> {
     match value.to_ascii_lowercase().as_str() {
         "off" => Ok(LevelFilter::Off),
@@ -157,11 +233,17 @@ fn parse_level(value: &str) -> Result<LevelFilter, io::Error> {
 fn parse_wire_log(value: &str) -> Result<WireLogPolicy, io::Error> {
     match value.to_ascii_lowercase().as_str() {
         "off" => Ok(WireLogPolicy::Off),
-        "full" => Ok(WireLogPolicy::Full),
-        value => Err(invalid_input(format!(
-            "未知 MODEL_WIRE_LOG 策略：{value}；应为 off/full"
-        ))),
+        _ => Err(invalid_input(
+            "protocol_smoke 会使用真实凭据，MODEL_WIRE_LOG 必须为 off",
+        )),
     }
+}
+
+fn parse_millis(value: &str) -> Result<u64, io::Error> {
+    value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| invalid_input("MODEL_MIN_GAP_MS 必须是非负整数（毫秒）"))
 }
 
 fn parse_timeout(value: &str) -> Result<u64, io::Error> {
@@ -209,7 +291,8 @@ mod tests {
         assert!(select_protocols("unknown").is_err());
         assert_eq!(parse_level("trace").unwrap(), LevelFilter::Trace);
         assert!(parse_level("verbose").is_err());
-        assert_eq!(parse_wire_log("full").unwrap(), WireLogPolicy::Full);
+        assert_eq!(parse_wire_log("off").unwrap(), WireLogPolicy::Off);
+        assert!(parse_wire_log("full").is_err());
         assert!(parse_wire_log("body").is_err());
     }
 
@@ -228,6 +311,38 @@ mod tests {
         assert_eq!(parse_timeout("90").unwrap(), 90);
         assert!(parse_timeout("0").is_err());
         assert!(parse_timeout("invalid").is_err());
+    }
+
+    #[test]
+    fn chat_fields_must_be_an_object_and_cannot_override_token_limits() {
+        let (fields, token_field) = parse_chat_configuration(
+            Some(r#"{"thinking":{"type":"disabled"},"temperature":0}"#),
+            None,
+        )
+        .unwrap();
+        assert_eq!(fields["temperature"], 0);
+        assert_eq!(fields["thinking"]["type"], "disabled");
+        assert_eq!(token_field, ChatTokenField::MaxTokens);
+
+        assert!(parse_chat_configuration(Some("[]"), None).is_err());
+        assert!(parse_chat_configuration(Some("not-json"), None).is_err());
+        assert!(parse_chat_configuration(Some(r#"{"max_tokens":4096}"#), None).is_err());
+        assert!(parse_chat_configuration(
+            Some(r#"{"max_completion_tokens":4096}"#),
+            Some("max_completion_tokens")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn chat_token_field_accepts_only_the_two_supported_wire_names() {
+        assert_eq!(
+            parse_chat_configuration(None, Some("max_completion_tokens"))
+                .unwrap()
+                .1,
+            ChatTokenField::MaxCompletionTokens
+        );
+        assert!(parse_chat_configuration(None, Some("max_output_tokens")).is_err());
     }
 
     #[test]

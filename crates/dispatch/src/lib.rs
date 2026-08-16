@@ -12,9 +12,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use agent::{
-    AbortedToolBatch, AbortedToolCall, AbortedToolCallOutcome, AgentError, IncrementalToolBatch,
-    PortFuture, ToolBatchAbortReason, ToolBatchStart, ToolCall, ToolCallBatch, ToolCallSlot,
-    ToolDefinition, ToolName, ToolResult, ToolResultBatch, ToolRuntime,
+    AbortClassification, AgentError, IncrementalToolBatch, PortFuture, ToolBatchAbortReason,
+    ToolBatchStart, ToolCall, ToolCallBatch, ToolCallReporter, ToolDefinition, ToolName,
+    ToolResult, ToolResultBatch, ToolRuntime,
 };
 
 /// 编排眼中的工具类别。内心与感知合并为 Free（都不受压制、不占域）；
@@ -166,24 +166,23 @@ impl ToolRuntime for Dispatcher {
 
     fn begin_incremental<'a>(
         &'a self,
-        batch: ToolBatchStart,
+        _batch: ToolBatchStart,
+        reporter: Arc<dyn ToolCallReporter>,
     ) -> PortFuture<'a, Result<Option<Box<dyn IncrementalToolBatch + 'a>>, AgentError>> {
         Box::pin(async move {
             let run: Box<dyn IncrementalToolBatch + 'a> = Box::new(IncrementalRun {
                 dispatcher: self,
-                start: batch,
-                executed: Vec::new(),
+                reporter,
             });
             Ok(Some(run))
         })
     }
 }
 
-/// 一次增量批：调用封口送达即执行，结果按槽序累积。
+/// 一次增量批：调用封口送达即执行，结果当场经 reporter 上报。
 struct IncrementalRun<'a> {
     dispatcher: &'a Dispatcher,
-    start: ToolBatchStart,
-    executed: Vec<(ToolCallSlot, ToolResult)>,
+    reporter: Arc<dyn ToolCallReporter>,
 }
 
 impl<'a> IncrementalToolBatch for IncrementalRun<'a> {
@@ -193,8 +192,7 @@ impl<'a> IncrementalToolBatch for IncrementalRun<'a> {
     ) -> PortFuture<'b, Result<(), AgentError>> {
         Box::pin(async move {
             let result = self.dispatcher.execute_one(call.call).await;
-            self.executed.push((call.slot, result));
-            Ok(())
+            self.reporter.settled(call.slot, result).await
         })
     }
 
@@ -202,44 +200,26 @@ impl<'a> IncrementalToolBatch for IncrementalRun<'a> {
         Box::pin(async { Ok(()) })
     }
 
-    fn commit<'b>(self: Box<Self>) -> PortFuture<'b, Result<ToolResultBatch, AgentError>>
+    fn commit<'b>(self: Box<Self>) -> PortFuture<'b, Result<(), AgentError>>
     where
         Self: 'b,
     {
-        Box::pin(async move {
-            let results = self
-                .executed
-                .into_iter()
-                .map(|(_, result)| result)
-                .collect();
-            Ok(ToolResultBatch { results })
-        })
+        // 执行同步于 submit，结果已逐槽 settled；这里没有剩余工作。
+        Box::pin(async { Ok(()) })
     }
 
     fn abort<'b>(
         self: Box<Self>,
         _reason: ToolBatchAbortReason,
-    ) -> PortFuture<'b, Result<AbortedToolBatch, AgentError>>
+    ) -> PortFuture<'b, Result<AbortClassification, AgentError>>
     where
         Self: 'b,
     {
         Box::pin(async move {
-            // 执行同步于 submit：凡已提交必已执行，结论全部确定。
+            // 执行同步于 submit：凡已提交必已执行、必已 settled，没有悬而未决的槽。
             // CancelledBeforeStart 与 OutcomeUnknown 在进程内实现中不可达。
             // 占用账本不回滚——已执行的开屏是回执里的既成事实，账本保持真实。
-            let calls = self
-                .executed
-                .into_iter()
-                .map(|(slot, result)| AbortedToolCall {
-                    slot,
-                    call_id: result.call_id.clone(),
-                    outcome: AbortedToolCallOutcome::Settled(result),
-                })
-                .collect();
-            Ok(AbortedToolBatch {
-                batch_attempt_id: self.start.batch_attempt_id,
-                calls,
-            })
+            Ok(AbortClassification::new())
         })
     }
 }

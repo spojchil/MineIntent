@@ -144,37 +144,7 @@ fn decode_chat_response(value: Value) -> Result<ModelResponse, AgentError> {
     let message = choice
         .get("message")
         .ok_or_else(|| model_error("openai_chat_response_missing_message"))?;
-
-    let content = message
-        .get("content")
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
-        .map(|text| vec![ContentPart::text(text)])
-        .unwrap_or_default();
-    let tool_calls = message
-        .get("tool_calls")
-        .and_then(Value::as_array)
-        .map(|calls| {
-            calls
-                .iter()
-                .map(|call| {
-                    let id = required_string(call, "id", "openai_chat_tool_call_missing_id")?;
-                    let function = call
-                        .get("function")
-                        .ok_or_else(|| model_error("openai_chat_tool_call_missing_function"))?;
-                    let name =
-                        required_string(function, "name", "openai_chat_tool_call_missing_name")?;
-                    let arguments = required_string(
-                        function,
-                        "arguments",
-                        "openai_chat_tool_call_missing_arguments",
-                    )?;
-                    Ok(ToolCall::new(id, name, parse_arguments(arguments)))
-                })
-                .collect::<Result<Vec<_>, AgentError>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
+    let (content, tool_calls) = decode_chat_message(message)?;
 
     let finish_reason = choice.get("finish_reason").cloned();
     let reason = finish_reason
@@ -234,6 +204,82 @@ fn decode_chat_response(value: Value) -> Result<ModelResponse, AgentError> {
         finish_reason,
         usage,
     })
+}
+
+fn decode_chat_message(message: &Value) -> Result<(Vec<ContentPart>, Vec<ToolCall>), AgentError> {
+    let message = message
+        .as_object()
+        .ok_or_else(|| model_error("openai_chat_message_not_object"))?;
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return Err(model_error("openai_chat_message_role_not_assistant"));
+    }
+    if message
+        .get("function_call")
+        .is_some_and(|value| !value.is_null())
+    {
+        // 旧版 function_call 没有进入 canonical tool_calls，直接回放会绕过调用闭包校验。
+        return Err(model_error("openai_chat_legacy_function_call_unsupported"));
+    }
+
+    let mut content = Vec::new();
+    match message.get("content") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(text)) if text.is_empty() => {}
+        Some(Value::String(text)) => content.push(ContentPart::text(text)),
+        Some(_) => return Err(model_error("openai_chat_message_content_not_string")),
+    }
+    // Chat 将安全拒答放在独立 refusal 字段。框架当前没有专用拒答 variant，因此把其
+    // 解释文本作为模型可见正文暴露；原字段仍保留在 provider_data 中以便精确回放。
+    match message.get("refusal") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(refusal)) if refusal.is_empty() => {}
+        Some(Value::String(refusal)) => content.push(ContentPart::text(refusal)),
+        Some(_) => return Err(model_error("openai_chat_message_refusal_not_string")),
+    }
+
+    let calls = match message.get("tool_calls") {
+        None | Some(Value::Null) => &[][..],
+        Some(Value::Array(calls)) => calls.as_slice(),
+        Some(_) => return Err(model_error("openai_chat_tool_calls_not_array")),
+    };
+    let tool_calls = calls
+        .iter()
+        .map(|call| {
+            if call.get("type").and_then(Value::as_str) != Some("function") {
+                return Err(model_error("openai_chat_unsupported_tool_type"));
+            }
+            let id = required_string(call, "id", "openai_chat_tool_call_missing_id")?;
+            let function = call
+                .get("function")
+                .ok_or_else(|| model_error("openai_chat_tool_call_missing_function"))?;
+            let name = required_string(function, "name", "openai_chat_tool_call_missing_name")?;
+            let arguments = required_string(
+                function,
+                "arguments",
+                "openai_chat_tool_call_missing_arguments",
+            )?;
+            Ok(ToolCall::new(id, name, parse_arguments(arguments)))
+        })
+        .collect::<Result<Vec<_>, AgentError>>()?;
+    Ok((content, tool_calls))
+}
+
+fn validated_raw_message<'a>(
+    output: &ModelOutput,
+    raw: &'a Value,
+) -> Result<&'a Value, AgentError> {
+    let (content, tool_calls) = decode_chat_message(raw)?;
+    if content != output.content || !same_tool_calls(&tool_calls, &output.tool_calls) {
+        return Err(model_error("openai_chat_raw_message_canonical_mismatch"));
+    }
+    Ok(raw)
+}
+
+fn same_tool_calls(left: &[ToolCall], right: &[ToolCall]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.id == right.id && left.name == right.name && left.arguments == right.arguments
+        })
 }
 
 #[derive(Default)]
@@ -319,11 +365,19 @@ struct ChatToolDraft {
     ready: Option<ToolCall>,
 }
 
+/// Chat 协议只有一段正文和一段推理，用固定的两个 part_index 表示。
+const TEXT_PART: u32 = 0;
+const REASONING_PART: u32 = 1;
+
 #[derive(Default)]
 struct ChatStreamDecoder {
     response_id: Option<Value>,
     role: Option<String>,
     content: String,
+    /// Chat 协议没有内容段的开始/结束信号，只能由适配器合成：首个非空增量视为开始，
+    /// `[DONE]` 时把还开着的段封口。
+    text_started: bool,
+    reasoning_started: bool,
     tools: BTreeMap<u32, ChatToolDraft>,
     message_extensions: Map<String, Value>,
     finish_reason: Option<Value>,
@@ -352,8 +406,12 @@ impl WireStreamDecoder for ChatStreamDecoder {
             value.get("id"),
             "openai_chat_stream_response_id_changed",
         )?;
-        if value.get("usage").is_some_and(|usage| !usage.is_null()) {
-            self.usage = value.get("usage").cloned();
+        if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
+            set_consistent_value(
+                &mut self.usage,
+                Some(usage),
+                "openai_chat_stream_usage_changed",
+            )?;
         }
 
         let mut events = Vec::new();
@@ -367,6 +425,15 @@ impl WireStreamDecoder for ChatStreamDecoder {
             if index != 0 {
                 continue;
             }
+            // Kimi 等兼容端点把流式 usage 放在终止 choice 内，而 OpenAI 放在顶层。
+            // 两种位置统一进入同一规范字段；若同时出现则必须完全一致。
+            if let Some(usage) = choice.get("usage").filter(|usage| !usage.is_null()) {
+                set_consistent_value(
+                    &mut self.usage,
+                    Some(usage),
+                    "openai_chat_stream_usage_changed",
+                )?;
+            }
             if let Some(delta) = choice.get("delta") {
                 if let Some(content) = delta.get("content").filter(|value| !value.is_null()) {
                     let content = content.as_str().ok_or_else(|| {
@@ -374,9 +441,37 @@ impl WireStreamDecoder for ChatStreamDecoder {
                     })?;
                     if !content.is_empty() {
                         self.content.push_str(content);
+                        if !self.text_started {
+                            self.text_started = true;
+                            events.push(ModelStreamEvent::TextStart {
+                                part_index: TEXT_PART,
+                            });
+                        }
                         events.push(ModelStreamEvent::TextDelta {
-                            part_index: 0,
+                            part_index: TEXT_PART,
                             delta: content.to_owned(),
+                        });
+                    }
+                }
+                // 多个兼容端点（DeepSeek、Kimi 等）用 reasoning_content 承载推理。
+                if let Some(reasoning) = delta
+                    .get("reasoning_content")
+                    .filter(|value| !value.is_null())
+                {
+                    let reasoning = reasoning.as_str().ok_or_else(|| {
+                        model_error("openai_chat_stream_reasoning_delta_not_string")
+                    })?;
+                    if !reasoning.is_empty() {
+                        // 正文累积在 message_extensions 里（回放保真），这里只负责观测。
+                        if !self.reasoning_started {
+                            self.reasoning_started = true;
+                            events.push(ModelStreamEvent::ReasoningStart {
+                                part_index: REASONING_PART,
+                            });
+                        }
+                        events.push(ModelStreamEvent::ReasoningDelta {
+                            part_index: REASONING_PART,
+                            delta: reasoning.to_owned(),
                         });
                     }
                 }
@@ -418,6 +513,9 @@ impl ChatStreamDecoder {
                     let role = value
                         .as_str()
                         .ok_or_else(|| model_error("openai_chat_stream_role_not_string"))?;
+                    if role != "assistant" {
+                        return Err(model_error("openai_chat_stream_role_not_assistant"));
+                    }
                     set_consistent_string(
                         &mut self.role,
                         Some(role),
@@ -582,6 +680,17 @@ impl ChatStreamDecoder {
         let call_count = u32::try_from(response.output.tool_calls.len())
             .map_err(|_| model_error("openai_chat_stream_tool_count_overflow"))?;
         let mut events = Vec::new();
+        // Chat 没有段结束信号，只能在流终止时把还开着的段封口。
+        if self.reasoning_started {
+            events.push(ModelStreamEvent::ReasoningEnd {
+                part_index: REASONING_PART,
+            });
+        }
+        if self.text_started {
+            events.push(ModelStreamEvent::TextEnd {
+                part_index: TEXT_PART,
+            });
+        }
         for (index, call) in response.output.tool_calls.iter().cloned().enumerate() {
             let index = u32::try_from(index)
                 .map_err(|_| model_error("openai_chat_stream_tool_count_overflow"))?;
@@ -679,7 +788,7 @@ fn encode_messages(
             TranscriptItem::ModelOutput(output) => {
                 if let Some(message) = output.provider_data.get(RAW_MESSAGE_KEY) {
                     // 服务端签发的调用结构和未知扩展字段必须与原响应一起回放。
-                    messages.push(message.clone());
+                    messages.push(validated_raw_message(output, message)?.clone());
                     continue;
                 }
                 let mut message = json!({

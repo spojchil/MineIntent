@@ -6,7 +6,7 @@ use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use agent::adapters::{
+use midturn::adapters::{
     anthropic::messages::RequestOptions as AnthropicRequestOptions,
     http::{HttpModel, HttpModelConfig, Protocol},
     openai::{
@@ -14,20 +14,24 @@ use agent::adapters::{
         responses::RequestOptions as OpenAiResponsesRequestOptions,
     },
 };
-use agent::{
-    AbortedToolBatch, AbortedToolCall, AbortedToolCallOutcome, AgentError, AgentErrorKind,
-    AgentEvent, AgentSession, Compaction, FilteredObserver, IncrementalToolBatch,
-    IncrementalToolCall, InputMessage, MailboxInput, Observer, PortFuture, PromptSource,
-    SessionConfig, ToolBatchAbortReason, ToolBatchStart, ToolCallBatch, ToolCallId, ToolCallSlot,
-    ToolDefinition, ToolResult, ToolResultBatch, ToolRuntime, TranscriptItem, TurnOutcome,
+use midturn::persistence::SessionId;
+use midturn::{
+    AbortClassification, AgentError, AgentErrorKind, AgentEvent, AgentSession, Compaction,
+    Enqueued, FilteredObserver, IncrementalToolBatch, IncrementalToolCall, InputMessage,
+    JsonObject, MailboxInput, Model, ModelRequest, ModelStreamEvent, ModelStreamSink, Observer,
+    PortFuture, PromptSource, RunId, SessionConfig, ToolBatchAbortReason, ToolBatchStart,
+    ToolCallBatch, ToolCallId, ToolCallReporter, ToolCallSlot, ToolDefinition, ToolResult,
+    ToolResultBatch, ToolRuntime, TranscriptItem, TurnOutcome,
 };
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::timeout;
 
-use crate::config::{SmokeConfig, SmokeProtocol};
+use crate::config::{ChatTokenField, SmokeConfig, SmokeProtocol};
 
 type SmokeError = Box<dyn Error + Send + Sync>;
+const SMOKE_MAX_OUTPUT_TOKENS: u64 = 256;
+const SMOKE_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 pub(crate) async fn run_smoke(
     protocol: SmokeProtocol,
@@ -40,16 +44,23 @@ pub(crate) async fn run_smoke(
         Arc::new(PrintingObserver { protocol }),
         config.level,
     ));
-    let model = HttpModel::new(
+    let model = Arc::new(HttpModel::new(
         HttpModelConfig::new(
             config.endpoint(protocol),
             config.api_key.clone(),
             config.model.clone(),
-            wire_protocol(protocol),
+            wire_protocol(protocol, config),
         )
         .with_timeout(config.timeout)
-        .with_wire_log(config.wire_log),
-    )?;
+        .with_wire_log(config.wire_log)
+        .with_max_response_bytes(SMOKE_MAX_RESPONSE_BYTES),
+    )?);
+    let model = Arc::new(PacedModel {
+        inner: model,
+        min_gap: config.min_request_gap,
+        last_started: tokio::sync::Mutex::new(None),
+    });
+    run_text_probes(model.as_ref(), protocol, config.timeout).await?;
     let tools = Arc::new(SmokeTools {
         started: started_tx,
         gate: gate.clone(),
@@ -58,26 +69,36 @@ pub(crate) async fn run_smoke(
         incremental_commits: AtomicUsize::new(0),
         legacy_dispatches: AtomicUsize::new(0),
     });
+    let mut session_config = SessionConfig::default();
+    session_config.model_timeout = Some(config.timeout);
+    session_config.tool_timeout = Some(config.timeout);
+    // 冒烟测试给整个会话封口：这一趟只该发几次请求、调几次工具。
+    session_config.budget.cumulative.max_model_requests = Some(4);
+    session_config.budget.cumulative.max_tool_calls = Some(4);
     let session = Arc::new(
         AgentSession::new(
             Arc::new(SmokePrompt),
             tools.clone(),
             Arc::new(NoCompaction),
-            Arc::new(model),
-            SessionConfig::default(),
+            model,
+            session_config,
         )
         .with_observer(observer),
     );
 
     let running = session.clone();
     let mut task = tokio::spawn(async move {
-        running
-            .start_if_idle(vec![InputMessage::text(
+        let started = running
+            .enqueue(MailboxInput::next_model_request(vec![InputMessage::text(
                 "user",
                 "请在同一条回复中调用 add 两次，分别计算 2+3 与 5+7；现在不要自己计算。",
             )
-            .into()])
-            .await
+            .into()]))
+            .await?;
+        let Enqueued::Started(handle) = started else {
+            return Err(io::Error::other("空闲会话应当因这次投递开跑").into());
+        };
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(handle.join().await)
     });
 
     let call_count = match timeout(config.timeout, started_rx.recv()).await {
@@ -100,7 +121,7 @@ pub(crate) async fn run_smoke(
     println!("增量 runtime 已接收并封口，调用数：{call_count}");
 
     session
-        .enqueue_if_running(MailboxInput::next_model_request(vec![InputMessage::text(
+        .enqueue(MailboxInput::next_model_request(vec![InputMessage::text(
             "user",
             "这是工具执行期间插入的消息：结果齐全后只简短报告两个和。",
         )
@@ -131,43 +152,219 @@ pub(crate) async fn run_smoke(
     }
 
     match outcome {
-        TurnOutcome::Completed { output, usage } => {
-            println!("最终文本：{}", output.text_content());
+        TurnOutcome::Completed { output, usage, .. } => {
+            println!("最终文本长度：{} 字节", output.text_content().len());
             println!("usage：{usage:?}");
             Ok(())
         }
-        other => Err(io::Error::other(format!("冒烟测试未正常完成：{other:?}")).into()),
+        TurnOutcome::Stopped { .. } => Err(io::Error::other("冒烟测试被停止").into()),
+        TurnOutcome::Failed { stage, error, .. } => Err(io::Error::other(format!(
+            "冒烟测试失败：stage={stage:?}, kind={:?}",
+            error.kind
+        ))
+        .into()),
+        _ => Err(io::Error::other("冒烟测试返回了当前示例尚未识别的终态").into()),
     }
 }
 
 /// 显式保留旧冒烟适配器的请求参数，避免公共适配器的通用默认值改变测试强度。
-fn wire_protocol(protocol: SmokeProtocol) -> Protocol {
+fn wire_protocol(protocol: SmokeProtocol, config: &SmokeConfig) -> Protocol {
     match protocol {
-        SmokeProtocol::OpenAiChat => Protocol::openai_chat_with(
-            OpenAiChatRequestOptions::new()
-                .with_max_tokens(256)
-                .with_tool_choice("auto"),
-        ),
+        SmokeProtocol::OpenAiChat => Protocol::openai_chat_with(openai_chat_options(
+            &config.chat_fields,
+            config.chat_token_field,
+        )),
         SmokeProtocol::OpenAiResponses => Protocol::openai_responses_with(
-            OpenAiResponsesRequestOptions::new()
-                .with_max_output_tokens(256)
-                .with_tool_choice("auto"),
+            OpenAiResponsesRequestOptions::new().with_max_output_tokens(SMOKE_MAX_OUTPUT_TOKENS),
         ),
-        SmokeProtocol::AnthropicMessages => Protocol::anthropic_messages_with(
-            AnthropicRequestOptions::new(256).with_tool_choice(json!({"type": "auto"})),
-        ),
+        SmokeProtocol::AnthropicMessages => {
+            Protocol::anthropic_messages_with(AnthropicRequestOptions::new(SMOKE_MAX_OUTPUT_TOKENS))
+        }
+    }
+}
+
+fn openai_chat_options(
+    additional_fields: &JsonObject,
+    token_field: ChatTokenField,
+) -> OpenAiChatRequestOptions {
+    let mut options = OpenAiChatRequestOptions::new();
+    options.additional_fields = additional_fields.clone();
+    match token_field {
+        ChatTokenField::MaxTokens => options.with_max_tokens(SMOKE_MAX_OUTPUT_TOKENS),
+        ChatTokenField::MaxCompletionTokens => {
+            options.with_additional_field("max_completion_tokens", SMOKE_MAX_OUTPUT_TOKENS)
+        }
+    }
+}
+
+/// 应用层节流：两次请求之间至少隔 `min_gap`。限速是服务商与应用之间的事，
+/// 内核只知道「一次模型请求」。
+struct PacedModel {
+    inner: Arc<HttpModel>,
+    min_gap: std::time::Duration,
+    last_started: tokio::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl PacedModel {
+    async fn pace(&self) {
+        if self.min_gap.is_zero() {
+            return;
+        }
+        let mut last = self.last_started.lock().await;
+        if let Some(started) = *last {
+            let elapsed = started.elapsed();
+            if elapsed < self.min_gap {
+                tokio::time::sleep(self.min_gap - elapsed).await;
+            }
+        }
+        *last = Some(std::time::Instant::now());
+    }
+}
+
+impl Model for PacedModel {
+    fn complete<'a>(
+        &'a self,
+        request: ModelRequest,
+    ) -> PortFuture<'a, Result<midturn::ModelResponse, AgentError>> {
+        Box::pin(async move {
+            self.pace().await;
+            self.inner.complete(request).await
+        })
+    }
+
+    fn complete_stream<'a>(
+        &'a self,
+        request: ModelRequest,
+        sink: &'a mut dyn ModelStreamSink,
+    ) -> PortFuture<'a, Result<midturn::ModelResponse, AgentError>> {
+        Box::pin(async move {
+            self.pace().await;
+            self.inner.complete_stream(request, sink).await
+        })
+    }
+}
+
+async fn run_text_probes(
+    model: &PacedModel,
+    protocol: SmokeProtocol,
+    deadline: std::time::Duration,
+) -> Result<(), SmokeError> {
+    let session_id = SessionId::new(format!("protocol-smoke-{}", protocol.label()))?;
+    let run_id = RunId::new(format!("{}/run/probe", session_id.as_str()));
+    let request = |request_index| {
+        ModelRequest::new(
+            session_id.clone(),
+            run_id.clone(),
+            request_index,
+            vec![
+                InputMessage::text("user", "Reply with exactly SMOKE_OK. Do not call tools.")
+                    .into(),
+            ],
+            Vec::new(),
+        )
+    };
+
+    let non_stream = timeout(deadline, model.complete(request(1)))
+        .await
+        .map_err(|_| io::Error::other(format!("等待 {} non-stream text 超时", protocol.label())))?
+        .map_err(|error| sanitized_probe_error(protocol, "non-stream", error))?;
+    validate_text_probe("non-stream", &non_stream.output)?;
+
+    let mut sink = TextProbeSink::default();
+    let streamed = timeout(deadline, model.complete_stream(request(2), &mut sink))
+        .await
+        .map_err(|_| io::Error::other(format!("等待 {} stream text 超时", protocol.label())))?
+        .map_err(|error| sanitized_probe_error(protocol, "stream", error))?;
+    validate_text_probe("stream", &streamed.output)?;
+    if sink.text_events == 0 || sink.saw_tool_event {
+        return Err(io::Error::other(format!(
+            "{} stream text 未观测到纯文本增量：source={}",
+            protocol.label(),
+            safe_text_source(&streamed.output)
+        ))
+        .into());
+    }
+
+    println!(
+        "text 预检通过：non-stream + stream（{} 个增量事件）",
+        sink.text_events
+    );
+    Ok(())
+}
+
+/// 真实凭据场景只公开失败阶段和种类，不传播可能由响应体派生的错误摘要。
+fn sanitized_probe_error(protocol: SmokeProtocol, stage: &str, error: AgentError) -> io::Error {
+    io::Error::other(format!(
+        "{} {stage} text 失败：kind={:?}",
+        protocol.label(),
+        error.kind
+    ))
+}
+
+/// 只报告文本来自哪个 wire 字段，不记录响应正文或任意字段值。
+fn safe_text_source(output: &midturn::ModelOutput) -> &'static str {
+    let Some(message) = output
+        .provider_data
+        .get("openai.chat.message")
+        .and_then(Value::as_object)
+    else {
+        return "canonical-or-opaque";
+    };
+    if message
+        .get("content")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.is_empty())
+    {
+        "content"
+    } else if message
+        .get("refusal")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.is_empty())
+    {
+        "refusal"
+    } else {
+        "extension"
+    }
+}
+
+fn validate_text_probe(label: &str, output: &midturn::ModelOutput) -> Result<(), SmokeError> {
+    if output.text_content().trim().is_empty() || !output.tool_calls.is_empty() {
+        return Err(io::Error::other(format!("{label} text 预检未返回纯文本")).into());
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct TextProbeSink {
+    text_events: usize,
+    saw_tool_event: bool,
+}
+
+impl ModelStreamSink for TextProbeSink {
+    fn emit<'a>(&'a mut self, event: ModelStreamEvent) -> PortFuture<'a, Result<(), AgentError>> {
+        Box::pin(async move {
+            match event {
+                ModelStreamEvent::TextDelta { .. } => self.text_events += 1,
+                ModelStreamEvent::ToolCallReady { .. } => self.saw_tool_event = true,
+                ModelStreamEvent::ToolCallsSealed { call_count } if call_count > 0 => {
+                    self.saw_tool_event = true;
+                }
+                _ => {}
+            }
+            Ok(())
+        })
     }
 }
 
 struct SmokePrompt;
 
 impl PromptSource for SmokePrompt {
-    fn base_context(&self) -> Vec<TranscriptItem> {
-        vec![InputMessage::text(
+    fn base_context(&self) -> Result<Vec<TranscriptItem>, AgentError> {
+        Ok(vec![InputMessage::text(
             "system",
             "你在执行 agent 协议冒烟测试。必须严格按用户要求调用工具。",
         )
-        .into()]
+        .into()])
     }
 }
 
@@ -224,12 +421,14 @@ impl ToolRuntime for SmokeTools {
     fn begin_incremental<'a>(
         &'a self,
         batch: ToolBatchStart,
+        reporter: Arc<dyn ToolCallReporter>,
     ) -> PortFuture<'a, Result<Option<Box<dyn IncrementalToolBatch + 'a>>, AgentError>> {
         Box::pin(async move {
             self.incremental_begins.fetch_add(1, Ordering::SeqCst);
             Ok(Some(Box::new(SmokeIncrementalBatch {
                 runtime: self,
                 batch,
+                reporter,
                 calls: BTreeMap::new(),
                 sealed_count: None,
             }) as Box<dyn IncrementalToolBatch + 'a>))
@@ -237,15 +436,17 @@ impl ToolRuntime for SmokeTools {
     }
 }
 
-/// 示例 runtime 只接管并缓存规范化调用；真正计算要等模型响应成功后的 `commit`。
+/// 示例 runtime 只接管并缓存规范化调用；真正计算要等模型响应成功后的 `commit`，
+/// 结果逐槽通过 `reporter.settled` 上报——那是结果唯一的通道。
 ///
 /// 因而这里的“增量”只降低调用信息的接管延迟，不提前产生工具副作用。如果 A 已经
 /// `submit`、B 仍在模型流中传输时断流，`abort` 可以把 A 确定为
 /// `CancelledBeforeStart`。需要在 `submit` 阶段提前执行的应用则必须在自己的
-/// `abort` 实现中据实区分已完成、确定未开始和结果未知。
+/// `abort` 实现中据实区分：已知结果的先 `settled`，剩下的分「确定没开始」和「不知道」。
 struct SmokeIncrementalBatch<'a> {
     runtime: &'a SmokeTools,
     batch: ToolBatchStart,
+    reporter: Arc<dyn ToolCallReporter>,
     calls: BTreeMap<ToolCallSlot, IncrementalToolCall>,
     sealed_count: Option<u32>,
 }
@@ -306,7 +507,7 @@ impl IncrementalToolBatch for SmokeIncrementalBatch<'_> {
         })
     }
 
-    fn commit<'a>(self: Box<Self>) -> PortFuture<'a, Result<ToolResultBatch, AgentError>>
+    fn commit<'a>(self: Box<Self>) -> PortFuture<'a, Result<(), AgentError>>
     where
         Self: 'a,
     {
@@ -328,41 +529,35 @@ impl IncrementalToolBatch for SmokeIncrementalBatch<'_> {
                     AgentError::new(AgentErrorKind::ToolDispatch, "smoke_gate_closed")
                 })?;
 
-            let results = self
-                .calls
-                .into_values()
-                .map(|item| add_result(item.call.id, &item.call.arguments))
-                .collect();
+            // 现在才执行；每算完一个就上报一个。上报顺序不重要——内核按槽位排。
+            for item in self.calls.into_values() {
+                let result = add_result(item.call.id, &item.call.arguments);
+                self.reporter.settled(item.slot, result).await?;
+            }
             self.runtime
                 .incremental_commits
                 .fetch_add(1, Ordering::SeqCst);
-            Ok(ToolResultBatch { results })
+            Ok(())
         })
     }
 
     fn abort<'a>(
         self: Box<Self>,
         _reason: ToolBatchAbortReason,
-    ) -> PortFuture<'a, Result<AbortedToolBatch, AgentError>>
+    ) -> PortFuture<'a, Result<AbortClassification, AgentError>>
     where
         Self: 'a,
     {
         Box::pin(async move {
             // 示例在 commit 获得 gate 前完全不执行，因此每个已 submit 项都能确定为未开始。
             // 这些取消结论不会被伪装成普通 ToolResults，也无需作为副作用事实进入恢复回执。
-            let calls = self
+            let _ = &self.batch;
+            Ok(self
                 .calls
-                .into_values()
-                .map(|item| AbortedToolCall {
-                    slot: item.slot,
-                    call_id: item.call.id,
-                    outcome: AbortedToolCallOutcome::CancelledBeforeStart,
-                })
-                .collect();
-            Ok(AbortedToolBatch {
-                batch_attempt_id: self.batch.batch_attempt_id,
-                calls,
-            })
+                .into_keys()
+                .fold(AbortClassification::new(), |report, slot| {
+                    report.cancelled_before_start(slot)
+                }))
         })
     }
 }
@@ -384,8 +579,8 @@ impl Compaction for NoCompaction {
     fn compact<'a>(
         &'a self,
         conversation: &'a [TranscriptItem],
-    ) -> PortFuture<'a, Vec<TranscriptItem>> {
-        Box::pin(async move { conversation.to_vec() })
+    ) -> PortFuture<'a, Result<Vec<TranscriptItem>, AgentError>> {
+        Box::pin(async move { Ok(conversation.to_vec()) })
     }
 }
 
@@ -406,7 +601,53 @@ impl Observer for PrintingObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent::{RunId, ToolBatchAttemptId, ToolCall};
+    use midturn::{AbortedSlot, ToolBatchAttemptId, ToolCall};
+
+    #[test]
+    fn chat_options_forward_extensions_and_keep_a_fixed_small_token_limit() {
+        let mut fields = JsonObject::new();
+        fields.insert("thinking".to_owned(), json!({"type": "disabled"}));
+
+        let legacy = openai_chat_options(&fields, ChatTokenField::MaxTokens);
+        assert_eq!(legacy.max_tokens, Some(SMOKE_MAX_OUTPUT_TOKENS));
+        assert_eq!(legacy.additional_fields, fields);
+
+        let completion = openai_chat_options(&fields, ChatTokenField::MaxCompletionTokens);
+        assert_eq!(completion.max_tokens, None);
+        assert_eq!(completion.additional_fields["thinking"]["type"], "disabled");
+        assert_eq!(
+            completion.additional_fields["max_completion_tokens"],
+            SMOKE_MAX_OUTPUT_TOKENS
+        );
+    }
+
+    #[tokio::test]
+    async fn text_probe_does_not_treat_an_empty_tool_seal_as_a_tool_call() {
+        let mut sink = TextProbeSink::default();
+        sink.emit(ModelStreamEvent::TextDelta {
+            part_index: 0,
+            delta: "ok".to_owned(),
+        })
+        .await
+        .unwrap();
+        sink.emit(ModelStreamEvent::ToolCallsSealed { call_count: 0 })
+            .await
+            .unwrap();
+        assert_eq!(sink.text_events, 1);
+        assert!(!sink.saw_tool_event);
+    }
+
+    #[test]
+    fn text_probe_error_does_not_copy_provider_summary() {
+        let sensitive = "provider-body-must-not-escape";
+        let error = sanitized_probe_error(
+            SmokeProtocol::OpenAiChat,
+            "stream",
+            AgentError::new(AgentErrorKind::Model, sensitive),
+        );
+        assert!(!error.to_string().contains(sensitive));
+        assert!(error.to_string().contains("kind=Model"));
+    }
 
     fn runtime() -> (SmokeTools, mpsc::UnboundedReceiver<usize>, Arc<Semaphore>) {
         let (started, receiver) = mpsc::unbounded_channel();
@@ -432,6 +673,25 @@ mod tests {
         }
     }
 
+    /// 这些用例直接驱动 runtime，不经过 session：上报端只是把结算收进一个列表。
+    #[derive(Default)]
+    struct RecordingReporter {
+        settled: std::sync::Mutex<Vec<(ToolCallSlot, ToolResult)>>,
+    }
+
+    impl ToolCallReporter for RecordingReporter {
+        fn settled<'a>(
+            &'a self,
+            slot: ToolCallSlot,
+            result: ToolResult,
+        ) -> PortFuture<'a, Result<(), AgentError>> {
+            Box::pin(async move {
+                self.settled.lock().unwrap().push((slot, result));
+                Ok(())
+            })
+        }
+    }
+
     fn incremental_call(slot: u32, id: &str, left: i64, right: i64) -> IncrementalToolCall {
         let start = start();
         IncrementalToolCall {
@@ -443,11 +703,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_runtime_seals_and_commits_in_slot_order() {
+    async fn incremental_runtime_seals_and_reports_every_slot_on_commit() {
         let (runtime, mut started, gate) = runtime();
-        let mut batch = runtime.begin_incremental(start()).await.unwrap().unwrap();
+        let reporter = Arc::new(RecordingReporter::default());
+        let mut batch = runtime
+            .begin_incremental(start(), reporter.clone())
+            .await
+            .unwrap()
+            .unwrap();
 
-        // 完成事件可以乱序到达；commit 的结果仍按规范 slot 顺序返回。
+        // 完成事件可以乱序到达；commit 时每个槽都会被上报一次。
         batch
             .submit(incremental_call(1, "second", 5, 7))
             .await
@@ -462,9 +727,16 @@ mod tests {
         assert_eq!(runtime.legacy_dispatches.load(Ordering::SeqCst), 0);
 
         gate.add_permits(1);
-        let results = batch.commit().await.unwrap();
-        assert_eq!(results.results[0].call_id.as_str(), "first");
-        assert_eq!(results.results[1].call_id.as_str(), "second");
+        batch.commit().await.unwrap();
+        let settled = reporter.settled.lock().unwrap();
+        assert_eq!(settled.len(), 2);
+        assert!(settled
+            .iter()
+            .any(|(slot, result)| slot.get() == 0 && result.call_id.as_str() == "first"));
+        assert!(settled
+            .iter()
+            .any(|(slot, result)| slot.get() == 1 && result.call_id.as_str() == "second"));
+        drop(settled);
         assert_eq!(runtime.incremental_begins.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.incremental_commits.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.legacy_dispatches.load(Ordering::SeqCst), 0);
@@ -473,7 +745,12 @@ mod tests {
     #[tokio::test]
     async fn incremental_runtime_abort_reports_every_call_as_not_started() {
         let (runtime, _started, _gate) = runtime();
-        let mut batch = runtime.begin_incremental(start()).await.unwrap().unwrap();
+        let reporter = Arc::new(RecordingReporter::default());
+        let mut batch = runtime
+            .begin_incremental(start(), reporter.clone())
+            .await
+            .unwrap()
+            .unwrap();
         batch
             .submit(incremental_call(0, "first", 2, 3))
             .await
@@ -487,12 +764,12 @@ mod tests {
             .abort(ToolBatchAbortReason::ModelStreamInterrupted)
             .await
             .unwrap();
-        assert_eq!(report.batch_attempt_id, start().batch_attempt_id);
-        assert_eq!(report.calls.len(), 2);
+        assert_eq!(report.slots.len(), 2);
         assert!(report
-            .calls
-            .iter()
-            .all(|call| matches!(call.outcome, AbortedToolCallOutcome::CancelledBeforeStart)));
+            .slots
+            .values()
+            .all(|outcome| matches!(outcome, AbortedSlot::CancelledBeforeStart)));
+        assert!(reporter.settled.lock().unwrap().is_empty());
         assert_eq!(runtime.incremental_commits.load(Ordering::SeqCst), 0);
         assert_eq!(runtime.legacy_dispatches.load(Ordering::SeqCst), 0);
     }

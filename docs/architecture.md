@@ -90,14 +90,17 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
 
 `viewport/` 同理分出 `geometry.rs`（纯几何原语，不认识读取器）。
 
-## 5. `agent` 与 toolturn 的镜像关系
+## 5. `agent` 与 midturn 的镜像关系
 
-`crates/agent` 已抽出为独立仓库 [toolturn](https://github.com/spojchil/toolturn)。
-两边的 `src/` **逐字节一致**，只有 package 名不同。
+`crates/agent` 是独立内核仓库 **midturn**（曾用名 toolturn）的镜像拷贝：
+package 名就是 `midturn`，下游 crate 用 Cargo 别名引用
+（`agent = { package = "midturn", path = "../agent" }`），源码里仍写 `agent::`。
+两边的 `src/`、`tests/`、`examples/` **逐字节一致**。
 
-现在是**两份拷贝**，靠人工同步。收敛路径是把它换成 git 依赖
-（与 azalea 同款：钉死 rev），前提是 toolturn 仓库可被 CI 访问。
-在那之前，改动 `crates/agent` 必须同步回 toolturn，反之亦然。
+现在是**两份拷贝**，靠人工同步：上游在维护者本机的 midturn 迭代仓里演进，
+更新后整体拷入本仓验收（下游破口修在下游）。收敛路径是把它换成 git 依赖
+（与 azalea 同款：钉死 rev），前提是 midturn 仓库可被 CI 访问。
+在那之前，改动 `crates/agent` 必须同步回上游，反之亦然。
 
 ## 6. 线程模型
 

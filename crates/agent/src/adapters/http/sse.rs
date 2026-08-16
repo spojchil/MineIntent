@@ -3,6 +3,8 @@
 //! 自动重连可能重复工具调用片段，因此 HTTP 模型只解析当前连接；连接中断由上层作为一次
 //! 未完成的模型尝试处理。
 
+use std::sync::Arc;
+
 use crate::types::AgentError;
 
 use super::transport::model_error;
@@ -13,7 +15,9 @@ const UTF8_BOM: &[u8; 3] = b"\xef\xbb\xbf";
 pub(crate) struct SseEvent {
     pub event: String,
     pub data: String,
-    pub id: String,
+    /// SSE 的 `id` 会跨事件继承；共享底层字符串可避免一个较大的持久 ID 在同一网络
+    /// chunk 中的每个事件上重复分配。
+    pub id: Arc<str>,
 }
 
 /// 按字节接收网络分块，避免 UTF-8 字符被 HTTP chunk 切开时提前解码。
@@ -22,7 +26,7 @@ pub(crate) struct SseParser {
     event_name: Vec<u8>,
     data: Vec<u8>,
     data_seen: bool,
-    last_event_id: Vec<u8>,
+    last_event_id: Arc<str>,
     beginning_checked: bool,
     max_event_bytes: usize,
 }
@@ -34,7 +38,7 @@ impl SseParser {
             event_name: Vec::new(),
             data: Vec::new(),
             data_seen: false,
-            last_event_id: Vec::new(),
+            last_event_id: Arc::from(""),
             beginning_checked: false,
             max_event_bytes,
         }
@@ -79,11 +83,41 @@ impl SseParser {
     }
 
     fn parse_lines(&mut self, eof: bool) -> Result<Vec<SseEvent>, AgentError> {
+        // 一次接管当前缓冲区并用游标扫描。旧实现为每行创建 Vec 后再从头 drain，单个
+        // 大 chunk 含很多短行时会反复移动剩余字节，形成 O(n^2) CPU/内存带宽开销。
+        let buffer = std::mem::take(&mut self.pending);
         let mut events = Vec::new();
-        while let Some(line) = take_line(&mut self.pending, eof) {
-            if let Some(event) = self.consume_line(&line)? {
+        let mut cursor = 0;
+        while cursor < buffer.len() {
+            let Some(relative_end) = buffer[cursor..]
+                .iter()
+                .position(|byte| matches!(byte, b'\r' | b'\n'))
+            else {
+                break;
+            };
+            let line_end = cursor + relative_end;
+            if buffer[line_end] == b'\r' && line_end + 1 == buffer.len() && !eof {
+                break;
+            }
+            let delimiter_len =
+                if buffer[line_end] == b'\r' && buffer.get(line_end + 1).copied() == Some(b'\n') {
+                    2
+                } else {
+                    1
+                };
+            if let Some(event) = self.consume_line(&buffer[cursor..line_end])? {
                 events.push(event);
             }
+            cursor = line_end + delimiter_len;
+        }
+        if eof && cursor < buffer.len() {
+            if let Some(event) = self.consume_line(&buffer[cursor..])? {
+                events.push(event);
+            }
+            cursor = buffer.len();
+        }
+        if cursor < buffer.len() {
+            self.pending.extend_from_slice(&buffer[cursor..]);
         }
         Ok(events)
     }
@@ -109,6 +143,9 @@ impl SseParser {
         match field {
             b"event" => {
                 ensure_utf8(value)?;
+                if value.len() > self.max_event_bytes {
+                    return Err(model_error("transport_sse_event_too_large"));
+                }
                 self.event_name.clear();
                 self.event_name.extend_from_slice(value);
             }
@@ -127,9 +164,12 @@ impl SseParser {
                 self.data_seen = true;
             }
             b"id" if !value.contains(&0) => {
-                ensure_utf8(value)?;
-                self.last_event_id.clear();
-                self.last_event_id.extend_from_slice(value);
+                let value = std::str::from_utf8(value)
+                    .map_err(|_| model_error("transport_sse_not_utf8"))?;
+                if value.len() > self.max_event_bytes {
+                    return Err(model_error("transport_sse_event_too_large"));
+                }
+                self.last_event_id = Arc::from(value);
             }
             // retry 和未来字段不会改变当前连接中的协议语义。
             _ => {}
@@ -154,8 +194,7 @@ impl SseParser {
         };
         let data = String::from_utf8(std::mem::take(&mut self.data))
             .map_err(|_| model_error("transport_sse_not_utf8"))?;
-        let id = String::from_utf8(self.last_event_id.clone())
-            .map_err(|_| model_error("transport_sse_not_utf8"))?;
+        let id = Arc::clone(&self.last_event_id);
         self.data_seen = false;
         Ok(Some(SseEvent { event, data, id }))
     }
@@ -169,28 +208,6 @@ fn ensure_utf8(value: &[u8]) -> Result<(), AgentError> {
 
 fn contains_line_ending(bytes: &[u8]) -> bool {
     bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n'))
-}
-
-fn take_line(buffer: &mut Vec<u8>, eof: bool) -> Option<Vec<u8>> {
-    let index = buffer.iter().position(|byte| matches!(byte, b'\r' | b'\n'));
-    match index {
-        Some(index) => {
-            if buffer[index] == b'\r' && index + 1 == buffer.len() && !eof {
-                return None;
-            }
-            let delimiter_len =
-                if buffer[index] == b'\r' && buffer.get(index + 1).copied() == Some(b'\n') {
-                    2
-                } else {
-                    1
-                };
-            let line = buffer[..index].to_vec();
-            buffer.drain(..index + delimiter_len);
-            Some(line)
-        }
-        None if eof && !buffer.is_empty() => Some(std::mem::take(buffer)),
-        None => None,
-    }
 }
 
 #[cfg(test)]
@@ -211,7 +228,7 @@ mod tests {
                 vec![SseEvent {
                     event: "delta".to_owned(),
                     data: "{\"text\":\"你好😀\"}".to_owned(),
-                    id: "7".to_owned(),
+                    id: Arc::from("7"),
                 }],
                 "split={split}"
             );
@@ -229,7 +246,7 @@ mod tests {
             vec![SseEvent {
                 event: "message".to_owned(),
                 data: "first\nsecond".to_owned(),
-                id: String::new(),
+                id: Arc::from(""),
             }]
         );
         parser.finish().unwrap();
@@ -241,8 +258,30 @@ mod tests {
         let events = parser.push(b"id: same\ndata:\n\ndata: next\n\n").unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].data, "");
-        assert_eq!(events[0].id, "same");
-        assert_eq!(events[1].id, "same");
+        assert_eq!(events[0].id.as_ref(), "same");
+        assert_eq!(events[1].id.as_ref(), "same");
+        assert!(Arc::ptr_eq(&events[0].id, &events[1].id));
+    }
+
+    #[test]
+    fn shares_a_large_persistent_id_across_many_events_and_bounds_id_lines() {
+        let id = "x".repeat(4096);
+        let mut wire = format!("id: {id}\n").into_bytes();
+        for _ in 0..2_000 {
+            wire.extend_from_slice(b"data: x\n\n");
+        }
+        let mut parser = SseParser::new(8192);
+        let events = parser.push(&wire).unwrap();
+        assert_eq!(events.len(), 2_000);
+        assert!(events
+            .windows(2)
+            .all(|events| Arc::ptr_eq(&events[0].id, &events[1].id)));
+
+        let mut oversized = SseParser::new(4);
+        assert_eq!(
+            oversized.push(b"id: 12345\n").unwrap_err().summary,
+            "transport_sse_event_too_large"
+        );
     }
 
     #[test]

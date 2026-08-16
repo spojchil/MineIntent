@@ -9,8 +9,10 @@
 
 use std::sync::Arc;
 
+use agent::persistence::SessionId;
 use agent::{
-    Compaction, InputMessage, Model, ModelRequest, PortFuture, PromptSource, TranscriptItem,
+    AgentError, Compaction, InputMessage, Model, ModelRequest, PortFuture, PromptSource, RunId,
+    TranscriptItem,
 };
 use memory::MemoryFile;
 use screens::ChatReadMark;
@@ -115,7 +117,7 @@ impl ContextStrategy {
 }
 
 impl PromptSource for ContextStrategy {
-    fn base_context(&self) -> Vec<TranscriptItem> {
+    fn base_context(&self) -> Result<Vec<TranscriptItem>, AgentError> {
         let mut items = vec![
             InputMessage::text("system", self.persona.clone()).into(),
             self.memory_message().into(),
@@ -123,7 +125,7 @@ impl PromptSource for ContextStrategy {
         if let Some(situation) = self.situation_message() {
             items.push(situation.into());
         }
-        items
+        Ok(items)
     }
 }
 
@@ -131,9 +133,10 @@ impl Compaction for ContextStrategy {
     fn compact<'a>(
         &'a self,
         conversation: &'a [TranscriptItem],
-    ) -> PortFuture<'a, Vec<TranscriptItem>> {
+    ) -> PortFuture<'a, Result<Vec<TranscriptItem>, AgentError>> {
         Box::pin(async move {
-            let unchanged = || conversation.to_vec();
+            // 压缩失败一律降级为「不压」：返回 Err 会终止运行，而保持原对话总是安全的。
+            let unchanged = || Ok(conversation.to_vec());
             let Some(model) = &self.model else {
                 return unchanged();
             };
@@ -150,8 +153,15 @@ impl Compaction for ContextStrategy {
             transcript.extend(conversation.iter().cloned());
             transcript.push(InputMessage::text("user", "请按上面的规则输出压缩 JSON。").into());
 
+            let session_id = match SessionId::new("compaction") {
+                Ok(id) => id,
+                Err(_) => return unchanged(),
+            };
             let Ok(response) = model
                 .complete(ModelRequest {
+                    session_id,
+                    run_id: RunId::new("compaction"),
+                    request_index: 1,
                     transcript,
                     function_tools: Vec::new(),
                 })
@@ -174,7 +184,21 @@ impl Compaction for ContextStrategy {
                 // 落盘失败就不丢对话：金律是"落盘否则就丢"，反之亦然。
                 return unchanged();
             }
-            vec![InputMessage::text("user", format!("{SUMMARY_PREFIX}\n{summary}")).into()]
+            // 耐久事实（中断回执、effect 对账等）说的是「外界真的发生过什么」，
+            // 内核要求逐项原样保留并校验序列一致，否则整个压缩结果被丢弃。
+            // 摘要在前，耐久事实按原相对顺序跟在后面。
+            let mut replaced: Vec<TranscriptItem> = vec![InputMessage::text(
+                "user",
+                format!("{SUMMARY_PREFIX}\n{summary}"),
+            )
+            .into()];
+            replaced.extend(
+                conversation
+                    .iter()
+                    .filter(|item| agent::durable_fact_kind(item).is_some())
+                    .cloned(),
+            );
+            Ok(replaced)
         })
     }
 }
@@ -220,7 +244,7 @@ mod tests {
         memory.write("我在山坡的木屋住下了。").unwrap();
         let strategy = ContextStrategy::new("你是小明。", memory);
 
-        let base = strategy.base_context();
+        let base = strategy.base_context().unwrap();
         assert_eq!(base.len(), 2);
         let (persona_role, persona_text) = text_of(&base[0]);
         assert_eq!(persona_role, "system");
@@ -237,12 +261,12 @@ mod tests {
         let strategy = ContextStrategy::new("人设", memory.clone());
 
         memory.write("第一轮的记忆").unwrap();
-        assert!(text_of(&strategy.base_context()[1])
+        assert!(text_of(&strategy.base_context().unwrap()[1])
             .1
             .contains("第一轮的记忆"));
 
         std::fs::write(dir.join("memory.md"), "维护者手改的记忆").unwrap();
-        assert!(text_of(&strategy.base_context()[1])
+        assert!(text_of(&strategy.base_context().unwrap()[1])
             .1
             .contains("维护者手改的记忆"));
     }
@@ -254,7 +278,7 @@ mod tests {
             Arc::new(MemoryFile::new(scratch_dir().join("memory.md"))),
         );
 
-        let base = strategy.base_context();
+        let base = strategy.base_context().unwrap();
         assert_eq!(base.len(), 2);
         assert!(text_of(&base[1]).1.contains("还没有记忆"));
     }
@@ -264,7 +288,7 @@ mod tests {
         // 把记忆路径指向目录本身制造真实读取错误（非 NotFound）。
         let strategy = ContextStrategy::new("人设", Arc::new(MemoryFile::new(scratch_dir())));
 
-        let (_, memory_text) = text_of(&strategy.base_context()[1]);
+        let (_, memory_text) = text_of(&strategy.base_context().unwrap()[1]);
         assert!(memory_text.contains("读取失败"));
         assert!(memory_text.contains("不要用 remember 改写"));
         assert!(!memory_text.contains("还没有记忆"));
@@ -300,7 +324,7 @@ mod tests {
             Arc::new(ChatReadMark::new()),
         );
 
-        let base = strategy.base_context();
+        let base = strategy.base_context().unwrap();
         assert_eq!(base.len(), 3);
         let (role, text) = text_of(&base[2]);
         assert_eq!(role, "system");
@@ -342,7 +366,7 @@ mod tests {
             ),
         ));
 
-        let compacted = strategy.compact(&conversation()).await;
+        let compacted = strategy.compact(&conversation()).await.unwrap();
         assert_eq!(compacted.len(), 1);
         let (role, text) = text_of(&compacted[0]);
         assert_eq!(role, "user");
@@ -358,7 +382,7 @@ mod tests {
             .with_model(Arc::new(CannedModel("我不想输出 JSON。".to_owned())));
 
         let original = conversation();
-        let compacted = strategy.compact(&original).await;
+        let compacted = strategy.compact(&original).await.unwrap();
         assert_eq!(compacted, original);
         assert_eq!(memory.read().unwrap(), "旧记忆。");
     }
@@ -373,8 +397,32 @@ mod tests {
         ));
 
         let original = conversation();
-        assert_eq!(strategy.compact(&original).await, original);
+        assert_eq!(strategy.compact(&original).await.unwrap(), original);
         assert_eq!(memory.read().unwrap(), "旧记忆。");
+    }
+
+    #[tokio::test]
+    async fn compaction_preserves_durable_facts_verbatim() {
+        let memory = Arc::new(MemoryFile::new(scratch_dir().join("memory.md")));
+        memory.write("旧记忆。").unwrap();
+        let strategy = ContextStrategy::new("人设", memory).with_model(Arc::new(CannedModel(
+            "{\"memory_full_text\": \"旧记忆。\", \"summary\": \"摘要。\"}".to_owned(),
+        )));
+
+        // 中断回执是耐久事实：不保留它，内核会丢弃整个压缩结果。
+        let receipt: TranscriptItem = InputMessage::new(
+            "user",
+            vec![agent::ContentPart::json(serde_json::json!({
+                "kind": agent::DurableFactKind::InterruptedToolBatch.as_wire(),
+            }))],
+        )
+        .into();
+        let mut with_receipt = conversation();
+        with_receipt.push(receipt.clone());
+
+        let compacted = strategy.compact(&with_receipt).await.unwrap();
+        assert_eq!(compacted.len(), 2, "摘要一条 + 回执一条：{compacted:?}");
+        assert_eq!(compacted[1], receipt);
     }
 
     #[tokio::test]
@@ -384,6 +432,6 @@ mod tests {
             Arc::new(MemoryFile::new(scratch_dir().join("memory.md"))),
         );
         let original = conversation();
-        assert_eq!(strategy.compact(&original).await, original);
+        assert_eq!(strategy.compact(&original).await.unwrap(), original);
     }
 }

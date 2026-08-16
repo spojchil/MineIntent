@@ -161,20 +161,7 @@ fn decode_responses_response(value: Value) -> Result<ModelResponse, AgentError> 
         .get("output")
         .and_then(Value::as_array)
         .ok_or_else(|| model_error("openai_responses_missing_output"))?;
-    let mut content = Vec::new();
-    let mut tool_calls = Vec::new();
-
-    for item in output {
-        match item.get("type").and_then(Value::as_str) {
-            Some("message") => decode_message_content(item, &mut content)?,
-            Some("function_call") => tool_calls.push(decode_function_call(item)?),
-            Some(kind) => content.push(ContentPart::Opaque {
-                kind: format!("openai.responses.{kind}"),
-                data: item.clone(),
-            }),
-            None => return Err(model_error("openai_responses_output_item_missing_type")),
-        }
-    }
+    let (content, tool_calls) = decode_output_items(output)?;
 
     let mut provider_data = JsonObject::new();
     // 原始输出数组保留 item 顺序、服务端 ID 以及兼容端点的未知扩展字段。
@@ -206,14 +193,76 @@ fn decode_responses_response(value: Value) -> Result<ModelResponse, AgentError> 
     })
 }
 
+fn decode_output_items(output: &[Value]) -> Result<(Vec<ContentPart>, Vec<ToolCall>), AgentError> {
+    let mut content = Vec::new();
+    let mut tool_calls = Vec::new();
+    for item in output {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => decode_message_content(item, &mut content)?,
+            Some("function_call") => tool_calls.push(decode_function_call(item)?),
+            Some(kind) if is_input_only_item(kind) => {
+                return Err(model_error(format!(
+                    "openai_responses_input_item_in_model_output:{kind}"
+                )));
+            }
+            Some(kind) => content.push(ContentPart::Opaque {
+                kind: format!("openai.responses.{kind}"),
+                data: item.clone(),
+            }),
+            None => return Err(model_error("openai_responses_output_item_missing_type")),
+        }
+    }
+    Ok((content, tool_calls))
+}
+
+fn is_input_only_item(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_call_output"
+            | "computer_call_output"
+            | "local_shell_call_output"
+            | "shell_call_output"
+            | "apply_patch_call_output"
+            | "custom_tool_call_output"
+            | "mcp_approval_response"
+            | "item_reference"
+    )
+}
+
 #[derive(Default)]
 struct ResponsesStreamDecoder {
     function_slots: BTreeMap<u64, ToolCallSlot>,
     ready_calls: BTreeMap<ToolCallSlot, ToolCall>,
-    text_parts: BTreeMap<(u64, u64), u32>,
+    text_parts: BTreeMap<(u64, u64), StreamTextDraft>,
+    /// 推理段单独跟踪：它是独立的 output item，不参与正文聚合，只用于观测。
+    ///
+    /// 但「不参与聚合」不等于不用维护状态：段的开始与结束成对、结束之后不再有增量，
+    /// 这些是 `ModelStreamEvent` 的契约，推理段同样要守。
+    reasoning_parts: BTreeMap<(u64, u64), StreamReasoningDraft>,
     next_tool_slot: u32,
     next_text_part: u32,
     terminal_seen: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamTextKind {
+    OutputText,
+    Refusal,
+}
+
+#[derive(Debug)]
+struct StreamTextDraft {
+    part_index: u32,
+    kind: StreamTextKind,
+    text: String,
+    done: bool,
+}
+
+#[derive(Debug)]
+struct StreamReasoningDraft {
+    part_index: u32,
+    text: String,
+    done: bool,
 }
 
 impl WireStreamDecoder for ResponsesStreamDecoder {
@@ -240,39 +289,14 @@ impl WireStreamDecoder for ResponsesStreamDecoder {
                 }
                 Ok(StreamDecode::events(Vec::new()))
             }
-            "response.output_text.delta" => {
-                let delta = required_string(
-                    &value,
-                    "delta",
-                    "openai_responses_stream_text_delta_missing_value",
-                )?;
-                let output_index = required_u64(
-                    &value,
-                    "output_index",
-                    "openai_responses_stream_text_delta_missing_output_index",
-                )?;
-                let content_index = value
-                    .get("content_index")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let key = (output_index, content_index);
-                let part_index = match self.text_parts.get(&key).copied() {
-                    Some(index) => index,
-                    None => {
-                        let index = self.next_text_part;
-                        self.next_text_part =
-                            self.next_text_part.checked_add(1).ok_or_else(|| {
-                                model_error("openai_responses_stream_text_part_overflow")
-                            })?;
-                        self.text_parts.insert(key, index);
-                        index
-                    }
-                };
-                Ok(StreamDecode::events(vec![ModelStreamEvent::TextDelta {
-                    part_index,
-                    delta: delta.to_owned(),
-                }]))
+            "response.reasoning_text.delta" => self.reasoning_delta(&value),
+            "response.reasoning_text.done" => self.reasoning_done(&value),
+            "response.output_text.delta" => self.text_delta(&value, StreamTextKind::OutputText),
+            "response.refusal.delta" => self.text_delta(&value, StreamTextKind::Refusal),
+            "response.output_text.done" => {
+                self.text_done(&value, StreamTextKind::OutputText, "text")
             }
+            "response.refusal.done" => self.text_done(&value, StreamTextKind::Refusal, "refusal"),
             "response.output_item.done" => self.output_item_done(&value),
             "response.completed" => self.complete(value),
             "response.failed" | "response.incomplete" | "error" => {
@@ -292,6 +316,209 @@ impl WireStreamDecoder for ResponsesStreamDecoder {
 }
 
 impl ResponsesStreamDecoder {
+    fn text_key(value: &Value) -> Result<(u64, u64), AgentError> {
+        let output_index = required_u64(
+            value,
+            "output_index",
+            "openai_responses_stream_text_missing_output_index",
+        )?;
+        let content_index = required_u64(
+            value,
+            "content_index",
+            "openai_responses_stream_text_missing_content_index",
+        )?;
+        Ok((output_index, content_index))
+    }
+
+    fn ensure_text_draft(
+        &mut self,
+        key: (u64, u64),
+        kind: StreamTextKind,
+    ) -> Result<&mut StreamTextDraft, AgentError> {
+        if !self.text_parts.contains_key(&key) {
+            let part_index = self.next_text_part;
+            self.next_text_part = self
+                .next_text_part
+                .checked_add(1)
+                .ok_or_else(|| model_error("openai_responses_stream_text_part_overflow"))?;
+            self.text_parts.insert(
+                key,
+                StreamTextDraft {
+                    part_index,
+                    kind,
+                    text: String::new(),
+                    done: false,
+                },
+            );
+        }
+        let draft = self.text_parts.get_mut(&key).expect("inserted above");
+        if draft.kind != kind {
+            return Err(model_error(
+                "openai_responses_stream_content_part_kind_changed",
+            ));
+        }
+        Ok(draft)
+    }
+
+    fn text_delta(
+        &mut self,
+        value: &Value,
+        kind: StreamTextKind,
+    ) -> Result<StreamDecode, AgentError> {
+        let delta = required_string(
+            value,
+            "delta",
+            "openai_responses_stream_text_delta_missing_value",
+        )?;
+        let key = Self::text_key(value)?;
+        let is_new = !self.text_parts.contains_key(&key);
+        let draft = self.ensure_text_draft(key, kind)?;
+        if draft.done {
+            return Err(model_error("openai_responses_stream_text_delta_after_done"));
+        }
+        draft.text.push_str(delta);
+        let part_index = draft.part_index;
+        let mut events = Vec::with_capacity(2);
+        if is_new {
+            events.push(ModelStreamEvent::TextStart { part_index });
+        }
+        events.push(ModelStreamEvent::TextDelta {
+            part_index,
+            delta: delta.to_owned(),
+        });
+        Ok(StreamDecode::events(events))
+    }
+
+    fn text_done(
+        &mut self,
+        value: &Value,
+        kind: StreamTextKind,
+        field: &str,
+    ) -> Result<StreamDecode, AgentError> {
+        let final_text = value
+            .get(field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| model_error("openai_responses_stream_text_done_missing_value"))?;
+        let key = Self::text_key(value)?;
+        let existed = self.text_parts.contains_key(&key);
+        let draft = self.ensure_text_draft(key, kind)?;
+        if draft.done {
+            return Err(model_error("openai_responses_stream_duplicate_text_done"));
+        }
+        if existed && draft.text != final_text {
+            return Err(model_error("openai_responses_stream_text_done_mismatch"));
+        }
+        if !existed {
+            draft.text.push_str(final_text);
+        }
+        draft.done = true;
+        let part_index = draft.part_index;
+        let mut events = Vec::with_capacity(2);
+        if !existed {
+            events.push(ModelStreamEvent::TextStart { part_index });
+        }
+        events.push(ModelStreamEvent::TextEnd { part_index });
+        Ok(StreamDecode::events(events))
+    }
+
+    /// 推理增量。推理不进入规范内容，只作为观测发布；精确回放靠 `provider_data` 里的原始
+    /// output item。
+    fn reasoning_delta(&mut self, value: &Value) -> Result<StreamDecode, AgentError> {
+        let delta = required_string(
+            value,
+            "delta",
+            "openai_responses_stream_text_delta_missing_value",
+        )?;
+        let key = Self::text_key(value)?;
+        let existed = self.reasoning_parts.contains_key(&key);
+        let draft = self.ensure_reasoning_draft(key)?;
+        // 段已经封口还来增量，说明上游或本解析器错乱了；再发出去等于告诉消费方
+        // `ReasoningEnd` 不算数，那条契约会当场失效。
+        if draft.done {
+            return Err(model_error(
+                "openai_responses_stream_reasoning_delta_after_done",
+            ));
+        }
+        draft.text.push_str(delta);
+        let part_index = draft.part_index;
+        let mut events = Vec::with_capacity(2);
+        if !existed {
+            events.push(ModelStreamEvent::ReasoningStart { part_index });
+        }
+        events.push(ModelStreamEvent::ReasoningDelta {
+            part_index,
+            delta: delta.to_owned(),
+        });
+        Ok(StreamDecode::events(events))
+    }
+
+    fn reasoning_done(&mut self, value: &Value) -> Result<StreamDecode, AgentError> {
+        let key = Self::text_key(value)?;
+        // 官方 schema 里 `text` 是必填：与 output_text.done / refusal.done 同样严格。
+        // done-only 的推理段全靠它拿到内容，缺了就是丢内容，不是可以放过的观测缺口。
+        let final_text = value
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| model_error("openai_responses_stream_reasoning_done_missing_text"))?;
+        let existed = self.reasoning_parts.contains_key(&key);
+        let draft = self.ensure_reasoning_draft(key)?;
+        if draft.done {
+            return Err(model_error(
+                "openai_responses_stream_duplicate_reasoning_done",
+            ));
+        }
+        if existed && draft.text != final_text {
+            return Err(model_error(
+                "openai_responses_stream_reasoning_done_mismatch",
+            ));
+        }
+        if !existed {
+            draft.text.push_str(final_text);
+        }
+        draft.done = true;
+        let part_index = draft.part_index;
+        let text = draft.text.clone();
+        let mut events = Vec::with_capacity(3);
+        if !existed {
+            events.push(ModelStreamEvent::ReasoningStart { part_index });
+            // 与正文段不同：推理不进入规范输出，所以只发一对空的开始/结束，会让整段内容
+            // 从观测里彻底消失。没见过增量时，把 done 带来的全文补成一条增量。
+            if !text.is_empty() {
+                events.push(ModelStreamEvent::ReasoningDelta {
+                    part_index,
+                    delta: text,
+                });
+            }
+        }
+        events.push(ModelStreamEvent::ReasoningEnd { part_index });
+        Ok(StreamDecode::events(events))
+    }
+
+    fn ensure_reasoning_draft(
+        &mut self,
+        key: (u64, u64),
+    ) -> Result<&mut StreamReasoningDraft, AgentError> {
+        if !self.reasoning_parts.contains_key(&key) {
+            let part_index = self.next_text_part;
+            self.next_text_part = self
+                .next_text_part
+                .checked_add(1)
+                .ok_or_else(|| model_error("openai_responses_stream_text_part_overflow"))?;
+            self.reasoning_parts.insert(
+                key,
+                StreamReasoningDraft {
+                    part_index,
+                    text: String::new(),
+                    done: false,
+                },
+            );
+        }
+        Ok(self
+            .reasoning_parts
+            .get_mut(&key)
+            .expect("draft inserted above"))
+    }
+
     fn ensure_function_slot(&mut self, output_index: u64) -> Result<ToolCallSlot, AgentError> {
         if let Some(slot) = self.function_slots.get(&output_index).copied() {
             return Ok(slot);
@@ -345,6 +572,7 @@ impl ResponsesStreamDecoder {
             .cloned()
             .ok_or_else(|| model_error("openai_responses_stream_completed_missing_response"))?;
         let response = decode_responses_response(response_value)?;
+        self.validate_terminal_text(&response)?;
         let call_count = u32::try_from(response.output.tool_calls.len())
             .map_err(|_| model_error("openai_responses_stream_tool_count_overflow"))?;
 
@@ -374,6 +602,53 @@ impl ResponsesStreamDecoder {
         events.push(ModelStreamEvent::ToolCallsSealed { call_count });
         Ok(StreamDecode::completed(events, response))
     }
+
+    fn validate_terminal_text(&self, response: &ModelResponse) -> Result<(), AgentError> {
+        let raw = response
+            .output
+            .provider_data
+            .get(RAW_OUTPUT_KEY)
+            .and_then(Value::as_array)
+            .ok_or_else(|| model_error("openai_responses_stream_terminal_missing_raw_output"))?;
+        for (key, draft) in &self.text_parts {
+            if !draft.done {
+                return Err(model_error("openai_responses_stream_text_missing_done"));
+            }
+            let block = raw
+                .get(usize::try_from(key.0).map_err(|_| {
+                    model_error("openai_responses_stream_text_output_index_overflow")
+                })?)
+                .and_then(|item| item.get("content"))
+                .and_then(Value::as_array)
+                .and_then(|content| {
+                    usize::try_from(key.1)
+                        .ok()
+                        .and_then(|index| content.get(index))
+                })
+                .ok_or_else(|| model_error("openai_responses_stream_text_missing_from_terminal"))?;
+            let (kind, text) = match block.get("type").and_then(Value::as_str) {
+                Some("output_text" | "text") => (
+                    StreamTextKind::OutputText,
+                    block.get("text").and_then(Value::as_str),
+                ),
+                Some("refusal") => (
+                    StreamTextKind::Refusal,
+                    block.get("refusal").and_then(Value::as_str),
+                ),
+                _ => {
+                    return Err(model_error(
+                        "openai_responses_stream_terminal_content_kind_mismatch",
+                    ));
+                }
+            };
+            if kind != draft.kind || text != Some(draft.text.as_str()) {
+                return Err(model_error(
+                    "openai_responses_stream_terminal_text_mismatch",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn required_u64(value: &Value, field: &str, error: &'static str) -> Result<u64, AgentError> {
@@ -398,15 +673,16 @@ fn encode_input(
                 }));
             }
             TranscriptItem::ModelOutput(output) => {
-                if let Some(raw) = output
-                    .provider_data
-                    .get(RAW_OUTPUT_KEY)
-                    .and_then(Value::as_array)
-                {
-                    // reasoning、item ID、未知扩展字段与输出顺序需要精确回放。
-                    input.extend(raw.iter().cloned());
-                } else {
-                    encode_canonical_output(output, &mut input);
+                match output.provider_data.get(RAW_OUTPUT_KEY) {
+                    Some(raw) => {
+                        let raw = raw
+                            .as_array()
+                            .ok_or_else(|| model_error("openai_responses_raw_output_not_array"))?;
+                        // reasoning、item ID、未知扩展字段与输出顺序需要精确回放。
+                        validate_raw_output(output, raw)?;
+                        input.extend(raw.iter().cloned());
+                    }
+                    None => encode_canonical_output(output, &mut input),
                 }
             }
             TranscriptItem::ToolResults(batch) => {
@@ -448,6 +724,15 @@ fn encode_canonical_output(output: &ModelOutput, input: &mut Vec<Value>) {
 }
 
 fn decode_message_content(item: &Value, content: &mut Vec<ContentPart>) -> Result<(), AgentError> {
+    if item.get("role").and_then(Value::as_str) != Some("assistant") {
+        return Err(model_error("openai_responses_message_role_not_assistant"));
+    }
+    if item
+        .get("status")
+        .is_some_and(|status| status.as_str() != Some("completed"))
+    {
+        return Err(model_error("openai_responses_message_not_completed"));
+    }
     let blocks = item
         .get("content")
         .and_then(Value::as_array)
@@ -461,12 +746,36 @@ fn decode_message_content(item: &Value, content: &mut Vec<ContentPart>) -> Resul
                     .ok_or_else(|| model_error("openai_responses_text_missing_value"))?;
                 content.push(ContentPart::text(text));
             }
+            Some("refusal") => {
+                let refusal = block
+                    .get("refusal")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| model_error("openai_responses_refusal_missing_value"))?;
+                content.push(ContentPart::text(refusal));
+            }
             Some(kind) => content.push(ContentPart::Opaque {
                 kind: format!("openai.responses.content.{kind}"),
                 data: block.clone(),
             }),
             None => return Err(model_error("openai_responses_content_missing_type")),
         }
+    }
+    Ok(())
+}
+
+fn validate_raw_output(output: &ModelOutput, raw: &[Value]) -> Result<(), AgentError> {
+    let (content, calls) = decode_output_items(raw)?;
+    let calls_match = calls.len() == output.tool_calls.len()
+        && calls.iter().zip(&output.tool_calls).all(|(left, right)| {
+            left.id == right.id
+                && left.name == right.name
+                && left.arguments == right.arguments
+                && left.provider_data.get(ITEM_ID_KEY) == right.provider_data.get(ITEM_ID_KEY)
+        });
+    if content != output.content || !calls_match {
+        return Err(model_error(
+            "openai_responses_raw_output_canonical_mismatch",
+        ));
     }
     Ok(())
 }

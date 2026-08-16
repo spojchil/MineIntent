@@ -1,9 +1,28 @@
 use std::sync::Mutex as StdMutex;
 
-use agent::{RunId, ToolBatchAttemptId, ToolBatchId};
+use agent::{RunId, ToolBatchAttemptId, ToolBatchId, ToolCallSlot};
 use serde_json::json;
 
 use super::*;
+
+/// 记录 settled 上报的假 reporter：新契约下结果只从这里出。
+#[derive(Default)]
+struct RecordingReporter {
+    settled: StdMutex<Vec<(ToolCallSlot, ToolResult)>>,
+}
+
+impl ToolCallReporter for RecordingReporter {
+    fn settled<'a>(
+        &'a self,
+        slot: ToolCallSlot,
+        result: ToolResult,
+    ) -> PortFuture<'a, Result<(), AgentError>> {
+        Box::pin(async move {
+            self.settled.lock().unwrap().push((slot, result));
+            Ok(())
+        })
+    }
+}
 
 /// 记录调用顺序的假供应者。
 struct FakeProvider {
@@ -145,11 +164,12 @@ async fn occupied_screen_suppresses_other_body_domains_but_not_free_or_screen() 
 }
 
 #[tokio::test]
-async fn incremental_submit_executes_immediately_and_commit_returns_in_slot_order() {
+async fn incremental_submit_executes_immediately_and_settles_through_the_reporter() {
     let fixture = fixture();
+    let reporter = Arc::new(RecordingReporter::default());
     let mut run = fixture
         .dispatcher
-        .begin_incremental(start())
+        .begin_incremental(start(), reporter.clone())
         .await
         .unwrap()
         .expect("编排应接管增量批");
@@ -157,27 +177,32 @@ async fn incremental_submit_executes_immediately_and_commit_returns_in_slot_orde
     run.submit(incremental_call(0, "a", "remember"))
         .await
         .unwrap();
-    // 尚未封口、尚未 commit，第一个调用已经执行——层级 2 的核心断言。
+    // 尚未封口、尚未 commit，第一个调用已经执行且已上报——层级 2 的核心断言。
     assert_eq!(*fixture.log.lock().unwrap(), vec!["remember"]);
+    assert_eq!(reporter.settled.lock().unwrap().len(), 1);
 
     run.submit(incremental_call(1, "b", "go_to")).await.unwrap();
     run.calls_sealed(2).await.unwrap();
+    run.commit().await.unwrap();
 
-    let results = run.commit().await.unwrap();
-    assert_eq!(results.results.len(), 2);
-    assert_eq!(results.results[0].call_id.as_str(), "a");
-    assert_eq!(results.results[1].call_id.as_str(), "b");
+    let settled = reporter.settled.lock().unwrap();
+    assert_eq!(settled.len(), 2);
+    assert_eq!(settled[0].0, ToolCallSlot::new(0));
+    assert_eq!(settled[0].1.call_id.as_str(), "a");
+    assert_eq!(settled[1].0, ToolCallSlot::new(1));
+    assert_eq!(settled[1].1.call_id.as_str(), "b");
 }
 
 #[tokio::test]
-async fn abort_reports_every_submitted_call_as_settled_and_leaves_occupancy_untouched() {
+async fn abort_reports_no_pending_slots_and_leaves_occupancy_untouched() {
     let fixture = fixture();
-    // 屏在上一批就开着；本批中断不得动它——回执已把执行事实告知模型。
+    // 屏在上一批就开着；本批中断不得动它——settled 上报已把执行事实告知内核。
     fixture.occupancy.occupy(Domain::Screen);
 
+    let reporter = Arc::new(RecordingReporter::default());
     let mut run = fixture
         .dispatcher
-        .begin_incremental(start())
+        .begin_incremental(start(), reporter.clone())
         .await
         .unwrap()
         .unwrap();
@@ -190,12 +215,9 @@ async fn abort_reports_every_submitted_call_as_settled_and_leaves_occupancy_unto
         .await
         .unwrap();
 
-    assert_eq!(report.batch_attempt_id.as_str(), "run-1/attempt/1");
-    assert_eq!(report.calls.len(), 1);
-    assert!(matches!(
-        report.calls[0].outcome,
-        AbortedToolCallOutcome::Settled(_)
-    ));
+    // 执行同步于 submit：凡提交必已 settled，中止报告里不存在悬而未决的槽。
+    assert!(report.slots.is_empty());
+    assert_eq!(reporter.settled.lock().unwrap().len(), 1);
     assert!(fixture.occupancy.is_occupied(Domain::Screen));
 }
 

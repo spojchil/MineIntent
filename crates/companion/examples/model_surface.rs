@@ -289,7 +289,7 @@ async fn main() {
     read_mark.mark_read(1, 2_300); // 看过第一条，第二条未读
     let strategy = context::ContextStrategy::new(PLACEHOLDER_PERSONA, memory_file.clone())
         .with_situation(snapshots.clone(), read_mark.clone());
-    for (index, item) in agent::PromptSource::base_context(&strategy).iter().enumerate() {
+    for (index, item) in agent::PromptSource::base_context(&strategy).unwrap().iter().enumerate() {
         if let agent::TranscriptItem::Input(message) = item {
             let text: String = message
                 .content
@@ -305,13 +305,13 @@ async fn main() {
     println!("记忆的另外两种状态：\n");
     let empty_memory = Arc::new(MemoryFile::new(scratch.join("empty.md")));
     let empty_strategy = context::ContextStrategy::new("（人设略）", empty_memory);
-    if let agent::TranscriptItem::Input(message) = &agent::PromptSource::base_context(&empty_strategy)[1] {
+    if let agent::TranscriptItem::Input(message) = &agent::PromptSource::base_context(&empty_strategy).unwrap()[1] {
         let text: String = message.content.iter().filter_map(|p| match p { ContentPart::Text { text } => Some(text.as_str()), _ => None }).collect();
         println!("- 空记忆时：`{text}`");
     }
     let broken_memory = Arc::new(MemoryFile::new(scratch.clone())); // 指向目录制造读取失败
     let broken_strategy = context::ContextStrategy::new("（人设略）", broken_memory);
-    if let agent::TranscriptItem::Input(message) = &agent::PromptSource::base_context(&broken_strategy)[1] {
+    if let agent::TranscriptItem::Input(message) = &agent::PromptSource::base_context(&broken_strategy).unwrap()[1] {
         let text: String = message.content.iter().filter_map(|p| match p { ContentPart::Text { text } => Some(text.as_str()), _ => None }).collect();
         println!("- 读取失败时：`{text}`\n");
     }

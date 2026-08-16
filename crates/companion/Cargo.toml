@@ -7,7 +7,7 @@ license = "MIT"
 publish = false
 
 [dependencies]
-agent = { path = "../agent", features = ["openai"] }
+agent = { package = "midturn", path = "../agent", features = ["openai"] }
 context = { path = "../context" }
 dispatch = { path = "../dispatch" }
 hand = { path = "../hand" }

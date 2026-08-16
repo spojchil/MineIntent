@@ -1,6 +1,6 @@
 //! 内核端口之间交换的服务商无关数据。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,6 +8,7 @@ use serde_json::Value;
 /// 由适配器或应用管理的可扩展 JSON 字段。
 pub type JsonObject = serde_json::Map<String, Value>;
 
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentErrorKind {
     /// 状态机方法的调用顺序错误。
@@ -18,6 +19,18 @@ pub enum AgentErrorKind {
     ToolDispatch,
     /// 调用与结果的 ID 未能一一对应。
     InvalidToolBatch,
+    /// 运行被调用方显式取消。
+    Cancelled,
+    /// 端口没有在配置的截止时间内完成。
+    Timeout,
+    /// 本轮运行超过模型请求、工具批次或其他资源预算。
+    BudgetExceeded,
+    /// checkpoint 或 effect ledger 无法可靠读写。
+    Persistence,
+    /// 持久化后端可能已提交写入，但确认响应丢失；调用方必须重开并检查，不能盲目重试。
+    PersistenceCommitUnknown,
+    /// 外部副作用的结果未知，必须先由应用或人工对账。
+    ReconciliationRequired,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,9 +75,11 @@ pub struct ModelUsage {
 impl ModelUsage {
     pub(crate) fn merge(&mut self, next: &Self) {
         fn add(total: &mut Option<u64>, value: Option<u64>) {
-            if let Some(value) = value {
-                *total = Some(total.unwrap_or(0).saturating_add(value));
-            }
+            // 缺失不是零。只有每个请求都报告了字段，聚合结果才仍然可信。
+            *total = match (*total, value) {
+                (Some(total), Some(value)) => Some(total.saturating_add(value)),
+                _ => None,
+            };
         }
 
         add(&mut self.input_tokens, next.input_tokens);
@@ -170,6 +185,7 @@ impl ToolCallSlot {
 
 /// 刻意保持精简的内容中间表示。未知的多模态或服务商原生内容块通过 `Opaque`
 /// 无损保留，并且仅由模型适配器解释。
+#[non_exhaustive]
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
@@ -219,12 +235,14 @@ impl InputMessage {
 /// 核心不会添加 OpenAI 的 `type: function` 外层结构或服务商托管工具。模型适配器负责将
 /// 这一通用 JSON Schema 子集映射为相应的传输格式。`metadata` 对内核不透明，可携带供应用
 /// 或适配器参考的扩展信息。
+///
+/// 这里刻意没有工具输出 schema：三种主流协议都不接受它，内核也不会用它校验工具结果，
+/// 保留一个只写不读的字段只会让实现方误以为填了就有效果。
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ToolDefinition {
     pub name: ToolName,
     pub description: Option<String>,
     pub input_schema: Value,
-    pub output_schema: Option<Value>,
     #[serde(default, skip_serializing_if = "JsonObject::is_empty")]
     pub metadata: JsonObject,
 }
@@ -235,7 +253,6 @@ impl ToolDefinition {
             name: ToolName::new(name),
             description: None,
             input_schema,
-            output_schema: None,
             metadata: JsonObject::new(),
         }
     }
@@ -298,6 +315,7 @@ pub struct IncrementalToolCall {
 }
 
 /// 候选工具批次终止的原因。
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolBatchAbortReason {
@@ -310,40 +328,50 @@ pub enum ToolBatchAbortReason {
     ToolRuntimeRejected,
 }
 
-/// 批次中断后，工具运行时对一个已经传给 `submit` 的调用给出的冻结结论。
+/// 运行时在 `abort` 时对一个**已交付但尚未上报结算**的槽给出的分类。
+///
+/// 只有两种，因为「已完成」不在这里表达——有结果就调
+/// [`crate::ToolCallReporter::settled`]，那是结果唯一的通道。
+#[non_exhaustive]
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "status", content = "value", rename_all = "snake_case")]
-pub enum AbortedToolCallOutcome {
-    /// 已经获得可信的真实工具结果；内核会把它作为恢复事实保留，而不是重新执行该调用。
-    Settled(ToolResult),
+pub enum AbortedSlot {
     /// 运行时确认该调用尚未开始且以后也不会开始，因此没有需要告知模型的副作用事实。
     CancelledBeforeStart,
-    /// 调用可能已经产生影响，但运行时无法确定最终结果。实现不得把这种状态降级为
-    /// `CancelledBeforeStart` 或伪造成一个成功结果。
+    /// 调用可能已经产生影响，但运行时无法确定最终结果。实现不得把这种状态伪造成
+    /// `CancelledBeforeStart`。
     OutcomeUnknown { summary: String },
 }
 
-/// 中断批次中一个已经尝试提交给 runtime 的调用及其冻结结论。
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct AbortedToolCall {
-    pub slot: ToolCallSlot,
-    pub call_id: ToolCallId,
-    pub outcome: AbortedToolCallOutcome,
+/// 增量工具运行时在 `abort` 时返回的冻结报告。
+///
+/// 覆盖范围是**已经通过 `submit` 交付、且运行时尚未 `settled` 的槽**。报告里缺的槽内核
+/// 一律按 `OutcomeUnknown` 处理；报告里多出的（已终态的）槽被忽略。返回后不得再执行该
+/// 候选批次中的工作，也不得再产生迟到结果——迟到的 `settled` 会撞上终态得到错误。
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct AbortClassification {
+    pub slots: BTreeMap<ToolCallSlot, AbortedSlot>,
 }
 
-/// 增量工具运行时在 `abort` 时返回的完整冻结报告。
-///
-/// `calls` 必须对每个已经传给 `submit` 的 slot 恰好给出一个结论，包括 `submit` 因确认
-/// 不确定而返回 `Err` 的当前调用；返回后不得再执行该批次中的任何工作，也不得再产生
-/// 迟到结果。仍在模型流中传输、尚未形成完整 `IncrementalToolCall` 的尾部不属于运行时，
-/// 不应出现在报告中。
-///
-/// 此报告不是整批事务的回滚记录。实现可以在 `submit` 时只缓存，因而全部调用都能确定为
-/// `CancelledBeforeStart`；也可以提前执行并据实报告 `Settled` 或 `OutcomeUnknown`。
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct AbortedToolBatch {
-    pub batch_attempt_id: ToolBatchAttemptId,
-    pub calls: Vec<AbortedToolCall>,
+impl AbortClassification {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancelled_before_start(mut self, slot: ToolCallSlot) -> Self {
+        self.slots.insert(slot, AbortedSlot::CancelledBeforeStart);
+        self
+    }
+
+    pub fn outcome_unknown(mut self, slot: ToolCallSlot, summary: impl Into<String>) -> Self {
+        self.slots.insert(
+            slot,
+            AbortedSlot::OutcomeUnknown {
+                summary: summary.into(),
+            },
+        );
+        self
+    }
 }
 
 /// 作为普通输入提交的中断批次执行事实。
@@ -354,8 +382,7 @@ pub struct AbortedToolBatch {
 /// 调用，也不会把结果未知伪造成成功。
 ///
 /// 这是一份事实回执，不是内核自行生成的工具结果。`Settled` 中的结果来自工具运行时。
-/// 提交后它就是普通历史；压缩策略可以像处理其他消息一样概括、替换或删除它，内核不永久
-/// 固定其原文。
+/// 提交后它属于受保护的耐久事实；压缩策略必须逐项原样保留，不能概括、替换或删除。
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct InterruptedToolBatchReceipt {
     pub batch_attempt_id: ToolBatchAttemptId,
@@ -372,6 +399,7 @@ pub struct InterruptedToolCallReceipt {
     pub outcome: InterruptedToolCallOutcome,
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "status", content = "value", rename_all = "snake_case")]
 pub enum InterruptedToolCallOutcome {
@@ -381,6 +409,7 @@ pub enum InterruptedToolCallOutcome {
     OutcomeUnknown { summary: String },
 }
 
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolResultStatus {
@@ -468,6 +497,7 @@ impl ModelOutput {
 }
 
 /// 会话保存的规范对话记录，并非任何服务商的请求传输格式。
+#[non_exhaustive]
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum TranscriptItem {
@@ -482,9 +512,83 @@ impl From<InputMessage> for TranscriptItem {
     }
 }
 
-/// 验证对话记录中的每个工具轮都已闭合。含调用的模型输出必须与紧随其后的一个完整、
-/// 同序结果批次成对出现；调用 ID 只在各自批内唯一，因此两个已闭合分段可以安全拼接。
-pub(crate) fn validate_closed_transcript(transcript: &[TranscriptItem]) -> Result<(), AgentError> {
+/// 受保护的耐久事实种类。
+///
+/// 这些记录说的是「外界真的发生过什么」，不是模型说过什么。[`crate::Compaction`]
+/// 必须把它们逐项原样保留——不能概括、不能重排、不能折叠重复项、不能删除。把一条
+/// 「这个远程写操作可能已经生效」概括掉，模型就再也没有机会去核实它。
+///
+/// 用 [`durable_fact_kind`] 判断一条记录属不属于这一类。不要自己去匹配 `kind`
+/// 字符串——内核加一种回执时，那样的代码不会收到任何提示。
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableFactKind {
+    /// 模型流中断时，已经交给运行时的调用的冻结结论。
+    InterruptedToolBatch,
+    /// 崩溃恢复时，对结果未知的 effect 做出的权威对账结论。
+    EffectReconciliation,
+    /// 从 checkpoint 恢复出来的、已经执行完成的工具批。
+    RecoveredToolBatch,
+}
+
+impl DurableFactKind {
+    /// 写进记录 `kind` 字段的稳定字符串。
+    ///
+    /// 构造回执和识别回执都走这里，两边不可能对不上。新增变体时这个 `match` 会因为
+    /// 不穷尽而编译失败——「记得同时改识别逻辑」于是成了编译期错误，而不是一条注释。
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::InterruptedToolBatch => "interrupted_tool_batch_receipt",
+            Self::EffectReconciliation => "effect_reconciliation_receipt",
+            Self::RecoveredToolBatch => "recovered_tool_batch_receipt",
+        }
+    }
+
+    /// 内核当前会产生的全部种类。
+    pub const ALL: &'static [Self] = &[
+        Self::InterruptedToolBatch,
+        Self::EffectReconciliation,
+        Self::RecoveredToolBatch,
+    ];
+
+    pub fn from_wire(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.as_wire() == value)
+    }
+}
+
+/// 判断一条记录是不是受保护的耐久事实，是的话给出它的种类。
+///
+/// 这些记录**只有内核会写**：`enqueue` 拒绝任何带保留 `kind` 的外部输入
+/// （`MailboxRejectedReason::InvalidInput`），所以对话里出现的一定来自内核的三条构造路径
+/// （流中断回执、重开恢复回执、对账结论）。
+///
+/// [`crate::Compaction`] 的实现应当用它筛出必须原样保留的记录，而不是自己认字符串。
+/// 内核会在压缩返回后独立校验这些记录的序列完全一致，不一致就丢弃压缩结果、沿用原
+/// 记录——所以这不是一条可以「尽力而为」的约定。
+pub fn durable_fact_kind(item: &TranscriptItem) -> Option<DurableFactKind> {
+    let TranscriptItem::Input(message) = item else {
+        return None;
+    };
+    message.content.iter().find_map(|part| {
+        let ContentPart::Json { value } = part else {
+            return None;
+        };
+        value
+            .get("kind")
+            .and_then(Value::as_str)
+            .and_then(DurableFactKind::from_wire)
+    })
+}
+
+/// 验证对话记录中的每个工具轮都已闭合。
+///
+/// 含调用的模型输出必须与紧随其后的一个完整、同序结果批次成对出现；调用 ID 只在各自
+/// 批内唯一，因此两个已闭合分段可以安全拼接。应用可以在入队或恢复前调用此函数得到具体
+/// 错误，而不必依赖 session 的粗粒度拒绝原因。
+pub fn validate_transcript(transcript: &[TranscriptItem]) -> Result<(), AgentError> {
     let mut index = 0;
 
     while index < transcript.len() {
@@ -523,11 +627,31 @@ pub(crate) fn validate_closed_transcript(transcript: &[TranscriptItem]) -> Resul
                     ));
                 };
 
-                let ordered = order_tool_results(&pending, results.results.clone())?;
-                if ordered
+                if results.results.len() != pending.len() {
+                    return Err(AgentError::new(
+                        AgentErrorKind::InvalidToolBatch,
+                        "tool_result_count_mismatch",
+                    ));
+                }
+                let mut result_ids = HashSet::with_capacity(results.results.len());
+                for result in &results.results {
+                    if !result_ids.insert(&result.call_id) {
+                        return Err(AgentError::new(
+                            AgentErrorKind::InvalidToolBatch,
+                            "duplicate_tool_result_id",
+                        ));
+                    }
+                }
+                if pending.iter().any(|id| !result_ids.contains(id)) {
+                    return Err(AgentError::new(
+                        AgentErrorKind::InvalidToolBatch,
+                        "missing_tool_result_id",
+                    ));
+                }
+                if pending
                     .iter()
                     .zip(&results.results)
-                    .any(|(expected, actual)| expected.call_id != actual.call_id)
+                    .any(|(expected, actual)| expected != &actual.call_id)
                 {
                     return Err(AgentError::new(
                         AgentErrorKind::InvalidToolBatch,
@@ -547,6 +671,8 @@ pub(crate) fn validate_closed_transcript(transcript: &[TranscriptItem]) -> Resul
 
     Ok(())
 }
+
+pub(crate) use validate_transcript as validate_closed_transcript;
 
 /// 在严格保证 ID 一一对应的同时恢复结果顺序。
 pub(crate) fn order_tool_results(
@@ -719,5 +845,32 @@ mod tests {
 
         let combined = first.into_iter().chain(second).collect::<Vec<_>>();
         validate_closed_transcript(&combined).unwrap();
+    }
+
+    #[test]
+    fn usage_merge_does_not_present_partial_fields_as_complete_totals() {
+        let mut accumulated = ModelUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(4),
+            total_tokens: Some(14),
+            cached_input_tokens: None,
+            cache_write_input_tokens: Some(2),
+            reasoning_output_tokens: Some(1),
+        };
+        accumulated.merge(&ModelUsage {
+            input_tokens: Some(20),
+            output_tokens: None,
+            total_tokens: Some(23),
+            cached_input_tokens: Some(5),
+            cache_write_input_tokens: Some(3),
+            reasoning_output_tokens: Some(2),
+        });
+
+        assert_eq!(accumulated.input_tokens, Some(30));
+        assert_eq!(accumulated.output_tokens, None);
+        assert_eq!(accumulated.total_tokens, Some(37));
+        assert_eq!(accumulated.cached_input_tokens, None);
+        assert_eq!(accumulated.cache_write_input_tokens, Some(5));
+        assert_eq!(accumulated.reasoning_output_tokens, Some(3));
     }
 }
