@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "crates/agent",
     "crates/companion",
     "crates/context",
     "crates/dispatch",
@@ -33,6 +32,10 @@ azalea = { git = "https://github.com/spojchil/azalea", rev = "d0cc847fa3c9e0d448
     "log",
     "packet-event",
 ] }
+# 模型内核（上游独立仓，曾用名 agent/toolturn）。rev 钉死；升级流程：
+# 上游更新→本地跑验收（测试+对抗读）→改此处 rev→修下游破口→推送。
+# 依赖键保持 `agent`，源码里仍写 `agent::`，改名不惊动下游。
+agent = { package = "midturn", git = "https://github.com/spojchil/midturn", rev = "ddc6e63377775fc4f71a6cbb4d052adc67073f6a" }
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

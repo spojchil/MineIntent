@@ -7,7 +7,7 @@ license = "MIT"
 publish = false
 
 [dependencies]
-agent = { package = "midturn", path = "../agent" }
+agent = { workspace = true }
 memory = { path = "../memory" }
 render = { path = "../render" }
 screens = { path = "../screens" }

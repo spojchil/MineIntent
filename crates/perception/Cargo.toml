@@ -7,7 +7,7 @@ license = "MIT"
 publish = false
 
 [dependencies]
-agent = { package = "midturn", path = "../agent" }
+agent = { workspace = true }
 dispatch = { path = "../dispatch" }
 render = { path = "../render" }
 serde_json = "1"

@@ -32,7 +32,7 @@
 两条读法上要注意的：
 
 - **`agent` 不认识 MineIntent。** 它是零项目依赖的模型—工具循环内核，
-  目录可整体拷出独立构建（见 §5）。
+  本体是独立仓库 midturn 的 git 依赖（见 §5）。
 - **`world` 不认识模型。** 它只做「原版连接与感知」，出口是 tick 快照。
 
 ## 2. 各 crate 一句话
@@ -90,17 +90,17 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
 
 `viewport/` 同理分出 `geometry.rs`（纯几何原语，不认识读取器）。
 
-## 5. `agent` 与 midturn 的镜像关系
+## 5. `agent` 是 git 依赖 midturn
 
-`crates/agent` 是独立内核仓库 **midturn**（曾用名 toolturn）的镜像拷贝：
-package 名就是 `midturn`，下游 crate 用 Cargo 别名引用
-（`agent = { package = "midturn", path = "../agent" }`），源码里仍写 `agent::`。
-两边的 `src/`、`tests/`、`examples/` **逐字节一致**。
+模型内核不在本仓：它是独立仓库
+[midturn](https://github.com/spojchil/midturn)（曾用名 agent/toolturn），
+与 azalea 同款接法——根 `Cargo.toml` 的 `[workspace.dependencies]` 钉死 rev，
+依赖键保持 `agent`（`agent = { package = "midturn", git = …, rev = … }`），
+源码里仍写 `agent::`。
 
-现在是**两份拷贝**，靠人工同步：上游在维护者本机的 midturn 迭代仓里演进，
-更新后整体拷入本仓验收（下游破口修在下游）。收敛路径是把它换成 git 依赖
-（与 azalea 同款：钉死 rev），前提是 midturn 仓库可被 CI 访问。
-在那之前，改动 `crates/agent` 必须同步回上游，反之亦然。
+升级流程：上游更新 → 本地验收（上游测试 + 对抗读）→ 改根 Cargo.toml 的
+rev → 修下游破口 → 推送。内核自己的测试在上游仓跑，不占本仓 CI。
+（此前的镜像拷贝期见 `docs/history/`；`crates/agent` 目录已于 2026-08-16 删除。）
 
 ## 6. 线程模型
 
