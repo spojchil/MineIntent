@@ -145,6 +145,54 @@ impl Default for ViewportOptions {
 }
 
 impl ViewportOptions {
+    /// 视口变焦（⑤，维护者裁定落地）：长宽角度与距离都是参数，耦合走
+    /// **等预算线**——工作量 ∝ tan(横半角)·tan(纵半角)·距离³，预算常数取
+    /// 默认组合（约 102°×70°、32 格）的工作量，不发明数字。收窄视锥即可
+    /// 换更远距离；超预算如实拒绝并告知该角度下的距离上限。
+    /// 硬天花板是服务器发来的已加载区块（射线遇 Unloaded 如实呈现），
+    /// 不设自己的人工帽。
+    pub fn zoomed(
+        width_degrees: f64,
+        height_degrees: f64,
+        range_blocks: f64,
+    ) -> Result<Self, String> {
+        for (name, value) in [("width", width_degrees), ("height", height_degrees)] {
+            if !value.is_finite() || !(10.0..=150.0).contains(&value) {
+                return Err(format!("{name} 需要在 10-150 度之间"));
+            }
+        }
+        if !range_blocks.is_finite() || !(2.0..=256.0).contains(&range_blocks) {
+            return Err("range 需要在 2-256 格之间".to_owned());
+        }
+        let horizontal_half = (width_degrees / 2.0).to_radians();
+        let vertical_half = (height_degrees / 2.0).to_radians();
+        let defaults = Self::default();
+        let budget = defaults.horizontal_half_angle.tan()
+            * defaults.vertical_half_angle.tan()
+            * defaults.max_distance.powi(3);
+        let cost = horizontal_half.tan() * vertical_half.tan() * range_blocks.powi(3);
+        if cost > budget * 1.001 {
+            let max_range = (budget / (horizontal_half.tan() * vertical_half.tan()))
+                .cbrt()
+                .floor();
+            return Err(format!(
+                "超出观察预算：{width_degrees:.0}°×{height_degrees:.0}° 视野下距离上限约 \
+{max_range:.0} 格；想看更远就收窄角度"
+            ));
+        }
+        let range = range_blocks.ceil() as i32;
+        // 竖向盒半径按默认比例（20/32）随距离缩放，行为在默认组合下不变。
+        let vertical_radius = ((range * 20 + 31) / 32).max(4);
+        Ok(Self {
+            horizontal_radius: range,
+            vertical_radius,
+            max_distance: range_blocks,
+            vertical_half_angle: vertical_half,
+            horizontal_half_angle: horizontal_half,
+            ..defaults
+        })
+    }
+
     /// 检查投影参数，避免无界扫描或无效三角函数。
     pub fn validate(&self) -> Result<(), String> {
         if !(0..=256).contains(&self.horizontal_radius) {

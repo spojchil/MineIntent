@@ -176,6 +176,33 @@ fn directed_kernel_reports_seen_air_four_reasons_and_first_occluder() {
 }
 
 #[test]
+fn zoom_trades_angle_for_distance_along_the_default_budget_line() {
+    let defaults = ViewportOptions::default();
+    let default_width = defaults.horizontal_half_angle.to_degrees() * 2.0;
+    let default_height = defaults.vertical_half_angle.to_degrees() * 2.0;
+
+    // 默认组合恰在预算线上：允许。
+    let same =
+        ViewportOptions::zoomed(default_width, default_height, 32.0).expect("默认组合必须可用");
+    assert_eq!(same.horizontal_radius, 32);
+    assert_eq!(same.vertical_radius, 20, "竖向盒半径按默认比例缩放");
+
+    // 默认角度想看 64 格：超预算，拒绝并报该角度下的上限。
+    let refused = ViewportOptions::zoomed(default_width, default_height, 64.0)
+        .expect_err("默认角度下 64 格必须超预算");
+    assert!(refused.contains("收窄角度"), "{refused}");
+
+    // 收窄到约 1/8 角度积（两轴各约 1/2.83 的 tan）：距离可翻倍。
+    let zoomed = ViewportOptions::zoomed(40.0, 26.0, 64.0).expect("收窄后 64 格应在预算内");
+    assert_eq!(zoomed.horizontal_radius, 64);
+    assert!(zoomed.max_distance > 63.0);
+
+    // 参数边界如实拒绝。
+    assert!(ViewportOptions::zoomed(5.0, 70.0, 32.0).is_err());
+    assert!(ViewportOptions::zoomed(102.0, 70.0, 500.0).is_err());
+}
+
+#[test]
 fn gaze_lands_on_terminal_air_at_sky_box_edge_and_loading_frontier() {
     // 看天：穿出世界高度前的最高一格空气。
     let sky_read = |position: BlockPosition| {

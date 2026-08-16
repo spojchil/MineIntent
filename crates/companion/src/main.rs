@@ -178,10 +178,13 @@ struct ModuleViewportDoor {
 }
 
 impl ViewportDoor for ModuleViewportDoor {
-    fn scan<'a>(&'a self) -> agent::PortFuture<'a, Result<world::ViewportProjection, String>> {
+    fn scan<'a>(
+        &'a self,
+        options: world::ViewportOptions,
+    ) -> agent::PortFuture<'a, Result<world::ViewportProjection, String>> {
         let module = self.module.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || module.scan(&world::ViewportOptions::default()))
+            tokio::task::spawn_blocking(move || module.scan(&options))
                 .await
                 .map_err(|error| format!("视口投影任务失败：{error}"))?
         })

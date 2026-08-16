@@ -14,7 +14,10 @@ use world::{BlockMemory, DirectedProjection, ViewportProjection, MAX_DIRECTED_VI
 /// 接入模块视口面的窄化：全景用当前姿态，定向按坐标逐个分类，
 /// 增量对比方块记忆只报变化（记忆推进在门后完成）。
 pub trait ViewportDoor: Send + Sync {
-    fn scan<'a>(&'a self) -> PortFuture<'a, Result<ViewportProjection, String>>;
+    fn scan<'a>(
+        &'a self,
+        options: world::ViewportOptions,
+    ) -> PortFuture<'a, Result<ViewportProjection, String>>;
     fn scan_directed<'a>(
         &'a self,
         positions: Vec<[i32; 3]>,
@@ -71,18 +74,36 @@ impl PerceptionTools {
             };
         }
         match arguments.get("at") {
-            None => match self.door.scan().await {
-                Ok(projection) => {
-                    self.absorb_projection(&projection);
-                    ToolResult::success(
-                        call_id,
-                        vec![agent::ContentPart::text(render::render_viewport(
-                            &projection,
-                        ))],
-                    )
+            None => {
+                // 变焦参数（⑤）：缺省即默认组合；耦合与拒绝话术在内核。
+                let number = |key: &str, fallback: f64| {
+                    arguments
+                        .get(key)
+                        .and_then(Value::as_f64)
+                        .unwrap_or(fallback)
+                };
+                let defaults = world::ViewportOptions::default();
+                let options = match world::ViewportOptions::zoomed(
+                    number("width", defaults.horizontal_half_angle.to_degrees() * 2.0),
+                    number("height", defaults.vertical_half_angle.to_degrees() * 2.0),
+                    number("range", defaults.max_distance),
+                ) {
+                    Ok(options) => options,
+                    Err(reason) => return ToolResult::failure(call_id, reason),
+                };
+                match self.door.scan(options).await {
+                    Ok(projection) => {
+                        self.absorb_projection(&projection);
+                        ToolResult::success(
+                            call_id,
+                            vec![agent::ContentPart::text(render::render_viewport(
+                                &projection,
+                            ))],
+                        )
+                    }
+                    Err(reason) => ToolResult::failure(call_id, reason),
                 }
-                Err(reason) => ToolResult::failure(call_id, reason),
-            },
+            }
             Some(at) => {
                 let positions: Option<Vec<[i32; 3]>> = at.as_array().map(|rows| {
                     rows.iter()
@@ -145,14 +166,18 @@ impl ToolProvider for PerceptionTools {
                     "changes": {
                         "type": "boolean",
                         "description": "可选：把当前视野与你已见过的对比，git 式只报差异行（+ 新成立、- 不再成立，每行 (x, y, z, 方块状态)——状态含可见属性如 furnace[lit=true]），比环视省得多。没列出的坐标不代表没东西；想确认具体位置用 at。与 at 互斥"
-                    }
+                    },
+                    "width": { "type": "number", "description": "环视可选：视野横向角度（度，默认约 102）。收窄换更远" },
+                    "height": { "type": "number", "description": "环视可选：视野纵向角度（度，默认 70）。收窄换更远" },
+                    "range": { "type": "number", "description": "环视可选：观察距离（格，默认 32=两个区块）。同一副眼睛的注意力预算固定：角度越窄能看的距离越远，超预算会被拒并告知该角度下的上限；实际还受服务器已加载范围限制" }
                 },
                 "additionalProperties": false
             }),
         );
         definition.description = Some(
-            "看。三种用法：环视（默认，用当前朝向，视锥+遮挡，看不见背后和被挡住的东西）、\
-定向（at，确认指定坐标可见与否）、增量（changes，只报自上次以来的变化）。不打断任何动作。"
+            "看。三种用法：环视（默认，用当前朝向，视锥+遮挡，看不见背后和被挡住的东西；\
+可用 width/height/range 变焦——收窄视野换更远距离）、定向（at，确认指定坐标可见与否）、\
+增量（changes，与已见过的对比只报差异）。不打断任何动作。"
                 .to_owned(),
         );
         vec![(definition, ToolClass::Free)]
@@ -173,7 +198,10 @@ mod tests {
     struct CannedDoor;
 
     impl ViewportDoor for CannedDoor {
-        fn scan<'a>(&'a self) -> PortFuture<'a, Result<ViewportProjection, String>> {
+        fn scan<'a>(
+            &'a self,
+            _options: world::ViewportOptions,
+        ) -> PortFuture<'a, Result<ViewportProjection, String>> {
             Box::pin(async {
                 Ok(ViewportProjection {
                     pose: world::ViewportPose {

@@ -38,7 +38,10 @@ impl ChatDoor for NoDoor {
 }
 impl ChatHistory for NoDoor {
     fn recent(&self, _count: usize) -> Vec<String> {
-        vec!["alice: 你好".to_owned(), "companion: 你好，alice！".to_owned()]
+        vec![
+            "alice: 你好".to_owned(),
+            "companion: 你好，alice！".to_owned(),
+        ]
     }
 }
 impl InventoryDoor for NoDoor {
@@ -113,7 +116,10 @@ impl hand::HandDoor for NoDoor {
     }
 }
 impl perception::ViewportDoor for NoDoor {
-    fn scan<'a>(&'a self) -> PortFuture<'a, Result<world::ViewportProjection, String>> {
+    fn scan<'a>(
+        &'a self,
+        _options: world::ViewportOptions,
+    ) -> PortFuture<'a, Result<world::ViewportProjection, String>> {
         Box::pin(async {
             Ok(world::ViewportProjection {
                 pose: world::ViewportPose {
@@ -224,13 +230,18 @@ impl perception::ViewportDoor for NoDoor {
 /// 样例快照：白天主世界、半血、身边有玩家与两只僵尸、背包有几样东西、
 /// 聊天窗两条未读。
 fn sample_snapshot() -> world::TickSnapshot {
-    let mut snap = world::TickSnapshot::empty(world::Epoch(1), 2_400, world::ConnectionPhase::Ready);
+    let mut snap =
+        world::TickSnapshot::empty(world::Epoch(1), 2_400, world::ConnectionPhase::Ready);
     snap.world_meta.dimension = "minecraft:overworld".to_owned();
     snap.world_meta.day_time = 3_000;
     snap.world_meta.rain_level = 1.0;
     snap.self_state.entity_key = "self-uuid".to_owned();
     snap.self_state.username = "companion".to_owned();
-    snap.self_state.position = world::Vec3Value { x: 10.5, y: 72.0, z: 3.5 };
+    snap.self_state.position = world::Vec3Value {
+        x: 10.5,
+        y: 72.0,
+        z: 3.5,
+    };
     snap.self_state.yaw = -90.0;
     snap.self_state.on_ground = true;
     snap.self_state.alive = true;
@@ -238,32 +249,57 @@ fn sample_snapshot() -> world::TickSnapshot {
     snap.self_state.food = 17.0;
     snap.self_state.inventory.selected_hotbar_slot = 0;
     snap.self_state.inventory.slots = vec![
-        world::InventorySlot { slot: 36, item_name: "iron_sword".to_owned(), count: 1, metadata: None, durability_used: None },
-        world::InventorySlot { slot: 10, item_name: "oak_planks".to_owned(), count: 12, metadata: None, durability_used: None },
-        world::InventorySlot { slot: 6, item_name: "iron_chestplate".to_owned(), count: 1, metadata: None, durability_used: None },
+        world::InventorySlot {
+            slot: 36,
+            item_name: "iron_sword".to_owned(),
+            count: 1,
+            metadata: None,
+            durability_used: None,
+        },
+        world::InventorySlot {
+            slot: 10,
+            item_name: "oak_planks".to_owned(),
+            count: 12,
+            metadata: None,
+            durability_used: None,
+        },
+        world::InventorySlot {
+            slot: 6,
+            item_name: "iron_chestplate".to_owned(),
+            count: 1,
+            metadata: None,
+            durability_used: None,
+        },
     ];
-    let entity = |key: &str, kind: &str, username: Option<&str>, x: f64, z: f64| world::EntitySnapshot {
-        entity_key: key.to_owned(),
-        protocol_entity_id: 7,
-        entity_type: kind.to_owned(),
-        name: None,
-        username: username.map(str::to_owned),
-        uuid: None,
-        position: world::Vec3Value { x, y: 72.0, z },
-        velocity: world::Vec3Value::default(),
-        yaw: 0.0,
-        pitch: 0.0,
-        head_yaw: None,
-        width: 0.6,
-        height: 1.8,
-        on_ground: true,
-        pose: None,
-        held_item_name: None,
-        equipment: Vec::new(),
-        valid: true,
-    };
+    let entity =
+        |key: &str, kind: &str, username: Option<&str>, x: f64, z: f64| world::EntitySnapshot {
+            entity_key: key.to_owned(),
+            protocol_entity_id: 7,
+            entity_type: kind.to_owned(),
+            name: None,
+            username: username.map(str::to_owned),
+            uuid: None,
+            position: world::Vec3Value { x, y: 72.0, z },
+            velocity: world::Vec3Value::default(),
+            yaw: 0.0,
+            pitch: 0.0,
+            head_yaw: None,
+            width: 0.6,
+            height: 1.8,
+            on_ground: true,
+            pose: None,
+            held_item_name: None,
+            equipment: Vec::new(),
+            valid: true,
+        };
     snap.entities = vec![
-        entity("self-uuid", "minecraft:player", Some("companion"), 10.5, 3.5),
+        entity(
+            "self-uuid",
+            "minecraft:player",
+            Some("companion"),
+            10.5,
+            3.5,
+        ),
         entity("1:8", "minecraft:player", Some("alice"), 13.5, 3.5),
         entity("1:9", "minecraft:zombie", None, 18.5, 8.5),
         entity("1:10", "minecraft:zombie", None, 20.5, 9.5),
@@ -273,8 +309,15 @@ fn sample_snapshot() -> world::TickSnapshot {
         tick,
         occurred_at: std::time::SystemTime::UNIX_EPOCH,
         source: world::FactSource::ServerObserved,
-        sender: Some(world::PlayerRef { username: "alice".to_owned(), uuid: None }),
-        content: world::ChatContent { plain_text: text.to_owned(), position: Some(world::ChatPosition::Chat), verified: None },
+        sender: Some(world::PlayerRef {
+            username: "alice".to_owned(),
+            uuid: None,
+        }),
+        content: world::ChatContent {
+            plain_text: text.to_owned(),
+            position: Some(world::ChatPosition::Chat),
+            verified: None,
+        },
     };
     snap.chat.entries = vec![chat(1, 2_300, "你在哪"), chat(2, 2_350, "过来一下")];
     snap
@@ -332,12 +375,18 @@ async fn main() {
     // ---- 一、基础上下文（每轮免压缩三段） ----
     println!("## 一、基础上下文（每轮开场，免压缩，全部 system 角色）\n");
     let memory_file = Arc::new(MemoryFile::new(scratch.join("memory.md")));
-    memory_file.write("我叫 companion。tester 最喜欢的方块是青金石块。").unwrap();
+    memory_file
+        .write("我叫 companion。tester 最喜欢的方块是青金石块。")
+        .unwrap();
     let read_mark = Arc::new(ChatReadMark::new());
     read_mark.mark_read(1, 2_300); // 看过第一条，第二条未读
     let strategy = context::ContextStrategy::new(PLACEHOLDER_PERSONA, memory_file.clone())
         .with_situation(snapshots.clone(), read_mark.clone());
-    for (index, item) in agent::PromptSource::base_context(&strategy).unwrap().iter().enumerate() {
+    for (index, item) in agent::PromptSource::base_context(&strategy)
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
         if let agent::TranscriptItem::Input(message) = item {
             let text: String = message
                 .content
@@ -347,31 +396,67 @@ async fn main() {
                     _ => None,
                 })
                 .collect();
-            println!("### 第 {} 段（role={}）\n\n```text\n{}\n```\n", index + 1, message.role.as_str(), text);
+            println!(
+                "### 第 {} 段（role={}）\n\n```text\n{}\n```\n",
+                index + 1,
+                message.role.as_str(),
+                text
+            );
         }
     }
     println!("记忆的另外两种状态：\n");
     let empty_memory = Arc::new(MemoryFile::new(scratch.join("empty.md")));
     let empty_strategy = context::ContextStrategy::new("（人设略）", empty_memory);
-    if let agent::TranscriptItem::Input(message) = &agent::PromptSource::base_context(&empty_strategy).unwrap()[1] {
-        let text: String = message.content.iter().filter_map(|p| match p { ContentPart::Text { text } => Some(text.as_str()), _ => None }).collect();
+    if let agent::TranscriptItem::Input(message) =
+        &agent::PromptSource::base_context(&empty_strategy).unwrap()[1]
+    {
+        let text: String = message
+            .content
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
         println!("- 空记忆时：`{text}`");
     }
     let broken_memory = Arc::new(MemoryFile::new(scratch.clone())); // 指向目录制造读取失败
     let broken_strategy = context::ContextStrategy::new("（人设略）", broken_memory);
-    if let agent::TranscriptItem::Input(message) = &agent::PromptSource::base_context(&broken_strategy).unwrap()[1] {
-        let text: String = message.content.iter().filter_map(|p| match p { ContentPart::Text { text } => Some(text.as_str()), _ => None }).collect();
+    if let agent::TranscriptItem::Input(message) =
+        &agent::PromptSource::base_context(&broken_strategy).unwrap()[1]
+    {
+        let text: String = message
+            .content
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
         println!("- 读取失败时：`{text}`\n");
     }
     println!("处境的其他相位：\n");
     for (name, phase) in [
         ("连接中", world::ConnectionPhase::Connecting),
-        ("断线", world::ConnectionPhase::Disconnected { reason: "与服务器的连接已断开".to_owned() }),
-        ("已停止", world::ConnectionPhase::Stopped { reason: "维护者停机".to_owned() }),
+        (
+            "断线",
+            world::ConnectionPhase::Disconnected {
+                reason: "与服务器的连接已断开".to_owned(),
+            },
+        ),
+        (
+            "已停止",
+            world::ConnectionPhase::Stopped {
+                reason: "维护者停机".to_owned(),
+            },
+        ),
     ] {
         let mut other = snapshot.clone();
         other.phase = phase;
-        println!("- {name}：`{}`", render::render_situation(&other, read_mark.position()));
+        println!(
+            "- {name}：`{}`",
+            render::render_situation(&other, read_mark.position())
+        );
     }
     {
         let mut dead = snapshot.clone();
@@ -384,65 +469,230 @@ async fn main() {
     let occupancy = Arc::new(Occupancy::new());
     let screen_state = Arc::new(ScreenState::new());
     let providers: Vec<(&str, Box<dyn ToolProvider>)> = vec![
-        ("chat_box", Box::new(ChatBox::new(occupancy.clone(), screen_state.clone(), door.clone(), door.clone(), read_mark.clone(), snapshots.clone()))),
-        ("inventory", Box::new(InventoryScreen::new(occupancy.clone(), screen_state.clone(), door.clone(), snapshots.clone()))),
-        ("container", Box::new(ContainerScreen::new(occupancy.clone(), screen_state.clone(), door.clone(), snapshots.clone()))),
+        (
+            "chat_box",
+            Box::new(ChatBox::new(
+                occupancy.clone(),
+                screen_state.clone(),
+                door.clone(),
+                door.clone(),
+                read_mark.clone(),
+                snapshots.clone(),
+            )),
+        ),
+        (
+            "inventory",
+            Box::new(InventoryScreen::new(
+                occupancy.clone(),
+                screen_state.clone(),
+                door.clone(),
+                snapshots.clone(),
+            )),
+        ),
+        (
+            "container",
+            Box::new(ContainerScreen::new(
+                occupancy.clone(),
+                screen_state.clone(),
+                door.clone(),
+                snapshots.clone(),
+            )),
+        ),
         ("remember", Box::new(MemoryTools::new(memory_file.clone()))),
-        ("motion/look", Box::new(motion::MotionTools::new(door.clone()))),
+        (
+            "motion/look",
+            Box::new(motion::MotionTools::new(door.clone())),
+        ),
         ("hand", Box::new(hand::HandTools::new(door.clone()))),
-        ("scan", Box::new(perception::PerceptionTools::new(door.clone(), Arc::new(std::sync::Mutex::new(world::BlockMemory::new()))))),
+        (
+            "scan",
+            Box::new(perception::PerceptionTools::new(
+                door.clone(),
+                Arc::new(std::sync::Mutex::new(world::BlockMemory::new())),
+            )),
+        ),
     ];
     for (label, provider) in &providers {
         for (definition, class) in provider.tools() {
             let _ = label;
-            println!("### `{}` — {}\n", definition.name.as_str(), class_word(class));
+            println!(
+                "### `{}` — {}\n",
+                definition.name.as_str(),
+                class_word(class)
+            );
             if let Some(description) = &definition.description {
                 println!("描述：{description}\n");
             }
-            println!("参数 schema：\n\n```json\n{}\n```\n", serde_json::to_string_pretty(&definition.input_schema).unwrap());
+            println!(
+                "参数 schema：\n\n```json\n{}\n```\n",
+                serde_json::to_string_pretty(&definition.input_schema).unwrap()
+            );
         }
     }
 
     // ---- 三、屏内文本与工具回执样例 ----
     println!("## 三、工具回执与屏内文本（真实调用产出）\n");
     let chat_box = &providers[0].1;
-    println!("chat_box open(describe=true)（含用法全文）：\n\n```text\n{}\n```\n", call(chat_box.as_ref(), "chat_box", json!({"action":"open","describe":true})).await);
-    println!("chat_box history：\n\n```text\n{}\n```\n", call(chat_box.as_ref(), "chat_box", json!({"action":"history","count":5})).await);
-    println!("chat_box say：`{}`\n", call(chat_box.as_ref(), "chat_box", json!({"action":"say","text":"你好"})).await);
+    println!(
+        "chat_box open(describe=true)（含用法全文）：\n\n```text\n{}\n```\n",
+        call(
+            chat_box.as_ref(),
+            "chat_box",
+            json!({"action":"open","describe":true})
+        )
+        .await
+    );
+    println!(
+        "chat_box history：\n\n```text\n{}\n```\n",
+        call(
+            chat_box.as_ref(),
+            "chat_box",
+            json!({"action":"history","count":5})
+        )
+        .await
+    );
+    println!(
+        "chat_box say：`{}`\n",
+        call(
+            chat_box.as_ref(),
+            "chat_box",
+            json!({"action":"say","text":"你好"})
+        )
+        .await
+    );
     let inventory = &providers[1].1;
-    println!("inventory open（46 格清单+用法全文）：\n\n```text\n{}\n```\n", call(inventory.as_ref(), "inventory", json!({"action":"open"})).await);
-    println!("inventory move：`{}`", call(inventory.as_ref(), "inventory", json!({"action":"move","from":10,"to":38})).await);
-    println!("inventory move 丢弃：`{}`", call(inventory.as_ref(), "inventory", json!({"action":"move","from":10,"to":99})).await);
-    println!("inventory close：`{}`\n", call(inventory.as_ref(), "inventory", json!({"action":"close"})).await);
+    println!(
+        "inventory open（46 格清单+用法全文）：\n\n```text\n{}\n```\n",
+        call(inventory.as_ref(), "inventory", json!({"action":"open"})).await
+    );
+    println!(
+        "inventory move：`{}`",
+        call(
+            inventory.as_ref(),
+            "inventory",
+            json!({"action":"move","from":10,"to":38})
+        )
+        .await
+    );
+    println!(
+        "inventory move 丢弃：`{}`",
+        call(
+            inventory.as_ref(),
+            "inventory",
+            json!({"action":"move","from":10,"to":99})
+        )
+        .await
+    );
+    println!(
+        "inventory close：`{}`\n",
+        call(inventory.as_ref(), "inventory", json!({"action":"close"})).await
+    );
     let container = &providers[2].1;
     // 容器没有 open 动作：开屏由服务器发起，这里模拟组合根对开屏事实的
     // 处置（登记状态）后取回执。开屏通知全文见 §五。
     screen_state.server_open(screens::ScreenKind::Container);
-    println!("container move（取成品到快捷栏）：`{}`", call(container.as_ref(), "container", json!({"action":"move","from":0,"to":40})).await);
-    println!("container move 拆栈：`{}`", call(container.as_ref(), "container", json!({"action":"move","from":37,"to":2,"count":1})).await);
-    println!("container close：`{}`\n", call(container.as_ref(), "container", json!({"action":"close"})).await);
+    println!(
+        "container move（取成品到快捷栏）：`{}`",
+        call(
+            container.as_ref(),
+            "container",
+            json!({"action":"move","from":0,"to":40})
+        )
+        .await
+    );
+    println!(
+        "container move 拆栈：`{}`",
+        call(
+            container.as_ref(),
+            "container",
+            json!({"action":"move","from":37,"to":2,"count":1})
+        )
+        .await
+    );
+    println!(
+        "container close：`{}`\n",
+        call(container.as_ref(), "container", json!({"action":"close"})).await
+    );
     let motion_tools = &providers[4].1;
-    println!("motion go_to：`{}`", call(motion_tools.as_ref(), "motion", json!({"action":"go_to","target":[35.0,72.0,3.0]})).await);
+    println!(
+        "motion go_to：`{}`",
+        call(
+            motion_tools.as_ref(),
+            "motion",
+            json!({"action":"go_to","target":[35.0,72.0,3.0]})
+        )
+        .await
+    );
     let scan = &providers[6].1;
-    println!("\nscan 环视（呈现样例）：\n\n```text\n{}\n```\n", call(scan.as_ref(), "scan", json!({})).await);
-    println!("scan 定向（呈现样例）：\n\n```text\n{}\n```\n", call(scan.as_ref(), "scan", json!({"at":[[6,72,3],[0,60,0]]})).await);
-    println!("scan 增量（呈现样例；与已见过的对比，git 式差异行）：\n\n```text\n{}\n```\n", call(scan.as_ref(), "scan", json!({"changes": true})).await);
+    println!(
+        "\nscan 环视（呈现样例）：\n\n```text\n{}\n```\n",
+        call(scan.as_ref(), "scan", json!({})).await
+    );
+    println!(
+        "scan 定向（呈现样例）：\n\n```text\n{}\n```\n",
+        call(scan.as_ref(), "scan", json!({"at":[[6,72,3],[0,60,0]]})).await
+    );
+    println!(
+        "scan 增量（呈现样例；与已见过的对比，git 式差异行）：\n\n```text\n{}\n```\n",
+        call(scan.as_ref(), "scan", json!({"changes": true})).await
+    );
 
     // ---- 四、拒绝与报错话术 ----
     println!("## 四、拒绝与报错话术（真实调用产出）\n");
     let _ = call(inventory.as_ref(), "inventory", json!({"action":"open"})).await; // 占屏
-    println!("- 物品栏开着时 chat_box say：`{}`", call(chat_box.as_ref(), "chat_box", json!({"action":"say","text":"你好"})).await);
+    println!(
+        "- 物品栏开着时 chat_box say：`{}`",
+        call(
+            chat_box.as_ref(),
+            "chat_box",
+            json!({"action":"say","text":"你好"})
+        )
+        .await
+    );
     println!("- 物品栏没开时 move：先 close 再试 → `{}`", {
         let _ = call(inventory.as_ref(), "inventory", json!({"action":"close"})).await;
-        call(inventory.as_ref(), "inventory", json!({"action":"move","from":1,"to":2})).await
+        call(
+            inventory.as_ref(),
+            "inventory",
+            json!({"action":"move","from":1,"to":2}),
+        )
+        .await
     });
-    println!("- 容器没开时 move：`{}`", call(container.as_ref(), "container", json!({"action":"move","from":1,"to":2})).await);
-    println!("- 未知 action：`{}`", call(chat_box.as_ref(), "chat_box", json!({"action":"dance"})).await);
-    println!("- motion 缺参数：`{}`", call(motion_tools.as_ref(), "motion", json!({"action":"forward"})).await);
-    println!("- look 越界俯仰：`{}`", call(motion_tools.as_ref(), "look", json!({"action":"face","yaw":0.0,"pitch":120.0})).await);
+    println!(
+        "- 容器没开时 move：`{}`",
+        call(
+            container.as_ref(),
+            "container",
+            json!({"action":"move","from":1,"to":2})
+        )
+        .await
+    );
+    println!(
+        "- 未知 action：`{}`",
+        call(chat_box.as_ref(), "chat_box", json!({"action":"dance"})).await
+    );
+    println!(
+        "- motion 缺参数：`{}`",
+        call(motion_tools.as_ref(), "motion", json!({"action":"forward"})).await
+    );
+    println!(
+        "- look 越界俯仰：`{}`",
+        call(
+            motion_tools.as_ref(),
+            "look",
+            json!({"action":"face","yaw":0.0,"pitch":120.0})
+        )
+        .await
+    );
     let hand_tools = &providers[5].1;
-    println!("- hand use_on 参数二选一：`{}`", call(hand_tools.as_ref(), "hand", json!({"action":"use_on"})).await);
-    println!("- scan at 越界：`{}`", call(scan.as_ref(), "scan", json!({"at":[[1,2]]})).await);
+    println!(
+        "- hand use_on 参数二选一：`{}`",
+        call(hand_tools.as_ref(), "hand", json!({"action":"use_on"})).await
+    );
+    println!(
+        "- scan at 越界：`{}`",
+        call(scan.as_ref(), "scan", json!({"at":[[1,2]]})).await
+    );
     println!("\n编排层拒绝（dispatch，字面常量）：\n");
     println!("- 屏压制其他身体域：`有界面开着，无法移动或与世界交互；先关闭界面再行动`");
     println!("- 未知工具名：`没有名为 xx 的工具；请改用工具列表中的名字`\n");
@@ -467,11 +717,24 @@ async fn main() {
             seq: 1,
             tick: 100,
             occurred_at: std::time::SystemTime::UNIX_EPOCH,
-            job: world::JobKind::MoveTo { destination: [35, 72, 3] },
+            job: world::JobKind::MoveTo {
+                destination: [35, 72, 3],
+            },
             outcome,
         };
-        let delivered = matches!(outcome, world::JobOutcome::Arrived | world::JobOutcome::PathEnded | world::JobOutcome::Stalled);
-        println!("- {}`{}`", if delivered { "" } else { "（入窗不投递）" }, render::render_job_entry(&entry));
+        let delivered = matches!(
+            outcome,
+            world::JobOutcome::Arrived | world::JobOutcome::PathEnded | world::JobOutcome::Stalled
+        );
+        println!(
+            "- {}`{}`",
+            if delivered {
+                ""
+            } else {
+                "（入窗不投递）"
+            },
+            render::render_job_entry(&entry)
+        );
     }
     println!("\n受伤通知：\n");
     for (before, after) in [(20.0_f32, 14.0_f32), (14.0, 0.0)] {
@@ -507,19 +770,51 @@ async fn main() {
     }
     println!("\n屏通知（容器真相在服务端，组合根随屏事实投递；种类差异=清单段表+用法补充）：\n");
     {
-        let mut crafting_snap = world::TickSnapshot::empty(world::Epoch(1), 120, world::ConnectionPhase::Ready);
+        let mut crafting_snap =
+            world::TickSnapshot::empty(world::Epoch(1), 120, world::ConnectionPhase::Ready);
         crafting_snap.self_state.inventory.slots = vec![
-            world::InventorySlot { slot: 5, item_name: "oak_planks".to_owned(), count: 2, metadata: None, durability_used: None },
-            world::InventorySlot { slot: 20, item_name: "stick".to_owned(), count: 4, metadata: None, durability_used: None },
-            world::InventorySlot { slot: 40, item_name: "bread".to_owned(), count: 7, metadata: None, durability_used: None },
+            world::InventorySlot {
+                slot: 5,
+                item_name: "oak_planks".to_owned(),
+                count: 2,
+                metadata: None,
+                durability_used: None,
+            },
+            world::InventorySlot {
+                slot: 20,
+                item_name: "stick".to_owned(),
+                count: 4,
+                metadata: None,
+                durability_used: None,
+            },
+            world::InventorySlot {
+                slot: 40,
+                item_name: "bread".to_owned(),
+                count: 7,
+                metadata: None,
+                durability_used: None,
+            },
         ];
         println!("开屏（hand use_on 工作台后，服务器打开界面）：\n\n```text\n容器界面已打开（crafting）。\n{}\n\n{}\n```\n", render::render_container_menu(&crafting_snap, "crafting"), container_usage("crafting"));
         println!("开屏（箱子，无种类补充时只有通用用法）：\n\n```text\n容器界面已打开（generic_9x3「木箱」）。\n{}\n\n{}\n```\n", render::render_container_menu(&crafting_snap, "generic_9x3"), container_usage("generic_9x3"));
 
-        let mut furnace_snap = world::TickSnapshot::empty(world::Epoch(1), 121, world::ConnectionPhase::Ready);
+        let mut furnace_snap =
+            world::TickSnapshot::empty(world::Epoch(1), 121, world::ConnectionPhase::Ready);
         furnace_snap.self_state.inventory.slots = vec![
-            world::InventorySlot { slot: 4, item_name: "raw_iron".to_owned(), count: 3, metadata: None, durability_used: None },
-            world::InventorySlot { slot: 30, item_name: "coal".to_owned(), count: 2, metadata: None, durability_used: None },
+            world::InventorySlot {
+                slot: 4,
+                item_name: "raw_iron".to_owned(),
+                count: 3,
+                metadata: None,
+                durability_used: None,
+            },
+            world::InventorySlot {
+                slot: 30,
+                item_name: "coal".to_owned(),
+                count: 2,
+                metadata: None,
+                durability_used: None,
+            },
         ];
         println!("开屏（熔炉族有专属段表与补充；高炉/烟熏炉同形）：\n\n```text\n容器界面已打开（furnace「熔炉」）。\n{}\n\n{}\n```\n", render::render_container_menu(&furnace_snap, "furnace"), container_usage("furnace"));
     }
@@ -527,9 +822,15 @@ async fn main() {
 
     // ---- 六、压缩（上下文满时的模型交互） ----
     println!("\n## 六、上下文压缩（满时对模型的指令与结果包裹）\n");
-    println!("压缩指令全文（system，后接【长期记忆现文】与被压缩对话）：\n\n```text\n{}\n```\n", context::COMPACTION_INSTRUCTIONS);
+    println!(
+        "压缩指令全文（system，后接【长期记忆现文】与被压缩对话）：\n\n```text\n{}\n```\n",
+        context::COMPACTION_INSTRUCTIONS
+    );
     println!("收尾催告（user）：`请按上面的规则输出压缩 JSON。`\n");
-    println!("压缩成功后新对话开头的摘要包裹（user）：\n\n```text\n{}\n（摘要正文）\n```", context::SUMMARY_PREFIX);
+    println!(
+        "压缩成功后新对话开头的摘要包裹（user）：\n\n```text\n{}\n（摘要正文）\n```",
+        context::SUMMARY_PREFIX
+    );
 
     let _ = std::fs::remove_dir_all(&scratch);
 }
