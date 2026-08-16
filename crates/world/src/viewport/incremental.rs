@@ -168,7 +168,10 @@ pub fn diff(
                 at: block.position,
                 fact: now,
             }),
-            Some(was) if *was != now => changes.push(BlockChange::Changed {
+            // 身份=名称，与全量呈现同一种语言（维护者裁定）。属性仍随吸收
+            // 进记忆，但不参与差异：模型面的呈现全都不含属性，比出属性差
+            // 只会产出两行一模一样的 +/-。
+            Some(was) if was.name != now.name => changes.push(BlockChange::Changed {
                 at: block.position,
                 was: was.clone(),
                 now,
