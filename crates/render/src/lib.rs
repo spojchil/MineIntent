@@ -438,10 +438,19 @@ pub fn render_viewport(projection: &world::ViewportProjection) -> String {
 pub fn render_directed(projection: &world::DirectedProjection) -> String {
     let mut lines = Vec::new();
     for seen in &projection.seen {
-        lines.push(format!(
-            "({}, {}, {})：看得见，是 {}。",
-            seen.at[0], seen.at[1], seen.at[2], seen.name
-        ));
+        // 空气格照实报「空」：亲眼可证的空位是一等观察结果（消失确认靠它），
+        // 不说「是 air」这种半生不熟的话。
+        if world::is_air_name(&seen.name) {
+            lines.push(format!(
+                "({}, {}, {})：看得见，那里是空的。",
+                seen.at[0], seen.at[1], seen.at[2]
+            ));
+        } else {
+            lines.push(format!(
+                "({}, {}, {})：看得见，是 {}。",
+                seen.at[0], seen.at[1], seen.at[2], seen.name
+            ));
+        }
     }
     for unseen in &projection.unseen {
         let mut reasons = Vec::new();

@@ -87,6 +87,43 @@ impl BlockMemory {
     }
 }
 
+/// 观察源接入：把一次**已送达模型**的观察吸收进记忆。
+///
+/// 与 [`diff`]/[`BlockMemory::apply`] 的两步不同，吸收是单步 upsert——
+/// 适用于观察本身就是模型收到的工具回执的场合（内核的 settled 通道
+/// 保证已定回执必达模型，所以产出时即可上账）。増量帧走 diff/apply
+/// 两步，工具回执走吸收，两者写同一本记忆。
+impl BlockMemory {
+    /// 吸收全量/扫描可见集：逐格 upsert。空气防御同 [`diff`]。
+    /// 只上账正面观察；本次没列出的格不动（缺席不当空气）。
+    pub fn absorb_visible(&mut self, visible: &[ViewportBlock]) {
+        for block in visible {
+            if is_air_name(&block.name) {
+                continue;
+            }
+            self.facts.insert(block.position, BlockFact::of(block));
+        }
+    }
+
+    /// 吸收定向结果：看见方块=upsert；亲眼见空=销账（消失确认）；
+    /// 各种「看不见」不动记忆。
+    pub fn absorb_directed(&mut self, projection: &super::DirectedProjection) {
+        for seen in &projection.seen {
+            if is_air_name(&seen.name) {
+                self.facts.remove(&seen.at);
+            } else {
+                self.facts.insert(
+                    seen.at,
+                    BlockFact {
+                        name: seen.name.clone(),
+                        properties: seen.properties.clone(),
+                    },
+                );
+            }
+        }
+    }
+}
+
 /// 一次 diff 的产出：三种亲眼可证的变化。
 #[derive(Clone, Debug, PartialEq)]
 pub enum BlockChange {
@@ -281,6 +318,43 @@ mod tests {
         let vanished = diff(&memory, &[], |_| true, |_| true);
         memory.apply(&vanished);
         assert!(memory.is_empty());
+    }
+
+    /// 吸收：可见集 upsert，定向见空销账，看不见不动。
+    #[test]
+    fn absorption_upserts_seen_and_erases_witnessed_empties() {
+        use crate::viewport::{DirectedProjection, DirectedSeenBlock, DirectedUnseenBlock, DirectedWhy};
+
+        let mut memory = BlockMemory::new();
+        memory.absorb_visible(&[block([0, 64, 0], "stone"), block([9, 64, 9], "air")]);
+        assert_eq!(memory.get([0, 64, 0]), Some(&fact("stone")));
+        assert_eq!(memory.get([9, 64, 9]), None, "空气不入账");
+
+        // 定向：一格见到新方块、一格亲眼见空、一格被挡。
+        memory.absorb_directed(&DirectedProjection {
+            seen: vec![
+                DirectedSeenBlock {
+                    at: [1, 64, 0],
+                    name: "furnace".to_owned(),
+                    properties: BTreeMap::new(),
+                },
+                DirectedSeenBlock {
+                    at: [0, 64, 0],
+                    name: "air".to_owned(),
+                    properties: BTreeMap::new(),
+                },
+            ],
+            unseen: vec![DirectedUnseenBlock {
+                at: [2, 64, 0],
+                why: vec![DirectedWhy::Occluded],
+                distance: None,
+                max: None,
+                by: None,
+            }],
+        });
+        assert_eq!(memory.get([1, 64, 0]), Some(&fact("furnace")));
+        assert_eq!(memory.get([0, 64, 0]), None, "亲眼见空销账");
+        assert_eq!(memory.len(), 1);
     }
 
     /// 防御：可见集里混入空气不入账；Vanished 输出按坐标字典序确定。

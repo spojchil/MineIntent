@@ -17,3 +17,23 @@ tokio = { workspace = true, features = ["rt", "sync", "time", "macros"], optiona
 
 [lints]
 workspace = true
+
+# 例子全部依赖连接机器。不声明 required-features 的话,
+# `cargo test -p world`(不带 feature)会试图编译它们而失败——
+# 工作区跑法只是被 companion 的特性统一掩着,这里把依赖说破。
+
+[[example]]
+name = "crafting_probe"
+required-features = ["azalea"]
+
+[[example]]
+name = "fake_player"
+required-features = ["azalea"]
+
+[[example]]
+name = "open_probe"
+required-features = ["azalea"]
+
+[[example]]
+name = "swap_probe"
+required-features = ["azalea"]

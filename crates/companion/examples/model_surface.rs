@@ -353,7 +353,7 @@ async fn main() {
         ("remember", Box::new(MemoryTools::new(memory_file.clone()))),
         ("motion/look", Box::new(motion::MotionTools::new(door.clone()))),
         ("hand", Box::new(hand::HandTools::new(door.clone()))),
-        ("scan", Box::new(perception::PerceptionTools::new(door.clone()))),
+        ("scan", Box::new(perception::PerceptionTools::new(door.clone(), Arc::new(std::sync::Mutex::new(world::BlockMemory::new()))))),
     ];
     for (label, provider) in &providers {
         for (definition, class) in provider.tools() {

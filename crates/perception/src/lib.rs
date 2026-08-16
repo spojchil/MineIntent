@@ -4,12 +4,12 @@
 //! 参数校验、门调用与呈现（措辞归渲染层）。视口变焦（真权衡参数）与
 //! 信息工具（Day #/群系）随裁定落位。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use agent::{PortFuture, ToolCall, ToolDefinition, ToolResult};
 use dispatch::{ToolClass, ToolProvider};
 use serde_json::{json, Value};
-use world::{DirectedProjection, ViewportProjection, MAX_DIRECTED_VIEW_POSITIONS};
+use world::{BlockMemory, DirectedProjection, ViewportProjection, MAX_DIRECTED_VIEW_POSITIONS};
 
 /// 接入模块视口面的窄化：全景用当前姿态，定向按坐标逐个分类。
 pub trait ViewportDoor: Send + Sync {
@@ -24,11 +24,27 @@ const TOOL_NAME: &str = "scan";
 
 pub struct PerceptionTools {
     door: Arc<dyn ViewportDoor>,
+    /// 方块记忆（组合根注入的共享认知状态）：scan 的回执送达模型即成为
+    /// 「模型知道的事实」，在此吸收。内核的 settled 通道保证已定回执必达，
+    /// 所以产出时上账即可，不需要请求级 commit 钩子。
+    memory: Arc<Mutex<BlockMemory>>,
 }
 
 impl PerceptionTools {
-    pub fn new(door: Arc<dyn ViewportDoor>) -> Self {
-        Self { door }
+    pub fn new(door: Arc<dyn ViewportDoor>, memory: Arc<Mutex<BlockMemory>>) -> Self {
+        Self { door, memory }
+    }
+
+    fn absorb_projection(&self, projection: &ViewportProjection) {
+        let mut memory = self.memory.lock().expect("方块记忆锁不应中毒");
+        memory.absorb_visible(&projection.visible_blocks.blocks);
+        // 脚下与注视方块同样呈现给了模型，一并上账。
+        for block in [&projection.standing_on_block, &projection.looked_at_block]
+            .into_iter()
+            .flatten()
+        {
+            memory.absorb_visible(std::slice::from_ref(block));
+        }
     }
 
     async fn dispatch(&self, call: ToolCall) -> ToolResult {
@@ -38,12 +54,15 @@ impl PerceptionTools {
         };
         match arguments.get("at") {
             None => match self.door.scan().await {
-                Ok(projection) => ToolResult::success(
-                    call_id,
-                    vec![agent::ContentPart::text(render::render_viewport(
-                        &projection,
-                    ))],
-                ),
+                Ok(projection) => {
+                    self.absorb_projection(&projection);
+                    ToolResult::success(
+                        call_id,
+                        vec![agent::ContentPart::text(render::render_viewport(
+                            &projection,
+                        ))],
+                    )
+                }
                 Err(reason) => ToolResult::failure(call_id, reason),
             },
             Some(at) => {
@@ -74,12 +93,18 @@ impl PerceptionTools {
                     );
                 };
                 match self.door.scan_directed(positions).await {
-                    Ok(projection) => ToolResult::success(
-                        call_id,
-                        vec![agent::ContentPart::text(render::render_directed(
-                            &projection,
-                        ))],
-                    ),
+                    Ok(projection) => {
+                        self.memory
+                            .lock()
+                            .expect("方块记忆锁不应中毒")
+                            .absorb_directed(&projection);
+                        ToolResult::success(
+                            call_id,
+                            vec![agent::ContentPart::text(render::render_directed(
+                                &projection,
+                            ))],
+                        )
+                    }
                     Err(reason) => ToolResult::failure(call_id, reason),
                 }
             }
@@ -172,16 +197,24 @@ mod tests {
         ToolCall::new("call-1", TOOL_NAME, arguments)
     }
 
+    fn tools_with_memory() -> (PerceptionTools, Arc<Mutex<BlockMemory>>) {
+        let memory = Arc::new(Mutex::new(BlockMemory::new()));
+        (
+            PerceptionTools::new(Arc::new(CannedDoor), memory.clone()),
+            memory,
+        )
+    }
+
     #[tokio::test]
     async fn panoramic_scan_renders_text() {
-        let tools = PerceptionTools::new(Arc::new(CannedDoor));
+        let (tools, _) = tools_with_memory();
         let result = tools.call(call(json!({}))).await;
         assert_eq!(result.status, ToolResultStatus::Success);
     }
 
     #[tokio::test]
     async fn directed_scan_accepts_coordinates_and_rejects_garbage() {
-        let tools = PerceptionTools::new(Arc::new(CannedDoor));
+        let (tools, _) = tools_with_memory();
         let ok = tools.call(call(json!({"at": [[1, 64, -3]]}))).await;
         assert_eq!(ok.status, ToolResultStatus::Success);
 
@@ -195,9 +228,21 @@ mod tests {
         }
     }
 
+    /// 观察源接入：scan 回执产出即吸收进方块记忆。
+    #[tokio::test]
+    async fn successful_scans_feed_the_block_memory() {
+        let (tools, memory) = tools_with_memory();
+        assert!(memory.lock().unwrap().is_empty());
+        let ok = tools.call(call(json!({"at": [[1, 64, -3]]}))).await;
+        assert_eq!(ok.status, ToolResultStatus::Success);
+        let facts = memory.lock().unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts.get([1, 64, -3]).unwrap().name, "stone");
+    }
+
     #[test]
     fn registers_one_free_tool() {
-        let tools = PerceptionTools::new(Arc::new(CannedDoor));
+        let (tools, _) = tools_with_memory();
         let registered = ToolProvider::tools(&tools);
         assert_eq!(registered.len(), 1);
         assert_eq!(registered[0].0.name.as_str(), "scan");

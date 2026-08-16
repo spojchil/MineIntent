@@ -238,6 +238,9 @@ async fn main() -> Result<(), String> {
     // ---- 中间层装配 ----
     let occupancy = Arc::new(Occupancy::new());
     let screen_state = Arc::new(ScreenState::new());
+    // 方块记忆：同伴「已知道什么」的共享认知状态。当前由 scan 回执喂入；
+    // 增量呈现与寻路合法域随后也读写这一本。
+    let block_memory = Arc::new(std::sync::Mutex::new(world::BlockMemory::new()));
     let read_mark = Arc::new(ChatReadMark::new());
     let memory_file = Arc::new(MemoryFile::new(memory_path));
     let snapshots: Arc<dyn SnapshotSource> = module.clone();
@@ -266,9 +269,10 @@ async fn main() -> Result<(), String> {
         Arc::new(MemoryTools::new(memory_file.clone())),
         Arc::new(MotionTools::new(Arc::new(ModuleMotionDoor(module.clone())))),
         Arc::new(HandTools::new(Arc::new(ModuleHandDoor(module.clone())))),
-        Arc::new(PerceptionTools::new(Arc::new(ModuleViewportDoor(
-            module.clone(),
-        )))),
+        Arc::new(PerceptionTools::new(
+            Arc::new(ModuleViewportDoor(module.clone())),
+            block_memory.clone(),
+        )),
     ];
     let dispatcher =
         Arc::new(Dispatcher::new(providers, occupancy.clone()).map_err(|error| error.to_string())?);
