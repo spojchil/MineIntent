@@ -12,7 +12,7 @@ use azalea::container::ContainerHandleRef;
 use azalea::entity::{LoadedBy, LookDirection, Position};
 use azalea::inventory::operations::{ClickOperation, SwapClick, ThrowClick};
 use azalea::pathfinder::goals::BlockPosGoal;
-use azalea::pathfinder::PathfinderClientExt;
+use azalea::pathfinder::{PathfinderClientExt, PathfinderOpts};
 use azalea::protocol::packets::game::s_player_action;
 use azalea::{BlockPos, Client, SprintDirection, WalkDirection};
 use tokio::sync::oneshot;
@@ -81,11 +81,16 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
         DoorCommand::GoTo([x, y, z]) => {
             let destination = [x.floor() as i32, y.floor() as i32, z.floor() as i32];
             inner.begin_movement_job(destination);
-            bot.start_goto(BlockPosGoal(BlockPos::new(
-                destination[0],
-                destination[1],
-                destination[2],
-            )));
+            // 禁止寻路器隐式挖方块：挖掘是模型的显式动作（hand mine），
+            // 不是移动的副作用——实测它会把作为目的地的工作台整个挖掉。
+            bot.start_goto_with_opts(
+                BlockPosGoal(BlockPos::new(
+                    destination[0],
+                    destination[1],
+                    destination[2],
+                )),
+                PathfinderOpts::new().allow_mining(false),
+            );
             Ok(())
         }
         DoorCommand::Forward(blocks) => {
@@ -105,7 +110,10 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
                 (position.2 + (-yaw.cos()) * blocks).floor() as i32,
             );
             inner.begin_movement_job([target.x, target.y, target.z]);
-            bot.start_goto(BlockPosGoal(target));
+            bot.start_goto_with_opts(
+                BlockPosGoal(target),
+                PathfinderOpts::new().allow_mining(false),
+            );
             Ok(())
         }
         DoorCommand::StopMoving => {

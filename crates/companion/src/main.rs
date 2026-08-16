@@ -363,6 +363,17 @@ async fn main() -> Result<(), String> {
                 // 新内核的 enqueue 一步完成「并入进行中的轮」或「叫醒空闲会话」，
                 // 旧的闲/忙两步竞态窗口已在内核里闭合，不再需要投递重试循环。
                 println!("[组合根] 唤醒：{} 条新话", items.len());
+                for item in &items {
+                    if let agent::TranscriptItem::Input(message) = item {
+                        for part in &message.content {
+                            if let agent::ContentPart::Text { text } = part {
+                                // 冒烟观测：投递原文（单行截断，长清单只看开头）。
+                                let head: String = text.chars().take(120).collect();
+                                println!("[组合根]   → {}", head.replace('\n', "⏎"));
+                            }
+                        }
+                    }
+                }
                 let session = session.clone();
                 tokio::spawn(async move {
                     match session
