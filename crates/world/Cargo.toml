@@ -37,3 +37,7 @@ required-features = ["azalea"]
 [[example]]
 name = "swap_probe"
 required-features = ["azalea"]
+
+[[example]]
+name = "gaze_probe"
+required-features = ["azalea"]
