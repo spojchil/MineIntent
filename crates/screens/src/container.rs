@@ -37,6 +37,22 @@ fn kind_supplement(kind: &str) -> Option<&'static str> {
 摆满配方后成品出现在 0，取成品用 move(0, 快捷栏或背包格)，会按配方消耗摆料；\
 配方要同种材料占多格时用 count 拆栈，如 {action:\"move\", from:37, to:2, count:1}。",
         ),
+        "furnace" => Some(
+            "这是熔炉：0 原料，1 燃料（只收燃料，如煤炭、木制品；放别的会被服务器退回），\
+2 成品（只出不进、只能整组取走），3-29 主背包，30-38 快捷栏，无副手格。\
+原料与燃料就位后自动开始烧，每件约 10 秒；不必守着界面——close 之后熔炉照样烧，\
+估摸烧完再回来开取成品。",
+        ),
+        "blast_furnace" => Some(
+            "这是高炉（只炼矿石与金属类，速度是熔炉两倍、每件约 5 秒）：\
+0 原料，1 燃料（只收燃料），2 成品（只出不进、只能整组取走），\
+3-29 主背包，30-38 快捷栏。close 之后照样烧，烧完再来取。",
+        ),
+        "smoker" => Some(
+            "这是烟熏炉（只烤食物，速度是熔炉两倍、每件约 5 秒）：\
+0 原料，1 燃料（只收燃料），2 成品（只出不进、只能整组取走），\
+3-29 主背包，30-38 快捷栏。close 之后照样烧，烧完再来取。",
+        ),
         _ => None,
     }
 }
@@ -413,5 +429,20 @@ mod tests {
         let chest = container_usage("generic_9x3");
         assert!(chest.contains("容器界面用法"));
         assert!(!chest.contains("成品"));
+    }
+
+    #[test]
+    fn furnace_family_supplements_teach_slots_and_fire_and_forget() {
+        // 三种炉子各有补充：格位语义 + 「close 之后照样烧」（不守界面）。
+        for kind in ["furnace", "blast_furnace", "smoker"] {
+            let usage = container_usage(kind);
+            assert!(usage.contains("容器界面用法"), "{kind}");
+            assert!(usage.contains("燃料"), "{kind}");
+            assert!(usage.contains("只出不进"), "{kind}");
+            assert!(usage.contains("照样烧"), "{kind}");
+        }
+        // 专属差异各自点名。
+        assert!(container_usage("blast_furnace").contains("矿石"));
+        assert!(container_usage("smoker").contains("食物"));
     }
 }

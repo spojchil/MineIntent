@@ -502,12 +502,14 @@ pub(super) fn plan_move(
 }
 
 /// 只出不进的格（成品格）。数据随容器种类扩展：玩家物品栏与工作台的
-/// 成品格都是 0 号；熔炉等落地时在此补行。
+/// 成品格都是 0 号；熔炉族（熔炉/高炉/烟熏炉）的成品格是 2 号；
+/// 其余容器落地时在此补行。
 fn slot_is_take_only(bot: &Client, slot: u16) -> bool {
     use azalea::entity::inventory::Inventory as InventoryComponent;
     use azalea::inventory::Menu;
     bot.try_query_self::<&InventoryComponent, _>(|inventory| match inventory.menu() {
         Menu::Player(_) | Menu::Crafting { .. } => slot == 0,
+        Menu::Furnace { .. } | Menu::BlastFurnace { .. } | Menu::Smoker { .. } => slot == 2,
         _ => false,
     })
     .unwrap_or(false)

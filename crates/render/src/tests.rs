@@ -329,7 +329,8 @@ fn inventory_changes_name_the_slot_and_call_out_the_craft_result() {
     };
     assert_eq!(render_inventory_change(&emptied), "合成结果格（0）变空了。");
 
-    // 容器格空间：成品格与普通格按工作台措辞。
+    // 容器格空间：措辞中性（0 号在工作台是成品格、在熔炉是原料格，
+    // 语义随开屏清单给过，这里不扣帽子）。
     let crafted = world::InventoryChangeEntry {
         container_id: 3,
         slot: 0,
@@ -339,7 +340,7 @@ fn inventory_changes_name_the_slot_and_call_out_the_craft_result() {
     };
     assert_eq!(
         render_inventory_change(&crafted),
-        "工作台成品格（0）出现了 oak_button ×1。"
+        "容器格 0 出现了 oak_button ×1。"
     );
     let in_container = world::InventoryChangeEntry {
         container_id: 3,
@@ -347,7 +348,7 @@ fn inventory_changes_name_the_slot_and_call_out_the_craft_result() {
     };
     assert_eq!(
         render_inventory_change(&in_container),
-        "工作台格 12 出现了 oak_planks ×4。"
+        "容器格 12 出现了 oak_planks ×4。"
     );
 }
 
@@ -399,4 +400,48 @@ fn crafting_menu_listing_uses_the_crafting_slot_space() {
     // 未知种类逐格罗列，不猜段界。
     let unknown = render_container_menu(&snap, "modded_thing");
     assert!(unknown.contains("非空格位："), "{unknown}");
+}
+
+#[test]
+fn furnace_menu_listing_names_the_three_working_slots() {
+    let mut snap = world::TickSnapshot::empty(world::Epoch(1), 1, world::ConnectionPhase::Ready);
+    snap.self_state.inventory.slots = vec![
+        world::InventorySlot {
+            slot: 0,
+            item_name: "raw_iron".to_owned(),
+            count: 3,
+            metadata: None,
+            durability_used: None,
+        },
+        world::InventorySlot {
+            slot: 1,
+            item_name: "coal".to_owned(),
+            count: 2,
+            metadata: None,
+            durability_used: None,
+        },
+        world::InventorySlot {
+            slot: 10,
+            item_name: "bread".to_owned(),
+            count: 5,
+            metadata: None,
+            durability_used: None,
+        },
+        world::InventorySlot {
+            slot: 31,
+            item_name: "stick".to_owned(),
+            count: 4,
+            metadata: None,
+            durability_used: None,
+        },
+    ];
+    // 熔炉族三种同形：原料/燃料/成品 + 玩家区（3-29 主背包、30-38 快捷栏）。
+    for kind in ["furnace", "blast_furnace", "smoker"] {
+        let text = render_container_menu(&snap, kind);
+        assert!(text.contains("原料（0）：raw_iron ×3"), "{kind}: {text}");
+        assert!(text.contains("燃料（1）：coal ×2"), "{kind}: {text}");
+        assert!(text.contains("成品（2）：空"), "{kind}: {text}");
+        assert!(text.contains("主背包（3-29）：10=bread ×5"), "{kind}: {text}");
+        assert!(text.contains("快捷栏（30-38）：31=stick ×4"), "{kind}: {text}");
+    }
 }

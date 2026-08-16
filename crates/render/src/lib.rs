@@ -241,14 +241,14 @@ pub fn render_player_menu(snap: &TickSnapshot) -> String {
 }
 
 /// 物品栏格位变化的通知措辞。合成结果格单独点名（维护者裁定：它的出现
-/// 也算预期之外的变化）。容器 0 是物品栏屏；其他容器按工作台措辞
-/// （成品格同样是 0 号）。
+/// 也算预期之外的变化）。容器 0 是物品栏屏；其他容器措辞保持中性
+/// （0 号在工作台是成品格、在熔炉是原料格——语义已随开屏清单给过，
+/// 这里不替格号扣帽子）。
 pub fn render_inventory_change(entry: &world::InventoryChangeEntry) -> String {
     let place = match (entry.container_id, entry.slot) {
         (0, 0) => "合成结果格（0）".to_owned(),
         (0, slot) => format!("物品栏格 {slot} "),
-        (_, 0) => "工作台成品格（0）".to_owned(),
-        (_, slot) => format!("工作台格 {slot} "),
+        (_, slot) => format!("容器格 {slot} "),
     };
     match &entry.item_name {
         Some(name) => format!("{place}出现了 {name} ×{}。", entry.count),
@@ -282,9 +282,10 @@ fn container_area_len(kind: &str) -> Option<u32> {
 
 /// 容器屏的格位清单（格号即协议号，属于该容器的格空间）。
 ///
-/// 语义段表是数据：工作台有专属标注（成品/摆料），其余已知容器按
-/// 「容器格 + 主背包 + 快捷栏」通用三段（尺寸查 [`container_area_len`]），
-/// 未知种类退化为逐格罗列——直译原则，不装懂。
+/// 语义段表是数据：工作台（成品/摆料）与熔炉族（原料/燃料/成品）有
+/// 专属标注，其余已知容器按「容器格 + 主背包 + 快捷栏」通用三段
+/// （尺寸查 [`container_area_len`]），未知种类退化为逐格罗列——
+/// 直译原则，不装懂。
 pub fn render_container_menu(snap: &TickSnapshot, kind: &str) -> String {
     let inventory = &snap.self_state.inventory;
     let item_at = |slot: u32| -> Option<String> {
@@ -310,15 +311,28 @@ pub fn render_container_menu(snap: &TickSnapshot, kind: &str) -> String {
             )
         }
     };
+    let single = |name: &str, slot: u32| -> String {
+        match item_at(slot) {
+            Some(item) => format!("{name}（{slot}）：{item}"),
+            None => format!("{name}（{slot}）：空"),
+        }
+    };
     if kind == "crafting" {
         let lines = [
-            match item_at(0) {
-                Some(item) => format!("成品（0）：{item}"),
-                None => "成品（0）：空".to_owned(),
-            },
+            single("成品", 0),
             section("摆料 3×3", 1..=9),
             section("主背包", 10..=36),
             section("快捷栏", 37..=45),
+        ];
+        return lines.join("\n");
+    }
+    if matches!(kind, "furnace" | "blast_furnace" | "smoker") {
+        let lines = [
+            single("原料", 0),
+            single("燃料", 1),
+            single("成品", 2),
+            section("主背包", 3..=29),
+            section("快捷栏", 30..=38),
         ];
         return lines.join("\n");
     }

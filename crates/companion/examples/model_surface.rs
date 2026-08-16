@@ -477,6 +477,13 @@ async fn main() {
         ];
         println!("开屏（hand use_on 工作台后，服务器打开界面）：\n\n```text\n容器界面已打开（crafting）。\n{}\n\n{}\n```\n", render::render_container_menu(&crafting_snap, "crafting"), container_usage("crafting"));
         println!("开屏（箱子，无种类补充时只有通用用法）：\n\n```text\n容器界面已打开（generic_9x3「木箱」）。\n{}\n\n{}\n```\n", render::render_container_menu(&crafting_snap, "generic_9x3"), container_usage("generic_9x3"));
+
+        let mut furnace_snap = world::TickSnapshot::empty(world::Epoch(1), 121, world::ConnectionPhase::Ready);
+        furnace_snap.self_state.inventory.slots = vec![
+            world::InventorySlot { slot: 4, item_name: "raw_iron".to_owned(), count: 3, metadata: None, durability_used: None },
+            world::InventorySlot { slot: 30, item_name: "coal".to_owned(), count: 2, metadata: None, durability_used: None },
+        ];
+        println!("开屏（熔炉族有专属段表与补充；高炉/烟熏炉同形）：\n\n```text\n容器界面已打开（furnace「熔炉」）。\n{}\n\n{}\n```\n", render::render_container_menu(&furnace_snap, "furnace"), container_usage("furnace"));
     }
     println!("- 被服务器关闭（非自己 close 的回声）：`容器界面被关闭了（crafting）。`");
 
