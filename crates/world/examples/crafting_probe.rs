@@ -22,9 +22,21 @@ async fn main() -> Result<(), String> {
         .parse()
         .map_err(|error| format!("端口无效：{error}"))?;
     let username = args.next().unwrap_or_else(|| "prober".to_owned());
-    let x: i32 = args.next().unwrap_or_else(|| "32".to_owned()).parse().unwrap();
-    let y: i32 = args.next().unwrap_or_else(|| "73".to_owned()).parse().unwrap();
-    let z: i32 = args.next().unwrap_or_else(|| "1".to_owned()).parse().unwrap();
+    let x: i32 = args
+        .next()
+        .unwrap_or_else(|| "32".to_owned())
+        .parse()
+        .unwrap();
+    let y: i32 = args
+        .next()
+        .unwrap_or_else(|| "73".to_owned())
+        .parse()
+        .unwrap();
+    let z: i32 = args
+        .next()
+        .unwrap_or_else(|| "1".to_owned())
+        .parse()
+        .unwrap();
 
     let module = Arc::new(
         Module::start(ConnectionConfig {
@@ -117,7 +129,11 @@ async fn main() -> Result<(), String> {
         .any(|slot| slot.slot == 0);
     println!(
         "[探针] 成品格：{}",
-        if result_filled { "有内容 ✓" } else { "空 ✗" }
+        if result_filled {
+            "有内容 ✓"
+        } else {
+            "空 ✗"
+        }
     );
     if result_filled {
         println!("[探针] swap(0, 44) 取成品到快捷栏末格");
@@ -163,7 +179,12 @@ async fn wait_for_screen(
 ) -> Option<String> {
     // 起点：跳过存量。
     if cursor.is_none() {
-        *cursor = module.latest().screens.entries.last().map(|entry| entry.seq);
+        *cursor = module
+            .latest()
+            .screens
+            .entries
+            .last()
+            .map(|entry| entry.seq);
     }
     for _ in 0..max_ticks {
         module.ticked().await;

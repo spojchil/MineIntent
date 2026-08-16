@@ -277,10 +277,10 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
 /// 背包索引是 `SetPlayerInventory` 与 `/item container.N` 的编号空间。
 fn inventory_index_to_menu_slot(index: u32) -> Option<u16> {
     match index {
-        0..=8 => Some(36 + index as u16),  // 快捷栏
-        9..=35 => Some(index as u16),      // 主背包（两个编号空间重合）
+        0..=8 => Some(36 + index as u16),         // 快捷栏
+        9..=35 => Some(index as u16),             // 主背包（两个编号空间重合）
         36..=39 => Some(8 - (index as u16 - 36)), // 盔甲：36脚→8 … 39头→5
-        40 => Some(45),                    // 副手
+        40 => Some(45),                           // 副手
         _ => None,
     }
 }

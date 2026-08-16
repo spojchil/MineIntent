@@ -200,8 +200,7 @@ impl Inner {
     }
 
     pub(super) fn mark_expected_close(&self) {
-        *self.expected_close.lock() =
-            Some(self.tick.load(Ordering::Acquire) + EXPECTED_SLOT_TICKS);
+        *self.expected_close.lock() = Some(self.tick.load(Ordering::Acquire) + EXPECTED_SLOT_TICKS);
     }
 
     fn push_screen_event(&self, source: FactSource, event: ScreenEvent) {
@@ -242,7 +241,10 @@ impl Inner {
         let source = {
             let mut expected = self.expected_slots.lock();
             expected.retain(|(_, until)| *until >= tick);
-            if expected.iter().any(|(expected_slot, _)| *expected_slot == slot) {
+            if expected
+                .iter()
+                .any(|(expected_slot, _)| *expected_slot == slot)
+            {
                 FactSource::Commanded
             } else {
                 FactSource::ServerObserved
@@ -527,7 +529,10 @@ mod tests {
             ScreenEvent::Opened { kind, container_id: 3, .. } if kind == "crafting"
         ));
         assert_eq!(window.entries[1].source, FactSource::ServerObserved);
-        assert!(matches!(&window.entries[1].event, ScreenEvent::Closed { .. }));
+        assert!(matches!(
+            &window.entries[1].event,
+            ScreenEvent::Closed { .. }
+        ));
         assert_eq!(window.entries[3].source, FactSource::Commanded);
         // 关完当前无容器。
         assert!(inner.open_screen.lock().is_none());

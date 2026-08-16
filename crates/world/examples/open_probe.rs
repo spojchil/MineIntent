@@ -64,13 +64,17 @@ async fn handle(
                         println!(
                             "[开探针] ✓ 打开成功：容器 id={}，菜单={:?}，格数={}",
                             handle.id(),
-                            handle.menu().map(|menu| format!("{:?}", std::mem::discriminant(&menu))),
+                            handle
+                                .menu()
+                                .map(|menu| format!("{:?}", std::mem::discriminant(&menu))),
                             handle.menu().map_or(0, |menu| menu.len()),
                         );
                         handle.close();
                         println!("[开探针] 已关闭");
                     }
-                    None => println!("[开探针] ✗ open_container_at 返回 None（10 tick 内菜单未出现）"),
+                    None => {
+                        println!("[开探针] ✗ open_container_at 返回 None（10 tick 内菜单未出现）")
+                    }
                 }
                 std::process::exit(0);
             });
@@ -82,7 +86,10 @@ async fn handle(
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let host = args.get(1).cloned().unwrap_or_else(|| "127.0.0.1".to_owned());
+    let host = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "127.0.0.1".to_owned());
     let port: u16 = args.get(2).map_or(25565, |v| v.parse().unwrap_or(25565));
     let username = args.get(3).cloned().unwrap_or_else(|| "prober".to_owned());
     let address = format!("{host}:{port}");

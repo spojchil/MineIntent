@@ -124,9 +124,7 @@ impl WakeCursors {
             }
             let commanded = entry.source == FactSource::Commanded;
             screens.push(match &entry.event {
-                ScreenEvent::Opened { kind, .. } => ScreenDirective::Opened {
-                    kind: kind.clone(),
-                },
+                ScreenEvent::Opened { kind, .. } => ScreenDirective::Opened { kind: kind.clone() },
                 ScreenEvent::Closed { kind } => ScreenDirective::Closed {
                     kind: kind.clone(),
                     commanded,
@@ -411,8 +409,12 @@ mod tests {
         assert!(cursors.collect(&snap, identity(), true).is_empty());
 
         // 屏开着：预期之外的投递，自己动作的回声（Commanded）不吵。
-        snap.inventory_changes.entries.push(inventory_change(2, 10, FactSource::Commanded));
-        snap.inventory_changes.entries.push(inventory_change(3, 0, FactSource::ServerObserved));
+        snap.inventory_changes
+            .entries
+            .push(inventory_change(2, 10, FactSource::Commanded));
+        snap.inventory_changes
+            .entries
+            .push(inventory_change(3, 0, FactSource::ServerObserved));
         let lines = cursors.collect(&snap, identity(), true).lines;
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("合成结果格"), "{lines:?}");

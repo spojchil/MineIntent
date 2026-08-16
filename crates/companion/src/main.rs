@@ -219,6 +219,21 @@ impl ViewportDoor for ModuleViewportDoor {
     }
 }
 
+/// 轮末帧观察端：只在一轮模型响应落定（AttemptCommitted）时发信号；
+/// 收集与投递在旁路任务做——观察端契约要求快速返回。
+struct RoundEndSignal(tokio::sync::mpsc::UnboundedSender<()>);
+
+impl agent::StreamObserver for RoundEndSignal {
+    fn observe(&self, event: &agent::ObservedModelStreamEvent) {
+        if matches!(
+            event.payload,
+            agent::ModelStreamObservation::AttemptCommitted
+        ) {
+            let _ = self.0.send(());
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     // ---- 配置 ----
@@ -325,13 +340,48 @@ async fn main() -> Result<(), String> {
             .with_situation(snapshots.clone(), read_mark.clone())
             .with_model(model.clone()),
     );
-    let session = Arc::new(AgentSession::new(
-        strategy.clone(),
-        dispatcher,
-        strategy,
-        model,
-        SessionConfig::default(),
-    ));
+    // 轮末帧（维护者裁定：模式=增量）：每轮模型响应落定后收集一次
+    // 「与记忆的差异」，非空则以 Passive 投递——Passive 不叫醒空闲会话
+    // （帧从不引发轮，只搭现有轮的车），信箱耐久故收集时即推进记忆。
+    let (round_end_tx, mut round_end_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let session = Arc::new(
+        AgentSession::new(
+            strategy.clone(),
+            dispatcher,
+            strategy,
+            model,
+            SessionConfig::default(),
+        )
+        .with_stream_observer(Arc::new(RoundEndSignal(round_end_tx))),
+    );
+    {
+        let session = session.clone();
+        let module = module.clone();
+        let block_memory = block_memory.clone();
+        tokio::spawn(async move {
+            while round_end_rx.recv().await.is_some() {
+                // 合并积压信号：连续几轮落定只收集一次，diff 是累积的不丢事。
+                while round_end_rx.try_recv().is_ok() {}
+                let scan_module = module.clone();
+                let scan_memory = block_memory.clone();
+                let changes = tokio::task::spawn_blocking(move || {
+                    scan_module.scan_changes(&scan_memory, &world::ViewportOptions::default())
+                })
+                .await;
+                // 未连接/世界未就绪等如实拒绝：轮末帧静默跳过，不是错误。
+                let Ok(Ok(changes)) = changes else { continue };
+                if changes.is_empty() {
+                    continue;
+                }
+                let text = render::render_block_changes(&changes);
+                println!("[组合根] 轮末帧：{} 条差异", changes.len());
+                let item: agent::TranscriptItem = InputMessage::text("user", text).into();
+                if let Err(rejected) = session.enqueue(MailboxInput::passive(vec![item])).await {
+                    eprintln!("[组合根] 轮末帧被拒：{:?}", rejected.reason);
+                }
+            }
+        });
+    }
 
     // ---- 最小唤醒脚手架：别人对我说话、受伤、移动任务有果就醒 ----
     // 判据本身是纯函数，在 `wake` 里，带单测；这里只负责取快照与投递。
