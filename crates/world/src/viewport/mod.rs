@@ -11,6 +11,9 @@ use crate::block::{is_air_name, BlockPosition, BlockProbe, BlockReadResult};
 use crate::{wrap_degrees, EntitySnapshot, Vec3Value};
 
 mod geometry;
+mod incremental;
+
+pub use incremental::{diff, BlockChange, BlockFact, BlockMemory};
 
 use geometry::{
     add, box_intersects_frustum, box_visibility_samples, compare_candidate, distance_to_box, dot,
