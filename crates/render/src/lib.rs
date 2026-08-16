@@ -368,13 +368,22 @@ pub fn render_viewport(projection: &world::ViewportProjection) -> String {
         pose.position[0], pose.position[1], pose.position[2], pose.yaw_degrees, pose.pitch_degrees
     ));
     if let Some(block) = &projection.looked_at_block {
-        lines.push(format!(
-            "准星对着：{} ({}, {}, {})。",
-            world::visible_block_label(&block.name, &block.properties),
-            block.position[0],
-            block.position[1],
-            block.position[2]
-        ));
+        // 准星几乎总有落点：非空气=第一个撞上的方块；空气=视线尽头那格
+        // （看天/一路空到扫描边界/撞到未加载区），如实说穿。
+        if world::is_air_name(&block.name) {
+            lines.push(format!(
+                "准星方向一路是空气，视线尽头 ({}, {}, {})。",
+                block.position[0], block.position[1], block.position[2]
+            ));
+        } else {
+            lines.push(format!(
+                "准星对着：{} ({}, {}, {})。",
+                world::visible_block_label(&block.name, &block.properties),
+                block.position[0],
+                block.position[1],
+                block.position[2]
+            ));
+        }
     }
     if let Some(block) = &projection.standing_on_block {
         lines.push(format!(

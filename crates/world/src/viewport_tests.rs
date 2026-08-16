@@ -51,7 +51,6 @@ fn options() -> ViewportOptions {
         horizontal_radius: 4,
         vertical_radius: 4,
         max_distance: 8.0,
-        looked_at_max_distance: 8.0,
         block_limit: 64,
         entity_limit: 8,
         ..ViewportOptions::default()
@@ -72,7 +71,7 @@ fn world_height_bounds_uses_u32_without_upper_bound_overflow() {
 
 #[test]
 fn projection_reports_pose_and_first_hit_in_absolute_coordinates() {
-    let projection = project(&pose(0.0), &[], fixture_read, &options())
+    let projection = project(&pose(180.0), &[], fixture_read, &options())
         .expect("fixture options should be valid");
 
     assert_eq!(projection.pose.position, [0.5, 1.0, 0.5]);
@@ -93,7 +92,7 @@ fn projection_reports_pose_and_first_hit_in_absolute_coordinates() {
 #[test]
 fn opaque_wall_blocks_far_blocks_and_entities() {
     let entities = [entity("near", 0.5), entity("behind-wall", -2.0)];
-    let projection = project(&pose(0.0), &entities, fixture_read, &options())
+    let projection = project(&pose(180.0), &entities, fixture_read, &options())
         .expect("fixture options should be valid");
 
     assert!(projection
@@ -116,7 +115,7 @@ fn invalid_options_are_rejected_before_scanning() {
         max_distance: f64::NAN,
         ..ViewportOptions::default()
     };
-    let result = project(&pose(0.0), &[], fixture_read, &options);
+    let result = project(&pose(180.0), &[], fixture_read, &options);
     assert!(result.is_err());
 }
 
@@ -124,7 +123,7 @@ fn invalid_options_are_rejected_before_scanning() {
 fn directed_kernel_reports_seen_air_four_reasons_and_first_occluder() {
     let positions = [[1, 2, -1], [0, 2, -2], [3, 2, -5], [5, 2, 0]];
     let result = project_directed(
-        &pose(0.0),
+        &pose(180.0),
         &positions,
         |position| {
             if position.x == 3 && position.y == 2 && position.z == -5 {
@@ -177,6 +176,58 @@ fn directed_kernel_reports_seen_air_four_reasons_and_first_occluder() {
 }
 
 #[test]
+fn gaze_lands_on_terminal_air_at_sky_box_edge_and_loading_frontier() {
+    // 看天：穿出世界高度前的最高一格空气。
+    let sky_read = |position: BlockPosition| {
+        if position.y > 5 {
+            BlockReadResult::OutOfWorld
+        } else {
+            BlockReadResult::Loaded {
+                block: block("air", true),
+            }
+        }
+    };
+    let up = Pose {
+        position: Vec3Value {
+            x: 0.5,
+            y: 1.0,
+            z: 0.5,
+        },
+        yaw: 0.0,
+        // 原版俯仰约定：−90 = 向上（视向量 y=−sin(pitch)）。
+        pitch: -90.0,
+    };
+    let projection = project(&up, &[], sky_read, &options()).expect("valid options");
+    let landing = projection.looked_at_block.expect("看天也该有落点");
+    assert_eq!(landing.name, "air");
+    assert_eq!(landing.position, [0, 5, 0], "{landing:?}");
+
+    // 一路空气：扫描盒边界上的那格空气（radius 4 → z 最远 -4）。
+    let all_air = |_position: BlockPosition| BlockReadResult::Loaded {
+        block: block("air", true),
+    };
+    let projection = project(&pose(180.0), &[], all_air, &options()).expect("valid options");
+    let landing = projection.looked_at_block.expect("一路空气也该有落点");
+    assert_eq!(landing.name, "air");
+    assert_eq!(landing.position, [0, 2, -4], "{landing:?}");
+
+    // 撞上未加载区：已知边界的最后一格空气。
+    let frontier = |position: BlockPosition| {
+        if position.z <= -3 {
+            BlockReadResult::Unloaded
+        } else {
+            BlockReadResult::Loaded {
+                block: block("air", true),
+            }
+        }
+    };
+    let projection = project(&pose(180.0), &[], frontier, &options()).expect("valid options");
+    let landing = projection.looked_at_block.expect("认知边界也该有落点");
+    assert_eq!(landing.name, "air");
+    assert_eq!(landing.position, [0, 2, -2], "{landing:?}");
+}
+
+#[test]
 fn changes_mode_reports_appearance_silence_vanish_and_ignores_whats_behind() {
     let all_air = |_position: BlockPosition| BlockReadResult::Loaded {
         block: block("air", true),
@@ -185,7 +236,7 @@ fn changes_mode_reports_appearance_silence_vanish_and_ignores_whats_behind() {
     // 首看：空记忆 → 石头是新看到。
     let mut memory = BlockMemory::new();
     let first = project_changes(
-        &pose(0.0),
+        &pose(180.0),
         &memory,
         fixture_read,
         &options(),
@@ -201,7 +252,7 @@ fn changes_mode_reports_appearance_silence_vanish_and_ignores_whats_behind() {
     // 推进后同景再看：无话可说。
     memory.apply(&first);
     let silent = project_changes(
-        &pose(0.0),
+        &pose(180.0),
         &memory,
         fixture_read,
         &options(),
@@ -211,7 +262,7 @@ fn changes_mode_reports_appearance_silence_vanish_and_ignores_whats_behind() {
     assert!(silent.is_empty(), "{silent:?}");
 
     // 石头被移走（世界全空）：亲眼可证 → 没了。
-    let vanish = project_changes(&pose(0.0), &memory, all_air, &options(), world_bounds())
+    let vanish = project_changes(&pose(180.0), &memory, all_air, &options(), world_bounds())
         .expect("fixture options should be valid");
     assert_eq!(vanish.len(), 1);
     assert!(
@@ -228,7 +279,7 @@ fn changes_mode_reports_appearance_silence_vanish_and_ignores_whats_behind() {
             properties: BTreeMap::new(),
         },
     }]);
-    let quiet = project_changes(&pose(0.0), &behind, all_air, &options(), world_bounds())
+    let quiet = project_changes(&pose(180.0), &behind, all_air, &options(), world_bounds())
         .expect("fixture options should be valid");
     assert!(quiet.is_empty(), "{quiet:?}");
     assert_eq!(behind.len(), 1, "记忆原样保留");
@@ -241,7 +292,7 @@ fn directed_geometry_short_circuits_extreme_coordinates_without_reading() {
         [i32::MIN, i32::MIN, i32::MIN],
     ];
     let result = project_directed(
-        &pose(0.0),
+        &pose(180.0),
         &positions,
         |_position| panic!("被几何拒绝的定向目标不得读世界"),
         &options(),
@@ -269,7 +320,7 @@ fn directed_geometry_short_circuits_extreme_coordinates_without_reading() {
 fn directed_clear_to_unloaded_target_reports_only_chunk_not_loaded() {
     let target = [0, 2, -2];
     let result = project_directed(
-        &pose(0.0),
+        &pose(180.0),
         &[target],
         |position| {
             if [position.x, position.y, position.z] == target {
@@ -332,7 +383,7 @@ fn directed_exposed_face_matches_full_when_target_centre_is_blocked() {
         DirectedRayOutcome::Hit(BlockHit { ref voxel, .. }) if *voxel == wall
     ));
 
-    let full = project(&pose(0.0), &[], read, &options())
+    let full = project(&pose(180.0), &[], read, &options())
         .expect("full projection should use the exposed-face predicate");
     assert!(full
         .visible_blocks
@@ -341,7 +392,7 @@ fn directed_exposed_face_matches_full_when_target_centre_is_blocked() {
         .any(|item| item.position == [target.x, target.y, target.z]));
 
     let directed = project_directed(
-        &pose(0.0),
+        &pose(180.0),
         &[[target.x, target.y, target.z]],
         read,
         &options(),
@@ -357,7 +408,7 @@ fn directed_exposed_face_matches_full_when_target_centre_is_blocked() {
 #[test]
 fn directed_kernel_reports_too_far_fields_and_stable_combined_reason_order() {
     let result = project_directed(
-        &pose(0.0),
+        &pose(180.0),
         &[[0, 2, -40], [40, 2, 0]],
         |_position| BlockReadResult::Loaded {
             block: block("air", true),
@@ -386,7 +437,7 @@ fn directed_kernel_reports_too_far_fields_and_stable_combined_reason_order() {
 #[test]
 fn directed_kernel_rejects_duplicate_input_and_keeps_target_out_of_world_per_row() {
     let duplicate = project_directed(
-        &pose(0.0),
+        &pose(180.0),
         &[[1, 2, -1], [1, 2, -1]],
         fixture_read,
         &options(),
@@ -396,7 +447,7 @@ fn directed_kernel_rejects_duplicate_input_and_keeps_target_out_of_world_per_row
     assert!(matches!(duplicate, Err(error) if error.field == "positions"));
 
     let out_of_world = project_directed(
-        &pose(0.0),
+        &pose(180.0),
         &[[0, 2, -1]],
         |_position| BlockReadResult::OutOfWorld,
         &options(),
@@ -414,9 +465,10 @@ fn directed_kernel_rejects_duplicate_input_and_keeps_target_out_of_world_per_row
 
 #[test]
 fn directed_world_height_bounds_lock_lower_and_upper_edges() {
-    let mut lower_pose = pose(0.0);
+    let mut lower_pose = pose(180.0);
     lower_pose.position.y = -64.0;
-    lower_pose.pitch = -35.0;
+    // 原版俯仰：正=向下（看向脚下边界的目标）。
+    lower_pose.pitch = 35.0;
     let lower = project_directed(
         &lower_pose,
         &[[0, -65, -3], [0, -64, -3]],
@@ -433,7 +485,7 @@ fn directed_world_height_bounds_lock_lower_and_upper_edges() {
     assert_eq!(lower.unseen[0].why, [DirectedWhy::OutOfWorld]);
     assert!(lower.seen.iter().any(|item| item.at == [0, -64, -3]));
 
-    let mut upper_pose = pose(0.0);
+    let mut upper_pose = pose(180.0);
     upper_pose.position.y = 319.0;
     let upper = project_directed(
         &upper_pose,
@@ -454,7 +506,7 @@ fn directed_world_height_bounds_lock_lower_and_upper_edges() {
 
 #[test]
 fn directed_out_of_world_geometry_short_circuits_and_mixes_with_other_rows() {
-    let mut observation_pose = pose(0.0);
+    let mut observation_pose = pose(180.0);
     observation_pose.position.y = 0.5;
     let bounds = WorldHeightBounds::new(-64, 66);
     let result = project_directed(
@@ -519,7 +571,7 @@ fn directed_out_of_world_geometry_short_circuits_and_mixes_with_other_rows() {
 fn directed_target_out_of_world_wins_over_inconsistent_test_bounds() {
     let target = [0, 2, -1];
     let result = project_directed(
-        &pose(0.0),
+        &pose(180.0),
         &[target],
         |position| {
             assert_eq!([position.x, position.y, position.z], target);
@@ -539,7 +591,8 @@ fn directed_target_out_of_world_wins_over_inconsistent_test_bounds() {
 fn pose_at(x: f64, y: f64, z: f64) -> Pose {
     Pose {
         position: Vec3Value { x, y, z },
-        yaw: 0.0,
+        // 夹具全部铺在 −z 侧；原版约定 yaw 180=北（−z），面朝夹具。
+        yaw: 180.0,
         pitch: 0.0,
     }
 }
@@ -600,7 +653,6 @@ fn wide_options() -> ViewportOptions {
         horizontal_radius: 12,
         vertical_radius: 10,
         max_distance: 20.0,
-        looked_at_max_distance: 4.5,
         block_limit: 64,
         entity_limit: 8,
         ..ViewportOptions::default()

@@ -107,10 +107,12 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
                 })
                 .map_err(|_| "读不到自身位置".to_owned())?;
             let yaw = yaw.to_radians();
+            // 原版视向量水平分量：x=−sin(yaw)、z=+cos(yaw)（yaw 0=南+z）。
+            // 2026-08-17 修正：z 此前取反，「前进」会走成后退。
             let target = BlockPos::new(
                 (position.0 + (-yaw.sin()) * blocks).floor() as i32,
                 position.1.floor() as i32,
-                (position.2 + (-yaw.cos()) * blocks).floor() as i32,
+                (position.2 + yaw.cos() * blocks).floor() as i32,
             );
             inner.begin_movement_job([target.x, target.y, target.z]);
             bot.start_goto_with_opts(

@@ -59,7 +59,6 @@ const RAY_STEP: f64 = 0.25;
 const FACE_EPSILON: f64 = 0.01;
 const DEFAULT_VERTICAL_HALF_ANGLE: f64 = 35.0 * PI / 180.0;
 const DEFAULT_ASPECT_RATIO: f64 = 16.0 / 9.0;
-const DEFAULT_LOOKED_AT_DISTANCE: f64 = 4.5;
 const DIRECTED_MAX_DISTANCE: f64 = 32.0;
 pub const MAX_DIRECTED_VIEW_POSITIONS: usize = 16;
 
@@ -127,7 +126,6 @@ pub struct ViewportOptions {
     pub block_limit: usize,
     pub entity_limit: usize,
     pub predicate: VisibilityPredicate,
-    pub looked_at_max_distance: f64,
 }
 
 impl Default for ViewportOptions {
@@ -142,7 +140,6 @@ impl Default for ViewportOptions {
             block_limit: 256,
             entity_limit: 8,
             predicate: VisibilityPredicate::ExposedFace,
-            looked_at_max_distance: DEFAULT_LOOKED_AT_DISTANCE,
         }
     }
 }
@@ -160,7 +157,6 @@ impl ViewportOptions {
             ("max_distance", self.max_distance),
             ("vertical_half_angle", self.vertical_half_angle),
             ("horizontal_half_angle", self.horizontal_half_angle),
-            ("looked_at_max_distance", self.looked_at_max_distance),
         ] {
             if !value.is_finite() || value <= 0.0 {
                 return Err(format!("viewport {name} 必须是正的有限数"));
@@ -245,7 +241,6 @@ struct BlockHit {
 
 #[derive(Clone, Copy, Debug)]
 enum RayProperty {
-    Visible,
     Occludes,
 }
 
@@ -883,6 +878,11 @@ where
     })
 }
 
+/// 准星落点（维护者裁定的新逻辑）：视线方向第一个非空气方块；一路空气则
+/// 报**视线尽头的那格空气**——穿出世界高度（看天）= 最高一格在界内的空气，
+/// 走到扫描盒边界 = 边界上的那格空气，撞上未加载区 = 已知边界的最后一格
+/// 空气（认知边界如实呈现）。准星因此几乎总有落点；仅当第一步就出界/未加载
+/// （异常姿态）才为 None。
 fn raycast_looked_at_block<P, F, C>(
     reader: &mut WorldReader<P, F>,
     eye: Point3,
@@ -897,29 +897,55 @@ where
 {
     checkpoint()?;
     let direction = view_axes(pose.yaw, pose.pitch).forward;
-    Ok(
-        match first_hit(
-            reader,
-            eye,
-            direction,
-            options.looked_at_max_distance,
-            RayProperty::Visible,
-            checkpoint,
-        )? {
-            // 注视的方块要交给读方，这里才付完整 DTO 的钱——一次投影一次。
-            RayOutcome::Hit(voxel) => match reader.full(voxel.clone()) {
-                BlockReadResult::Loaded { block } => Some(ViewportBlock {
-                    name: block.name,
-                    properties: block.properties,
-                    position: [voxel.x, voxel.y, voxel.z],
-                }),
-                // 探针命中、完整读拿不到：只可能是两次读之间世界变了。
-                // 不报一个读不出来的方块。
-                BlockReadResult::Unloaded | BlockReadResult::OutOfWorld => None,
-            },
-            RayOutcome::Clear | RayOutcome::Unloaded => None,
-        },
-    )
+    let self_voxel = BlockPosition {
+        x: pose.position.x.floor() as i32,
+        y: pose.position.y.floor() as i32,
+        z: pose.position.z.floor() as i32,
+    };
+    let in_box = |voxel: &BlockPosition| -> bool {
+        (voxel.x - self_voxel.x).abs() <= options.horizontal_radius
+            && (voxel.y - self_voxel.y).abs() <= options.vertical_radius
+            && (voxel.z - self_voxel.z).abs() <= options.horizontal_radius
+    };
+    // 对角线穿盒的最长路径；逐步走，出盒即止。
+    let max_distance = f64::from(options.horizontal_radius.max(options.vertical_radius)) * 2.0;
+    let steps = (max_distance / RAY_STEP).ceil() as i32;
+    let mut last_air: Option<BlockPosition> = None;
+    let mut terminal: Option<BlockPosition> = None;
+    for step in 1..=steps {
+        checkpoint()?;
+        let distance = f64::from(step) * RAY_STEP;
+        let voxel = BlockPosition {
+            x: (eye.x + direction.x * distance).floor() as i32,
+            y: (eye.y + direction.y * distance).floor() as i32,
+            z: (eye.z + direction.z * distance).floor() as i32,
+        };
+        if !in_box(&voxel) {
+            break; // 扫描盒边界：落点=最后一格空气。
+        }
+        match reader.probe(voxel.clone()) {
+            BlockProbe::OutOfWorld => break, // 穿出世界高度（看天/看虚空）。
+            BlockProbe::Unloaded => break,   // 认知边界。
+            BlockProbe::Loaded { visible: true, .. } => {
+                terminal = Some(voxel);
+                break; // 第一个非空气方块。
+            }
+            BlockProbe::Loaded { visible: false, .. } => {
+                last_air = Some(voxel);
+            }
+        }
+    }
+    let landing = terminal.or(last_air);
+    Ok(landing.and_then(|voxel| match reader.full(voxel.clone()) {
+        // 注视的方块要交给读方，这里才付完整 DTO 的钱——一次投影一次。
+        BlockReadResult::Loaded { block } => Some(ViewportBlock {
+            name: block.name,
+            properties: block.properties,
+            position: [voxel.x, voxel.y, voxel.z],
+        }),
+        // 探针可读、完整读拿不到：两次读之间世界变了。不报读不出来的方块。
+        BlockReadResult::Unloaded | BlockReadResult::OutOfWorld => None,
+    }))
 }
 
 fn visible_blocks<P, F, C>(
@@ -1343,7 +1369,6 @@ where
             BlockProbe::Unloaded => return Ok(RayOutcome::Unloaded),
         };
         let hits = match property {
-            RayProperty::Visible => visible,
             RayProperty::Occludes => visible && !transparent_hint,
         };
         if hits {
