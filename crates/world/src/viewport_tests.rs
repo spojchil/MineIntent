@@ -177,6 +177,52 @@ fn directed_kernel_reports_seen_air_four_reasons_and_first_occluder() {
 }
 
 #[test]
+fn changes_mode_reports_appearance_silence_vanish_and_ignores_whats_behind() {
+    let all_air = |_position: BlockPosition| BlockReadResult::Loaded {
+        block: block("air", true),
+    };
+
+    // 首看：空记忆 → 石头是新看到。
+    let mut memory = BlockMemory::new();
+    let first = project_changes(&pose(0.0), &memory, fixture_read, &options(), world_bounds())
+        .expect("fixture options should be valid");
+    assert_eq!(first.len(), 1);
+    assert!(
+        matches!(&first[0], BlockChange::Appeared { at, fact } if *at == [0, 2, -1] && fact.name == "stone"),
+        "{first:?}"
+    );
+
+    // 推进后同景再看：无话可说。
+    memory.apply(&first);
+    let silent = project_changes(&pose(0.0), &memory, fixture_read, &options(), world_bounds())
+        .expect("fixture options should be valid");
+    assert!(silent.is_empty(), "{silent:?}");
+
+    // 石头被移走（世界全空）：亲眼可证 → 没了。
+    let vanish = project_changes(&pose(0.0), &memory, all_air, &options(), world_bounds())
+        .expect("fixture options should be valid");
+    assert_eq!(vanish.len(), 1);
+    assert!(
+        matches!(&vanish[0], BlockChange::Vanished { at, was } if *at == [0, 2, -1] && was.name == "stone"),
+        "{vanish:?}"
+    );
+
+    // 背后的记忆（视锥外）：即使世界全空也保持沉默——看不到就不下结论。
+    let mut behind = BlockMemory::new();
+    behind.apply(&[BlockChange::Appeared {
+        at: [0, 2, 3],
+        fact: BlockFact {
+            name: "stone".to_owned(),
+            properties: BTreeMap::new(),
+        },
+    }]);
+    let quiet = project_changes(&pose(0.0), &behind, all_air, &options(), world_bounds())
+        .expect("fixture options should be valid");
+    assert!(quiet.is_empty(), "{quiet:?}");
+    assert_eq!(behind.len(), 1, "记忆原样保留");
+}
+
+#[test]
 fn directed_geometry_short_circuits_extreme_coordinates_without_reading() {
     let positions = [
         [i32::MAX, i32::MAX, i32::MAX],

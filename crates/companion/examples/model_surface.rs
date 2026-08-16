@@ -182,6 +182,37 @@ impl perception::ViewportDoor for NoDoor {
             })
         })
     }
+    fn scan_changes<'a>(&'a self) -> PortFuture<'a, Result<Vec<world::BlockChange>, String>> {
+        Box::pin(async {
+            Ok(vec![
+                world::BlockChange::Appeared {
+                    at: [8, 72, 4],
+                    fact: world::BlockFact {
+                        name: "chest".to_owned(),
+                        properties: Default::default(),
+                    },
+                },
+                world::BlockChange::Changed {
+                    at: [6, 72, 3],
+                    was: world::BlockFact {
+                        name: "oak_log".to_owned(),
+                        properties: Default::default(),
+                    },
+                    now: world::BlockFact {
+                        name: "campfire".to_owned(),
+                        properties: Default::default(),
+                    },
+                },
+                world::BlockChange::Vanished {
+                    at: [6, 73, 3],
+                    was: world::BlockFact {
+                        name: "oak_log".to_owned(),
+                        properties: Default::default(),
+                    },
+                },
+            ])
+        })
+    }
 }
 
 /// 样例快照：白天主世界、半血、身边有玩家与两只僵尸、背包有几样东西、
@@ -389,6 +420,7 @@ async fn main() {
     let scan = &providers[6].1;
     println!("\nscan 环视（呈现样例）：\n\n```text\n{}\n```\n", call(scan.as_ref(), "scan", json!({})).await);
     println!("scan 定向（呈现样例）：\n\n```text\n{}\n```\n", call(scan.as_ref(), "scan", json!({"at":[[6,72,3],[0,60,0]]})).await);
+    println!("scan 增量（呈现样例；只报自上次以来的变化）：\n\n```text\n{}\n```\n", call(scan.as_ref(), "scan", json!({"changes": true})).await);
 
     // ---- 四、拒绝与报错话术 ----
     println!("## 四、拒绝与报错话术（真实调用产出）\n");

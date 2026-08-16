@@ -682,6 +682,93 @@ where
     Ok(projection)
 }
 
+/// 增量投影：视口的第三种模式（与全量、定向同一台内核）。
+///
+/// 把当前视野与方块记忆对比，只产出变化（判定表见 [`incremental`] 模块头）。
+/// 消费方不止 scan 工具——增量呈现、寻路合法域后续都调这同一个函数。
+/// 只读不写：推进记忆由调用方在变化确实送达之后 [`BlockMemory::apply`]。
+pub fn project_changes<F>(
+    pose: &Pose,
+    memory: &BlockMemory,
+    read_block: F,
+    options: &ViewportOptions,
+    world_bounds: WorldHeightBounds,
+) -> Result<Vec<BlockChange>, String>
+where
+    F: Fn(BlockPosition) -> BlockReadResult,
+{
+    // 第一遍：全量内核拿当前可见集（实体不参与增量，传空）。
+    let projection = project_with_reader(
+        pose,
+        &[],
+        WorldReader::new(
+            |position| BlockProbe::from_read(&read_block(position)),
+            &read_block,
+        ),
+        options,
+        || Ok(()),
+    )
+    .map_err(|error| error.message)?;
+
+    let eye = Point3 {
+        x: pose.position.x,
+        y: pose.position.y + EYE_HEIGHT,
+        z: pose.position.z,
+    };
+    let axes = view_axes(pose.yaw, pose.pitch);
+    // 探针距离与定向模式同帽：范围外的记忆连问都不问（剪枝=工作量边界）。
+    let probe_max_distance = options.max_distance.min(DIRECTED_MAX_DISTANCE);
+    let scope = |at: [i32; 3]| -> bool {
+        if !world_bounds.contains_y(at[1]) {
+            return false;
+        }
+        let center = Point3 {
+            x: f64::from(at[0]) + 0.5,
+            y: f64::from(at[1]) + 0.5,
+            z: f64::from(at[2]) + 0.5,
+        };
+        let delta = subtract(center, eye);
+        length(delta) <= probe_max_distance && inside_frustum(axes, delta, options)
+    };
+
+    let mut vanish_reader = WorldReader::new(
+        |position| BlockProbe::from_read(&read_block(position)),
+        &read_block,
+    );
+    let mut checkpoint = || Ok(());
+    let visibly_empty = |at: [i32; 3]| -> bool {
+        let voxel = BlockPosition {
+            x: at[0],
+            y: at[1],
+            z: at[2],
+        };
+        // 亲眼可证的空 = 该格已加载为空气，且到格心的射线通达。
+        let is_air = matches!(
+            vanish_reader.full(voxel.clone()),
+            BlockReadResult::Loaded { ref block } if crate::block::is_air_name(&block.name)
+        );
+        if !is_air {
+            return false;
+        }
+        let center = Point3 {
+            x: f64::from(at[0]) + 0.5,
+            y: f64::from(at[1]) + 0.5,
+            z: f64::from(at[2]) + 0.5,
+        };
+        matches!(
+            first_occluder_before_target(&mut vanish_reader, eye, center, &voxel, &mut checkpoint),
+            Ok(DirectedRayOutcome::Clear)
+        )
+    };
+
+    Ok(incremental::diff(
+        memory,
+        &projection.visible_blocks.blocks,
+        scope,
+        visibly_empty,
+    ))
+}
+
 enum DirectedRayOutcome {
     Hit(BlockHit),
     Clear,

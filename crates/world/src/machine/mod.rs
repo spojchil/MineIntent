@@ -241,6 +241,44 @@ impl Module {
         .map_err(|error| error.to_string())
     }
 
+    /// 增量视口投影：对比方块记忆只报变化，并当场推进记忆（回执走内核
+    /// settled 通道必达模型，产出即送达）。约束同 [`Module::scan`]。
+    pub fn scan_changes(
+        &self,
+        memory: &std::sync::Mutex<crate::BlockMemory>,
+        options: &crate::ViewportOptions,
+    ) -> Result<Vec<crate::BlockChange>, String> {
+        let snapshot = self.latest();
+        if !matches!(snapshot.phase, ConnectionPhase::Ready) {
+            return Err("尚未连接到世界，无法观察".to_owned());
+        }
+        let world = self
+            .inner
+            .world_handle
+            .lock()
+            .clone()
+            .ok_or_else(|| "世界模型尚未就绪".to_owned())?;
+        let world = world.read();
+        let bounds = crate::WorldHeightBounds::new(world.chunks.min_y(), world.chunks.height());
+        let pose = crate::viewport::Pose {
+            position: snapshot.self_state.position,
+            yaw: snapshot.self_state.yaw,
+            pitch: snapshot.self_state.pitch,
+        };
+        // 对比与推进在同一次持锁内完成：与并行吸收（其他 scan 回执）互斥，
+        // 不会对着推进到一半的记忆做 diff。
+        let mut memory = memory.lock().expect("方块记忆锁不应中毒");
+        let changes = crate::viewport::project_changes(
+            &pose,
+            &memory,
+            |position| read_block_from_world(&world, position),
+            options,
+            bounds,
+        )?;
+        memory.apply(&changes);
+        Ok(changes)
+    }
+
     /// 聊天窗读取：最近 count 条，旧在前新在后。
     pub fn recent_chat(&self, count: usize) -> Vec<String> {
         let window = self.inner.chat_window.lock();

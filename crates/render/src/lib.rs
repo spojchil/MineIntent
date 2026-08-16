@@ -434,6 +434,38 @@ pub fn render_viewport(projection: &world::ViewportProjection) -> String {
     lines.join("\n")
 }
 
+/// 增量查看结果的呈现：只报自上次以来亲眼可证的变化。
+/// 末尾固定教一句「缺席≠没有」（维护者要求）：没列出的坐标不能当空气，
+/// 想确认具体位置用定向。
+pub fn render_block_changes(changes: &[world::BlockChange]) -> String {
+    let mut lines = Vec::new();
+    if changes.is_empty() {
+        lines.push("自上次报告以来，视野内没有变化。".to_owned());
+    } else {
+        lines.push("自上次报告以来的可见变化：".to_owned());
+        for change in changes {
+            lines.push(match change {
+                world::BlockChange::Appeared { at, fact } => {
+                    format!("- 新看到：({}, {}, {}) {}", at[0], at[1], at[2], fact.name)
+                }
+                world::BlockChange::Changed { at, was, now } => format!(
+                    "- 变了：({}, {}, {}) 原是 {}，现在是 {}",
+                    at[0], at[1], at[2], was.name, now.name
+                ),
+                world::BlockChange::Vanished { at, was } => format!(
+                    "- 没了：({}, {}, {}) 原是 {}，现在亲眼看到是空的",
+                    at[0], at[1], at[2], was.name
+                ),
+            });
+        }
+    }
+    lines.push(
+        "（没列出的坐标不代表那里没东西——这里只报变化；想确认某个位置，用 at 定向查看。）"
+            .to_owned(),
+    );
+    lines.join("\n")
+}
+
 /// 定向查看结果的呈现：逐坐标报可见/不可见与原因。
 pub fn render_directed(projection: &world::DirectedProjection) -> String {
     let mut lines = Vec::new();

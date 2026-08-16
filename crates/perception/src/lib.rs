@@ -11,13 +11,15 @@ use dispatch::{ToolClass, ToolProvider};
 use serde_json::{json, Value};
 use world::{BlockMemory, DirectedProjection, ViewportProjection, MAX_DIRECTED_VIEW_POSITIONS};
 
-/// 接入模块视口面的窄化：全景用当前姿态，定向按坐标逐个分类。
+/// 接入模块视口面的窄化：全景用当前姿态，定向按坐标逐个分类，
+/// 增量对比方块记忆只报变化（记忆推进在门后完成）。
 pub trait ViewportDoor: Send + Sync {
     fn scan<'a>(&'a self) -> PortFuture<'a, Result<ViewportProjection, String>>;
     fn scan_directed<'a>(
         &'a self,
         positions: Vec<[i32; 3]>,
     ) -> PortFuture<'a, Result<DirectedProjection, String>>;
+    fn scan_changes<'a>(&'a self) -> PortFuture<'a, Result<Vec<world::BlockChange>, String>>;
 }
 
 const TOOL_NAME: &str = "scan";
@@ -52,6 +54,25 @@ impl PerceptionTools {
         let Some(arguments) = call.arguments.as_object() else {
             return ToolResult::failure(call_id, "参数必须是 JSON 对象；请改写调用");
         };
+        let changes_mode = matches!(arguments.get("changes"), Some(Value::Bool(true)));
+        if changes_mode && arguments.get("at").is_some() {
+            return ToolResult::failure(
+                call_id,
+                "changes 与 at 一次只能用一种模式；请改写调用",
+            );
+        }
+        if changes_mode {
+            // 记忆的 diff 与推进都在门后同一把锁内完成，这里只管呈现。
+            return match self.door.scan_changes().await {
+                Ok(changes) => ToolResult::success(
+                    call_id,
+                    vec![agent::ContentPart::text(render::render_block_changes(
+                        &changes,
+                    ))],
+                ),
+                Err(reason) => ToolResult::failure(call_id, reason),
+            };
+        }
         match arguments.get("at") {
             None => match self.door.scan().await {
                 Ok(projection) => {
@@ -123,14 +144,18 @@ impl ToolProvider for PerceptionTools {
                         "type": "array",
                         "items": { "type": "array", "items": { "type": "integer" } },
                         "description": "可选：定向查看这些方块坐标 [[x,y,z],..]（至多 16 个），逐个告诉你看得见还是被什么挡住。不给则环视当前朝向的整个视野"
+                    },
+                    "changes": {
+                        "type": "boolean",
+                        "description": "可选：只报自上次以来视野内的变化（新看到/变了/亲眼见空），比环视省得多。没列出的坐标不代表没东西；想确认具体位置用 at。与 at 互斥"
                     }
                 },
                 "additionalProperties": false
             }),
         );
         definition.description = Some(
-            "看。用你当前的朝向环视（视锥+遮挡，看不见背后和被挡住的东西），\
-或定向确认指定坐标是否可见。不打断任何动作。"
+            "看。三种用法：环视（默认，用当前朝向，视锥+遮挡，看不见背后和被挡住的东西）、\
+定向（at，确认指定坐标可见与否）、增量（changes，只报自上次以来的变化）。不打断任何动作。"
                 .to_owned(),
         );
         vec![(definition, ToolClass::Free)]
@@ -191,6 +216,18 @@ mod tests {
                 })
             })
         }
+
+        fn scan_changes<'a>(&'a self) -> PortFuture<'a, Result<Vec<world::BlockChange>, String>> {
+            Box::pin(async {
+                Ok(vec![world::BlockChange::Appeared {
+                    at: [3, 64, 3],
+                    fact: world::BlockFact {
+                        name: "oak_log".to_owned(),
+                        properties: Default::default(),
+                    },
+                }])
+            })
+        }
     }
 
     fn call(arguments: serde_json::Value) -> ToolCall {
@@ -226,6 +263,22 @@ mod tests {
             let result = tools.call(call(json!({"at": bad["at"]}))).await;
             assert_eq!(result.status, ToolResultStatus::Error, "{bad}");
         }
+    }
+
+    /// 增量模式：走门取变化并呈现；与 at 连用如实拒绝。
+    #[tokio::test]
+    async fn changes_mode_renders_deltas_and_excludes_directed() {
+        let (tools, _) = tools_with_memory();
+        let ok = tools.call(call(json!({"changes": true}))).await;
+        assert_eq!(ok.status, ToolResultStatus::Success);
+        let text = format!("{:?}", ok.content);
+        assert!(text.contains("新看到"), "{text}");
+        assert!(text.contains("定向查看"), "{text}");
+
+        let both = tools
+            .call(call(json!({"changes": true, "at": [[1, 2, 3]]})))
+            .await;
+        assert_eq!(both.status, ToolResultStatus::Error);
     }
 
     /// 观察源接入：scan 回执产出即吸收进方块记忆。

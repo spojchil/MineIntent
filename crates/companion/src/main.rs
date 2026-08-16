@@ -171,11 +171,15 @@ impl InventoryDoor for ModuleInventoryDoor {
 }
 
 /// 视口门：投影是纯 CPU 重活，放阻塞池，不占用异步线程。
-struct ModuleViewportDoor(Arc<Module>);
+struct ModuleViewportDoor {
+    module: Arc<Module>,
+    /// 增量模式的对比基线：与 perception 吸收共用同一本方块记忆。
+    block_memory: Arc<std::sync::Mutex<world::BlockMemory>>,
+}
 
 impl ViewportDoor for ModuleViewportDoor {
     fn scan<'a>(&'a self) -> agent::PortFuture<'a, Result<world::ViewportProjection, String>> {
-        let module = self.0.clone();
+        let module = self.module.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || module.scan(&world::ViewportOptions::default()))
                 .await
@@ -187,10 +191,24 @@ impl ViewportDoor for ModuleViewportDoor {
         &'a self,
         positions: Vec<[i32; 3]>,
     ) -> agent::PortFuture<'a, Result<world::DirectedProjection, String>> {
-        let module = self.0.clone();
+        let module = self.module.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
                 module.scan_directed(&positions, &world::ViewportOptions::default())
+            })
+            .await
+            .map_err(|error| format!("视口投影任务失败：{error}"))?
+        })
+    }
+
+    fn scan_changes<'a>(
+        &'a self,
+    ) -> agent::PortFuture<'a, Result<Vec<world::BlockChange>, String>> {
+        let module = self.module.clone();
+        let memory = self.block_memory.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                module.scan_changes(&memory, &world::ViewportOptions::default())
             })
             .await
             .map_err(|error| format!("视口投影任务失败：{error}"))?
@@ -270,7 +288,10 @@ async fn main() -> Result<(), String> {
         Arc::new(MotionTools::new(Arc::new(ModuleMotionDoor(module.clone())))),
         Arc::new(HandTools::new(Arc::new(ModuleHandDoor(module.clone())))),
         Arc::new(PerceptionTools::new(
-            Arc::new(ModuleViewportDoor(module.clone())),
+            Arc::new(ModuleViewportDoor {
+                module: module.clone(),
+                block_memory: block_memory.clone(),
+            }),
             block_memory.clone(),
         )),
     ];
