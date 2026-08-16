@@ -12,8 +12,8 @@ use agent::{ContentPart, PortFuture, ToolCall, ToolResult};
 use dispatch::{Occupancy, ToolClass, ToolProvider};
 use memory::{MemoryFile, MemoryTools};
 use screens::{
-    ChatBox, ChatDoor, ChatHistory, ChatReadMark, CraftingScreen, InventoryDoor, InventoryScreen,
-    ScreenState, CRAFTING_USAGE,
+    container_usage, ChatBox, ChatDoor, ChatHistory, ChatReadMark, ContainerScreen, InventoryDoor,
+    InventoryScreen, ScreenState,
 };
 use serde_json::json;
 use world::SnapshotSource;
@@ -349,7 +349,7 @@ async fn main() {
     let providers: Vec<(&str, Box<dyn ToolProvider>)> = vec![
         ("chat_box", Box::new(ChatBox::new(occupancy.clone(), screen_state.clone(), door.clone(), door.clone(), read_mark.clone(), snapshots.clone()))),
         ("inventory", Box::new(InventoryScreen::new(occupancy.clone(), screen_state.clone(), door.clone(), snapshots.clone()))),
-        ("crafting_table", Box::new(CraftingScreen::new(occupancy.clone(), screen_state.clone(), door.clone(), snapshots.clone()))),
+        ("container", Box::new(ContainerScreen::new(occupancy.clone(), screen_state.clone(), door.clone(), snapshots.clone()))),
         ("remember", Box::new(MemoryTools::new(memory_file.clone()))),
         ("motion/look", Box::new(motion::MotionTools::new(door.clone()))),
         ("hand", Box::new(hand::HandTools::new(door.clone()))),
@@ -377,12 +377,13 @@ async fn main() {
     println!("inventory swap：`{}`", call(inventory.as_ref(), "inventory", json!({"action":"swap","a":10,"b":38})).await);
     println!("inventory swap 丢弃：`{}`", call(inventory.as_ref(), "inventory", json!({"action":"swap","a":10,"b":99})).await);
     println!("inventory close：`{}`\n", call(inventory.as_ref(), "inventory", json!({"action":"close"})).await);
-    let crafting = &providers[2].1;
-    // 工作台没有 open 动作：开屏由服务器发起，这里模拟组合根对开屏事实的
+    let container = &providers[2].1;
+    // 容器没有 open 动作：开屏由服务器发起，这里模拟组合根对开屏事实的
     // 处置（登记状态）后取回执。开屏通知全文见 §五。
-    screen_state.server_open(screens::ScreenKind::CraftingTable);
-    println!("crafting_table swap（取成品到快捷栏）：`{}`", call(crafting.as_ref(), "crafting_table", json!({"action":"swap","a":0,"b":40})).await);
-    println!("crafting_table close：`{}`\n", call(crafting.as_ref(), "crafting_table", json!({"action":"close"})).await);
+    screen_state.server_open(screens::ScreenKind::Container);
+    println!("container swap（取成品到快捷栏）：`{}`", call(container.as_ref(), "container", json!({"action":"swap","a":0,"b":40})).await);
+    println!("container swap 拆栈：`{}`", call(container.as_ref(), "container", json!({"action":"swap","a":37,"b":2,"count":1})).await);
+    println!("container close：`{}`\n", call(container.as_ref(), "container", json!({"action":"close"})).await);
     let motion_tools = &providers[4].1;
     println!("motion go_to：`{}`", call(motion_tools.as_ref(), "motion", json!({"action":"go_to","target":[35.0,72.0,3.0]})).await);
     let scan = &providers[6].1;
@@ -397,7 +398,7 @@ async fn main() {
         let _ = call(inventory.as_ref(), "inventory", json!({"action":"close"})).await;
         call(inventory.as_ref(), "inventory", json!({"action":"swap","a":1,"b":2})).await
     });
-    println!("- 工作台没开时 swap：`{}`", call(crafting.as_ref(), "crafting_table", json!({"action":"swap","a":1,"b":2})).await);
+    println!("- 容器没开时 swap：`{}`", call(container.as_ref(), "container", json!({"action":"swap","a":1,"b":2})).await);
     println!("- 未知 action：`{}`", call(chat_box.as_ref(), "chat_box", json!({"action":"dance"})).await);
     println!("- motion 缺参数：`{}`", call(motion_tools.as_ref(), "motion", json!({"action":"forward"})).await);
     println!("- look 越界俯仰：`{}`", call(motion_tools.as_ref(), "look", json!({"action":"face","yaw":0.0,"pitch":120.0})).await);
@@ -411,7 +412,7 @@ async fn main() {
     println!("- `尚未连接到世界，无法行动` / `尚未连接到世界，无法观察` / `连接已结束`");
     println!("- `附近没有 {{entity_key}} 这个实体`（attack/use_on 实体找不到时）");
     println!("- `格号 {{slot}} 超出当前界面范围（0-{{max}}）` / `两个格号相同，没有可交换的`");
-    println!("- `没有开着的容器界面`（没有容器时 crafting_table close）\n");
+    println!("- `没有开着的容器界面`（没有容器时 container close）\n");
 
     // ---- 五、通知措辞（唤醒时以 user 角色投递） ----
     println!("## 五、唤醒投递的措辞（user 角色）\n");
@@ -446,7 +447,7 @@ async fn main() {
         };
         println!("- `{}`", render::render_damage_entry(&entry));
     }
-    println!("\n库存变化通知（格位类屏开着才投递；自己动作的回声不投递；容器 0=物品栏屏，非 0=工作台格空间）：\n");
+    println!("\n库存变化通知（格位类屏开着才投递；自己动作的回声不投递；容器 0=物品栏屏，非 0=当时开着的容器格空间）：\n");
     for (container_id, slot, item, count) in [
         (0_i32, 38_u16, Some("emerald"), 5_u32),
         (0, 0, Some("oak_button"), 1),
@@ -466,7 +467,7 @@ async fn main() {
         };
         println!("- `{}`", render::render_inventory_change(&entry));
     }
-    println!("\n屏通知（工作台真相在服务端，组合根随屏事实投递）：\n");
+    println!("\n屏通知（容器真相在服务端，组合根随屏事实投递；种类差异=清单段表+用法补充）：\n");
     {
         let mut crafting_snap = world::TickSnapshot::empty(world::Epoch(1), 120, world::ConnectionPhase::Ready);
         crafting_snap.self_state.inventory.slots = vec![
@@ -474,10 +475,10 @@ async fn main() {
             world::InventorySlot { slot: 20, item_name: "stick".to_owned(), count: 4, metadata: None, durability_used: None },
             world::InventorySlot { slot: 40, item_name: "bread".to_owned(), count: 7, metadata: None, durability_used: None },
         ];
-        println!("开屏（hand use_on 工作台后，服务器打开界面）：\n\n```text\n工作台界面已打开。\n{}\n\n{}\n```\n", render::render_crafting_menu(&crafting_snap), CRAFTING_USAGE);
+        println!("开屏（hand use_on 工作台后，服务器打开界面）：\n\n```text\n容器界面已打开（crafting）。\n{}\n\n{}\n```\n", render::render_container_menu(&crafting_snap, "crafting"), container_usage("crafting"));
+        println!("开屏（箱子，无种类补充时只有通用用法）：\n\n```text\n容器界面已打开（generic_9x3「木箱」）。\n{}\n\n{}\n```\n", render::render_container_menu(&crafting_snap, "generic_9x3"), container_usage("generic_9x3"));
     }
-    println!("- 被服务器关闭（非自己 close 的回声）：`工作台界面被关闭了。`");
-    println!("- 无工具的容器被打开：`服务器打开了 {{kind}} 界面；当前版本没有操作它的工具。`");
+    println!("- 被服务器关闭（非自己 close 的回声）：`容器界面被关闭了（crafting）。`");
 
     // ---- 六、压缩（上下文满时的模型交互） ----
     println!("\n## 六、上下文压缩（满时对模型的指令与结果包裹）\n");

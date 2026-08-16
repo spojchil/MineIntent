@@ -1,9 +1,11 @@
-//! 工作台屏：3×3 合成容器（真相在服务端）。
+//! 容器屏：所有服务端容器（工作台、箱子、熔炉……）共用的一件工具。
 //!
-//! 与物品栏屏的差别只在**开屏路径**：工作台没有 open 动作——模型对着
-//! 工作台方块使用（hand use_on），服务器发 OpenScreen，组合根随屏事实
-//! 占域并投递格位清单。本工具只有 swap 与 close 两个动词，格号按工作台
-//! 格空间解释（0 成品、1-9 摆料、10-36 主背包、37-45 快捷栏，无副手）。
+//! 与物品栏屏的本质差异在**开/关路径**：容器真相在服务端——没有 open
+//! 动作，模型对容器方块使用（hand use_on），服务器发 OpenScreen，组合根
+//! 随屏事实占域并投递格位清单与用法；关闭要通知服务器（ContainerClose），
+//! 服务器也可以强关。格子层面各容器只是"几个格子的差别"：交换/拆栈/
+//! 丢弃动词一律通用（机器按活动菜单几何执行），每种容器的差异降为
+//! 数据（清单段表在 render，用法补充在 [`container_usage`]）。
 //!
 //! 配方知识在模型自己身上：机器不查配方表，摆什么出什么由服务器仲裁。
 
@@ -16,28 +18,44 @@ use world::SnapshotSource;
 
 use crate::inventory::{kind_word, InventoryDoor, ScreenKind, ScreenState, DISCARD_SLOT};
 
-const TOOL_NAME: &str = "crafting_table";
+const TOOL_NAME: &str = "container";
 
-/// 开屏通知随附的用法说明。组合根在投递「工作台界面已打开」时引用，
-/// 公开以便模型可见面导出评审。
-pub const CRAFTING_USAGE: &str = "工作台用法：格号即协议号——0 成品（只出不进），\
-1-9 摆料（3×3，行优先：1-3 上行、4-6 中行、7-9 下行），10-36 主背包，37-45 快捷栏；\
-没有副手格，物品栏屏的格号在这里不适用。\
+/// 所有容器共用的动词说明。开屏通知 = 种类名 + 格位清单 + 本文 +
+/// 种类补充（[`container_usage`] 汇总）。公开以便模型可见面导出评审。
+pub const CONTAINER_USAGE: &str = "容器界面用法：格号即协议号，属于当前界面（物品栏屏的格号在这里不适用）。\
 {action:\"swap\", a, b} 交换两格内容，一次一对；b 用 99 表示把 a 整格丢出去；\
-两格恰有一格为空时可加 count 只挪这么多个过去（拆栈）——配方要同种材料占多格时\
-就靠它，如把一组木板分放两格：{action:\"swap\", a:37, b:2, count:1} 再 {a:37, b:5, count:1}。\
-取成品用 swap(0, 快捷栏或背包格)，会按配方消耗摆料。摆满配方后成品出现在 0，\
-格位变化会另行通知。{action:\"close\"} 关闭工作台回到世界。\
-开着工作台时无法移动或与世界交互。";
+两格恰有一格为空时可加 count 只挪这么多个过去（拆栈）。\
+{action:\"close\"} 关闭容器回到世界。开着容器时无法移动或与世界交互。";
 
-pub struct CraftingScreen {
+/// 种类专属的用法补充（数据，不是代码）：只写通用动词说明覆盖不到的语义。
+fn kind_supplement(kind: &str) -> Option<&'static str> {
+    match kind {
+        "crafting" => Some(
+            "这是工作台（3×3 合成）：0 成品（只出不进），1-9 摆料（行优先：1-3 上行、\
+4-6 中行、7-9 下行），10-36 主背包，37-45 快捷栏，无副手格。摆满配方后成品出现在 0，\
+取成品用 swap(0, 快捷栏或背包格)，会按配方消耗摆料；配方要同种材料占多格时用 count \
+拆栈，如 {action:\"swap\", a:37, b:2, count:1}。",
+        ),
+        _ => None,
+    }
+}
+
+/// 某种容器的完整用法文本：通用动词说明 + 种类补充（若有）。
+pub fn container_usage(kind: &str) -> String {
+    match kind_supplement(kind) {
+        Some(supplement) => format!("{CONTAINER_USAGE}\n{supplement}"),
+        None => CONTAINER_USAGE.to_owned(),
+    }
+}
+
+pub struct ContainerScreen {
     occupancy: Arc<Occupancy>,
     state: Arc<ScreenState>,
     door: Arc<dyn InventoryDoor>,
     snapshots: Arc<dyn SnapshotSource>,
 }
 
-impl CraftingScreen {
+impl ContainerScreen {
     pub fn new(
         occupancy: Arc<Occupancy>,
         state: Arc<ScreenState>,
@@ -60,17 +78,17 @@ impl CraftingScreen {
         count: Option<&Value>,
     ) -> ToolResult {
         match self.state.current() {
-            Some(ScreenKind::CraftingTable) => {}
+            Some(ScreenKind::Container) => {}
             Some(other) => {
                 return ToolResult::failure(
                     call_id,
-                    format!("{}开着，不是工作台", kind_word(other)),
+                    format!("{}开着，不是容器界面", kind_word(other)),
                 );
             }
             None => {
                 return ToolResult::failure(
                     call_id,
-                    "工作台没有打开；先对着工作台方块使用（hand use_on），等界面打开的通知",
+                    "没有开着的容器界面；先对容器方块使用（hand use_on），等界面打开的通知",
                 );
             }
         }
@@ -101,7 +119,7 @@ impl CraftingScreen {
         if let Err(reason) = outcome {
             return ToolResult::failure(call_id, reason);
         }
-        // 点击本地预演即时生效，本 tick 的快照已按工作台格空间更新。
+        // 点击本地预演即时生效，本 tick 的快照已按容器格空间更新。
         let snapshot = self.snapshots.latest();
         let describe = |slot: u16| -> String {
             snapshot
@@ -130,7 +148,7 @@ impl CraftingScreen {
     async fn close(&self, call_id: agent::ToolCallId) -> ToolResult {
         let outcome = self.door.close_container().await;
         // 无论门怎么说，本地屏状态与占域都收口：服务端容器不在了就该放行。
-        self.state.close(ScreenKind::CraftingTable);
+        self.state.close(ScreenKind::Container);
         self.occupancy.release(Domain::Screen);
         match outcome {
             Ok(()) => ToolResult::success_json(call_id, json!({ "state": "closed" })),
@@ -139,7 +157,7 @@ impl CraftingScreen {
     }
 }
 
-impl dispatch::ToolProvider for CraftingScreen {
+impl dispatch::ToolProvider for ContainerScreen {
     fn tools(&self) -> Vec<(ToolDefinition, ToolClass)> {
         let mut definition = ToolDefinition::new(
             TOOL_NAME,
@@ -149,20 +167,20 @@ impl dispatch::ToolProvider for CraftingScreen {
                     "action": {
                         "type": "string",
                         "enum": ["swap", "close"],
-                        "description": "swap=交换两格（一次一对）；close=关闭工作台"
+                        "description": "swap=交换两格（一次一对）；close=关闭容器"
                     },
-                    "a": { "type": "integer", "description": "swap 用：格号（0-45，工作台格空间）" },
-                    "b": { "type": "integer", "description": "swap 用：格号（0-45），或 99=把 a 整格丢出去" },
-                    "count": { "type": "integer", "description": "swap 可选：两格恰有一格为空时，从非空格挪这么多个到空格（拆栈，摆多格配方用）；不给则整组交换" }
+                    "a": { "type": "integer", "description": "swap 用：格号（当前容器的格空间）" },
+                    "b": { "type": "integer", "description": "swap 用：格号，或 99=把 a 整格丢出去" },
+                    "count": { "type": "integer", "description": "swap 可选：两格恰有一格为空时，从非空格挪这么多个到空格（拆栈）；不给则整组交换" }
                 },
                 "required": ["action"],
                 "additionalProperties": false
             }),
         );
         definition.description = Some(
-            "工作台（3×3 合成）。没有 open：对着工作台方块使用（hand use_on）后界面\
-由服务器打开并通知你格位清单；开着期间用 swap 摆料/取成品，close 关闭。\
-开着时无法移动或与世界交互。"
+            "当前开着的容器界面（工作台、箱子、熔炉等共用）。没有 open：对容器方块\
+使用（hand use_on）后界面由服务器打开，你会收到格位清单与用法；开着期间用 swap \
+整理/摆料/取物，close 关闭。开着时无法移动或与世界交互。"
                 .to_owned(),
         );
         vec![(
@@ -256,7 +274,7 @@ mod tests {
     }
 
     struct Fixture {
-        screen: CraftingScreen,
+        screen: ContainerScreen,
         occupancy: Arc<Occupancy>,
         state: Arc<ScreenState>,
         door: Arc<RecordingDoor>,
@@ -269,7 +287,7 @@ mod tests {
             refuse_close,
             ..RecordingDoor::default()
         });
-        let screen = CraftingScreen::new(
+        let screen = ContainerScreen::new(
             occupancy.clone(),
             state.clone(),
             door.clone(),
@@ -302,12 +320,12 @@ mod tests {
 
     /// 模拟组合根对开屏事实的反应：登记状态并占域。
     fn server_opens(fixture: &Fixture) {
-        fixture.state.server_open(ScreenKind::CraftingTable);
+        fixture.state.server_open(ScreenKind::Container);
         fixture.occupancy.occupy(Domain::Screen);
     }
 
     #[tokio::test]
-    async fn swap_requires_the_crafting_screen_to_be_open() {
+    async fn swap_requires_a_container_to_be_open() {
         let fixture = fixture(false);
         let closed = invoke(&fixture, json!({"action": "swap", "a": 0, "b": 40})).await;
         assert_eq!(closed.status, ToolResultStatus::Error);
@@ -373,17 +391,27 @@ mod tests {
     #[test]
     fn server_open_displaces_a_local_screen_and_reports_it() {
         let state = ScreenState::new();
-        state.server_open(ScreenKind::CraftingTable);
-        assert_eq!(state.current(), Some(ScreenKind::CraftingTable));
+        state.server_open(ScreenKind::Container);
+        assert_eq!(state.current(), Some(ScreenKind::Container));
         // 已是同种类：不算顶替。
-        assert_eq!(state.server_open(ScreenKind::CraftingTable), None);
-        state.server_close(ScreenKind::CraftingTable);
+        assert_eq!(state.server_open(ScreenKind::Container), None);
+        state.server_close(ScreenKind::Container);
         assert_eq!(state.current(), None);
         // 顶掉本地聊天屏要报出来（组合根据此提醒模型）。
         state.server_open(ScreenKind::Chat);
         assert_eq!(
-            state.server_open(ScreenKind::CraftingTable),
+            state.server_open(ScreenKind::Container),
             Some(ScreenKind::Chat)
         );
+    }
+
+    #[test]
+    fn crafting_usage_carries_the_semantic_supplement_and_unknown_kinds_stay_generic() {
+        let crafting = container_usage("crafting");
+        assert!(crafting.contains("容器界面用法"));
+        assert!(crafting.contains("成品"));
+        let chest = container_usage("generic_9x3");
+        assert!(chest.contains("容器界面用法"));
+        assert!(!chest.contains("成品"));
     }
 }

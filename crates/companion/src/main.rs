@@ -19,8 +19,8 @@ use memory::{MemoryFile, MemoryTools};
 use motion::{MotionDoor, MotionTools};
 use perception::{PerceptionTools, ViewportDoor};
 use screens::{
-    ChatBox, ChatDoor, ChatHistory, ChatReadMark, CraftingScreen, InventoryDoor, InventoryScreen,
-    ScreenKind, ScreenState, CRAFTING_USAGE,
+    container_usage, ChatBox, ChatDoor, ChatHistory, ChatReadMark, ContainerScreen, InventoryDoor,
+    InventoryScreen, ScreenKind, ScreenState,
 };
 use world::{ConnectionConfig, DoorCommand, Module, SnapshotSource};
 
@@ -253,7 +253,7 @@ async fn main() -> Result<(), String> {
             Arc::new(ModuleInventoryDoor(module.clone())),
             snapshots.clone(),
         )),
-        Arc::new(CraftingScreen::new(
+        Arc::new(ContainerScreen::new(
             occupancy.clone(),
             screen_state.clone(),
             Arc::new(ModuleInventoryDoor(module.clone())),
@@ -316,7 +316,7 @@ async fn main() -> Result<(), String> {
                     // 格位变化只在格位类屏（物品栏/工作台）开着时投递（维护者裁定）。
                     matches!(
                         screen_state.current(),
-                        Some(ScreenKind::Inventory | ScreenKind::CraftingTable)
+                        Some(ScreenKind::Inventory | ScreenKind::Container)
                     ),
                 );
                 if wake.is_empty() {
@@ -324,35 +324,36 @@ async fn main() -> Result<(), String> {
                 }
                 let mut lines = wake.lines;
                 // 屏事实的副作用：状态翻转 + 占域随服务端真相走。
+                // 所有服务端容器共用一件 container 工具；种类差异只在
+                // 通知携带的清单段表与用法补充（数据，不是分支）。
                 for directive in wake.screens {
                     match directive {
-                        ScreenDirective::OpenedCrafting => {
-                            let displaced = screen_state.server_open(ScreenKind::CraftingTable);
+                        ScreenDirective::Opened { kind } => {
+                            let displaced = screen_state.server_open(ScreenKind::Container);
                             occupancy.occupy(dispatch::Domain::Screen);
-                            let mut text = String::from("工作台界面已打开。");
+                            let title = snapshot
+                                .open_screen
+                                .as_ref()
+                                .and_then(|screen| screen.title.clone())
+                                .map(|title| format!("「{title}」"))
+                                .unwrap_or_default();
+                            let mut text = format!("容器界面已打开（{kind}{title}）。");
                             if displaced == Some(ScreenKind::Chat) {
                                 text.push_str("（聊天框被它顶掉了。）");
                             }
                             text.push('\n');
-                            text.push_str(&render::render_crafting_menu(&snapshot));
+                            text.push_str(&render::render_container_menu(&snapshot, &kind));
                             text.push_str("\n\n");
-                            text.push_str(CRAFTING_USAGE);
+                            text.push_str(&container_usage(&kind));
                             lines.push(text);
                         }
-                        ScreenDirective::OpenedOther { kind } => {
-                            lines.push(format!(
-                                "服务器打开了 {kind} 界面；当前版本没有操作它的工具。"
-                            ));
-                        }
                         ScreenDirective::Closed { kind, commanded } => {
-                            if kind == "crafting" {
-                                screen_state.server_close(ScreenKind::CraftingTable);
-                                if screen_state.current().is_none() {
-                                    occupancy.release(dispatch::Domain::Screen);
-                                }
-                                if !commanded {
-                                    lines.push("工作台界面被关闭了。".to_owned());
-                                }
+                            screen_state.server_close(ScreenKind::Container);
+                            if screen_state.current().is_none() {
+                                occupancy.release(dispatch::Domain::Screen);
+                            }
+                            if !commanded {
+                                lines.push(format!("容器界面被关闭了（{kind}）。"));
                             }
                         }
                     }

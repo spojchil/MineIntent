@@ -27,9 +27,10 @@ pub const DISCARD_SLOT: u16 = 99;
 pub enum ScreenKind {
     Chat,
     Inventory,
-    /// 工作台：真相在服务端（use_on 触发开、可被强关），
-    /// 本地状态由组合根随屏事实翻转。
-    CraftingTable,
+    /// 服务端容器（工作台、箱子、熔炉等）：真相在服务端（use_on 触发开、
+    /// 可被强关），本地状态由组合根随屏事实翻转。具体种类在快照
+    /// `open_screen` 里，这里只管互斥。
+    Container,
 }
 
 /// 屏种类状态：屏模块内共享，己也读它（开屏期间才投递库存变化通知）。
@@ -87,7 +88,7 @@ pub(crate) fn kind_word(kind: ScreenKind) -> &'static str {
     match kind {
         ScreenKind::Chat => "聊天框",
         ScreenKind::Inventory => "物品栏",
-        ScreenKind::CraftingTable => "工作台",
+        ScreenKind::Container => "容器界面",
     }
 }
 

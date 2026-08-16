@@ -10,10 +10,10 @@
 //! 服务端强关同样经屏事实收口。
 
 mod chat;
-mod crafting;
+mod container;
 mod inventory;
 mod segment;
 
 pub use chat::{ChatBox, ChatDoor, ChatHistory, ChatReadMark};
-pub use crafting::{CraftingScreen, CRAFTING_USAGE};
+pub use container::{container_usage, ContainerScreen, CONTAINER_USAGE};
 pub use inventory::{InventoryDoor, InventoryScreen, ScreenKind, ScreenState, DISCARD_SLOT};

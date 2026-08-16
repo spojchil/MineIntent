@@ -384,10 +384,19 @@ fn crafting_menu_listing_uses_the_crafting_slot_space() {
             durability_used: None,
         },
     ];
-    let text = render_crafting_menu(&snap);
+    let text = render_container_menu(&snap, "crafting");
     assert!(text.contains("成品（0）：oak_button ×1"), "{text}");
     assert!(text.contains("摆料 3×3（1-9）：5=oak_planks ×1"), "{text}");
     assert!(text.contains("主背包（10-36）：20=diamond ×3"), "{text}");
     // 玩家屏里 45 是副手；工作台屏里 45 是快捷栏末格。
     assert!(text.contains("快捷栏（37-45）：45=bread ×7"), "{text}");
+
+    // 已知容器按通用三段（箱子：27 容器格 + 主背包 + 快捷栏）。
+    let chest = render_container_menu(&snap, "generic_9x3");
+    assert!(chest.contains("容器格（0-26）"), "{chest}");
+    assert!(chest.contains("主背包（27-53）"), "{chest}");
+    assert!(chest.contains("快捷栏（54-62）"), "{chest}");
+    // 未知种类逐格罗列，不猜段界。
+    let unknown = render_container_menu(&snap, "modded_thing");
+    assert!(unknown.contains("非空格位："), "{unknown}");
 }

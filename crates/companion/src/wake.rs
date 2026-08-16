@@ -17,10 +17,9 @@ use world::{
 /// 屏事实要组合根做的事：状态翻转与占域是副作用，出纯函数交给外面。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScreenDirective {
-    /// 工作台开了：登记屏状态、占域、投递格位清单与用法。
-    OpenedCrafting,
-    /// 打开了当前版本没有工具的容器：只如实告知。
-    OpenedOther { kind: String },
+    /// 容器开了（工作台、箱子、熔炉……同一件 container 工具操作）：
+    /// 登记屏状态、占域、投递格位清单与用法。
+    Opened { kind: String },
     /// 容器关了。`commanded`=我们 close 动词的回声（工具已回执，不再吵）。
     Closed { kind: String, commanded: bool },
 }
@@ -125,10 +124,7 @@ impl WakeCursors {
             }
             let commanded = entry.source == FactSource::Commanded;
             screens.push(match &entry.event {
-                ScreenEvent::Opened { kind, .. } if kind == "crafting" => {
-                    ScreenDirective::OpenedCrafting
-                }
-                ScreenEvent::Opened { kind, .. } => ScreenDirective::OpenedOther {
+                ScreenEvent::Opened { kind, .. } => ScreenDirective::Opened {
                     kind: kind.clone(),
                 },
                 ScreenEvent::Closed { kind } => ScreenDirective::Closed {
@@ -477,12 +473,14 @@ mod tests {
         assert_eq!(
             wake.screens,
             vec![
-                ScreenDirective::OpenedCrafting,
+                ScreenDirective::Opened {
+                    kind: "crafting".to_owned(),
+                },
                 ScreenDirective::Closed {
                     kind: "crafting".to_owned(),
                     commanded: true,
                 },
-                ScreenDirective::OpenedOther {
+                ScreenDirective::Opened {
                     kind: "generic_9x3".to_owned(),
                 },
                 ScreenDirective::Closed {

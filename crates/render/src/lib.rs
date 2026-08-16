@@ -256,10 +256,36 @@ pub fn render_inventory_change(entry: &world::InventoryChangeEntry) -> String {
     }
 }
 
-/// 工作台屏的格位清单。格号即协议号：0 成品、1-9 摆料（3×3）、
-/// 10-36 主背包、37-45 快捷栏；没有副手格。开屏期间快照的格位清单
-/// 属于工作台格空间，直接按此空间标注。
-pub fn render_crafting_menu(snap: &TickSnapshot) -> String {
+/// 每种容器**自有区**的格数（玩家区 36 格总在其后）。
+/// 直译 azalea `declare_menus`（azalea-inventory/src/lib.rs 声明表）；
+/// 加一种容器的清单支持 = 在这里加一行。
+fn container_area_len(kind: &str) -> Option<u32> {
+    Some(match kind {
+        "generic_9x1" => 9,
+        "generic_9x2" => 18,
+        "generic_9x3" | "shulker_box" => 27,
+        "generic_9x4" => 36,
+        "generic_9x5" => 45,
+        "generic_9x6" => 54,
+        "generic_3x3" | "crafter_3x3" => 9,
+        "anvil" | "blast_furnace" | "furnace" | "smoker" | "grindstone" | "merchant"
+        | "cartography_table" => 3,
+        "beacon" | "lectern" => 1,
+        "brewing_stand" | "hopper" => 5,
+        "crafting" => 10,
+        "enchantment" | "stonecutter" => 2,
+        "loom" => 4,
+        "smithing" => 4,
+        _ => return None,
+    })
+}
+
+/// 容器屏的格位清单（格号即协议号，属于该容器的格空间）。
+///
+/// 语义段表是数据：工作台有专属标注（成品/摆料），其余已知容器按
+/// 「容器格 + 主背包 + 快捷栏」通用三段（尺寸查 [`container_area_len`]），
+/// 未知种类退化为逐格罗列——直译原则，不装懂。
+pub fn render_container_menu(snap: &TickSnapshot, kind: &str) -> String {
     let inventory = &snap.self_state.inventory;
     let item_at = |slot: u32| -> Option<String> {
         inventory
@@ -284,16 +310,38 @@ pub fn render_crafting_menu(snap: &TickSnapshot) -> String {
             )
         }
     };
-    let lines = [
-        match item_at(0) {
-            Some(item) => format!("成品（0）：{item}"),
-            None => "成品（0）：空".to_owned(),
-        },
-        section("摆料 3×3", 1..=9),
-        section("主背包", 10..=36),
-        section("快捷栏", 37..=45),
-    ];
-    lines.join("\n")
+    if kind == "crafting" {
+        let lines = [
+            match item_at(0) {
+                Some(item) => format!("成品（0）：{item}"),
+                None => "成品（0）：空".to_owned(),
+            },
+            section("摆料 3×3", 1..=9),
+            section("主背包", 10..=36),
+            section("快捷栏", 37..=45),
+        ];
+        return lines.join("\n");
+    }
+    if let Some(own) = container_area_len(kind) {
+        let lines = [
+            section("容器格", 0..=own - 1),
+            section("主背包", own..=own + 26),
+            section("快捷栏", own + 27..=own + 35),
+        ];
+        return lines.join("\n");
+    }
+    // 未知种类：逐格罗列非空格位，不猜段界。
+    let mut slots: Vec<String> = inventory
+        .slots
+        .iter()
+        .map(|entry| format!("{}={} ×{}", entry.slot, entry.item_name, entry.count))
+        .collect();
+    slots.sort();
+    if slots.is_empty() {
+        "（全部格位为空）".to_owned()
+    } else {
+        format!("非空格位：{}", slots.join("、"))
+    }
 }
 
 /// 视口全景的呈现：同名方块聚合（数量+最近位置），实体逐个列出。
