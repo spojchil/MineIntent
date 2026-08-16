@@ -3,9 +3,9 @@
 //! 与物品栏屏的本质差异在**开/关路径**：容器真相在服务端——没有 open
 //! 动作，模型对容器方块使用（hand use_on），服务器发 OpenScreen，组合根
 //! 随屏事实占域并投递格位清单与用法；关闭要通知服务器（ContainerClose），
-//! 服务器也可以强关。格子层面各容器只是"几个格子的差别"：交换/拆栈/
-//! 丢弃动词一律通用（机器按活动菜单几何执行），每种容器的差异降为
-//! 数据（清单段表在 render，用法补充在 [`container_usage`]）。
+//! 服务器也可以强关。格子层面各容器只是"几个格子的差别"：move（移动/
+//! 合堆/对调）与丢弃动词一律通用（机器按活动菜单现状仲裁），每种容器的
+//! 差异降为数据（清单段表在 render，用法补充在 [`container_usage`]）。
 //!
 //! 配方知识在模型自己身上：机器不查配方表，摆什么出什么由服务器仲裁。
 
@@ -23,18 +23,19 @@ const TOOL_NAME: &str = "container";
 /// 所有容器共用的动词说明。开屏通知 = 种类名 + 格位清单 + 本文 +
 /// 种类补充（[`container_usage`] 汇总）。公开以便模型可见面导出评审。
 pub const CONTAINER_USAGE: &str = "容器界面用法：格号即协议号，属于当前界面（物品栏屏的格号在这里不适用）。\
-{action:\"swap\", a, b} 交换两格内容，一次一对；b 用 99 表示把 a 整格丢出去；\
-两格恰有一格为空时可加 count 只挪这么多个过去（拆栈）。\
+{action:\"move\", from, to} 把 from 格的东西弄到 to 格，语义随 to 现状：to 为空=移过去\
+（可加 count 只挪几个，拆栈）；to 是同种物品=倒入合堆（可加 count 只倒几个，装不下的留在原格）；\
+to 是不同物品=整组对调（count 不适用）；to 用 99=把 from 整格丢出去。\
 {action:\"close\"} 关闭容器回到世界。开着容器时无法移动或与世界交互。";
 
 /// 种类专属的用法补充（数据，不是代码）：只写通用动词说明覆盖不到的语义。
 fn kind_supplement(kind: &str) -> Option<&'static str> {
     match kind {
         "crafting" => Some(
-            "这是工作台（3×3 合成）：0 成品（只出不进），1-9 摆料（行优先：1-3 上行、\
-4-6 中行、7-9 下行），10-36 主背包，37-45 快捷栏，无副手格。摆满配方后成品出现在 0，\
-取成品用 swap(0, 快捷栏或背包格)，会按配方消耗摆料；配方要同种材料占多格时用 count \
-拆栈，如 {action:\"swap\", a:37, b:2, count:1}。",
+            "这是工作台（3×3 合成）：0 成品（只出不进、只能整组取走），1-9 摆料\
+（行优先：1-3 上行、4-6 中行、7-9 下行），10-36 主背包，37-45 快捷栏，无副手格。\
+摆满配方后成品出现在 0，取成品用 move(0, 快捷栏或背包格)，会按配方消耗摆料；\
+配方要同种材料占多格时用 count 拆栈，如 {action:\"move\", from:37, to:2, count:1}。",
         ),
         _ => None,
     }
@@ -70,11 +71,11 @@ impl ContainerScreen {
         }
     }
 
-    async fn swap(
+    async fn move_items(
         &self,
         call_id: agent::ToolCallId,
-        a: Option<&Value>,
-        b: Option<&Value>,
+        from: Option<&Value>,
+        to: Option<&Value>,
         count: Option<&Value>,
     ) -> ToolResult {
         match self.state.current() {
@@ -93,8 +94,8 @@ impl ContainerScreen {
             }
         }
         let slot = |value: Option<&Value>| value.and_then(Value::as_u64).map(|slot| slot as u16);
-        let (Some(a), Some(b)) = (slot(a), slot(b)) else {
-            return ToolResult::failure(call_id, "swap 需要整数参数 a 与 b；请改写调用");
+        let (Some(from), Some(to)) = (slot(from), slot(to)) else {
+            return ToolResult::failure(call_id, "move 需要整数参数 from 与 to；请改写调用");
         };
         let count = match count {
             None => None,
@@ -105,16 +106,16 @@ impl ContainerScreen {
                 }
             },
         };
-        if count.is_some() && b == DISCARD_SLOT {
+        if count.is_some() && to == DISCARD_SLOT {
             return ToolResult::failure(
                 call_id,
-                "count 只用于与空格之间挪个数，不能与 99 丢弃连用；请改写调用",
+                "count 不能与 99 丢弃连用（丢弃是整格）；请改写调用",
             );
         }
-        let outcome = if b == DISCARD_SLOT {
-            self.door.throw_slot(a).await
+        let outcome = if to == DISCARD_SLOT {
+            self.door.throw_slot(from).await
         } else {
-            self.door.swap_slots(a, b, count).await
+            self.door.move_slots(from, to, count).await
         };
         if let Err(reason) = outcome {
             return ToolResult::failure(call_id, reason);
@@ -131,16 +132,14 @@ impl ContainerScreen {
                 .map(|entry| format!("{} ×{}", entry.item_name, entry.count))
                 .unwrap_or_else(|| "空".to_owned())
         };
-        let summary = if b == DISCARD_SLOT {
-            format!("已丢弃；格 {a} 现在：{}", describe(a))
-        } else if let Some(count) = count {
-            format!(
-                "已挪 {count} 个；格 {a}：{}，格 {b}：{}",
-                describe(a),
-                describe(b)
-            )
+        let summary = if to == DISCARD_SLOT {
+            format!("已丢弃；格 {from} 现在：{}", describe(from))
         } else {
-            format!("已交换；格 {a}：{}，格 {b}：{}", describe(a), describe(b))
+            format!(
+                "已完成；格 {from}：{}，格 {to}：{}",
+                describe(from),
+                describe(to)
+            )
         };
         ToolResult::success_json(call_id, json!({ "done": summary }))
     }
@@ -166,12 +165,12 @@ impl dispatch::ToolProvider for ContainerScreen {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["swap", "close"],
-                        "description": "swap=交换两格（一次一对）；close=关闭容器"
+                        "enum": ["move", "close"],
+                        "description": "move=把 from 格的东西弄到 to 格（移动/合堆/对调）；close=关闭容器"
                     },
-                    "a": { "type": "integer", "description": "swap 用：格号（当前容器的格空间）" },
-                    "b": { "type": "integer", "description": "swap 用：格号，或 99=把 a 整格丢出去" },
-                    "count": { "type": "integer", "description": "swap 可选：两格恰有一格为空时，从非空格挪这么多个到空格（拆栈）；不给则整组交换" }
+                    "from": { "type": "integer", "description": "move 用：来源格号（当前容器的格空间）" },
+                    "to": { "type": "integer", "description": "move 用：目标格号——空=移过去、同种物品=倒入合堆、不同物品=整组对调；99=把 from 整格丢出去" },
+                    "count": { "type": "integer", "description": "move 可选：只挪/只倒这么多个（to 为空或同种物品时）；不给则整组" }
                 },
                 "required": ["action"],
                 "additionalProperties": false
@@ -179,8 +178,8 @@ impl dispatch::ToolProvider for ContainerScreen {
         );
         definition.description = Some(
             "当前开着的容器界面（工作台、箱子、熔炉等共用）。没有 open：对容器方块\
-使用（hand use_on）后界面由服务器打开，你会收到格位清单与用法；开着期间用 swap \
-整理/摆料/取物，close 关闭。开着时无法移动或与世界交互。"
+使用（hand use_on）后界面由服务器打开，你会收到格位清单与用法；开着期间用 move \
+搬动/合堆/摆料/取物，close 关闭。开着时无法移动或与世界交互。"
                 .to_owned(),
         );
         vec![(
@@ -198,17 +197,17 @@ impl dispatch::ToolProvider for ContainerScreen {
                 return ToolResult::failure(call_id, "参数必须是 JSON 对象；请改写调用");
             };
             match arguments.get("action").and_then(Value::as_str) {
-                Some("swap") => {
-                    self.swap(
+                Some("move") => {
+                    self.move_items(
                         call_id,
-                        arguments.get("a"),
-                        arguments.get("b"),
+                        arguments.get("from"),
+                        arguments.get("to"),
                         arguments.get("count"),
                     )
                     .await
                 }
                 Some("close") => self.close(call_id).await,
-                _ => ToolResult::failure(call_id, "action 必须是 swap/close 之一；请改写调用"),
+                _ => ToolResult::failure(call_id, "action 必须是 move/close 之一；请改写调用"),
             }
         })
     }
@@ -229,10 +228,10 @@ mod tests {
     }
 
     impl InventoryDoor for RecordingDoor {
-        fn swap_slots<'a>(
+        fn move_slots<'a>(
             &'a self,
-            a: u16,
-            b: u16,
+            from: u16,
+            to: u16,
             count: Option<u32>,
         ) -> PortFuture<'a, Result<(), String>> {
             Box::pin(async move {
@@ -240,7 +239,7 @@ mod tests {
                 self.calls
                     .lock()
                     .unwrap()
-                    .push(format!("swap({a},{b}{suffix})"));
+                    .push(format!("move({from},{to}{suffix})"));
                 Ok(())
             })
         }
@@ -325,21 +324,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn swap_requires_a_container_to_be_open() {
+    async fn move_requires_a_container_to_be_open() {
         let fixture = fixture(false);
-        let closed = invoke(&fixture, json!({"action": "swap", "a": 0, "b": 40})).await;
+        let closed = invoke(&fixture, json!({"action": "move", "from": 0, "to": 40})).await;
         assert_eq!(closed.status, ToolResultStatus::Error);
         assert!(text_of(&closed).contains("hand use_on"));
         assert!(fixture.door.calls.lock().unwrap().is_empty());
 
         server_opens(&fixture);
-        let swapped = invoke(&fixture, json!({"action": "swap", "a": 0, "b": 40})).await;
-        assert_eq!(swapped.status, ToolResultStatus::Success);
-        let thrown = invoke(&fixture, json!({"action": "swap", "a": 5, "b": 99})).await;
+        let moved = invoke(&fixture, json!({"action": "move", "from": 0, "to": 40})).await;
+        assert_eq!(moved.status, ToolResultStatus::Success);
+        let thrown = invoke(&fixture, json!({"action": "move", "from": 5, "to": 99})).await;
         assert_eq!(thrown.status, ToolResultStatus::Success);
         assert_eq!(
             *fixture.door.calls.lock().unwrap(),
-            vec!["swap(0,40)", "throw(5)"]
+            vec!["move(0,40)", "throw(5)"]
         );
     }
 
@@ -347,21 +346,22 @@ mod tests {
     async fn count_passes_through_to_the_door_but_not_with_discard() {
         let fixture = fixture(false);
         server_opens(&fixture);
-        let moved = invoke(&fixture, json!({"action": "swap", "a": 37, "b": 2, "count": 1})).await;
+        let moved =
+            invoke(&fixture, json!({"action": "move", "from": 37, "to": 2, "count": 1})).await;
         assert_eq!(moved.status, ToolResultStatus::Success);
-        assert!(format!("{moved:?}").contains("已挪 1 个"), "{moved:?}");
-        assert_eq!(*fixture.door.calls.lock().unwrap(), vec!["swap(37,2,1)"]);
+        assert_eq!(*fixture.door.calls.lock().unwrap(), vec!["move(37,2,1)"]);
 
-        let bad = invoke(&fixture, json!({"action": "swap", "a": 37, "b": 99, "count": 2})).await;
+        let bad =
+            invoke(&fixture, json!({"action": "move", "from": 37, "to": 99, "count": 2})).await;
         assert_eq!(bad.status, ToolResultStatus::Error);
         assert!(text_of(&bad).contains("不能与 99 丢弃连用"));
     }
 
     #[tokio::test]
-    async fn swap_refuses_when_a_different_screen_is_open() {
+    async fn move_refuses_when_a_different_screen_is_open() {
         let fixture = fixture(false);
         fixture.state.server_open(ScreenKind::Inventory);
-        let result = invoke(&fixture, json!({"action": "swap", "a": 1, "b": 2})).await;
+        let result = invoke(&fixture, json!({"action": "move", "from": 1, "to": 2})).await;
         assert_eq!(result.status, ToolResultStatus::Error);
         assert!(text_of(&result).contains("物品栏"));
     }

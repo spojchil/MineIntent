@@ -53,16 +53,14 @@ pub enum DoorCommand {
     },
     SwapOffhand,
     SelectSlot(u8),
-    /// 交换当前界面两格（菜单协议号，格空间随开着的界面）。任意两格经
-    /// 快捷栏中转三包同 tick 完成（实测原子，见 swap_probe）；一侧在
-    /// 快捷栏/副手则原生一包。
-    ///
-    /// `count`：仅当两格恰有一格为空时有效——从非空格挪这么多个到空格
-    /// （拆栈原语：拿起整组→右键放 n 个→余量放回，同 tick 多包，
-    /// 动词始末指针为空）。两格都有物品时给 count 是如实拒绝。
-    SwapSlots {
-        a: u16,
-        b: u16,
+    /// 把 `from` 格的东西弄到 `to` 格（菜单协议号，格空间随开着的界面）。
+    /// 语义按 `to` 格现状分派：空=移动（count 可拆栈）；同种物品=倒入
+    /// 合堆（count 可只倒几个，溢出留原格）；不同物品=整组对调
+    /// （count 不适用）。只出格（成品格）只能整组取走、不能倒入。
+    /// 全部编排为同 tick 多包点击，动词始末指针为空。
+    MoveSlots {
+        from: u16,
+        to: u16,
         count: Option<u32>,
     },
     /// 丢弃整格（屏内 Ctrl+Q 语义）。
@@ -213,61 +211,73 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             bot.set_selected_hotbar_slot(slot);
             Ok(())
         }
-        DoorCommand::SwapSlots { a, b, count: None } => {
+        DoorCommand::MoveSlots { from, to, count } => {
             let geometry = active_menu_geometry(bot);
-            let clicks = plan_swap(a, b, &geometry)?;
-            let mut touched = vec![a, b];
-            // 三连包经首个快捷格中转——它也会短暂变动再复位。
-            if clicks.len() > 1 {
-                touched.push(geometry.hotbar_start);
-            }
-            inner.mark_expected_slots(&touched);
-            let handle = ContainerHandleRef::new(geometry.container_id, bot.clone());
-            for click in clicks {
-                handle.click(ClickOperation::Swap(click));
-            }
-            Ok(())
-        }
-        DoorCommand::SwapSlots {
-            a,
-            b,
-            count: Some(count),
-        } => {
-            let geometry = active_menu_geometry(bot);
-            if a > geometry.max_slot || b > geometry.max_slot {
+            if from > geometry.max_slot || to > geometry.max_slot {
                 return Err(format!(
-                    "格号超出当前界面范围（0-{}）：{a}、{b}",
+                    "格号超出当前界面范围（0-{}）：{from}、{to}",
                     geometry.max_slot
                 ));
             }
-            if a == b {
+            if from == to {
                 return Err("两个格号相同，没有可挪的".to_owned());
             }
-            // 挪个数需要知道两格现状：从活动菜单读（服务器已确认的本地镜像）。
+            // 语义按两格现状分派：从活动菜单读（服务器已确认的本地镜像）。
             use azalea::entity::inventory::Inventory as InventoryComponent;
-            let (count_a, count_b) = bot
+            use azalea::inventory::item::MaxStackSizeExt;
+            let (from_stack, to_count, same_item) = bot
                 .try_query_self::<&InventoryComponent, _>(|inventory| {
                     let slots = inventory.menu().slots();
-                    let at = |slot: u16| {
-                        slots
-                            .get(usize::from(slot))
-                            .map_or(0, |item| item.count().max(0) as u32)
+                    let stack = |slot: u16| {
+                        slots.get(usize::from(slot)).and_then(|item| {
+                            if item.is_empty() {
+                                None
+                            } else {
+                                Some((
+                                    item.kind(),
+                                    item.count().max(0) as u32,
+                                    item.kind().max_stack_size().max(1) as u32,
+                                ))
+                            }
+                        })
                     };
-                    (at(a), at(b))
+                    let from_stack = stack(from);
+                    let to_stack = stack(to);
+                    let same_item = matches!(
+                        (&from_stack, &to_stack),
+                        (Some((a, _, _)), Some((b, _, _))) if a == b
+                    );
+                    (
+                        from_stack.map(|(_, count, cap)| (count, cap)),
+                        to_stack.map(|(_, count, _)| count),
+                        same_item,
+                    )
                 })
                 .map_err(|_| "读不到物品栏".to_owned())?;
-            let (source, target, available) = match (count_a, count_b) {
-                (0, 0) => return Err("两格都是空的，没有可挪的".to_owned()),
-                (_, 0) => (a, b, count_a),
-                (0, _) => (b, a, count_b),
-                _ => {
-                    return Err(
-                        "count 只在一方为空格时可用；两格都有物品时只能整组交换".to_owned()
-                    )
-                }
-            };
-            let clicks = plan_count_move(source, target, available, count)?;
-            inner.mark_expected_slots(&[a, b]);
+            let clicks = plan_move(
+                MoveEnds {
+                    from,
+                    to,
+                    from_stack,
+                    to_count,
+                    same_item,
+                    from_take_only: slot_is_take_only(bot, from),
+                    to_take_only: slot_is_take_only(bot, to),
+                },
+                count,
+                &geometry,
+            )?;
+            let mut touched = vec![from, to];
+            // SWAP 三连包经首个快捷格中转——它也会短暂变动再复位。
+            if clicks
+                .iter()
+                .filter(|click| matches!(click, ClickOperation::Swap(_)))
+                .count()
+                > 1
+            {
+                touched.push(geometry.hotbar_start);
+            }
+            inner.mark_expected_slots(&touched);
             let handle = ContainerHandleRef::new(geometry.container_id, bot.clone());
             for click in clicks {
                 handle.click(click);
@@ -371,32 +381,136 @@ pub(super) fn plan_swap(a: u16, b: u16, geometry: &MenuGeometry) -> Result<Vec<S
     ])
 }
 
-/// 把「从 source 挪 count 个到空格 target」翻译成点击序列（纯函数，可单测）。
+/// `plan_move` 的两端现状（纯数据，可单测）。
+pub(super) struct MoveEnds {
+    pub(super) from: u16,
+    pub(super) to: u16,
+    /// from 格：Some((数量, 堆叠上限))；None=空。
+    pub(super) from_stack: Option<(u32, u32)>,
+    /// to 格现有数量；None=空。
+    pub(super) to_count: Option<u32>,
+    /// 两格是否同种物品（都非空时才可能为 true）。
+    pub(super) same_item: bool,
+    /// 只出不进的格（成品格）。
+    pub(super) from_take_only: bool,
+    pub(super) to_take_only: bool,
+}
+
+/// 把「from 格的东西弄到 to 格」翻译成点击序列（纯函数，可单测）。
 ///
-/// 全挪 = 左键拿起 + 左键放下（两包）；部分挪 = 左键拿起整组 →
-/// 右键点 target n 次（每次放一个）→ 左键把余量放回 source。
-/// 同 tick 发出，点击序列始末指针都为空。
-pub(super) fn plan_count_move(
-    source: u16,
-    target: u16,
-    available: u32,
-    count: u32,
+/// 语义按 to 格现状分派：
+/// - **空**：整组走 SWAP（原生/三包中转）；给 count 走拆栈
+///   （左键拿起 → 右键放 n → 余量放回）；
+/// - **同种物品**：倒入合堆——左键拿起、左键倒入（顶到堆叠上限），
+///   溢出/余量左键放回；给 count 用右键逐个倒；
+/// - **不同物品**：整组对调（SWAP），count 不适用。
+///
+/// 只出格规则：成品格不能被倒入；作为来源时不能留余量（服务器会拒绝
+/// 放回，指针会悬着）——部分挪/装不下都如实拒绝。
+/// 全部同 tick 发出，点击序列始末指针为空。
+pub(super) fn plan_move(
+    ends: MoveEnds,
+    count: Option<u32>,
+    geometry: &MenuGeometry,
 ) -> Result<Vec<ClickOperation>, String> {
-    if count == 0 {
-        return Err("count 必须大于 0".to_owned());
-    }
-    if count > available {
-        return Err(format!("格 {source} 只有 {available} 个，挪不了 {count} 个"));
+    let MoveEnds {
+        from,
+        to,
+        from_stack,
+        to_count,
+        same_item,
+        from_take_only,
+        to_take_only,
+    } = ends;
+    let Some((available, cap)) = from_stack else {
+        return Err(format!("格 {from} 是空的，没有可挪的"));
+    };
+    if let Some(count) = count {
+        if count == 0 {
+            return Err("count 必须大于 0".to_owned());
+        }
+        if count > available {
+            return Err(format!("格 {from} 只有 {available} 个，挪不了 {count} 个"));
+        }
     }
     let left = |slot: u16| ClickOperation::Pickup(PickupClick::Left { slot: Some(slot) });
     let right = |slot: u16| ClickOperation::Pickup(PickupClick::Right { slot: Some(slot) });
-    if count == available {
-        return Ok(vec![left(source), left(target)]);
+    match to_count {
+        // 目标为空：整组对调（与空格对调=移动）或拆栈。
+        None => match count {
+            None => Ok(plan_swap(from, to, geometry)?
+                .into_iter()
+                .map(ClickOperation::Swap)
+                .collect()),
+            Some(count) => {
+                if from_take_only && count < available {
+                    return Err("成品格只能整组取走，不能留余量".to_owned());
+                }
+                if count == available {
+                    return Ok(vec![left(from), left(to)]);
+                }
+                let mut clicks = vec![left(from)];
+                clicks.extend((0..count).map(|_| right(to)));
+                clicks.push(left(from));
+                Ok(clicks)
+            }
+        },
+        // 同种物品：倒入合堆。
+        Some(existing) if same_item => {
+            if to_take_only {
+                return Err(format!("格 {to} 是成品格，只出不进"));
+            }
+            let space = cap.saturating_sub(existing);
+            if space == 0 {
+                return Err(format!("格 {to} 已经满了，倒不进去"));
+            }
+            let pour = count.unwrap_or_else(|| available.min(space));
+            if pour > space {
+                return Err(format!("格 {to} 只装得下 {space} 个"));
+            }
+            let remainder = available - pour;
+            if from_take_only && remainder > 0 {
+                return Err(format!("格 {to} 装不下全部，而成品格不能留余量"));
+            }
+            if pour == available {
+                // 整组拿起倒入，装得下就没有余量要放回。
+                return Ok(vec![left(from), left(to)]);
+            }
+            match count {
+                // 未指定 count：倒到 to 满为止，余量放回。
+                None => Ok(vec![left(from), left(to), left(from)]),
+                // 指定 count：右键逐个倒，余量放回。
+                Some(count) => {
+                    let mut clicks = vec![left(from)];
+                    clicks.extend((0..count).map(|_| right(to)));
+                    clicks.push(left(from));
+                    Ok(clicks)
+                }
+            }
+        }
+        // 不同物品：整组对调。
+        Some(_) => {
+            if count.is_some() {
+                return Err("两格物品不同，只能整组对调；count 不适用".to_owned());
+            }
+            Ok(plan_swap(from, to, geometry)?
+                .into_iter()
+                .map(ClickOperation::Swap)
+                .collect())
+        }
     }
-    let mut clicks = vec![left(source)];
-    clicks.extend((0..count).map(|_| right(target)));
-    clicks.push(left(source));
-    Ok(clicks)
+}
+
+/// 只出不进的格（成品格）。数据随容器种类扩展：玩家物品栏与工作台的
+/// 成品格都是 0 号；熔炉等落地时在此补行。
+fn slot_is_take_only(bot: &Client, slot: u16) -> bool {
+    use azalea::entity::inventory::Inventory as InventoryComponent;
+    use azalea::inventory::Menu;
+    bot.try_query_self::<&InventoryComponent, _>(|inventory| match inventory.menu() {
+        Menu::Player(_) | Menu::Crafting { .. } => slot == 0,
+        _ => false,
+    })
+    .unwrap_or(false)
 }
 
 /// 菜单号能否直接充当 SWAP 的目标按钮：快捷栏 9 格 → 按钮 0-8，
@@ -469,29 +583,114 @@ mod tests {
         assert!(plan_swap(7, 7, &player).is_err());
     }
 
+    fn ends(
+        from: u16,
+        to: u16,
+        from_stack: Option<(u32, u32)>,
+        to_count: Option<u32>,
+        same_item: bool,
+    ) -> MoveEnds {
+        MoveEnds {
+            from,
+            to,
+            from_stack,
+            to_count,
+            same_item,
+            from_take_only: false,
+            to_take_only: false,
+        }
+    }
+
     #[test]
-    fn count_moves_are_pickup_place_sequences_with_empty_cursor_at_both_ends() {
-        // 全挪：拿起 + 放下两包。
-        let plan = plan_count_move(37, 2, 8, 8).unwrap();
-        assert_eq!(plan.len(), 2);
-        // 部分挪：拿起 + n 次右键放一 + 余量放回。
-        let plan = plan_count_move(37, 2, 8, 3).unwrap();
+    fn move_to_empty_is_swap_or_split() {
+        let geometry = player_menu_geometry();
+        // 整组：走 SWAP（一侧快捷栏=原生一包）。
+        let plan = plan_move(ends(10, 38, Some((8, 64)), None, false), None, &geometry).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert!(matches!(plan[0], ClickOperation::Swap(_)));
+        // 拆栈：拿起 + n 右键 + 余量放回。
+        let plan = plan_move(ends(37, 2, Some((8, 64)), None, false), Some(3), &geometry).unwrap();
         assert_eq!(plan.len(), 5);
         assert!(matches!(
             plan[0],
             ClickOperation::Pickup(PickupClick::Left { slot: Some(37) })
         ));
         assert!(matches!(
-            plan[1],
-            ClickOperation::Pickup(PickupClick::Right { slot: Some(2) })
-        ));
-        assert!(matches!(
             plan[4],
             ClickOperation::Pickup(PickupClick::Left { slot: Some(37) })
         ));
-        // 越量与零个如实拒绝。
-        assert!(plan_count_move(37, 2, 8, 9).is_err());
-        assert!(plan_count_move(37, 2, 8, 0).is_err());
+        // count=全部：拿起+放下两包。
+        let plan = plan_move(ends(37, 2, Some((8, 64)), None, false), Some(8), &geometry).unwrap();
+        assert_eq!(plan.len(), 2);
+        // 越量/零个/空来源如实拒绝。
+        assert!(plan_move(ends(37, 2, Some((8, 64)), None, false), Some(9), &geometry).is_err());
+        assert!(plan_move(ends(37, 2, Some((8, 64)), None, false), Some(0), &geometry).is_err());
+        assert!(plan_move(ends(37, 2, None, None, false), None, &geometry).is_err());
+    }
+
+    #[test]
+    fn merge_pours_into_same_item_respecting_the_stack_cap() {
+        let geometry = player_menu_geometry();
+        // 装得下：拿起 + 倒入两包。
+        let plan =
+            plan_move(ends(10, 20, Some((8, 64)), Some(40), true), None, &geometry).unwrap();
+        assert_eq!(plan.len(), 2);
+        // 装不下全部：倒到满，余量放回（三包）。
+        let plan =
+            plan_move(ends(10, 20, Some((30, 64)), Some(50), true), None, &geometry).unwrap();
+        assert_eq!(plan.len(), 3);
+        // 指定 count：右键逐个倒。
+        let plan =
+            plan_move(ends(10, 20, Some((8, 64)), Some(40), true), Some(2), &geometry).unwrap();
+        assert_eq!(plan.len(), 4);
+        // 目标已满 / count 超过剩余空间：如实拒绝。
+        assert!(plan_move(ends(10, 20, Some((8, 64)), Some(64), true), None, &geometry).is_err());
+        assert!(
+            plan_move(ends(10, 20, Some((30, 64)), Some(60), true), Some(5), &geometry).is_err()
+        );
+    }
+
+    #[test]
+    fn different_items_only_do_whole_exchange() {
+        let geometry = player_menu_geometry();
+        let plan =
+            plan_move(ends(10, 20, Some((8, 64)), Some(3), false), None, &geometry).unwrap();
+        assert_eq!(plan.len(), 3, "两侧都不在快捷栏：三包中转对调");
+        assert!(
+            plan_move(ends(10, 20, Some((8, 64)), Some(3), false), Some(2), &geometry).is_err()
+        );
+    }
+
+    #[test]
+    fn take_only_slots_never_keep_a_remainder_and_never_accept() {
+        let geometry = crafting_menu_geometry();
+        let take_only_source = |to_count: Option<u32>, same: bool| MoveEnds {
+            from: 0,
+            to: 40,
+            from_stack: Some((4, 64)),
+            to_count,
+            same_item: same,
+            from_take_only: true,
+            to_take_only: false,
+        };
+        // 整组取走（目标空）：合法。
+        assert!(plan_move(take_only_source(None, false), None, &geometry).is_ok());
+        assert!(plan_move(take_only_source(None, false), Some(4), &geometry).is_ok());
+        // 部分取走：拒绝（余量放不回成品格）。
+        assert!(plan_move(take_only_source(None, false), Some(2), &geometry).is_err());
+        // 倒入同种但装不下全部：拒绝。
+        assert!(plan_move(take_only_source(Some(63), true), None, &geometry).is_err());
+        // 往成品格里倒：拒绝。
+        let into_result = MoveEnds {
+            from: 40,
+            to: 0,
+            from_stack: Some((4, 64)),
+            to_count: Some(4),
+            same_item: true,
+            from_take_only: false,
+            to_take_only: true,
+        };
+        assert!(plan_move(into_result, None, &geometry).is_err());
     }
 
     #[test]

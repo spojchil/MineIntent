@@ -75,9 +75,9 @@ async fn main() -> Result<(), String> {
     let planks = find_slot(&module, "oak_planks").ok_or("背包里没有橡木木板")?;
     println!("[探针] 木板在格 {planks}；swap({planks}, 2) 入摆料格");
     module
-        .execute(DoorCommand::SwapSlots {
-            a: planks,
-            b: 2,
+        .execute(DoorCommand::MoveSlots {
+            from: planks,
+            to: 2,
             count: None,
         })
         .await
@@ -93,9 +93,9 @@ async fn main() -> Result<(), String> {
         Some(slot) if slot != 2 => {
             println!("[探针] 第二组木板在格 {slot}；swap({slot}, 5)");
             module
-                .execute(DoorCommand::SwapSlots {
-                    a: slot,
-                    b: 5,
+                .execute(DoorCommand::MoveSlots {
+                    from: slot,
+                    to: 5,
                     count: None,
                 })
                 .await
@@ -122,9 +122,9 @@ async fn main() -> Result<(), String> {
     if result_filled {
         println!("[探针] swap(0, 44) 取成品到快捷栏末格");
         module
-            .execute(DoorCommand::SwapSlots {
-                a: 0,
-                b: 44,
+            .execute(DoorCommand::MoveSlots {
+                from: 0,
+                to: 44,
                 count: None,
             })
             .await

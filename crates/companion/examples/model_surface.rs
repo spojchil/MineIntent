@@ -42,10 +42,10 @@ impl ChatHistory for NoDoor {
     }
 }
 impl InventoryDoor for NoDoor {
-    fn swap_slots<'a>(
+    fn move_slots<'a>(
         &'a self,
-        _a: u16,
-        _b: u16,
+        _from: u16,
+        _to: u16,
         _count: Option<u32>,
     ) -> PortFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
@@ -374,15 +374,15 @@ async fn main() {
     println!("chat_box say：`{}`\n", call(chat_box.as_ref(), "chat_box", json!({"action":"say","text":"你好"})).await);
     let inventory = &providers[1].1;
     println!("inventory open（46 格清单+用法全文）：\n\n```text\n{}\n```\n", call(inventory.as_ref(), "inventory", json!({"action":"open"})).await);
-    println!("inventory swap：`{}`", call(inventory.as_ref(), "inventory", json!({"action":"swap","a":10,"b":38})).await);
-    println!("inventory swap 丢弃：`{}`", call(inventory.as_ref(), "inventory", json!({"action":"swap","a":10,"b":99})).await);
+    println!("inventory move：`{}`", call(inventory.as_ref(), "inventory", json!({"action":"move","from":10,"to":38})).await);
+    println!("inventory move 丢弃：`{}`", call(inventory.as_ref(), "inventory", json!({"action":"move","from":10,"to":99})).await);
     println!("inventory close：`{}`\n", call(inventory.as_ref(), "inventory", json!({"action":"close"})).await);
     let container = &providers[2].1;
     // 容器没有 open 动作：开屏由服务器发起，这里模拟组合根对开屏事实的
     // 处置（登记状态）后取回执。开屏通知全文见 §五。
     screen_state.server_open(screens::ScreenKind::Container);
-    println!("container swap（取成品到快捷栏）：`{}`", call(container.as_ref(), "container", json!({"action":"swap","a":0,"b":40})).await);
-    println!("container swap 拆栈：`{}`", call(container.as_ref(), "container", json!({"action":"swap","a":37,"b":2,"count":1})).await);
+    println!("container move（取成品到快捷栏）：`{}`", call(container.as_ref(), "container", json!({"action":"move","from":0,"to":40})).await);
+    println!("container move 拆栈：`{}`", call(container.as_ref(), "container", json!({"action":"move","from":37,"to":2,"count":1})).await);
     println!("container close：`{}`\n", call(container.as_ref(), "container", json!({"action":"close"})).await);
     let motion_tools = &providers[4].1;
     println!("motion go_to：`{}`", call(motion_tools.as_ref(), "motion", json!({"action":"go_to","target":[35.0,72.0,3.0]})).await);
@@ -394,11 +394,11 @@ async fn main() {
     println!("## 四、拒绝与报错话术（真实调用产出）\n");
     let _ = call(inventory.as_ref(), "inventory", json!({"action":"open"})).await; // 占屏
     println!("- 物品栏开着时 chat_box say：`{}`", call(chat_box.as_ref(), "chat_box", json!({"action":"say","text":"你好"})).await);
-    println!("- 物品栏没开时 swap：先 close 再试 → `{}`", {
+    println!("- 物品栏没开时 move：先 close 再试 → `{}`", {
         let _ = call(inventory.as_ref(), "inventory", json!({"action":"close"})).await;
-        call(inventory.as_ref(), "inventory", json!({"action":"swap","a":1,"b":2})).await
+        call(inventory.as_ref(), "inventory", json!({"action":"move","from":1,"to":2})).await
     });
-    println!("- 容器没开时 swap：`{}`", call(container.as_ref(), "container", json!({"action":"swap","a":1,"b":2})).await);
+    println!("- 容器没开时 move：`{}`", call(container.as_ref(), "container", json!({"action":"move","from":1,"to":2})).await);
     println!("- 未知 action：`{}`", call(chat_box.as_ref(), "chat_box", json!({"action":"dance"})).await);
     println!("- motion 缺参数：`{}`", call(motion_tools.as_ref(), "motion", json!({"action":"forward"})).await);
     println!("- look 越界俯仰：`{}`", call(motion_tools.as_ref(), "look", json!({"action":"face","yaw":0.0,"pitch":120.0})).await);

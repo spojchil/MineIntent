@@ -2,10 +2,10 @@
 //!
 //! 原版同构：打开不发包（E 键是纯客户端动作），格位编号即协议号
 //! （0 合成结果、1-4 随身合成、5-8 盔甲、9-35 主背包、36-44 快捷栏、
-//! 45 副手）；操作单动词 **swap 一次一对**——指针持物状态对模型不存在
-//! （交换开始空、结束空），伪格 99 表示丢弃（只进：swap(a,99)=把 a 整格
-//! 丢出去）。非法交换（盔甲格类型不符、结果格放入等）由服务器仲裁，
-//! 门如实转达。
+//! 45 副手）；操作单动词 **move 一次一对**（移动/合堆/对调三合一，语义
+//! 随 to 格现状）——指针持物状态对模型不存在（动词开始空、结束空），
+//! 伪格 99 表示丢弃（只进：move(from,99)=把 from 整格丢出去）。
+//! 非法放置（盔甲格类型不符、成品格倒入等）由机器与服务器如实仲裁。
 //!
 //! 开屏期间预期之外的格位变化（拾取、合成结果出现等）由己投递通知；
 //! 本屏只负责「开着没有」这个事实（[`ScreenState`]）。
@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use world::SnapshotSource;
 
-/// 丢弃伪格：swap(a, 99) = 把 a 整格丢出去（屏内 Ctrl+Q 语义）。只进不出。
+/// 丢弃伪格：move(from, 99) = 把 from 整格丢出去（屏内 Ctrl+Q 语义）。只进不出。
 pub const DISCARD_SLOT: u16 = 99;
 
 /// 当前开着的屏的种类。一次只能开一个屏（原版事实）；
@@ -92,15 +92,15 @@ pub(crate) fn kind_word(kind: ScreenKind) -> &'static str {
     }
 }
 
-/// 接入模块写口的窄化：交换与丢弃都在 tick 回调内原子执行，
+/// 接入模块写口的窄化：搬动与丢弃都在 tick 回调内原子执行，
 /// 格空间随当前开着的界面（机器按活动菜单解释格号）。
 pub trait InventoryDoor: Send + Sync {
-    /// `count`：仅当两格恰有一格为空时有效——从非空格挪这么多个到空格
-    /// （拆栈）；None = 整组交换。合法性由机器按两格现状如实仲裁。
-    fn swap_slots<'a>(
+    /// 把 from 格的东西弄到 to 格。语义按 to 现状分派（空=移动、同种=
+    /// 合堆、不同=对调），count 拆栈/限量；合法性由机器按两格现状仲裁。
+    fn move_slots<'a>(
         &'a self,
-        a: u16,
-        b: u16,
+        from: u16,
+        to: u16,
         count: Option<u32>,
     ) -> PortFuture<'a, Result<(), String>>;
     fn throw_slot<'a>(&'a self, slot: u16) -> PortFuture<'a, Result<(), String>>;
@@ -112,9 +112,11 @@ const TOOL_NAME: &str = "inventory";
 
 const USAGE: &str = "物品栏用法：格号即协议号——0 合成结果（只出不进），1-4 随身合成格（2×2 摆料，\
 成品出现在 0），5-8 盔甲（头/胸/腿/脚），9-35 主背包，36-44 快捷栏，45 副手。\
-{action:\"swap\", a, b} 交换两格内容，一次一对；b 用 99 表示把 a 整格丢出去；\
-两格恰有一格为空时可加 count 只挪这么多个过去（拆栈），如 {action:\"swap\", a:9, b:2, count:1}。\
-非法放置（如盔甲格放非装备）会被世界拒绝。开着物品栏时无法移动或与世界交互。";
+{action:\"move\", from, to} 把 from 格的东西弄到 to 格，语义随 to 现状：to 为空=移过去\
+（可加 count 只挪几个，拆栈）；to 是同种物品=倒入合堆（可加 count 只倒几个，装不下的留在原格）；\
+to 是不同物品=整组对调（count 不适用）；to 用 99=把 from 整格丢出去。\
+成品格（0）只能整组取走。非法放置（如盔甲格放非装备）会被世界拒绝。\
+开着物品栏时无法移动或与世界交互。";
 
 pub struct InventoryScreen {
     occupancy: Arc<Occupancy>,
@@ -153,19 +155,19 @@ impl InventoryScreen {
         )
     }
 
-    async fn swap(
+    async fn move_items(
         &self,
         call_id: agent::ToolCallId,
-        a: Option<&Value>,
-        b: Option<&Value>,
+        from: Option<&Value>,
+        to: Option<&Value>,
         count: Option<&Value>,
     ) -> ToolResult {
         if self.state.current() != Some(ScreenKind::Inventory) {
             return ToolResult::failure(call_id, "物品栏没有打开；先 open");
         }
         let slot = |value: Option<&Value>| value.and_then(Value::as_u64).map(|slot| slot as u16);
-        let (Some(a), Some(b)) = (slot(a), slot(b)) else {
-            return ToolResult::failure(call_id, "swap 需要整数参数 a 与 b；请改写调用");
+        let (Some(from), Some(to)) = (slot(from), slot(to)) else {
+            return ToolResult::failure(call_id, "move 需要整数参数 from 与 to；请改写调用");
         };
         let count = match count {
             None => None,
@@ -176,21 +178,21 @@ impl InventoryScreen {
                 }
             },
         };
-        if count.is_some() && b == DISCARD_SLOT {
+        if count.is_some() && to == DISCARD_SLOT {
             return ToolResult::failure(
                 call_id,
-                "count 只用于与空格之间挪个数，不能与 99 丢弃连用；请改写调用",
+                "count 不能与 99 丢弃连用（丢弃是整格）；请改写调用",
             );
         }
-        let outcome = if b == DISCARD_SLOT {
-            self.door.throw_slot(a).await
+        let outcome = if to == DISCARD_SLOT {
+            self.door.throw_slot(from).await
         } else {
-            self.door.swap_slots(a, b, count).await
+            self.door.move_slots(from, to, count).await
         };
         if let Err(reason) = outcome {
             return ToolResult::failure(call_id, reason);
         }
-        // 点击本地预演即时生效，本 tick 的快照已含交换后内容。
+        // 点击本地预演即时生效，本 tick 的快照已含搬动后内容。
         let snapshot = self.snapshots.latest();
         let describe = |slot: u16| -> String {
             snapshot
@@ -202,16 +204,14 @@ impl InventoryScreen {
                 .map(|entry| format!("{} ×{}", entry.item_name, entry.count))
                 .unwrap_or_else(|| "空".to_owned())
         };
-        let summary = if b == DISCARD_SLOT {
-            format!("已丢弃；格 {a} 现在：{}", describe(a))
-        } else if let Some(count) = count {
-            format!(
-                "已挪 {count} 个；格 {a}：{}，格 {b}：{}",
-                describe(a),
-                describe(b)
-            )
+        let summary = if to == DISCARD_SLOT {
+            format!("已丢弃；格 {from} 现在：{}", describe(from))
         } else {
-            format!("已交换；格 {a}：{}，格 {b}：{}", describe(a), describe(b))
+            format!(
+                "已完成；格 {from}：{}，格 {to}：{}",
+                describe(from),
+                describe(to)
+            )
         };
         ToolResult::success_json(call_id, json!({ "done": summary }))
     }
@@ -232,19 +232,19 @@ impl dispatch::ToolProvider for InventoryScreen {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["open", "swap", "close"],
-                        "description": "open=打开并列出全部格位与用法；swap=交换两格（一次一对）；close=关闭"
+                        "enum": ["open", "move", "close"],
+                        "description": "open=打开并列出全部格位与用法；move=把 from 格的东西弄到 to 格（移动/合堆/对调）；close=关闭"
                     },
-                    "a": { "type": "integer", "description": "swap 用：格号（0-45）" },
-                    "b": { "type": "integer", "description": "swap 用：格号（0-45），或 99=把 a 整格丢出去" },
-                    "count": { "type": "integer", "description": "swap 可选：两格恰有一格为空时，从非空格挪这么多个到空格（拆栈）；不给则整组交换" }
+                    "from": { "type": "integer", "description": "move 用：来源格号（0-45）" },
+                    "to": { "type": "integer", "description": "move 用：目标格号（0-45）——空=移过去、同种物品=倒入合堆、不同物品=整组对调；99=把 from 整格丢出去" },
+                    "count": { "type": "integer", "description": "move 可选：只挪/只倒这么多个（to 为空或同种物品时）；不给则整组" }
                 },
                 "required": ["action"],
                 "additionalProperties": false
             }),
         );
         definition.description = Some(
-            "物品栏。打开才能看到格位并整理（交换/穿装备/摆随身合成/丢弃）；\
+            "物品栏。打开才能看到格位并整理（搬动/合堆/穿装备/摆随身合成/丢弃）；\
 打开期间无法移动或与世界交互，看完记得关。"
                 .to_owned(),
         );
@@ -264,11 +264,11 @@ impl dispatch::ToolProvider for InventoryScreen {
             };
             match arguments.get("action").and_then(Value::as_str) {
                 Some("open") => self.open(call_id),
-                Some("swap") => {
-                    self.swap(
+                Some("move") => {
+                    self.move_items(
                         call_id,
-                        arguments.get("a"),
-                        arguments.get("b"),
+                        arguments.get("from"),
+                        arguments.get("to"),
                         arguments.get("count"),
                     )
                     .await
@@ -276,7 +276,7 @@ impl dispatch::ToolProvider for InventoryScreen {
                 Some("close") => self.close(call_id),
                 _ => ToolResult::failure(
                     call_id,
-                    "action 必须是 open/swap/close 之一；请改写调用",
+                    "action 必须是 open/move/close 之一；请改写调用",
                 ),
             }
         })
@@ -298,10 +298,10 @@ mod tests {
     }
 
     impl InventoryDoor for RecordingDoor {
-        fn swap_slots<'a>(
+        fn move_slots<'a>(
             &'a self,
-            a: u16,
-            b: u16,
+            from: u16,
+            to: u16,
             count: Option<u32>,
         ) -> PortFuture<'a, Result<(), String>> {
             Box::pin(async move {
@@ -312,7 +312,7 @@ mod tests {
                 self.calls
                     .lock()
                     .unwrap()
-                    .push(format!("swap({a},{b}{suffix})"));
+                    .push(format!("move({from},{to}{suffix})"));
                 Ok(())
             })
         }
@@ -408,20 +408,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn swap_requires_open_then_reaches_the_door() {
+    async fn move_requires_open_then_reaches_the_door() {
         let fixture = fixture(None);
-        let closed = invoke(&fixture, json!({"action": "swap", "a": 10, "b": 38})).await;
+        let closed = invoke(&fixture, json!({"action": "move", "from": 10, "to": 38})).await;
         assert_eq!(closed.status, ToolResultStatus::Error);
         assert!(fixture.door.calls.lock().unwrap().is_empty());
 
         invoke(&fixture, json!({"action": "open"})).await;
-        let swapped = invoke(&fixture, json!({"action": "swap", "a": 10, "b": 38})).await;
-        assert_eq!(swapped.status, ToolResultStatus::Success);
-        let thrown = invoke(&fixture, json!({"action": "swap", "a": 10, "b": 99})).await;
+        let moved = invoke(&fixture, json!({"action": "move", "from": 10, "to": 38})).await;
+        assert_eq!(moved.status, ToolResultStatus::Success);
+        let counted =
+            invoke(&fixture, json!({"action": "move", "from": 10, "to": 20, "count": 3})).await;
+        assert_eq!(counted.status, ToolResultStatus::Success);
+        let thrown = invoke(&fixture, json!({"action": "move", "from": 10, "to": 99})).await;
         assert_eq!(thrown.status, ToolResultStatus::Success);
         assert_eq!(
             *fixture.door.calls.lock().unwrap(),
-            vec!["swap(10,38)", "throw(10)"]
+            vec!["move(10,38)", "move(10,20,3)", "throw(10)"]
         );
     }
 
@@ -429,7 +432,7 @@ mod tests {
     async fn door_refusal_comes_back_verbatim() {
         let fixture = fixture(Some("盔甲格只收对应装备"));
         invoke(&fixture, json!({"action": "open"})).await;
-        let result = invoke(&fixture, json!({"action": "swap", "a": 10, "b": 5})).await;
+        let result = invoke(&fixture, json!({"action": "move", "from": 10, "to": 5})).await;
         assert_eq!(result.status, ToolResultStatus::Error);
         assert!(text_of(&result).contains("盔甲格只收对应装备"));
     }
