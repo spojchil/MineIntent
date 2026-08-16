@@ -420,7 +420,7 @@ async fn main() {
     let scan = &providers[6].1;
     println!("\nscan 环视（呈现样例）：\n\n```text\n{}\n```\n", call(scan.as_ref(), "scan", json!({})).await);
     println!("scan 定向（呈现样例）：\n\n```text\n{}\n```\n", call(scan.as_ref(), "scan", json!({"at":[[6,72,3],[0,60,0]]})).await);
-    println!("scan 增量（呈现样例；只报自上次以来的变化）：\n\n```text\n{}\n```\n", call(scan.as_ref(), "scan", json!({"changes": true})).await);
+    println!("scan 增量（呈现样例；与已见过的对比，git 式差异行）：\n\n```text\n{}\n```\n", call(scan.as_ref(), "scan", json!({"changes": true})).await);
 
     // ---- 四、拒绝与报错话术 ----
     println!("## 四、拒绝与报错话术（真实调用产出）\n");

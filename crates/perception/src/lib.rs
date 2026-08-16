@@ -147,7 +147,7 @@ impl ToolProvider for PerceptionTools {
                     },
                     "changes": {
                         "type": "boolean",
-                        "description": "可选：只报自上次以来视野内的变化（新看到/变了/亲眼见空），比环视省得多。没列出的坐标不代表没东西；想确认具体位置用 at。与 at 互斥"
+                        "description": "可选：把当前视野与你已见过的对比，git 式只报差异行（+ 新成立、- 不再成立，每行 (x, y, z, 方块名)），比环视省得多。没列出的坐标不代表没东西；想确认具体位置用 at。与 at 互斥"
                     }
                 },
                 "additionalProperties": false
@@ -272,8 +272,8 @@ mod tests {
         let ok = tools.call(call(json!({"changes": true}))).await;
         assert_eq!(ok.status, ToolResultStatus::Success);
         let text = format!("{:?}", ok.content);
-        assert!(text.contains("新看到"), "{text}");
-        assert!(text.contains("定向查看"), "{text}");
+        assert!(text.contains("+ (3, 64, 3, oak_log)"), "{text}");
+        assert!(text.contains("未列出≠没有"), "{text}");
 
         let both = tools
             .call(call(json!({"changes": true, "at": [[1, 2, 3]]})))
