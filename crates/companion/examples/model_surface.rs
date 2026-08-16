@@ -42,7 +42,12 @@ impl ChatHistory for NoDoor {
     }
 }
 impl InventoryDoor for NoDoor {
-    fn swap_slots<'a>(&'a self, _a: u16, _b: u16) -> PortFuture<'a, Result<(), String>> {
+    fn swap_slots<'a>(
+        &'a self,
+        _a: u16,
+        _b: u16,
+        _count: Option<u32>,
+    ) -> PortFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
     fn throw_slot<'a>(&'a self, _slot: u16) -> PortFuture<'a, Result<(), String>> {

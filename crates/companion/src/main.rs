@@ -150,8 +150,13 @@ impl HandDoor for ModuleHandDoor {
 struct ModuleInventoryDoor(Arc<Module>);
 
 impl InventoryDoor for ModuleInventoryDoor {
-    fn swap_slots<'a>(&'a self, a: u16, b: u16) -> agent::PortFuture<'a, Result<(), String>> {
-        Box::pin(async move { self.0.execute(DoorCommand::SwapSlots { a, b }).await })
+    fn swap_slots<'a>(
+        &'a self,
+        a: u16,
+        b: u16,
+        count: Option<u32>,
+    ) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::SwapSlots { a, b, count }).await })
     }
     fn throw_slot<'a>(&'a self, slot: u16) -> agent::PortFuture<'a, Result<(), String>> {
         Box::pin(async move { self.0.execute(DoorCommand::ThrowSlot(slot)).await })

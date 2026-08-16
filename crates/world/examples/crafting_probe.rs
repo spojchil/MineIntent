@@ -75,7 +75,11 @@ async fn main() -> Result<(), String> {
     let planks = find_slot(&module, "oak_planks").ok_or("背包里没有橡木木板")?;
     println!("[探针] 木板在格 {planks}；swap({planks}, 2) 入摆料格");
     module
-        .execute(DoorCommand::SwapSlots { a: planks, b: 2 })
+        .execute(DoorCommand::SwapSlots {
+            a: planks,
+            b: 2,
+            count: None,
+        })
         .await
         .map_err(|error| format!("swap 入格 2 被拒：{error}"))?;
     wait_ticks(&module, 10).await;
@@ -89,7 +93,11 @@ async fn main() -> Result<(), String> {
         Some(slot) if slot != 2 => {
             println!("[探针] 第二组木板在格 {slot}；swap({slot}, 5)");
             module
-                .execute(DoorCommand::SwapSlots { a: slot, b: 5 })
+                .execute(DoorCommand::SwapSlots {
+                    a: slot,
+                    b: 5,
+                    count: None,
+                })
                 .await
                 .map_err(|error| format!("swap 入格 5 被拒：{error}"))?;
         }
@@ -114,7 +122,11 @@ async fn main() -> Result<(), String> {
     if result_filled {
         println!("[探针] swap(0, 44) 取成品到快捷栏末格");
         module
-            .execute(DoorCommand::SwapSlots { a: 0, b: 44 })
+            .execute(DoorCommand::SwapSlots {
+                a: 0,
+                b: 44,
+                count: None,
+            })
             .await
             .map_err(|error| format!("取成品被拒：{error}"))?;
         wait_ticks(&module, 20).await;

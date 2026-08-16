@@ -94,7 +94,14 @@ pub(crate) fn kind_word(kind: ScreenKind) -> &'static str {
 /// 接入模块写口的窄化：交换与丢弃都在 tick 回调内原子执行，
 /// 格空间随当前开着的界面（机器按活动菜单解释格号）。
 pub trait InventoryDoor: Send + Sync {
-    fn swap_slots<'a>(&'a self, a: u16, b: u16) -> PortFuture<'a, Result<(), String>>;
+    /// `count`：仅当两格恰有一格为空时有效——从非空格挪这么多个到空格
+    /// （拆栈）；None = 整组交换。合法性由机器按两格现状如实仲裁。
+    fn swap_slots<'a>(
+        &'a self,
+        a: u16,
+        b: u16,
+        count: Option<u32>,
+    ) -> PortFuture<'a, Result<(), String>>;
     fn throw_slot<'a>(&'a self, slot: u16) -> PortFuture<'a, Result<(), String>>;
     /// 关闭当前开着的服务端容器（发 ContainerClose）。物品栏屏用不到它。
     fn close_container<'a>(&'a self) -> PortFuture<'a, Result<(), String>>;
@@ -104,7 +111,8 @@ const TOOL_NAME: &str = "inventory";
 
 const USAGE: &str = "物品栏用法：格号即协议号——0 合成结果（只出不进），1-4 随身合成格（2×2 摆料，\
 成品出现在 0），5-8 盔甲（头/胸/腿/脚），9-35 主背包，36-44 快捷栏，45 副手。\
-{action:\"swap\", a, b} 交换两格内容，一次一对；b 用 99 表示把 a 整格丢出去。\
+{action:\"swap\", a, b} 交换两格内容，一次一对；b 用 99 表示把 a 整格丢出去；\
+两格恰有一格为空时可加 count 只挪这么多个过去（拆栈），如 {action:\"swap\", a:9, b:2, count:1}。\
 非法放置（如盔甲格放非装备）会被世界拒绝。开着物品栏时无法移动或与世界交互。";
 
 pub struct InventoryScreen {
@@ -149,6 +157,7 @@ impl InventoryScreen {
         call_id: agent::ToolCallId,
         a: Option<&Value>,
         b: Option<&Value>,
+        count: Option<&Value>,
     ) -> ToolResult {
         if self.state.current() != Some(ScreenKind::Inventory) {
             return ToolResult::failure(call_id, "物品栏没有打开；先 open");
@@ -157,10 +166,25 @@ impl InventoryScreen {
         let (Some(a), Some(b)) = (slot(a), slot(b)) else {
             return ToolResult::failure(call_id, "swap 需要整数参数 a 与 b；请改写调用");
         };
+        let count = match count {
+            None => None,
+            Some(value) => match value.as_u64() {
+                Some(count) => Some(count as u32),
+                None => {
+                    return ToolResult::failure(call_id, "count 必须是正整数；请改写调用");
+                }
+            },
+        };
+        if count.is_some() && b == DISCARD_SLOT {
+            return ToolResult::failure(
+                call_id,
+                "count 只用于与空格之间挪个数，不能与 99 丢弃连用；请改写调用",
+            );
+        }
         let outcome = if b == DISCARD_SLOT {
             self.door.throw_slot(a).await
         } else {
-            self.door.swap_slots(a, b).await
+            self.door.swap_slots(a, b, count).await
         };
         if let Err(reason) = outcome {
             return ToolResult::failure(call_id, reason);
@@ -179,6 +203,12 @@ impl InventoryScreen {
         };
         let summary = if b == DISCARD_SLOT {
             format!("已丢弃；格 {a} 现在：{}", describe(a))
+        } else if let Some(count) = count {
+            format!(
+                "已挪 {count} 个；格 {a}：{}，格 {b}：{}",
+                describe(a),
+                describe(b)
+            )
         } else {
             format!("已交换；格 {a}：{}，格 {b}：{}", describe(a), describe(b))
         };
@@ -205,7 +235,8 @@ impl dispatch::ToolProvider for InventoryScreen {
                         "description": "open=打开并列出全部格位与用法；swap=交换两格（一次一对）；close=关闭"
                     },
                     "a": { "type": "integer", "description": "swap 用：格号（0-45）" },
-                    "b": { "type": "integer", "description": "swap 用：格号（0-45），或 99=把 a 整格丢出去" }
+                    "b": { "type": "integer", "description": "swap 用：格号（0-45），或 99=把 a 整格丢出去" },
+                    "count": { "type": "integer", "description": "swap 可选：两格恰有一格为空时，从非空格挪这么多个到空格（拆栈）；不给则整组交换" }
                 },
                 "required": ["action"],
                 "additionalProperties": false
@@ -233,8 +264,13 @@ impl dispatch::ToolProvider for InventoryScreen {
             match arguments.get("action").and_then(Value::as_str) {
                 Some("open") => self.open(call_id),
                 Some("swap") => {
-                    self.swap(call_id, arguments.get("a"), arguments.get("b"))
-                        .await
+                    self.swap(
+                        call_id,
+                        arguments.get("a"),
+                        arguments.get("b"),
+                        arguments.get("count"),
+                    )
+                    .await
                 }
                 Some("close") => self.close(call_id),
                 _ => ToolResult::failure(
@@ -261,12 +297,21 @@ mod tests {
     }
 
     impl InventoryDoor for RecordingDoor {
-        fn swap_slots<'a>(&'a self, a: u16, b: u16) -> PortFuture<'a, Result<(), String>> {
+        fn swap_slots<'a>(
+            &'a self,
+            a: u16,
+            b: u16,
+            count: Option<u32>,
+        ) -> PortFuture<'a, Result<(), String>> {
             Box::pin(async move {
                 if let Some(reason) = self.refuse {
                     return Err(reason.to_owned());
                 }
-                self.calls.lock().unwrap().push(format!("swap({a},{b})"));
+                let suffix = count.map(|n| format!(",{n}")).unwrap_or_default();
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("swap({a},{b}{suffix})"));
                 Ok(())
             })
         }

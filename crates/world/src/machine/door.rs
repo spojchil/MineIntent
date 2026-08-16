@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 
 use azalea::container::ContainerHandleRef;
 use azalea::entity::{LoadedBy, LookDirection, Position};
-use azalea::inventory::operations::{ClickOperation, SwapClick, ThrowClick};
+use azalea::inventory::operations::{ClickOperation, PickupClick, SwapClick, ThrowClick};
 use azalea::pathfinder::goals::BlockPosGoal;
 use azalea::pathfinder::{PathfinderClientExt, PathfinderOpts};
 use azalea::protocol::packets::game::s_player_action;
@@ -56,9 +56,14 @@ pub enum DoorCommand {
     /// 交换当前界面两格（菜单协议号，格空间随开着的界面）。任意两格经
     /// 快捷栏中转三包同 tick 完成（实测原子，见 swap_probe）；一侧在
     /// 快捷栏/副手则原生一包。
+    ///
+    /// `count`：仅当两格恰有一格为空时有效——从非空格挪这么多个到空格
+    /// （拆栈原语：拿起整组→右键放 n 个→余量放回，同 tick 多包，
+    /// 动词始末指针为空）。两格都有物品时给 count 是如实拒绝。
     SwapSlots {
         a: u16,
         b: u16,
+        count: Option<u32>,
     },
     /// 丢弃整格（屏内 Ctrl+Q 语义）。
     ThrowSlot(u16),
@@ -208,7 +213,7 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             bot.set_selected_hotbar_slot(slot);
             Ok(())
         }
-        DoorCommand::SwapSlots { a, b } => {
+        DoorCommand::SwapSlots { a, b, count: None } => {
             let geometry = active_menu_geometry(bot);
             let clicks = plan_swap(a, b, &geometry)?;
             let mut touched = vec![a, b];
@@ -220,6 +225,52 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             let handle = ContainerHandleRef::new(geometry.container_id, bot.clone());
             for click in clicks {
                 handle.click(ClickOperation::Swap(click));
+            }
+            Ok(())
+        }
+        DoorCommand::SwapSlots {
+            a,
+            b,
+            count: Some(count),
+        } => {
+            let geometry = active_menu_geometry(bot);
+            if a > geometry.max_slot || b > geometry.max_slot {
+                return Err(format!(
+                    "格号超出当前界面范围（0-{}）：{a}、{b}",
+                    geometry.max_slot
+                ));
+            }
+            if a == b {
+                return Err("两个格号相同，没有可挪的".to_owned());
+            }
+            // 挪个数需要知道两格现状：从活动菜单读（服务器已确认的本地镜像）。
+            use azalea::entity::inventory::Inventory as InventoryComponent;
+            let (count_a, count_b) = bot
+                .try_query_self::<&InventoryComponent, _>(|inventory| {
+                    let slots = inventory.menu().slots();
+                    let at = |slot: u16| {
+                        slots
+                            .get(usize::from(slot))
+                            .map_or(0, |item| item.count().max(0) as u32)
+                    };
+                    (at(a), at(b))
+                })
+                .map_err(|_| "读不到物品栏".to_owned())?;
+            let (source, target, available) = match (count_a, count_b) {
+                (0, 0) => return Err("两格都是空的，没有可挪的".to_owned()),
+                (_, 0) => (a, b, count_a),
+                (0, _) => (b, a, count_b),
+                _ => {
+                    return Err(
+                        "count 只在一方为空格时可用；两格都有物品时只能整组交换".to_owned()
+                    )
+                }
+            };
+            let clicks = plan_count_move(source, target, available, count)?;
+            inner.mark_expected_slots(&[a, b]);
+            let handle = ContainerHandleRef::new(geometry.container_id, bot.clone());
+            for click in clicks {
+                handle.click(click);
             }
             Ok(())
         }
@@ -320,6 +371,34 @@ pub(super) fn plan_swap(a: u16, b: u16, geometry: &MenuGeometry) -> Result<Vec<S
     ])
 }
 
+/// 把「从 source 挪 count 个到空格 target」翻译成点击序列（纯函数，可单测）。
+///
+/// 全挪 = 左键拿起 + 左键放下（两包）；部分挪 = 左键拿起整组 →
+/// 右键点 target n 次（每次放一个）→ 左键把余量放回 source。
+/// 同 tick 发出，点击序列始末指针都为空。
+pub(super) fn plan_count_move(
+    source: u16,
+    target: u16,
+    available: u32,
+    count: u32,
+) -> Result<Vec<ClickOperation>, String> {
+    if count == 0 {
+        return Err("count 必须大于 0".to_owned());
+    }
+    if count > available {
+        return Err(format!("格 {source} 只有 {available} 个，挪不了 {count} 个"));
+    }
+    let left = |slot: u16| ClickOperation::Pickup(PickupClick::Left { slot: Some(slot) });
+    let right = |slot: u16| ClickOperation::Pickup(PickupClick::Right { slot: Some(slot) });
+    if count == available {
+        return Ok(vec![left(source), left(target)]);
+    }
+    let mut clicks = vec![left(source)];
+    clicks.extend((0..count).map(|_| right(target)));
+    clicks.push(left(source));
+    Ok(clicks)
+}
+
 /// 菜单号能否直接充当 SWAP 的目标按钮：快捷栏 9 格 → 按钮 0-8，
 /// 副手（仅玩家屏）→ 按钮 40。
 fn swap_button(menu_slot: u16, geometry: &MenuGeometry) -> Option<u8> {
@@ -388,6 +467,31 @@ mod tests {
         assert!(plan_swap(46, 0, &player).is_err());
         assert!(plan_swap(0, 99, &player).is_err());
         assert!(plan_swap(7, 7, &player).is_err());
+    }
+
+    #[test]
+    fn count_moves_are_pickup_place_sequences_with_empty_cursor_at_both_ends() {
+        // 全挪：拿起 + 放下两包。
+        let plan = plan_count_move(37, 2, 8, 8).unwrap();
+        assert_eq!(plan.len(), 2);
+        // 部分挪：拿起 + n 次右键放一 + 余量放回。
+        let plan = plan_count_move(37, 2, 8, 3).unwrap();
+        assert_eq!(plan.len(), 5);
+        assert!(matches!(
+            plan[0],
+            ClickOperation::Pickup(PickupClick::Left { slot: Some(37) })
+        ));
+        assert!(matches!(
+            plan[1],
+            ClickOperation::Pickup(PickupClick::Right { slot: Some(2) })
+        ));
+        assert!(matches!(
+            plan[4],
+            ClickOperation::Pickup(PickupClick::Left { slot: Some(37) })
+        ));
+        // 越量与零个如实拒绝。
+        assert!(plan_count_move(37, 2, 8, 9).is_err());
+        assert!(plan_count_move(37, 2, 8, 0).is_err());
     }
 
     #[test]

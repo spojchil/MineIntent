@@ -24,6 +24,8 @@ pub const CRAFTING_USAGE: &str = "工作台用法：格号即协议号——0 �
 1-9 摆料（3×3，行优先：1-3 上行、4-6 中行、7-9 下行），10-36 主背包，37-45 快捷栏；\
 没有副手格，物品栏屏的格号在这里不适用。\
 {action:\"swap\", a, b} 交换两格内容，一次一对；b 用 99 表示把 a 整格丢出去；\
+两格恰有一格为空时可加 count 只挪这么多个过去（拆栈）——配方要同种材料占多格时\
+就靠它，如把一组木板分放两格：{action:\"swap\", a:37, b:2, count:1} 再 {a:37, b:5, count:1}。\
 取成品用 swap(0, 快捷栏或背包格)，会按配方消耗摆料。摆满配方后成品出现在 0，\
 格位变化会另行通知。{action:\"close\"} 关闭工作台回到世界。\
 开着工作台时无法移动或与世界交互。";
@@ -55,6 +57,7 @@ impl CraftingScreen {
         call_id: agent::ToolCallId,
         a: Option<&Value>,
         b: Option<&Value>,
+        count: Option<&Value>,
     ) -> ToolResult {
         match self.state.current() {
             Some(ScreenKind::CraftingTable) => {}
@@ -75,10 +78,25 @@ impl CraftingScreen {
         let (Some(a), Some(b)) = (slot(a), slot(b)) else {
             return ToolResult::failure(call_id, "swap 需要整数参数 a 与 b；请改写调用");
         };
+        let count = match count {
+            None => None,
+            Some(value) => match value.as_u64() {
+                Some(count) => Some(count as u32),
+                None => {
+                    return ToolResult::failure(call_id, "count 必须是正整数；请改写调用");
+                }
+            },
+        };
+        if count.is_some() && b == DISCARD_SLOT {
+            return ToolResult::failure(
+                call_id,
+                "count 只用于与空格之间挪个数，不能与 99 丢弃连用；请改写调用",
+            );
+        }
         let outcome = if b == DISCARD_SLOT {
             self.door.throw_slot(a).await
         } else {
-            self.door.swap_slots(a, b).await
+            self.door.swap_slots(a, b, count).await
         };
         if let Err(reason) = outcome {
             return ToolResult::failure(call_id, reason);
@@ -97,6 +115,12 @@ impl CraftingScreen {
         };
         let summary = if b == DISCARD_SLOT {
             format!("已丢弃；格 {a} 现在：{}", describe(a))
+        } else if let Some(count) = count {
+            format!(
+                "已挪 {count} 个；格 {a}：{}，格 {b}：{}",
+                describe(a),
+                describe(b)
+            )
         } else {
             format!("已交换；格 {a}：{}，格 {b}：{}", describe(a), describe(b))
         };
@@ -128,7 +152,8 @@ impl dispatch::ToolProvider for CraftingScreen {
                         "description": "swap=交换两格（一次一对）；close=关闭工作台"
                     },
                     "a": { "type": "integer", "description": "swap 用：格号（0-45，工作台格空间）" },
-                    "b": { "type": "integer", "description": "swap 用：格号（0-45），或 99=把 a 整格丢出去" }
+                    "b": { "type": "integer", "description": "swap 用：格号（0-45），或 99=把 a 整格丢出去" },
+                    "count": { "type": "integer", "description": "swap 可选：两格恰有一格为空时，从非空格挪这么多个到空格（拆栈，摆多格配方用）；不给则整组交换" }
                 },
                 "required": ["action"],
                 "additionalProperties": false
@@ -156,8 +181,13 @@ impl dispatch::ToolProvider for CraftingScreen {
             };
             match arguments.get("action").and_then(Value::as_str) {
                 Some("swap") => {
-                    self.swap(call_id, arguments.get("a"), arguments.get("b"))
-                        .await
+                    self.swap(
+                        call_id,
+                        arguments.get("a"),
+                        arguments.get("b"),
+                        arguments.get("count"),
+                    )
+                    .await
                 }
                 Some("close") => self.close(call_id).await,
                 _ => ToolResult::failure(call_id, "action 必须是 swap/close 之一；请改写调用"),
@@ -181,9 +211,18 @@ mod tests {
     }
 
     impl InventoryDoor for RecordingDoor {
-        fn swap_slots<'a>(&'a self, a: u16, b: u16) -> PortFuture<'a, Result<(), String>> {
+        fn swap_slots<'a>(
+            &'a self,
+            a: u16,
+            b: u16,
+            count: Option<u32>,
+        ) -> PortFuture<'a, Result<(), String>> {
             Box::pin(async move {
-                self.calls.lock().unwrap().push(format!("swap({a},{b})"));
+                let suffix = count.map(|n| format!(",{n}")).unwrap_or_default();
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("swap({a},{b}{suffix})"));
                 Ok(())
             })
         }
@@ -284,6 +323,20 @@ mod tests {
             *fixture.door.calls.lock().unwrap(),
             vec!["swap(0,40)", "throw(5)"]
         );
+    }
+
+    #[tokio::test]
+    async fn count_passes_through_to_the_door_but_not_with_discard() {
+        let fixture = fixture(false);
+        server_opens(&fixture);
+        let moved = invoke(&fixture, json!({"action": "swap", "a": 37, "b": 2, "count": 1})).await;
+        assert_eq!(moved.status, ToolResultStatus::Success);
+        assert!(format!("{moved:?}").contains("已挪 1 个"), "{moved:?}");
+        assert_eq!(*fixture.door.calls.lock().unwrap(), vec!["swap(37,2,1)"]);
+
+        let bad = invoke(&fixture, json!({"action": "swap", "a": 37, "b": 99, "count": 2})).await;
+        assert_eq!(bad.status, ToolResultStatus::Error);
+        assert!(text_of(&bad).contains("不能与 99 丢弃连用"));
     }
 
     #[tokio::test]
