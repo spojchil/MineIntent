@@ -314,6 +314,7 @@ fn inventory_changes_name_the_slot_and_call_out_the_craft_result() {
         tick: 10,
         occurred_at: SystemTime::now(),
         source: world::FactSource::ServerObserved,
+        container_id: 0,
         slot: 12,
         item_name: Some("oak_planks".to_owned()),
         count: 4,
@@ -324,7 +325,69 @@ fn inventory_changes_name_the_slot_and_call_out_the_craft_result() {
         slot: 0,
         item_name: None,
         count: 0,
-        ..entry
+        ..entry.clone()
     };
     assert_eq!(render_inventory_change(&emptied), "合成结果格（0）变空了。");
+
+    // 容器格空间：成品格与普通格按工作台措辞。
+    let crafted = world::InventoryChangeEntry {
+        container_id: 3,
+        slot: 0,
+        item_name: Some("oak_button".to_owned()),
+        count: 1,
+        ..entry.clone()
+    };
+    assert_eq!(
+        render_inventory_change(&crafted),
+        "工作台成品格（0）出现了 oak_button ×1。"
+    );
+    let in_container = world::InventoryChangeEntry {
+        container_id: 3,
+        ..entry
+    };
+    assert_eq!(
+        render_inventory_change(&in_container),
+        "工作台格 12 出现了 oak_planks ×4。"
+    );
+}
+
+#[test]
+fn crafting_menu_listing_uses_the_crafting_slot_space() {
+    let mut snap = world::TickSnapshot::empty(world::Epoch(1), 1, world::ConnectionPhase::Ready);
+    snap.self_state.inventory.slots = vec![
+        world::InventorySlot {
+            slot: 0,
+            item_name: "oak_button".to_owned(),
+            count: 1,
+            metadata: None,
+            durability_used: None,
+        },
+        world::InventorySlot {
+            slot: 5,
+            item_name: "oak_planks".to_owned(),
+            count: 1,
+            metadata: None,
+            durability_used: None,
+        },
+        world::InventorySlot {
+            slot: 20,
+            item_name: "diamond".to_owned(),
+            count: 3,
+            metadata: None,
+            durability_used: None,
+        },
+        world::InventorySlot {
+            slot: 45,
+            item_name: "bread".to_owned(),
+            count: 7,
+            metadata: None,
+            durability_used: None,
+        },
+    ];
+    let text = render_crafting_menu(&snap);
+    assert!(text.contains("成品（0）：oak_button ×1"), "{text}");
+    assert!(text.contains("摆料 3×3（1-9）：5=oak_planks ×1"), "{text}");
+    assert!(text.contains("主背包（10-36）：20=diamond ×3"), "{text}");
+    // 玩家屏里 45 是副手；工作台屏里 45 是快捷栏末格。
+    assert!(text.contains("快捷栏（37-45）：45=bread ×7"), "{text}");
 }

@@ -53,14 +53,17 @@ pub enum DoorCommand {
     },
     SwapOffhand,
     SelectSlot(u8),
-    /// 交换物品栏两格（菜单协议号 0-45）。任意两格经快捷栏中转三包同 tick
-    /// 完成（实测原子，见 swap_probe）；一侧在快捷栏/副手则原生一包。
+    /// 交换当前界面两格（菜单协议号，格空间随开着的界面）。任意两格经
+    /// 快捷栏中转三包同 tick 完成（实测原子，见 swap_probe）；一侧在
+    /// 快捷栏/副手则原生一包。
     SwapSlots {
         a: u16,
         b: u16,
     },
     /// 丢弃整格（屏内 Ctrl+Q 语义）。
     ThrowSlot(u16),
+    /// 关闭当前开着的服务端容器（发 ContainerClose 并清本地菜单）。
+    CloseContainer,
 }
 
 pub(super) struct PendingCommand {
@@ -198,47 +201,96 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             Ok(())
         }
         DoorCommand::SwapSlots { a, b } => {
-            let clicks = plan_swap(a, b)?;
+            let geometry = active_menu_geometry(bot);
+            let clicks = plan_swap(a, b, &geometry)?;
             let mut touched = vec![a, b];
-            // 三连包经快捷格 0 中转（菜单号 36）——它也会短暂变动再复位。
+            // 三连包经首个快捷格中转——它也会短暂变动再复位。
             if clicks.len() > 1 {
-                touched.push(TEMP_HOTBAR_MENU_SLOT);
+                touched.push(geometry.hotbar_start);
             }
             inner.mark_expected_slots(&touched);
-            let handle = ContainerHandleRef::new(0, bot.clone());
+            let handle = ContainerHandleRef::new(geometry.container_id, bot.clone());
             for click in clicks {
                 handle.click(ClickOperation::Swap(click));
             }
             Ok(())
         }
         DoorCommand::ThrowSlot(slot) => {
-            if slot > MAX_MENU_SLOT {
-                return Err(format!("格号 {slot} 超出物品栏范围（0-{MAX_MENU_SLOT}）"));
+            let geometry = active_menu_geometry(bot);
+            if slot > geometry.max_slot {
+                return Err(format!(
+                    "格号 {slot} 超出当前界面范围（0-{}）",
+                    geometry.max_slot
+                ));
             }
             inner.mark_expected_slots(&[slot]);
-            ContainerHandleRef::new(0, bot.clone())
+            ContainerHandleRef::new(geometry.container_id, bot.clone())
                 .click(ClickOperation::Throw(ThrowClick::All { slot }));
+            Ok(())
+        }
+        DoorCommand::CloseContainer => {
+            let geometry = active_menu_geometry(bot);
+            if geometry.container_id == 0 {
+                return Err("没有开着的容器界面".to_owned());
+            }
+            inner.mark_expected_close();
+            ContainerHandleRef::new(geometry.container_id, bot.clone()).close();
             Ok(())
         }
     }
 }
 
-/// 玩家物品栏屏的最大菜单号（45=副手）。
-const MAX_MENU_SLOT: u16 = 45;
 /// 三连包中转用的快捷栏按钮（0-8 任选；轮换必复位，不要求为空）。
 const TEMP_HOTBAR_BUTTON: u8 = 0;
-/// 中转快捷格对应的菜单号。
-const TEMP_HOTBAR_MENU_SLOT: u16 = 36;
+
+/// 当前界面的交换几何：容器 id、格号上限、快捷栏起点、副手格（仅玩家屏有）。
+pub(super) struct MenuGeometry {
+    pub(super) container_id: i32,
+    pub(super) max_slot: u16,
+    /// 快捷栏首格的菜单号（玩家屏 36；容器屏 = 总格数 − 9）。
+    pub(super) hotbar_start: u16,
+    /// 副手格的菜单号。只有玩家物品栏屏有（45）。
+    pub(super) offhand_slot: Option<u16>,
+}
+
+/// 玩家物品栏屏的几何（容器读不到时的兜底，也是无容器时的常态）。
+fn player_menu_geometry() -> MenuGeometry {
+    MenuGeometry {
+        container_id: 0,
+        max_slot: 45,
+        hotbar_start: 36,
+        offhand_slot: Some(45),
+    }
+}
+
+/// 从 ECS 读当前活动菜单的几何。容器开着时按容器格空间，否则玩家屏。
+fn active_menu_geometry(bot: &Client) -> MenuGeometry {
+    use azalea::entity::inventory::Inventory as InventoryComponent;
+    bot.try_query_self::<&InventoryComponent, _>(|inventory| match &inventory.container_menu {
+        Some(menu) => {
+            let hotbar = menu.hotbar_slots_range();
+            MenuGeometry {
+                container_id: inventory.id,
+                max_slot: (menu.len() - 1) as u16,
+                hotbar_start: *hotbar.start() as u16,
+                offhand_slot: None,
+            }
+        }
+        None => player_menu_geometry(),
+    })
+    .unwrap_or_else(|_| player_menu_geometry())
+}
 
 /// 把「交换菜单格 a、b」翻译成 SWAP 点击序列（纯函数，可单测）。
 ///
 /// 协议的 SWAP 模式只能拿任意格对快捷栏（按钮 0-8）或副手（按钮 40）换：
-/// - 一侧是快捷栏（菜单 36-44）或副手（菜单 45）→ 原生一包；
-/// - 两侧都不是 → 经快捷格 0 三步轮换：a↔0、b↔0、a↔0，同 tick 三包
-///   （实测原子且中转格必复位，见 examples/swap_probe.rs）。
-pub(super) fn plan_swap(a: u16, b: u16) -> Result<Vec<SwapClick>, String> {
-    if a > MAX_MENU_SLOT || b > MAX_MENU_SLOT {
-        return Err(format!("格号超出物品栏范围（0-{MAX_MENU_SLOT}）：{a}、{b}"));
+/// - 一侧是快捷栏或副手 → 原生一包；
+/// - 两侧都不是 → 经首个快捷格三步轮换：a↔中转、b↔中转、a↔中转，
+///   同 tick 三包（实测原子且中转格必复位，见 examples/swap_probe.rs）。
+pub(super) fn plan_swap(a: u16, b: u16, geometry: &MenuGeometry) -> Result<Vec<SwapClick>, String> {
+    let max = geometry.max_slot;
+    if a > max || b > max {
+        return Err(format!("格号超出当前界面范围（0-{max}）：{a}、{b}"));
     }
     if a == b {
         return Err("两个格号相同，没有可交换的".to_owned());
@@ -247,10 +299,10 @@ pub(super) fn plan_swap(a: u16, b: u16) -> Result<Vec<SwapClick>, String> {
         source_slot: source,
         target_slot: button,
     };
-    if let Some(button) = swap_button(b) {
+    if let Some(button) = swap_button(b, geometry) {
         return Ok(vec![swap_with(a, button)]);
     }
-    if let Some(button) = swap_button(a) {
+    if let Some(button) = swap_button(a, geometry) {
         return Ok(vec![swap_with(b, button)]);
     }
     Ok(vec![
@@ -260,13 +312,17 @@ pub(super) fn plan_swap(a: u16, b: u16) -> Result<Vec<SwapClick>, String> {
     ])
 }
 
-/// 菜单号能否直接充当 SWAP 的目标按钮：快捷栏 36-44 → 0-8，副手 45 → 40。
-fn swap_button(menu_slot: u16) -> Option<u8> {
-    match menu_slot {
-        36..=44 => Some((menu_slot - 36) as u8),
-        45 => Some(40),
-        _ => None,
+/// 菜单号能否直接充当 SWAP 的目标按钮：快捷栏 9 格 → 按钮 0-8，
+/// 副手（仅玩家屏）→ 按钮 40。
+fn swap_button(menu_slot: u16, geometry: &MenuGeometry) -> Option<u8> {
+    if geometry.offhand_slot == Some(menu_slot) {
+        return Some(40);
     }
+    let hotbar = geometry.hotbar_start..=geometry.hotbar_start + 8;
+    if hotbar.contains(&menu_slot) {
+        return Some((menu_slot - geometry.hotbar_start) as u8);
+    }
+    None
 }
 
 /// 按快照里的实体键（`{epoch}:{协议id}`）找回 ECS 实体。
@@ -291,27 +347,54 @@ pub(super) fn find_entity_by_key(
 mod tests {
     use super::*;
 
+    fn crafting_menu_geometry() -> MenuGeometry {
+        // 工作台屏：0 成品、1-9 摆料、10-36 主背包、37-45 快捷栏、无副手。
+        MenuGeometry {
+            container_id: 7,
+            max_slot: 45,
+            hotbar_start: 37,
+            offhand_slot: None,
+        }
+    }
+
     #[test]
     fn swap_plans_follow_the_protocol_swap_constraints() {
+        let player = player_menu_geometry();
         // 一侧在快捷栏：原生一包，按钮 = 菜单号 − 36。
-        let plan = plan_swap(10, 38).unwrap();
+        let plan = plan_swap(10, 38, &player).unwrap();
         assert_eq!(plan.len(), 1);
         assert_eq!((plan[0].source_slot, plan[0].target_slot), (10, 2));
         // 副手按钮 40；快捷栏在 a 侧同样一包。
-        let plan = plan_swap(45, 20).unwrap();
+        let plan = plan_swap(45, 20, &player).unwrap();
         assert_eq!((plan[0].source_slot, plan[0].target_slot), (20, 40));
-        let plan = plan_swap(44, 5).unwrap();
+        let plan = plan_swap(44, 5, &player).unwrap();
         assert_eq!((plan[0].source_slot, plan[0].target_slot), (5, 8));
         // 两侧都不在快捷栏/副手：经快捷格 0 三步轮换。
-        let plan = plan_swap(10, 20).unwrap();
+        let plan = plan_swap(10, 20, &player).unwrap();
         let steps: Vec<(u16, u8)> = plan
             .iter()
             .map(|click| (click.source_slot, click.target_slot))
             .collect();
         assert_eq!(steps, vec![(10, 0), (20, 0), (10, 0)]);
         // 越界与同格拒绝。
-        assert!(plan_swap(46, 0).is_err());
-        assert!(plan_swap(0, 99).is_err());
-        assert!(plan_swap(7, 7).is_err());
+        assert!(plan_swap(46, 0, &player).is_err());
+        assert!(plan_swap(0, 99, &player).is_err());
+        assert!(plan_swap(7, 7, &player).is_err());
+    }
+
+    #[test]
+    fn crafting_menu_swaps_use_its_own_hotbar_and_have_no_offhand() {
+        let crafting = crafting_menu_geometry();
+        // 工作台屏快捷栏 37-45：按钮 = 菜单号 − 37。取成品 = swap(0, 快捷格)。
+        let plan = plan_swap(0, 45, &crafting).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!((plan[0].source_slot, plan[0].target_slot), (0, 8));
+        // 玩家屏里 45 是副手按钮 40；工作台屏里 45 是快捷栏末格——几何决定按钮。
+        let plan = plan_swap(20, 37, &crafting).unwrap();
+        assert_eq!((plan[0].source_slot, plan[0].target_slot), (20, 0));
+        // 摆料 ↔ 主背包：两侧都不在快捷栏，经快捷首格（按钮 0）三步轮换。
+        let plan = plan_swap(3, 15, &crafting).unwrap();
+        assert_eq!(plan.len(), 3);
+        assert!(plan.iter().all(|click| click.target_slot == 0));
     }
 }

@@ -10,15 +10,42 @@
 //! 三个窗共用一条单调 `seq`，所以三个游标互不干扰，且「同一 tick 内多条」
 //! 不会漏——tick 会重复，seq 不会。
 
-use world::{DamageEntry, FactSource, InventoryChangeEntry, JobEntry, JobOutcome, TickSnapshot};
+use world::{
+    DamageEntry, FactSource, InventoryChangeEntry, JobEntry, JobOutcome, ScreenEvent, TickSnapshot,
+};
 
-/// 三个窗各自的消费位置。启动时置于窗尾，不消费启动前的存量。
+/// 屏事实要组合根做的事：状态翻转与占域是副作用，出纯函数交给外面。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScreenDirective {
+    /// 工作台开了：登记屏状态、占域、投递格位清单与用法。
+    OpenedCrafting,
+    /// 打开了当前版本没有工具的容器：只如实告知。
+    OpenedOther { kind: String },
+    /// 容器关了。`commanded`=我们 close 动词的回声（工具已回执，不再吵）。
+    Closed { kind: String, commanded: bool },
+}
+
+/// 一次收集的产出：要投递的行 + 要执行的屏副作用。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Wake {
+    pub lines: Vec<String>,
+    pub screens: Vec<ScreenDirective>,
+}
+
+impl Wake {
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty() && self.screens.is_empty()
+    }
+}
+
+/// 各窗各自的消费位置。启动时置于窗尾，不消费启动前的存量。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WakeCursors {
     chat: Option<u64>,
     damage: Option<u64>,
     jobs: Option<u64>,
     inventory: Option<u64>,
+    screens: Option<u64>,
 }
 
 impl WakeCursors {
@@ -33,21 +60,24 @@ impl WakeCursors {
                 .entries
                 .last()
                 .map(|entry| entry.seq),
+            screens: snapshot.screens.entries.last().map(|entry| entry.seq),
         }
     }
 
     /// 自身身份，用于防自激。
     ///
     /// `entity_key` 是自身 UUID；服务端不给发言者 UUID 时退回用户名比较。
-    /// `inventory_open`：物品栏屏开着才投递库存变化（维护者裁定——
-    /// 「打开物品栏时有预期之外的格子变化，也有通知」；关着时不吵）。
+    /// `item_screen_open`：格位类屏（物品栏/工作台）开着才投递格位变化
+    /// （维护者裁定——「打开物品栏时有预期之外的格子变化，也有通知」；
+    /// 关着时不吵）。
     pub fn collect(
         &mut self,
         snapshot: &TickSnapshot,
         own: SelfIdentity<'_>,
-        inventory_open: bool,
-    ) -> Vec<String> {
+        item_screen_open: bool,
+    ) -> Wake {
         let mut lines = Vec::new();
+        let mut screens = Vec::new();
 
         for entry in &snapshot.chat.entries {
             if !advance(&mut self.chat, entry.seq) {
@@ -82,14 +112,33 @@ impl WakeCursors {
         for entry in &snapshot.inventory_changes.entries {
             // 游标先推进（含屏关着时错过的条目——过了就是过了，不回放）。
             if advance(&mut self.inventory, entry.seq)
-                && inventory_open
+                && item_screen_open
                 && wakes_on_inventory(entry)
             {
                 lines.push(render_inventory_change(entry));
             }
         }
 
-        lines
+        for entry in &snapshot.screens.entries {
+            if !advance(&mut self.screens, entry.seq) {
+                continue;
+            }
+            let commanded = entry.source == FactSource::Commanded;
+            screens.push(match &entry.event {
+                ScreenEvent::Opened { kind, .. } if kind == "crafting" => {
+                    ScreenDirective::OpenedCrafting
+                }
+                ScreenEvent::Opened { kind, .. } => ScreenDirective::OpenedOther {
+                    kind: kind.clone(),
+                },
+                ScreenEvent::Closed { kind } => ScreenDirective::Closed {
+                    kind: kind.clone(),
+                    commanded,
+                },
+            });
+        }
+
+        Wake { lines, screens }
     }
 }
 
@@ -237,7 +286,7 @@ mod tests {
             ],
         };
 
-        let lines = cursors.collect(&snap, identity(), false);
+        let lines = cursors.collect(&snap, identity(), false).lines;
 
         assert_eq!(lines, vec!["companion: 冒名者说的".to_owned()]);
     }
@@ -253,7 +302,7 @@ mod tests {
             ],
         };
 
-        let lines = cursors.collect(&snap, identity(), false);
+        let lines = cursors.collect(&snap, identity(), false).lines;
 
         assert_eq!(lines, vec!["alice: 别人说的".to_owned()]);
     }
@@ -282,7 +331,7 @@ mod tests {
         // 每 tick 复检一次。
         snap.chat.entries.push(chat(2, "alice", None, "后来的"));
         assert_eq!(
-            cursors.collect(&snap, identity(), false),
+            cursors.collect(&snap, identity(), false).lines,
             vec!["alice: 后来的".to_owned()]
         );
     }
@@ -294,11 +343,11 @@ mod tests {
         snap.chat = Window {
             entries: vec![chat(1, "alice", None, "第一句")],
         };
-        assert_eq!(cursors.collect(&snap, identity(), false).len(), 1);
+        assert_eq!(cursors.collect(&snap, identity(), false).lines.len(), 1);
         assert!(cursors.collect(&snap, identity(), false).is_empty());
 
         snap.chat.entries.push(chat(2, "alice", None, "第二句"));
-        assert_eq!(cursors.collect(&snap, identity(), false).len(), 1);
+        assert_eq!(cursors.collect(&snap, identity(), false).lines.len(), 1);
         assert!(cursors.collect(&snap, identity(), false).is_empty());
     }
 
@@ -317,7 +366,7 @@ mod tests {
         };
 
         // 顶替与停止是模型自己下的令的回声，不该把它自己吵醒。
-        assert_eq!(cursors.collect(&snap, identity(), false).len(), 3);
+        assert_eq!(cursors.collect(&snap, identity(), false).lines.len(), 3);
     }
 
     #[test]
@@ -335,7 +384,7 @@ mod tests {
             entries: vec![job(3, JobOutcome::Arrived)],
         };
 
-        let lines = cursors.collect(&snap, identity(), false);
+        let lines = cursors.collect(&snap, identity(), false).lines;
 
         assert_eq!(lines.len(), 3, "三个窗各出一条：{lines:?}");
         assert!(cursors.collect(&snap, identity(), false).is_empty());
@@ -347,6 +396,7 @@ mod tests {
             tick: seq,
             occurred_at: std::time::SystemTime::UNIX_EPOCH,
             source,
+            container_id: 0,
             slot,
             item_name: Some("oak_planks".to_owned()),
             count: 4,
@@ -367,8 +417,81 @@ mod tests {
         // 屏开着：预期之外的投递，自己动作的回声（Commanded）不吵。
         snap.inventory_changes.entries.push(inventory_change(2, 10, FactSource::Commanded));
         snap.inventory_changes.entries.push(inventory_change(3, 0, FactSource::ServerObserved));
-        let lines = cursors.collect(&snap, identity(), true);
+        let lines = cursors.collect(&snap, identity(), true).lines;
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("合成结果格"), "{lines:?}");
+    }
+
+    fn screen_entry(seq: u64, source: FactSource, event: ScreenEvent) -> world::ScreenEntry {
+        world::ScreenEntry {
+            seq,
+            tick: seq,
+            occurred_at: std::time::SystemTime::UNIX_EPOCH,
+            source,
+            event,
+        }
+    }
+
+    #[test]
+    fn screen_facts_become_directives_with_echo_marked() {
+        let mut snap = snapshot();
+        let mut cursors = WakeCursors::default();
+        snap.screens = Window {
+            entries: vec![
+                screen_entry(
+                    1,
+                    FactSource::ServerObserved,
+                    ScreenEvent::Opened {
+                        kind: "crafting".to_owned(),
+                        container_id: 3,
+                        title: None,
+                    },
+                ),
+                screen_entry(
+                    2,
+                    FactSource::Commanded,
+                    ScreenEvent::Closed {
+                        kind: "crafting".to_owned(),
+                    },
+                ),
+                screen_entry(
+                    3,
+                    FactSource::ServerObserved,
+                    ScreenEvent::Opened {
+                        kind: "generic_9x3".to_owned(),
+                        container_id: 4,
+                        title: Some("box".to_owned()),
+                    },
+                ),
+                screen_entry(
+                    4,
+                    FactSource::ServerObserved,
+                    ScreenEvent::Closed {
+                        kind: "generic_9x3".to_owned(),
+                    },
+                ),
+            ],
+        };
+
+        let wake = cursors.collect(&snap, identity(), false);
+        assert_eq!(
+            wake.screens,
+            vec![
+                ScreenDirective::OpenedCrafting,
+                ScreenDirective::Closed {
+                    kind: "crafting".to_owned(),
+                    commanded: true,
+                },
+                ScreenDirective::OpenedOther {
+                    kind: "generic_9x3".to_owned(),
+                },
+                ScreenDirective::Closed {
+                    kind: "generic_9x3".to_owned(),
+                    commanded: false,
+                },
+            ]
+        );
+        // 屏事实恰好一次。
+        assert!(cursors.collect(&snap, identity(), false).is_empty());
     }
 }

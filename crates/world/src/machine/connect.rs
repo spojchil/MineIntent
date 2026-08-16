@@ -180,10 +180,18 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             ClientboundGamePacket::SetHealth(set_health) => {
                 inner.track_health(f64::from(set_health.health));
             }
-            // 容器 0 = 玩家物品栏。格位变化直译入窗；是回声还是意外由
-            // 预期标记判定（state.rs），投不投由消费方裁。
-            ClientboundGamePacket::ContainerSetSlot(set_slot) if set_slot.container_id == 0 => {
-                {
+            // 容器 0 = 玩家物品栏；非 0 = 当时开着的服务端容器（工作台等）。
+            // 格位变化直译入窗；是回声还是意外由预期标记判定（state.rs），
+            // 投不投由消费方裁。不追踪的容器 id（陈旧包）直接丢。
+            ClientboundGamePacket::ContainerSetSlot(set_slot) => {
+                let container_id = set_slot.container_id;
+                let tracked = container_id == 0
+                    || inner
+                        .open_screen
+                        .lock()
+                        .as_ref()
+                        .is_some_and(|screen| screen.container_id == container_id);
+                if tracked {
                     let (item_name, count) = if set_slot.item_stack.is_empty() {
                         (None, 0)
                     } else {
@@ -194,7 +202,7 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                             set_slot.item_stack.count() as u32,
                         )
                     };
-                    inner.push_inventory_change(set_slot.slot, item_name, count);
+                    inner.push_inventory_change(container_id, set_slot.slot, item_name, count);
                 }
             }
             // /give、拾取等对玩家背包的更新走专用包（不经容器 0 的 SetSlot）。
@@ -212,7 +220,7 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                             set_inventory.contents.count() as u32,
                         )
                     };
-                    inner.push_inventory_change(menu_slot, item_name, count);
+                    inner.push_inventory_change(0, menu_slot, item_name, count);
                 }
             }
             _ => {}
@@ -238,6 +246,25 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                 let _ = pending_command.ack.send(outcome);
             }
             poll_movement_job(inner, &bot);
+            // 与容器组件对账：开/关变迁产屏事实（use_on 触发的服务端开屏
+            // 也从这里被看见）。
+            let open_screen = bot
+                .try_query_self::<&azalea::entity::inventory::Inventory, _>(|inventory| {
+                    inventory
+                        .container_menu
+                        .as_ref()
+                        .map(|menu| crate::OpenScreenState {
+                            kind: super::capture::menu_kind_name(menu).to_owned(),
+                            container_id: inventory.id,
+                            title: inventory
+                                .container_menu_title
+                                .as_ref()
+                                .map(ToString::to_string),
+                        })
+                })
+                .ok()
+                .flatten();
+            inner.track_open_screen(open_screen);
             if let Some(snapshot) = assemble_snapshot(inner, &bot) {
                 inner.publish(snapshot);
             }

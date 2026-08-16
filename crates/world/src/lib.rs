@@ -81,6 +81,8 @@ impl TickSnapshot {
             damage: Window::default(),
             jobs: Window::default(),
             inventory_changes: Window::default(),
+            open_screen: None,
+            screens: Window::default(),
         }
     }
 }
@@ -116,6 +118,46 @@ pub struct TickSnapshot {
     /// 窗装全部变化；自己动作的回声标 Commanded，预期之外标 ServerObserved，
     /// 投不投、开屏才投——判据在消费方。
     pub inventory_changes: Window<InventoryChangeEntry>,
+    /// 当前开着的**服务端容器**（工作台、箱子等）。None = 没有容器开着
+    /// （纯客户端的物品栏/聊天屏不在此列——服务器不知道它们开没开）。
+    /// 开着时 `self_state.inventory.slots` 的格号属于该容器的格空间。
+    pub open_screen: Option<OpenScreenState>,
+    /// 容器开/关的事实窗。关闭是否自己下令由 source 区分；投不投在消费方。
+    pub screens: Window<ScreenEntry>,
+}
+
+/// 当前开着的服务端容器：种类直译 + 容器 id + 标题。
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenScreenState {
+    /// 菜单种类的直译名（`crafting`、`generic_9x3` 等，azalea Menu 变体）。
+    pub kind: String,
+    pub container_id: i32,
+    /// 服务器给的界面标题（箱子可自定义名）。
+    pub title: Option<String>,
+}
+
+/// 容器开/关事实。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScreenEntry {
+    /// 与 ChatEntry.seq 同源的单调到达序号。
+    pub seq: u64,
+    pub tick: u64,
+    pub occurred_at: Timestamp,
+    /// Commanded=我们 close 动作的预期回声；ServerObserved=服务器主动开/关。
+    pub source: FactSource,
+    pub event: ScreenEvent,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScreenEvent {
+    Opened {
+        kind: String,
+        container_id: i32,
+        title: Option<String>,
+    },
+    Closed {
+        kind: String,
+    },
 }
 
 /// 世界环境的直译。呈现（时段文案、"下大雨"）归渲染层。
@@ -279,8 +321,12 @@ pub struct InventoryChangeEntry {
     /// Commanded=我们 swap/丢弃动作的预期回声；ServerObserved=预期之外
     /// （拾取入包、合成结果格出现、外部给予等）。
     pub source: FactSource,
+    /// 变化发生在哪个容器的格空间。0=玩家物品栏屏；其他=当时开着的
+    /// 服务端容器（工作台等），格号按该容器的编号空间解释。
+    pub container_id: i32,
     /// 菜单协议号。玩家物品栏屏：0 合成结果、1-4 随身合成、5-8 盔甲、
-    /// 9-35 主背包、36-44 快捷栏、45 副手。
+    /// 9-35 主背包、36-44 快捷栏、45 副手。工作台屏：0 成品、1-9 摆料、
+    /// 10-36 主背包、37-45 快捷栏。
     pub slot: u16,
     /// 变化后的内容；None = 变空。
     pub item_name: Option<String>,

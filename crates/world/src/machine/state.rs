@@ -17,11 +17,13 @@ use tokio::sync::{oneshot, watch, Notify};
 
 use super::door::{DoorCommand, PendingCommand};
 use super::movement::MovementJob;
-use super::{DAMAGE_WINDOW_ENTRIES, INVENTORY_WINDOW_ENTRIES, JOBS_WINDOW_ENTRIES};
+use super::{
+    DAMAGE_WINDOW_ENTRIES, INVENTORY_WINDOW_ENTRIES, JOBS_WINDOW_ENTRIES, SCREEN_WINDOW_ENTRIES,
+};
 use crate::{
     ChatContent, ChatEntry, ChatPosition, ConnectionPhase, DamageEntry, Epoch, FactSource,
-    InventoryChangeEntry, JobEntry, JobKind, JobOutcome, PlayerRef, TickSnapshot, Window,
-    WorldMeta, CHAT_WINDOW_LINES,
+    InventoryChangeEntry, JobEntry, JobKind, JobOutcome, OpenScreenState, PlayerRef, ScreenEntry,
+    ScreenEvent, TickSnapshot, Window, WorldMeta, CHAT_WINDOW_LINES,
 };
 
 /// 预期回声的时限：swap/丢弃后这么多 tick 内，同格的 SetSlot 视为自己
@@ -42,6 +44,11 @@ pub(crate) struct Inner {
     pub(super) inventory_window: Mutex<VecDeque<InventoryChangeEntry>>,
     /// 预期会变的格位（我们刚 swap/丢弃过）：(菜单号, 失效 tick)。
     pub(super) expected_slots: Mutex<Vec<(u16, u64)>>,
+    /// 当前开着的服务端容器（每 tick 与 ECS 组件对账，变迁产屏事实）。
+    pub(super) open_screen: Mutex<Option<OpenScreenState>>,
+    pub(super) screens_window: Mutex<VecDeque<ScreenEntry>>,
+    /// 预期关屏（我们刚下过 close）：失效 tick。时限内的 Closed 算回声。
+    pub(super) expected_close: Mutex<Option<u64>>,
     pub(super) pending: Mutex<Vec<PendingCommand>>,
     /// 一次性跳跃的复位标记：跳跃布尔保持一整 tick 后放开。
     pub(super) jump_reset: AtomicBool,
@@ -79,6 +86,9 @@ impl Inner {
             movement_job: Mutex::new(None),
             inventory_window: Mutex::new(VecDeque::new()),
             expected_slots: Mutex::new(Vec::new()),
+            open_screen: Mutex::new(None),
+            screens_window: Mutex::new(VecDeque::new()),
+            expected_close: Mutex::new(None),
             pending: Mutex::new(Vec::new()),
             jump_reset: AtomicBool::new(false),
             world_handle: Mutex::new(None),
@@ -112,6 +122,7 @@ impl Inner {
         snapshot.damage = self.damage_window_now();
         snapshot.jobs = self.jobs_window_now();
         snapshot.inventory_changes = self.inventory_window_now();
+        snapshot.screens = self.screens_window_now();
         self.publish(snapshot);
     }
 
@@ -139,6 +150,75 @@ impl Inner {
         }
     }
 
+    pub(super) fn screens_window_now(&self) -> Window<ScreenEntry> {
+        Window {
+            entries: self.screens_window.lock().iter().cloned().collect(),
+        }
+    }
+
+    /// 每 tick 与 ECS 的容器组件对账：变迁产开/关事实。
+    ///
+    /// 关闭是否自己下令由预期标记判定（close 动词先 [`Self::mark_expected_close`]）；
+    /// 打开一律 ServerObserved——即便由我们 use_on 触发，界面内容仍是服务器决定的。
+    pub(super) fn track_open_screen(&self, current: Option<OpenScreenState>) {
+        let mut open = self.open_screen.lock();
+        if *open == current {
+            return;
+        }
+        let previous = std::mem::replace(&mut *open, current.clone());
+        drop(open);
+        if let Some(previous) = previous {
+            let tick = self.tick.load(Ordering::Acquire);
+            let source = {
+                let mut expected = self.expected_close.lock();
+                match expected.take_if(|until| *until >= tick) {
+                    Some(_) => FactSource::Commanded,
+                    None => {
+                        // 过期标记顺手清掉。
+                        *expected = None;
+                        FactSource::ServerObserved
+                    }
+                }
+            };
+            self.push_screen_event(
+                source,
+                ScreenEvent::Closed {
+                    kind: previous.kind,
+                },
+            );
+        }
+        if let Some(current) = current {
+            self.push_screen_event(
+                FactSource::ServerObserved,
+                ScreenEvent::Opened {
+                    kind: current.kind,
+                    container_id: current.container_id,
+                    title: current.title,
+                },
+            );
+        }
+    }
+
+    pub(super) fn mark_expected_close(&self) {
+        *self.expected_close.lock() =
+            Some(self.tick.load(Ordering::Acquire) + EXPECTED_SLOT_TICKS);
+    }
+
+    fn push_screen_event(&self, source: FactSource, event: ScreenEvent) {
+        let entry = ScreenEntry {
+            seq: self.fact_seq.fetch_add(1, Ordering::AcqRel),
+            tick: self.tick.load(Ordering::Acquire),
+            occurred_at: SystemTime::now(),
+            source,
+            event,
+        };
+        let mut window = self.screens_window.lock();
+        window.push_back(entry);
+        while window.len() > SCREEN_WINDOW_ENTRIES {
+            window.pop_front();
+        }
+    }
+
     /// 标记这些菜单格即将因我们的动作而变：时限内的 SetSlot 算回声。
     pub(super) fn mark_expected_slots(&self, slots: &[u16]) {
         let until = self.tick.load(Ordering::Acquire) + EXPECTED_SLOT_TICKS;
@@ -148,10 +228,12 @@ impl Inner {
         }
     }
 
-    /// 容器 0 的格位变化入窗（ContainerSetSlot 包直译）。
-    /// 在预期时限内的格标 Commanded（自己动作的回声），其余 ServerObserved。
+    /// 格位变化入窗（ContainerSetSlot 包直译；容器 0=玩家物品栏屏，
+    /// 其他=当时开着的服务端容器）。在预期时限内的格标 Commanded
+    /// （自己动作的回声），其余 ServerObserved。
     pub(super) fn push_inventory_change(
         &self,
+        container_id: i32,
         slot: u16,
         item_name: Option<String>,
         count: u32,
@@ -171,6 +253,7 @@ impl Inner {
             tick,
             occurred_at: SystemTime::now(),
             source,
+            container_id,
             slot,
             item_name,
             count,
@@ -420,6 +503,62 @@ mod tests {
         );
         assert_eq!(latest.chat.entries.len(), 1);
         assert!(ticked.has_changed().unwrap());
+    }
+
+    #[test]
+    fn screen_transitions_produce_open_and_close_facts() {
+        let inner = Inner::new();
+        let crafting = OpenScreenState {
+            kind: "crafting".to_owned(),
+            container_id: 3,
+            title: None,
+        };
+        inner.track_open_screen(Some(crafting.clone()));
+        inner.track_open_screen(Some(crafting.clone())); // 不变不产事实
+        inner.track_open_screen(None); // 服务器主动关
+        inner.track_open_screen(Some(crafting.clone()));
+        inner.mark_expected_close();
+        inner.track_open_screen(None); // 我们下令关的回声
+
+        let window = inner.screens_window_now();
+        assert_eq!(window.entries.len(), 4);
+        assert!(matches!(
+            &window.entries[0].event,
+            ScreenEvent::Opened { kind, container_id: 3, .. } if kind == "crafting"
+        ));
+        assert_eq!(window.entries[1].source, FactSource::ServerObserved);
+        assert!(matches!(&window.entries[1].event, ScreenEvent::Closed { .. }));
+        assert_eq!(window.entries[3].source, FactSource::Commanded);
+        // 关完当前无容器。
+        assert!(inner.open_screen.lock().is_none());
+    }
+
+    #[test]
+    fn switching_containers_directly_closes_the_old_one_first() {
+        let inner = Inner::new();
+        let old = OpenScreenState {
+            kind: "crafting".to_owned(),
+            container_id: 3,
+            title: None,
+        };
+        let new = OpenScreenState {
+            kind: "generic_9x3".to_owned(),
+            container_id: 4,
+            title: Some("box".to_owned()),
+        };
+        inner.track_open_screen(Some(old));
+        inner.track_open_screen(Some(new));
+
+        let window = inner.screens_window_now();
+        let shapes: Vec<&'static str> = window
+            .entries
+            .iter()
+            .map(|entry| match entry.event {
+                ScreenEvent::Opened { .. } => "opened",
+                ScreenEvent::Closed { .. } => "closed",
+            })
+            .collect();
+        assert_eq!(shapes, vec!["opened", "closed", "opened"]);
     }
 
     #[tokio::test]

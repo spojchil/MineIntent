@@ -18,12 +18,15 @@ use hand::{HandDoor, HandTools};
 use memory::{MemoryFile, MemoryTools};
 use motion::{MotionDoor, MotionTools};
 use perception::{PerceptionTools, ViewportDoor};
-use screens::{ChatBox, ChatDoor, ChatHistory, ChatReadMark, InventoryDoor, InventoryScreen, ScreenKind, ScreenState};
+use screens::{
+    ChatBox, ChatDoor, ChatHistory, ChatReadMark, CraftingScreen, InventoryDoor, InventoryScreen,
+    ScreenKind, ScreenState, CRAFTING_USAGE,
+};
 use world::{ConnectionConfig, DoorCommand, Module, SnapshotSource};
 
 mod wake;
 
-use wake::{SelfIdentity, WakeCursors};
+use wake::{ScreenDirective, SelfIdentity, WakeCursors};
 
 /// 人设占位（Q01 未裁；正式文本由维护者给出后替换）。
 const PLACEHOLDER_PERSONA: &str = "\
@@ -153,6 +156,9 @@ impl InventoryDoor for ModuleInventoryDoor {
     fn throw_slot<'a>(&'a self, slot: u16) -> agent::PortFuture<'a, Result<(), String>> {
         Box::pin(async move { self.0.execute(DoorCommand::ThrowSlot(slot)).await })
     }
+    fn close_container<'a>(&'a self) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::CloseContainer).await })
+    }
 }
 
 /// 视口门：投影是纯 CPU 重活，放阻塞池，不占用异步线程。
@@ -242,6 +248,12 @@ async fn main() -> Result<(), String> {
             Arc::new(ModuleInventoryDoor(module.clone())),
             snapshots.clone(),
         )),
+        Arc::new(CraftingScreen::new(
+            occupancy.clone(),
+            screen_state.clone(),
+            Arc::new(ModuleInventoryDoor(module.clone())),
+            snapshots.clone(),
+        )),
         Arc::new(MemoryTools::new(memory_file.clone())),
         Arc::new(MotionTools::new(Arc::new(ModuleMotionDoor(module.clone())))),
         Arc::new(HandTools::new(Arc::new(ModuleHandDoor(module.clone())))),
@@ -250,7 +262,7 @@ async fn main() -> Result<(), String> {
         )))),
     ];
     let dispatcher =
-        Arc::new(Dispatcher::new(providers, occupancy).map_err(|error| error.to_string())?);
+        Arc::new(Dispatcher::new(providers, occupancy.clone()).map_err(|error| error.to_string())?);
     {
         use agent::ToolRuntime;
         let names: Vec<String> = dispatcher
@@ -293,16 +305,58 @@ async fn main() -> Result<(), String> {
         tokio::select! {
             _ = module.ticked() => {
                 let snapshot = snapshots.latest();
-                let fresh = cursors.collect(
+                let wake = cursors.collect(
                     &snapshot,
                     SelfIdentity { entity_key: &own_key, username: &username },
-                    // 库存变化只在物品栏开着时投递（维护者裁定）。
-                    screen_state.current() == Some(ScreenKind::Inventory),
+                    // 格位变化只在格位类屏（物品栏/工作台）开着时投递（维护者裁定）。
+                    matches!(
+                        screen_state.current(),
+                        Some(ScreenKind::Inventory | ScreenKind::CraftingTable)
+                    ),
                 );
-                if fresh.is_empty() {
+                if wake.is_empty() {
                     continue;
                 }
-                let items: Vec<agent::TranscriptItem> = fresh
+                let mut lines = wake.lines;
+                // 屏事实的副作用：状态翻转 + 占域随服务端真相走。
+                for directive in wake.screens {
+                    match directive {
+                        ScreenDirective::OpenedCrafting => {
+                            let displaced = screen_state.server_open(ScreenKind::CraftingTable);
+                            occupancy.occupy(dispatch::Domain::Screen);
+                            let mut text = String::from("工作台界面已打开。");
+                            if displaced == Some(ScreenKind::Chat) {
+                                text.push_str("（聊天框被它顶掉了。）");
+                            }
+                            text.push('\n');
+                            text.push_str(&render::render_crafting_menu(&snapshot));
+                            text.push_str("\n\n");
+                            text.push_str(CRAFTING_USAGE);
+                            lines.push(text);
+                        }
+                        ScreenDirective::OpenedOther { kind } => {
+                            lines.push(format!(
+                                "服务器打开了 {kind} 界面；当前版本没有操作它的工具。"
+                            ));
+                        }
+                        ScreenDirective::Closed { kind, commanded } => {
+                            if kind == "crafting" {
+                                screen_state.server_close(ScreenKind::CraftingTable);
+                                if screen_state.current().is_none() {
+                                    occupancy.release(dispatch::Domain::Screen);
+                                }
+                                if !commanded {
+                                    lines.push("工作台界面被关闭了。".to_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+                if lines.is_empty() {
+                    // 只有副作用（如 close 回声）没有要说的话：不吵模型。
+                    continue;
+                }
+                let items: Vec<agent::TranscriptItem> = lines
                     .into_iter()
                     .map(|line| InputMessage::text("user", line).into())
                     .collect();

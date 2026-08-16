@@ -27,6 +27,9 @@ pub const DISCARD_SLOT: u16 = 99;
 pub enum ScreenKind {
     Chat,
     Inventory,
+    /// 工作台：真相在服务端（use_on 触发开、可被强关），
+    /// 本地状态由组合根随屏事实翻转。
+    CraftingTable,
 }
 
 /// 屏种类状态：屏模块内共享，己也读它（开屏期间才投递库存变化通知）。
@@ -63,6 +66,20 @@ impl ScreenState {
             *current = None;
         }
     }
+
+    /// 服务端主导的开屏（容器屏真相在服务端）：无条件登记，
+    /// 返回被顶掉的本地屏种类（若有）——服务器说开就是开了。
+    pub fn server_open(&self, kind: ScreenKind) -> Option<ScreenKind> {
+        let mut current = self.current.lock();
+        let displaced = current.filter(|existing| *existing != kind);
+        *current = Some(kind);
+        displaced
+    }
+
+    /// 服务端主导的关屏（幂等；只清本种类）。
+    pub fn server_close(&self, kind: ScreenKind) {
+        self.close(kind);
+    }
 }
 
 /// 屏种类的人话名，拒绝话术用。
@@ -70,13 +87,17 @@ pub(crate) fn kind_word(kind: ScreenKind) -> &'static str {
     match kind {
         ScreenKind::Chat => "聊天框",
         ScreenKind::Inventory => "物品栏",
+        ScreenKind::CraftingTable => "工作台",
     }
 }
 
-/// 接入模块写口的窄化：交换与丢弃都在 tick 回调内原子执行。
+/// 接入模块写口的窄化：交换与丢弃都在 tick 回调内原子执行，
+/// 格空间随当前开着的界面（机器按活动菜单解释格号）。
 pub trait InventoryDoor: Send + Sync {
     fn swap_slots<'a>(&'a self, a: u16, b: u16) -> PortFuture<'a, Result<(), String>>;
     fn throw_slot<'a>(&'a self, slot: u16) -> PortFuture<'a, Result<(), String>>;
+    /// 关闭当前开着的服务端容器（发 ContainerClose）。物品栏屏用不到它。
+    fn close_container<'a>(&'a self) -> PortFuture<'a, Result<(), String>>;
 }
 
 const TOOL_NAME: &str = "inventory";
@@ -254,6 +275,9 @@ mod tests {
                 self.calls.lock().unwrap().push(format!("throw({slot})"));
                 Ok(())
             })
+        }
+        fn close_container<'a>(&'a self) -> PortFuture<'a, Result<(), String>> {
+            Box::pin(async move { Err("物品栏屏用不到容器关闭".to_owned()) })
         }
     }
 

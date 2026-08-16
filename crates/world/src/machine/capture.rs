@@ -94,7 +94,42 @@ pub(super) fn assemble_snapshot(inner: &Inner, bot: &Client) -> Option<TickSnaps
         damage: inner.damage_window_now(),
         jobs: inner.jobs_window_now(),
         inventory_changes: inner.inventory_window_now(),
+        open_screen: inner.open_screen.lock().clone(),
+        screens: inner.screens_window_now(),
     })
+}
+
+/// azalea Menu 变体 → 屏种类直译名（snake_case，与注册名风格一致）。
+pub(super) fn menu_kind_name(menu: &azalea::inventory::Menu) -> &'static str {
+    use azalea::inventory::Menu;
+    match menu {
+        Menu::Player(_) => "player",
+        Menu::Generic9x1 { .. } => "generic_9x1",
+        Menu::Generic9x2 { .. } => "generic_9x2",
+        Menu::Generic9x3 { .. } => "generic_9x3",
+        Menu::Generic9x4 { .. } => "generic_9x4",
+        Menu::Generic9x5 { .. } => "generic_9x5",
+        Menu::Generic9x6 { .. } => "generic_9x6",
+        Menu::Generic3x3 { .. } => "generic_3x3",
+        Menu::Crafter3x3 { .. } => "crafter_3x3",
+        Menu::Anvil { .. } => "anvil",
+        Menu::Beacon { .. } => "beacon",
+        Menu::BlastFurnace { .. } => "blast_furnace",
+        Menu::BrewingStand { .. } => "brewing_stand",
+        Menu::Crafting { .. } => "crafting",
+        Menu::Enchantment { .. } => "enchantment",
+        Menu::Furnace { .. } => "furnace",
+        Menu::Grindstone { .. } => "grindstone",
+        Menu::Hopper { .. } => "hopper",
+        Menu::Lectern { .. } => "lectern",
+        Menu::Loom { .. } => "loom",
+        Menu::Merchant { .. } => "merchant",
+        Menu::ShulkerBox { .. } => "shulker_box",
+        Menu::Smithing { .. } => "smithing",
+        Menu::Smoker { .. } => "smoker",
+        Menu::CartographyTable { .. } => "cartography_table",
+        Menu::Stonecutter { .. } => "stonecutter",
+    }
 }
 
 fn capture_inventory(bot: &Client) -> Inventory {
