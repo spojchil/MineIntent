@@ -242,6 +242,65 @@ impl ViewportDoor for ModuleViewportDoor {
     }
 }
 
+/// 诊断轨迹：把每一轮模型说了什么、调了哪些工具、工具回了什么写进一个文件。
+///
+/// 只在 `MINEINTENT_TRACE_FILE` 给了路径时装配。默认不开的理由与内核 wire 日志
+/// 同款：内容**未经脱敏**（聊天原文都在里面），落盘或外传前要自己看一眼。
+///
+/// 不记 `ModelRequestTranscript`——那是每次请求的整份上下文，量级完全不同，
+/// 要看那个另说。这里只回答「它做了什么」。
+struct TraceObserver(std::sync::Mutex<std::fs::File>);
+
+impl TraceObserver {
+    fn open(path: &str) -> Result<Self, String> {
+        std::fs::File::create(path)
+            .map(|file| Self(std::sync::Mutex::new(file)))
+            .map_err(|error| format!("诊断轨迹文件打不开（{path}）：{error}"))
+    }
+
+    fn write(&self, line: &str) {
+        use std::io::Write;
+        // 诊断出口失败不该拖垮同伴：写不进去就算了，别 panic 进观察端旁路。
+        if let Ok(mut file) = self.0.lock() {
+            let _ = writeln!(file, "{line}");
+            let _ = file.flush();
+        }
+    }
+}
+
+impl agent::ContentObserver for TraceObserver {
+    fn observe(&self, event: &agent::ContentEvent) {
+        match event {
+            agent::ContentEvent::ModelResponseOutput { output, .. } => {
+                for part in &output.content {
+                    if let agent::ContentPart::Text { text } = part {
+                        self.write(&format!("[说] {text}"));
+                    }
+                }
+                for call in &output.tool_calls {
+                    self.write(&format!("[调用] {} {}", call.name.as_str(), call.arguments));
+                }
+            }
+            agent::ContentEvent::ToolBatchResults { results, .. } => {
+                for result in &results.results {
+                    let body: String = result
+                        .content
+                        .iter()
+                        .map(|part| match part {
+                            agent::ContentPart::Text { text } => text.clone(),
+                            agent::ContentPart::Json { value } => value.to_string(),
+                            other => format!("{other:?}"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    self.write(&format!("[回执/{:?}] {body}", result.status));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// 轮末帧观察端：只在一轮模型响应落定（AttemptCommitted）时发信号；
 /// 收集与投递在旁路任务做——观察端契约要求快速返回。
 struct RoundEndSignal(tokio::sync::mpsc::UnboundedSender<()>);
@@ -372,16 +431,19 @@ async fn main() -> Result<(), String> {
     // 「与记忆的差异」，非空则以 Passive 投递——Passive 不叫醒空闲会话
     // （帧从不引发轮，只搭现有轮的车），信箱耐久故收集时即推进记忆。
     let (round_end_tx, mut round_end_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let session = Arc::new(
-        AgentSession::new(
-            strategy.clone(),
-            dispatcher,
-            strategy,
-            model,
-            SessionConfig::default(),
-        )
-        .with_stream_observer(Arc::new(RoundEndSignal(round_end_tx))),
-    );
+    let mut assembled = AgentSession::new(
+        strategy.clone(),
+        dispatcher,
+        strategy,
+        model,
+        SessionConfig::default(),
+    )
+    .with_stream_observer(Arc::new(RoundEndSignal(round_end_tx)));
+    if let Ok(path) = std::env::var("MINEINTENT_TRACE_FILE") {
+        assembled = assembled.with_content_observer(Arc::new(TraceObserver::open(&path)?));
+        println!("[组合根] 诊断轨迹：{path}（内容未脱敏）");
+    }
+    let session = Arc::new(assembled);
     {
         let session = session.clone();
         let module = module.clone();
