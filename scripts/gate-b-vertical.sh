@@ -427,9 +427,23 @@ fi
 
 # ------------------------------------------- 死亡恢复（自动重生 + 死后可唤醒）
 # 用怪物打死而不是 /kill：伤害→掉血→死亡整条观察链都要真实经过。
-# 新栈没有 respawn 工具——azalea 的自动重生被有意保留（machine/connect.rs
-# 的 v1 裁定），所以这里判的是「自动重生真的生效」，以及历史故障
-# 「死后失聪」的回归：重生后同伴还能被唤醒说话。
+#
+# 死亡在新栈里有两条呈现，判据只能挂在后一条上：
+#
+#   状态：SelfState.alive（capture.rs 读 azalea 的 Dead 组件），渲染成
+#   「你已经死亡。」顶掉整行体征。但它走**每 tick 采样**，而 state.rs 的
+#   track_health 自己写着：自动重生把 14→0→20 压进一个 tick，采样会整个
+#   错过 0（实测发生）。同一个压缩同样吞掉 Dead 组件的存在窗口——这个状态
+#   在真实运行里多半根本采不到。而且它 gate 不了任何东西：全仓只有
+#   render_vitals 一处读 alive，dispatch 从不看它，死亡期间没有工具被拦。
+#
+#   事件：伤害窗（由 ClientboundSetHealth 包驱动，不采样故不漏），
+#   render_damage_entry 在 health_after <= 0 时追一句「你死了。」。
+#
+# 所以：服务端侧判自动重生生效，同伴侧只交叉印证**事件**到没到模型面前，
+# 不去断言那个多半采不到的状态。旧脚本的 respawn 工具判据则整个不存在了
+# ——azalea 自动重生被有意保留（machine/connect.rs 的 v1 裁定），恢复不经模型。
+# 另判历史故障「死后失聪」的回归：重生后同伴还能被唤醒说话。
 if [ "$DEATH_SCENARIO" != "off" ]; then
   phase "死亡恢复"
   [ -n "$FAKE_PID" ] && kill -TERM "$FAKE_PID" 2>/dev/null; FAKE_PID=""
@@ -479,6 +493,20 @@ if [ "$DEATH_SCENARIO" != "off" ]; then
     else
       assert "自动重生把生命值恢复" "服务端 data get Health" 1 \
         "30 次轮询仍未回满：$(entity_data)"
+    fi
+
+    # 交叉印证：死亡作为**事件**有没有到模型面前。伤害窗是包驱动的，
+    # 按 state.rs 的说法它不该漏；漏了就说明那条「不采样所以不漏」的
+    # 理由在实盘上不成立，是要查的事。不判失败，如实记。
+    #
+    # 只印证事件不印证状态：状态（alive → 「你已经死亡。」）走每 tick
+    # 采样，多半被自动重生压掉，且它只进上下文不进 stdout，本脚本看不到。
+    if grep -q '你死了' "$APP_LOG" 2>/dev/null; then
+      note "死亡事件已投给模型：$(grep -oE '→ .*你死了。*' "$APP_LOG" | tail -1)"
+      RESULTS+=("交叉印证|死亡事件到达模型|同伴 stdout 的投递原文|$(grep -oE '→ .*你死了[^⏎]*' "$APP_LOG" | tail -1)")
+    else
+      note "同伴投递行里没有死亡事件——伤害窗声称包驱动不漏，这里没到，值得查"
+      RESULTS+=("交叉印证|死亡事件未到达模型|同伴 stdout 的投递原文|伤害窗声称包驱动不漏，实盘未见，待查")
     fi
 
     # 回归目标：历史上死过一次之后同伴就再也不响应了（死后失聪）。
