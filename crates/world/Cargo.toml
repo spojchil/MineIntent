@@ -45,3 +45,7 @@ required-features = ["azalea"]
 [[example]]
 name = "gaze_probe"
 required-features = ["azalea"]
+
+[[example]]
+name = "dig_place_probe"
+required-features = ["azalea"]
