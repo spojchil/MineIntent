@@ -435,13 +435,18 @@ fi
 # 2026-08-17 起自动重生已关（machine/connect.rs），死亡是**持续状态**：
 # 不调 presence 工具就一直躺着。这把判据从「自动重生生效」翻成了两条更强的：
 #
-#   一、躺得住：致死后一段时间内服务端 Health 保持 0。这是自动重生真的关掉了
-#       的唯一服务端侧证据。它同时让状态呈现变得可观察——自动重生在时，
-#       14→0→20 压在一个 tick 里，每 tick 采样的 alive 几乎必然错过 false
-#       （state.rs 的 track_health 为此把伤害改成包驱动）。
+#   一、死亡态有持续时间：致死后秒级轮询能**连读到多次** Health=0。自动重生
+#       是在客户端收到 SetHealth(0) 的同一拍回发复活包的，本机往返不足一个
+#       tick，秒级轮询连一次都难读到。这同时说明为什么关掉它之后状态呈现才
+#       变得可观察——自动重生在时 14→0→20 压在一个 tick 里，每 tick 采样的
+#       alive 几乎必然错过 false（state.rs 的 track_health 为此把伤害改成
+#       包驱动）。
 #   二、自己起得来：随后 Health 由 0 回满。自动重生既然关了，复活包的唯一
 #       发出者就是模型调的 presence——服务端看到回满即证明那条链走通了。
 #       比旧脚本的「自动重生生效」强得多：那条连模型都不经过。
+#
+#   两条读同一趟轮询，互不冲突。别写成「躺够 N 拍」+「回满」两段——那是同一个
+#   信号的两个方向，只有模型够慢才可能都过，模型快反而判失败（首跑踩过）。
 #
 # 死亡期间的动作面按原版收窄（26.1.2 客户端字节码考证）：看得见世界、听得见
 # 声音、收得到别人说话（死亡屏不暂停），但开不了口（handleKeybinds 只在
@@ -481,38 +486,44 @@ if [ "$DEATH_SCENARIO" != "off" ]; then
     unproven "模型自己决定复活并生效" "未致死，前提不成立"
     unproven "复活后仍能被唤醒说话" "未致死，前提不成立"
   else
-    # 一、躺得住。自动重生若还开着，Health 会在死亡同一个 tick 内就回满，
-    # 这一轮轮询必然当场看到满值。所以「一段时间内保持 0」就是它确实关了。
-    STAYED_DEAD=0
-    for _ in $(seq 1 10); do
+    # 一趟轮询把两件事一起读出来。
+    #
+    # 2026-08-17 首跑订正：原来分两段写——前一段要它「躺够 10 拍」证明自动
+    # 重生关了，后一段要它「回满」证明模型自己起来了。两段读的是同一个信号，
+    # 于是只有模型够慢才可能都过。实测模型 4 秒就把自己拉起来了（死亡到达时
+    # 已有一轮在跑，伤害是并入的），第一段当场判失败——失败的是判据不是代码。
+    #
+    # 改判：自动重生关没关，看**死亡态被读到几次**。自动重生是在客户端收到
+    # SetHealth(0) 的同一拍回发复活包的，本机往返不足一个 tick，秒级轮询
+    # 连一次 0 都难读到，更不可能连读两次。而模型要走一整个来回。
+    ZERO_READS=0
+    RESPAWNED=1
+    for _ in $(seq 1 "$OBSERVE_SECS"); do
       console "data get entity $BOT_NAME Health" 1
-      if entity_data | grep -qE ' (20|19|18|17|16)\.[0-9]+f'; then
-        STAYED_DEAD=1; break
+      if entity_data | grep -qE ' 0\.0f'; then
+        ZERO_READS=$((ZERO_READS + 1))
+      elif entity_data | grep -qE ' (20|19|18|17|16)\.[0-9]+f'; then
+        RESPAWNED=0; break
       fi
     done
-    if [ "$STAYED_DEAD" -eq 0 ]; then
-      assert "死亡是持续状态（不会自己恢复）" "服务端 data get Health（10 次轮询）" 0 \
-        "十余秒内 Health 未自行回满"
+
+    if [ "$ZERO_READS" -ge 2 ]; then
+      assert "死亡是持续状态（自动重生已关）" "服务端 data get Health（秒级轮询）" 0 \
+        "连读 ${ZERO_READS} 次 Health=0；自动重生在时这个窗口不足一个 tick"
     else
-      assert "死亡是持续状态（不会自己恢复）" "服务端 data get Health（10 次轮询）" 1 \
-        "生命值自行回满了，自动重生疑似仍开着：$(entity_data)"
+      assert "死亡是持续状态（自动重生已关）" "服务端 data get Health（秒级轮询）" 1 \
+        "只读到 ${ZERO_READS} 次 0，死亡态几乎没有持续时间，自动重生疑似仍开着"
     fi
 
-    # 二、自己起得来。自动重生已关，复活包的唯一发出者就是模型调的 presence；
+    # 自己起得来。自动重生已关，复活包的唯一发出者就是模型调的 presence
+    # （azalea 侧 perform_respawn 只认 PerformRespawnEvent，写它的只剩写口），
     # 服务端看到 Health 由 0 回满，即证明「死亡入模型 → 模型决定 → 工具 →
     # 世界」整条链走通了。不用「公屏上出现某句话」间接证明：实测重生会把
     # 作用域推到下一代，重生前入队的发言作为旧作用域遗留被正确拦掉，
     # 拿一个必然失败的现象当判据是错的。
-    RESPAWNED=1
-    for _ in $(seq 1 "$OBSERVE_SECS"); do
-      console "data get entity $BOT_NAME Health" 1
-      if entity_data | grep -qE ' (20|19|18|17|16)\.[0-9]+f'; then
-        RESPAWNED=0; break
-      fi
-    done
     if [ "$RESPAWNED" -eq 0 ]; then
       assert "模型自己决定复活并生效" "服务端 data get Health（自动重生已关）" 0 \
-        "$(entity_data | grep -oE '[0-9.]+f' | tail -1)"
+        "躺了约 ${ZERO_READS} 秒后回满：$(entity_data | grep -oE '[0-9.]+f' | tail -1)"
     else
       assert "模型自己决定复活并生效" "服务端 data get Health（自动重生已关）" 1 \
         "${OBSERVE_SECS} 次轮询仍未回满，模型未复活：$(entity_data)"
