@@ -9,11 +9,14 @@
 use std::sync::atomic::Ordering;
 
 use azalea::container::ContainerHandleRef;
+use azalea::core::direction::Direction;
 use azalea::entity::{LoadedBy, LookDirection, Position};
 use azalea::inventory::operations::{ClickOperation, PickupClick, SwapClick, ThrowClick};
 use azalea::pathfinder::goals::BlockPosGoal;
 use azalea::pathfinder::{PathfinderClientExt, PathfinderOpts};
+use azalea::protocol::packets::game::s_interact::InteractionHand;
 use azalea::protocol::packets::game::s_player_action;
+use azalea::protocol::packets::game::s_use_item_on::{BlockHit, ServerboundUseItemOn};
 use azalea::respawn::PerformRespawnEvent;
 use azalea::{BlockPos, Client, SprintDirection, WalkDirection};
 use tokio::sync::oneshot;
@@ -41,8 +44,11 @@ pub enum DoorCommand {
     Attack {
         entity_key: String,
     },
+    /// 挖掉一格方块（异步持续：挖穿与否由世界变化通知证实）。
     Mine([i32; 3]),
     UseOnBlock([i32; 3]),
+    /// 把手持方块放到目标空位（目标须紧挨已有方块，被点的是共享面）。
+    PlaceBlock([i32; 3]),
     UseOnEntity {
         entity_key: String,
     },
@@ -163,11 +169,75 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             Ok(())
         }
         DoorCommand::Mine([x, y, z]) => {
-            bot.start_mining(BlockPos::new(x, y, z));
+            let target = BlockPos::new(x, y, z);
+            let (name, _) = read_target_block(inner, [x, y, z])?;
+            if crate::is_air_name(&name) {
+                return Err(format!("({x},{y},{z}) 没有方块，是空气"));
+            }
+            check_reach(bot, target.center())?;
+            // 挖什么看什么（原版机制）：开挖前看一眼目标。azalea 在事件处理
+            // 时若发现视线正落在目标上会用真实命中面，否则填 Down 兜底。
+            bot.look_at(target.center());
+            bot.start_mining(target);
             Ok(())
         }
         DoorCommand::UseOnBlock([x, y, z]) => {
             bot.block_interact(BlockPos::new(x, y, z));
+            Ok(())
+        }
+        DoorCommand::PlaceBlock([x, y, z]) => {
+            use azalea::entity::inventory::Inventory as InventoryComponent;
+            let empty_handed = bot
+                .try_query_self::<&InventoryComponent, _>(|inventory| {
+                    inventory.held_item().is_empty()
+                })
+                .map_err(|_| "读不到物品栏".to_owned())?;
+            if empty_handed {
+                return Err("手里没拿东西，先用 select_slot 选中要放的方块".to_owned());
+            }
+            let (name, _) = read_target_block(inner, [x, y, z])?;
+            if !crate::is_air_name(&name) {
+                return Err(format!("({x},{y},{z}) 已经有方块：{name}"));
+            }
+            let (eye, _) = eye_and_reach(bot)?;
+            check_reach(bot, BlockPos::new(x, y, z).center())?;
+            let support = {
+                let world = world_handle(inner)?;
+                let world = world.read();
+                pick_support_face([x, y, z], [eye.x, eye.y, eye.z], |position| {
+                    block_has_collision(&world, position)
+                })
+            };
+            let Some((neighbor, direction, hit)) = support else {
+                return Err(format!(
+                    "({x},{y},{z}) 六面都没有可依附的方块，放不上去；先在旁边放好落脚块"
+                ));
+            };
+            let location = azalea::Vec3 {
+                x: hit[0],
+                y: hit[1],
+                z: hit[2],
+            };
+            // 人放方块是看着依附面点右键：看向命中点，然后自己构造真实命中
+            // 发包。不走 block_interact——它在视线没落到目标时会伪造
+            // 「中心点+Up 面」，放置会歪到依附块顶上。
+            bot.look_at(location);
+            let seq = bot
+                .try_query_self::<&mut azalea::interact::BlockStatePredictionHandler, _>(
+                    |mut handler| handler.start_predicting(),
+                )
+                .unwrap_or_default();
+            bot.write_packet(ServerboundUseItemOn {
+                hand: InteractionHand::MainHand,
+                block_hit: BlockHit {
+                    block_pos: BlockPos::new(neighbor[0], neighbor[1], neighbor[2]),
+                    direction,
+                    location,
+                    inside: false,
+                    world_border: false,
+                },
+                seq,
+            });
             Ok(())
         }
         DoorCommand::UseOnEntity { entity_key } => {
@@ -181,7 +251,15 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             Ok(())
         }
         DoorCommand::ReleaseHand => {
-            bot.left_click_mine(false);
+            // 停挖要发真事件（AbortDestroyBlock 由它触发）。旧实现调的
+            // left_click_mine(false) 只摘「自动挖准星」组件——从未装过，
+            // 等于停不掉挖掘。守卫：azalea 的停挖处理器在没挖时会 panic
+            // （MineBlockPos 内层 expect），只有真在挖才发。
+            if bot.get_component::<azalea::mining::Mining>().is_some() {
+                bot.ecs
+                    .write()
+                    .write_message(azalea::mining::StopMiningBlockEvent { entity: bot.entity });
+            }
             bot.write_packet(s_player_action::ServerboundPlayerAction {
                 action: s_player_action::Action::ReleaseUseItem,
                 pos: BlockPos::new(0, 0, 0),
@@ -548,6 +626,129 @@ fn swap_button(menu_slot: u16, geometry: &MenuGeometry) -> Option<u8> {
     None
 }
 
+/// 世界模型句柄（Spawn 时登记；未就绪即如实拒绝）。
+fn world_handle(
+    inner: &Inner,
+) -> Result<std::sync::Arc<parking_lot::RwLock<azalea::world::World>>, String> {
+    inner
+        .world_handle
+        .lock()
+        .clone()
+        .ok_or_else(|| "世界模型尚未就绪".to_owned())
+}
+
+/// 读目标格的（方块名，有无碰撞体）。未加载/超高度如实拒绝。
+fn read_target_block(inner: &Inner, [x, y, z]: [i32; 3]) -> Result<(String, bool), String> {
+    let world = world_handle(inner)?;
+    let world = world.read();
+    let y64 = i64::from(y);
+    let min_y = i64::from(world.chunks.min_y());
+    if y64 < min_y || y64 >= min_y + i64::from(world.chunks.height()) {
+        return Err(format!("({x},{y},{z}) 在世界高度之外"));
+    }
+    let Some(state) = world.get_block_state(BlockPos::new(x, y, z)) else {
+        return Err(format!("({x},{y},{z}) 还没加载进来，先走近或看向那里"));
+    };
+    let block: Box<dyn azalea::block::BlockTrait> = Box::from(state);
+    Ok((block.id().to_owned(), state_has_collision(state)))
+}
+
+/// 这一格有没有碰撞体（可依附）。空气、水、火把、草都算没有。
+fn block_has_collision(world: &azalea::world::World, [x, y, z]: [i32; 3]) -> bool {
+    world
+        .get_block_state(BlockPos::new(x, y, z))
+        .is_some_and(state_has_collision)
+}
+
+fn state_has_collision(state: azalea::block::BlockState) -> bool {
+    use azalea::physics::collision::BlockWithShape;
+    !state.collision_shape().to_aabbs().is_empty()
+}
+
+/// 眼睛位置与方块触及上限（原版属性，生存默认 4.5 格）。
+fn eye_and_reach(bot: &Client) -> Result<(azalea::Vec3, f64), String> {
+    use azalea::entity::dimensions::EntityDimensions;
+    bot.try_query_self::<(&Position, &EntityDimensions, &azalea::entity::Attributes), _>(
+        |(position, dimensions, attributes)| {
+            (
+                azalea::Vec3 {
+                    x: position.x,
+                    y: position.y + f64::from(dimensions.eye_height),
+                    z: position.z,
+                },
+                attributes.block_interaction_range.calculate(),
+            )
+        },
+    )
+    .map_err(|_| "读不到自身位置".to_owned())
+}
+
+/// 目标点在触及范围内吗（按眼到格中心；比服务端的宽容值略严）。
+fn check_reach(bot: &Client, target: azalea::Vec3) -> Result<(), String> {
+    let (eye, reach) = eye_and_reach(bot)?;
+    let distance =
+        ((eye.x - target.x).powi(2) + (eye.y - target.y).powi(2) + (eye.z - target.z).powi(2))
+            .sqrt();
+    if distance > reach {
+        return Err(format!(
+            "太远了：目标离眼 {distance:.1} 格，触及上限 {reach:.1} 格；先走近"
+        ));
+    }
+    Ok(())
+}
+
+/// 依附面选择的结果：（邻块坐标、被点的面、命中点）。
+pub(super) type SupportFace = ([i32; 3], Direction, [f64; 3]);
+
+/// 放置的依附面选择（纯函数，可单测）。
+///
+/// 目标格 T 的六个邻格里找有碰撞体的方块 N，被点的是 N 朝向 T 的那面，
+/// 命中点取共享面中心；多个候选时选面法向最朝向眼睛的——人放方块点的
+/// 是自己看得见的面。
+pub(super) fn pick_support_face(
+    target: [i32; 3],
+    eye: [f64; 3],
+    mut solid_at: impl FnMut([i32; 3]) -> bool,
+) -> Option<SupportFace> {
+    // 面法向 = 从邻块指向目标格；原版语义：North=-z、South=+z、West=-x、East=+x。
+    const FACES: [(Direction, [i32; 3]); 6] = [
+        (Direction::Down, [0, -1, 0]),
+        (Direction::Up, [0, 1, 0]),
+        (Direction::North, [0, 0, -1]),
+        (Direction::South, [0, 0, 1]),
+        (Direction::West, [-1, 0, 0]),
+        (Direction::East, [1, 0, 0]),
+    ];
+    let center = [
+        f64::from(target[0]) + 0.5,
+        f64::from(target[1]) + 0.5,
+        f64::from(target[2]) + 0.5,
+    ];
+    let mut best: Option<(f64, SupportFace)> = None;
+    for (direction, normal) in FACES {
+        let neighbor = [
+            target[0] - normal[0],
+            target[1] - normal[1],
+            target[2] - normal[2],
+        ];
+        if !solid_at(neighbor) {
+            continue;
+        }
+        let hit = [
+            center[0] - 0.5 * f64::from(normal[0]),
+            center[1] - 0.5 * f64::from(normal[1]),
+            center[2] - 0.5 * f64::from(normal[2]),
+        ];
+        let score = (eye[0] - hit[0]) * f64::from(normal[0])
+            + (eye[1] - hit[1]) * f64::from(normal[1])
+            + (eye[2] - hit[2]) * f64::from(normal[2]);
+        if best.as_ref().is_none_or(|(top, _)| score > *top) {
+            best = Some((score, (neighbor, direction, hit)));
+        }
+    }
+    best.map(|(_, choice)| choice)
+}
+
 /// 按快照里的实体键（`{epoch}:{协议id}`）找回 ECS 实体。
 pub(super) fn find_entity_by_key(
     bot: &Client,
@@ -578,6 +779,37 @@ mod tests {
             hotbar_start: 37,
             offhand_slot: None,
         }
+    }
+
+    #[test]
+    fn support_face_uses_the_only_solid_neighbor() {
+        // 只有脚下有地面：依附块是下邻格，被点的是它的顶面，命中点在共享面中心。
+        let picked = pick_support_face([0, 64, 0], [0.5, 65.6, 0.5], |position| {
+            position == [0, 63, 0]
+        });
+        assert_eq!(picked, Some(([0, 63, 0], Direction::Up, [0.5, 64.0, 0.5])));
+    }
+
+    #[test]
+    fn support_face_prefers_the_face_visible_from_the_eye() {
+        let solid = |position: [i32; 3]| position == [0, 63, 0] || position == [1, 64, 0];
+        // 眼在西侧：东邻墙的西面正对眼睛，胜过只擦边的顶面。
+        let picked = pick_support_face([0, 64, 0], [-2.5, 64.5, 0.5], solid);
+        assert_eq!(
+            picked,
+            Some(([1, 64, 0], Direction::West, [1.0, 64.5, 0.5]))
+        );
+        // 眼在东侧：看不见那面西墙（法向背对眼睛），退回选顶面。
+        let picked = pick_support_face([0, 64, 0], [3.5, 64.5, 0.5], solid);
+        assert_eq!(picked, Some(([0, 63, 0], Direction::Up, [0.5, 64.0, 0.5])));
+    }
+
+    #[test]
+    fn support_face_is_none_when_floating() {
+        assert_eq!(
+            pick_support_face([0, 64, 0], [0.5, 65.6, 0.5], |_| false),
+            None
+        );
     }
 
     #[test]

@@ -4,10 +4,11 @@
 //! 用着物品时攻/挖/用的点击被吞、挖着时不能用、攻与用都过 isHandsBusy——
 //! 门拒绝什么，工具就把原因原文转达给模型。手与移动完全正交（边走边挖合法）。
 //!
-//! 挖掘与持续使用是状态：`mine` 期间朝向由挖掘目标牵引（挖什么看什么，
-//! 原版机制），`release` 是唯一的松手动词（停止挖掘或松开使用中的物品——
-//! 手是单槽，正在做的只有一件事，不需要两个松法）。
-//! 瞬时动词（attack/drop/swap_offhand/select_slot）发出即完，无持续占用。
+//! 挖掘与持续使用是状态：开挖/放置那刻机器代看一眼目标（挖什么看什么的
+//! 原版机制，命中面因此真实），`release` 是唯一的松手动词（停止挖掘或
+//! 松开使用中的物品——手是单槽，正在做的只有一件事，不需要两个松法）。
+//! 瞬时动词（attack/place/drop/swap_offhand/select_slot）发出即完，无持续占用；
+//! 挖穿/放上与否由世界变化通知证实，回执不替服务端作证。
 
 use std::sync::Arc;
 
@@ -20,6 +21,8 @@ use serde_json::{json, Value};
 pub trait HandDoor: Send + Sync {
     fn attack<'a>(&'a self, entity_key: &'a str) -> PortFuture<'a, Result<(), String>>;
     fn mine<'a>(&'a self, block: [i32; 3]) -> PortFuture<'a, Result<(), String>>;
+    /// 把手持方块放到目标空位（目标须紧挨已有方块；依附面由机器代选）。
+    fn place<'a>(&'a self, block: [i32; 3]) -> PortFuture<'a, Result<(), String>>;
     fn use_on_block<'a>(&'a self, block: [i32; 3]) -> PortFuture<'a, Result<(), String>>;
     fn use_on_entity<'a>(&'a self, entity_key: &'a str) -> PortFuture<'a, Result<(), String>>;
     fn use_item<'a>(&'a self) -> PortFuture<'a, Result<(), String>>;
@@ -56,6 +59,10 @@ impl HandTools {
             },
             Some("mine") => match read_block(arguments.get("block")) {
                 Ok(block) => self.door.mine(block).await,
+                Err(reason) => return ToolResult::failure(call_id, reason),
+            },
+            Some("place") => match read_block(arguments.get("block")) {
+                Ok(block) => self.door.place(block).await,
                 Err(reason) => return ToolResult::failure(call_id, reason),
             },
             Some("use_on") => {
@@ -107,7 +114,7 @@ impl HandTools {
             _ => {
                 return ToolResult::failure(
                     call_id,
-                    "action 必须是 attack/mine/use_on/use_item/release/drop/swap_offhand/select_slot 之一；请改写调用",
+                    "action 必须是 attack/mine/place/use_on/use_item/release/drop/swap_offhand/select_slot 之一；请改写调用",
                 )
             }
         };
@@ -143,11 +150,11 @@ impl ToolProvider for HandTools {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["attack", "mine", "use_on", "use_item", "release", "drop", "swap_offhand", "select_slot"],
-                        "description": "attack=攻击实体；mine=挖方块（持续到挖穿或 release）；use_on=对方块/实体使用（右键）；use_item=使用手持物品（吃/喝/举盾，持续到用完或 release）；release=松手；drop=丢手持物；swap_offhand=主副手对调；select_slot=选快捷栏格"
+                        "enum": ["attack", "mine", "place", "use_on", "use_item", "release", "drop", "swap_offhand", "select_slot"],
+                        "description": "attack=攻击实体；mine=挖掉一格方块（要挖一阵子，可用 release 中途停手）；place=把手持方块放到目标空位（目标须紧挨已有方块）；use_on=对方块/实体使用（右键）；use_item=使用手持物品（吃/喝/举盾，持续到用完或 release）；release=松手；drop=丢手持物；swap_offhand=主副手对调；select_slot=选快捷栏格"
                     },
                     "entity": { "type": "string", "description": "attack/use_on 用：目标实体的 entity_key" },
-                    "block": { "type": "array", "items": {"type": "integer"}, "description": "mine/use_on 用：方块坐标 [x, y, z]" },
+                    "block": { "type": "array", "items": {"type": "integer"}, "description": "mine/place/use_on 用：方块坐标 [x, y, z]" },
                     "stack": { "type": "boolean", "description": "drop 用：true 丢整组，默认丢一个" },
                     "slot": { "type": "integer", "minimum": 0, "maximum": 8, "description": "select_slot 用：快捷栏格号" }
                 },
@@ -157,7 +164,9 @@ impl ToolProvider for HandTools {
         );
         definition.description = Some(
             "手上动作。攻击、挖掘、使用三者同一时刻只能做一件（正在使用物品时攻击和挖掘\
-无效，挖掘中无法使用物品）；与走动互不影响。挖掘期间视线跟着挖掘目标。"
+无效，挖掘中无法使用物品）；与走动互不影响。开挖和放置时会自动看向目标。\
+回执只代表动作已发出：挖穿了没有、放上了没有，以世界变化通知为准，等通知即可，别急着重做。\
+放置放的是当前手持物；拿的不是可放置的方块时服务端不会理会。"
                 .to_owned(),
         );
         vec![(
@@ -207,6 +216,9 @@ mod tests {
         fn mine<'a>(&'a self, block: [i32; 3]) -> PortFuture<'a, Result<(), String>> {
             self.log(format!("mine{block:?}"))
         }
+        fn place<'a>(&'a self, block: [i32; 3]) -> PortFuture<'a, Result<(), String>> {
+            self.log(format!("place{block:?}"))
+        }
         fn use_on_block<'a>(&'a self, block: [i32; 3]) -> PortFuture<'a, Result<(), String>> {
             self.log(format!("use_on_block{block:?}"))
         }
@@ -248,6 +260,7 @@ mod tests {
         for arguments in [
             json!({"action": "attack", "entity": "zombie-7"}),
             json!({"action": "mine", "block": [10, 64, -3]}),
+            json!({"action": "place", "block": [11, 64, -3]}),
             json!({"action": "use_on", "block": [10, 65, -3]}),
             json!({"action": "use_on", "entity": "villager-2"}),
             json!({"action": "use_item"}),
@@ -265,6 +278,7 @@ mod tests {
             vec![
                 "attack(zombie-7)",
                 "mine[10, 64, -3]",
+                "place[11, 64, -3]",
                 "use_on_block[10, 65, -3]",
                 "use_on_entity(villager-2)",
                 "use_item",
@@ -284,6 +298,8 @@ mod tests {
             json!({"action": "attack"}),
             json!({"action": "mine", "block": [1, 2]}),
             json!({"action": "mine", "block": [1.5, 2.0, 3.0]}),
+            json!({"action": "place"}),
+            json!({"action": "place", "block": [1, 2]}),
             json!({"action": "use_on"}),
             json!({"action": "use_on", "entity": "a", "block": [1, 2, 3]}),
             json!({"action": "select_slot", "slot": 9}),
