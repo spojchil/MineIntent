@@ -1,7 +1,7 @@
 //! 聊天框：界面域的第一个屏。
 //!
-//! 单工具 `chat_box`，动词四个：说（`/` 开头的行按原版语义作为命令路由）、
-//! 历史、开、关。说与历史是完整闭环（结束必关屏）；只有显式"开"保持打开。
+//! 单工具 `chat_box`，动词五个：说（`/` 开头的行按原版语义作为命令路由）、
+//! 历史、开、取用法、关。说与历史是完整闭环（结束必关屏）；只有显式"开"保持打开。
 //! 发送无客户端限速——频率约束由服务端仲裁，与玩家同规。
 
 use std::sync::{Arc, Mutex as StdMutex};
@@ -52,7 +52,7 @@ const TOOL_NAME: &str = "chat_box";
 
 const USAGE: &str = "聊天框用法：{action:\"say\", text} 按行发送，以 / 开头的行作为命令执行，\
 每行至多 256 字符，聊天全服可见；{action:\"history\", count} 查看最近的聊天记录；\
-{action:\"open\", describe?} 打开并保持聊天框；{action:\"close\"} 关闭。";
+{action:\"open\"} 打开并保持聊天框；{action:\"close\"} 关闭。";
 
 pub struct ChatBox {
     occupancy: Arc<Occupancy>,
@@ -100,8 +100,8 @@ impl ChatBox {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["say", "history", "open", "close"],
-                        "description": "say=说话或执行命令；history=翻聊天记录；open=打开并保持；close=关闭"
+                        "enum": ["say", "history", "open", "describe", "close"],
+                        "description": "say=说话或执行命令；history=翻聊天记录；open=打开并保持；describe=取聊天框的完整用法（不随开屏自动给，要看自己取）；close=关闭"
                     },
                     "text": {
                         "type": "string",
@@ -111,10 +111,6 @@ impl ChatBox {
                         "type": "integer",
                         "minimum": 1,
                         "description": "history 用：要看最近多少条"
-                    },
-                    "describe": {
-                        "type": "boolean",
-                        "description": "open 用：是否附带用法介绍"
                     }
                 },
                 "required": ["action"],
@@ -136,11 +132,12 @@ impl ChatBox {
             match arguments.get("action").and_then(Value::as_str) {
                 Some("say") => self.say(call_id, arguments.get("text")).await,
                 Some("history") => self.browse_history(call_id, arguments.get("count")),
-                Some("open") => self.open(call_id, arguments.get("describe")),
+                Some("open") => self.open(call_id),
+                Some("describe") => self.describe(call_id),
                 Some("close") => self.close(call_id),
                 _ => ToolResult::failure(
                     call_id,
-                    "action 必须是 say/history/open/close 之一；请改写调用",
+                    "action 必须是 say/history/open/describe/close 之一；请改写调用",
                 ),
             }
         })
@@ -196,16 +193,21 @@ impl ChatBox {
         ToolResult::success_json(call_id, json!({ "lines": lines }))
     }
 
-    fn open(&self, call_id: agent::ToolCallId, describe: Option<&Value>) -> ToolResult {
+    fn open(&self, call_id: agent::ToolCallId) -> ToolResult {
         if let Err(reason) = self.claim_chat_screen() {
             return ToolResult::failure(call_id, reason);
         }
         self.occupancy.occupy(Domain::Screen);
-        let mut payload = json!({ "state": "open" });
-        if describe.and_then(Value::as_bool) == Some(true) {
-            payload["usage"] = Value::String(USAGE.to_owned());
-        }
-        ToolResult::success_json(call_id, payload)
+        ToolResult::success_json(call_id, json!({ "state": "open" }))
+    }
+
+    /// 用法全文按需取。
+    ///
+    /// 2026-08-17 由 `open{describe}` 参数改成独立动作，与 inventory/container
+    /// 收口成同一套：查用法是界面的一个动作，不是开屏的一个选项。开着的时候
+    /// 想再看一眼用法，不必为此重开一次屏。
+    fn describe(&self, call_id: agent::ToolCallId) -> ToolResult {
+        ToolResult::success(call_id, vec![agent::ContentPart::text(USAGE.to_owned())])
     }
 
     fn close(&self, call_id: agent::ToolCallId) -> ToolResult {
@@ -393,15 +395,10 @@ mod tests {
     #[tokio::test]
     async fn open_keeps_the_screen_and_say_still_releases_at_the_end() {
         let fixture = fixture(None);
-        let opened = fixture
-            .chat
-            .call(call(json!({"action": "open", "describe": true})))
-            .await;
+        let opened = fixture.chat.call(call(json!({"action": "open"}))).await;
         assert_eq!(json_payload(&opened)["state"], "open");
-        assert!(json_payload(&opened)["usage"]
-            .as_str()
-            .unwrap()
-            .contains("聊天框用法"));
+        // 开屏回执里不带用法：它是静态文本，要看自己调 describe。
+        assert!(json_payload(&opened).get("usage").is_none());
         assert!(screen_occupied(&fixture));
 
         fixture
@@ -409,6 +406,26 @@ mod tests {
             .call(call(json!({"action": "say", "text": "嗯"})))
             .await;
         assert!(!screen_occupied(&fixture));
+    }
+
+    /// 用法是独立动作，不是开屏的选项——开着的时候想再看一眼，不必重开屏。
+    #[tokio::test]
+    async fn describe_is_an_action_and_works_while_already_open() {
+        let fixture = fixture(None);
+        fixture.chat.call(call(json!({"action": "open"}))).await;
+        let described = fixture.chat.call(call(json!({"action": "describe"}))).await;
+        assert_eq!(described.status, agent::ToolResultStatus::Success);
+        let text: String = described
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains("聊天框用法"), "{text}");
+        // 取用法不该动屏：仍然开着。
+        assert!(screen_occupied(&fixture));
     }
 
     #[tokio::test]
