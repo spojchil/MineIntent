@@ -20,8 +20,8 @@ use motion::{MotionDoor, MotionTools};
 use perception::{PerceptionTools, ViewportDoor};
 use presence::{PresenceDoor, PresenceTools};
 use screens::{
-    container_usage, ChatBox, ChatDoor, ChatHistory, ChatReadMark, ContainerScreen, InventoryDoor,
-    InventoryScreen, ScreenKind, ScreenState,
+    ChatBox, ChatDoor, ChatHistory, ChatReadMark, ContainerScreen, InventoryDoor, InventoryScreen,
+    ScreenKind, ScreenState,
 };
 use world::{ConnectionConfig, DoorCommand, Module, SnapshotSource};
 
@@ -441,21 +441,13 @@ async fn main() -> Result<(), String> {
                         ScreenDirective::Opened { kind } => {
                             let displaced = screen_state.server_open(ScreenKind::Container);
                             occupancy.occupy(dispatch::Domain::Screen);
-                            let title = snapshot
-                                .open_screen
-                                .as_ref()
-                                .and_then(|screen| screen.title.clone())
-                                .map(|title| format!("「{title}」"))
-                                .unwrap_or_default();
-                            let mut text = format!("容器界面已打开（{kind}{title}）。");
-                            if displaced == Some(ScreenKind::Chat) {
-                                text.push_str("（聊天框被它顶掉了。）");
-                            }
-                            text.push('\n');
-                            text.push_str(&render::render_container_menu(&snapshot, &kind));
-                            text.push_str("\n\n");
-                            text.push_str(&container_usage(&kind));
-                            lines.push(text);
+                            // 措辞装配归 render（与 model_surface 导出共用一份）；
+                            // 这里只做副作用：占域与屏状态翻转。
+                            lines.push(render::render_container_opened(
+                                &snapshot,
+                                &kind,
+                                displaced == Some(ScreenKind::Chat),
+                            ));
                         }
                         ScreenDirective::Closed { kind, commanded } => {
                             screen_state.server_close(ScreenKind::Container);

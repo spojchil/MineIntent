@@ -286,6 +286,31 @@ fn container_area_len(kind: &str) -> Option<u32> {
 /// 专属标注，其余已知容器按「容器格 + 主背包 + 快捷栏」通用三段
 /// （尺寸查 [`container_area_len`]），未知种类退化为逐格罗列——
 /// 直译原则，不装懂。
+/// 容器开屏通知的整段文本。
+///
+/// 组合根与 `model_surface` 导出**共用这一份**——此前两边各拼各的，
+/// 2026-08-17 把用法全文改成按需取时导出没跟着变，「保真导出」当场失真。
+/// 装配是呈现选择，归本层；组合根只管副作用（占域、屏状态翻转）。
+///
+/// 不带用法全文：用法是静态文本，随开屏无条件投递等于每开一次就往会话区
+/// 塞一份同样的几百字节。要看用法自己调 `container` 的 describe。
+pub fn render_container_opened(snap: &TickSnapshot, kind: &str, chat_displaced: bool) -> String {
+    let title = snap
+        .open_screen
+        .as_ref()
+        .and_then(|screen| screen.title.clone())
+        .map(|title| format!("「{title}」"))
+        .unwrap_or_default();
+    let mut text = format!("容器界面已打开（{kind}{title}）。");
+    if chat_displaced {
+        text.push_str("（聊天框被它顶掉了。）");
+    }
+    text.push('\n');
+    text.push_str(&render_container_menu(snap, kind));
+    text.push_str("\n\n（这种容器怎么用：{\"action\":\"describe\"}）");
+    text
+}
+
 pub fn render_container_menu(snap: &TickSnapshot, kind: &str) -> String {
     let inventory = &snap.self_state.inventory;
     let item_at = |slot: u32| -> Option<String> {

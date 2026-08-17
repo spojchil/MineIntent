@@ -118,6 +118,9 @@ to 是不同物品=整组对调（count 不适用）；to 用 99=把 from 整格
 成品格（0）只能整组取走。非法放置（如盔甲格放非装备）会被世界拒绝。\
 开着物品栏时无法移动或与世界交互。";
 
+/// 开屏时代替用法全文的一行指路。
+const USAGE_POINTER: &str = "（格号语义与 move 的用法：{\"action\":\"describe\"}）";
+
 pub struct InventoryScreen {
     occupancy: Arc<Occupancy>,
     state: Arc<ScreenState>,
@@ -149,10 +152,18 @@ impl InventoryScreen {
         }
         self.occupancy.occupy(Domain::Screen);
         let listing = render::render_player_menu(&self.snapshots.latest());
+        // 只给清单，不带用法全文。用法是**静态文本**：随开屏无条件重发，等于每开
+        // 一次就往会话区里塞一份同样的 700 字节，而它一个字都不会变。查用法自己
+        // 是一个动作（describe），与 chat_box 的 open{describe} 同一立场。
         ToolResult::success(
             call_id,
-            vec![ContentPart::text(format!("{listing}\n\n{USAGE}"))],
+            vec![ContentPart::text(format!("{listing}\n\n{USAGE_POINTER}"))],
         )
+    }
+
+    /// 用法全文按需取。
+    fn describe(&self, call_id: agent::ToolCallId) -> ToolResult {
+        ToolResult::success(call_id, vec![ContentPart::text(USAGE.to_owned())])
     }
 
     async fn move_items(
@@ -232,8 +243,8 @@ impl dispatch::ToolProvider for InventoryScreen {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["open", "move", "close"],
-                        "description": "open=打开并列出全部格位与用法；move=把 from 格的东西弄到 to 格（移动/合堆/对调）；close=关闭"
+                        "enum": ["open", "describe", "move", "close"],
+                        "description": "open=打开并列出全部格位；describe=取格号语义与 move 的完整用法（不随开屏自动给，要看自己取）；move=把 from 格的东西弄到 to 格（移动/合堆/对调）；close=关闭"
                     },
                     "from": { "type": "integer", "description": "move 用：来源格号（0-45）" },
                     "to": { "type": "integer", "description": "move 用：目标格号（0-45）——空=移过去、同种物品=倒入合堆、不同物品=整组对调；99=把 from 整格丢出去" },
@@ -264,6 +275,7 @@ impl dispatch::ToolProvider for InventoryScreen {
             };
             match arguments.get("action").and_then(Value::as_str) {
                 Some("open") => self.open(call_id),
+                Some("describe") => self.describe(call_id),
                 Some("move") => {
                     self.move_items(
                         call_id,
@@ -274,7 +286,10 @@ impl dispatch::ToolProvider for InventoryScreen {
                     .await
                 }
                 Some("close") => self.close(call_id),
-                _ => ToolResult::failure(call_id, "action 必须是 open/move/close 之一；请改写调用"),
+                _ => ToolResult::failure(
+                    call_id,
+                    "action 必须是 open/describe/move/close 之一；请改写调用",
+                ),
             }
         })
     }
@@ -389,16 +404,33 @@ mod tests {
             .collect()
     }
 
+    /// 开屏只给清单与一行指路，**不带用法全文**——用法是静态文本，随开屏
+    /// 无条件重发等于每开一次就往会话区塞一份同样的几百字节。
     #[tokio::test]
-    async fn open_lists_slots_with_usage_and_occupies_screen() {
+    async fn open_lists_slots_without_the_usage_text_and_occupies_screen() {
         let fixture = fixture(None);
         let result = invoke(&fixture, json!({"action": "open"})).await;
         assert_eq!(result.status, ToolResultStatus::Success);
         let text = text_of(&result);
         assert!(text.contains("10=diamond ×3"), "{text}");
-        assert!(text.contains("物品栏用法"), "{text}");
+        assert!(!text.contains("物品栏用法"), "开屏不该带用法全文：{text}");
+        assert!(text.contains("describe"), "但要指得出路：{text}");
         assert!(fixture.occupancy.is_occupied(Domain::Screen));
         assert_eq!(fixture.state.current(), Some(ScreenKind::Inventory));
+    }
+
+    /// 用法按需取。指路里写的动作必须真的存在——否则指了个空。
+    #[tokio::test]
+    async fn describe_returns_the_full_usage() {
+        let fixture = fixture(None);
+        let opened = text_of(&invoke(&fixture, json!({"action": "open"})).await);
+        let described = invoke(&fixture, json!({"action": "describe"})).await;
+        assert_eq!(described.status, ToolResultStatus::Success);
+        let text = text_of(&described);
+        assert!(text.contains("物品栏用法"), "{text}");
+        assert!(text.contains("成品格（0）只能整组取走"), "{text}");
+        // 指路那行提到的动作名与真实动作对得上。
+        assert!(opened.contains("\"action\":\"describe\""), "{opened}");
     }
 
     #[tokio::test]

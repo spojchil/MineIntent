@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use agent::{PortFuture, ToolCall, ToolDefinition, ToolResult};
+use agent::{ContentPart, PortFuture, ToolCall, ToolDefinition, ToolResult};
 use dispatch::{Domain, Occupancy, ToolClass};
 use serde_json::{json, Value};
 use world::SnapshotSource;
@@ -161,6 +161,21 @@ impl ContainerScreen {
         ToolResult::success_json(call_id, json!({ "done": summary }))
     }
 
+    /// 用法全文按需取——种类随**当前开着的那个屏**，不用模型自己报。
+    ///
+    /// 用法是静态文本：随开屏无条件投递等于每开一次就往会话区塞一份同样的
+    /// 900 字节，而它一个字都不会变。查用法自己是一个动作。
+    fn describe(&self, call_id: agent::ToolCallId) -> ToolResult {
+        let snapshot = self.snapshots.latest();
+        let Some(open) = snapshot.open_screen.as_ref() else {
+            return ToolResult::failure(call_id, "现在没有开着的容器界面");
+        };
+        ToolResult::success(
+            call_id,
+            vec![ContentPart::text(container_usage(&open.kind))],
+        )
+    }
+
     async fn close(&self, call_id: agent::ToolCallId) -> ToolResult {
         let outcome = self.door.close_container().await;
         // 无论门怎么说，本地屏状态与占域都收口：服务端容器不在了就该放行。
@@ -182,8 +197,8 @@ impl dispatch::ToolProvider for ContainerScreen {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["move", "close"],
-                        "description": "move=把 from 格的东西弄到 to 格（移动/合堆/对调）；close=关闭容器"
+                        "enum": ["move", "describe", "close"],
+                        "description": "move=把 from 格的东西弄到 to 格（移动/合堆/对调）；describe=取当前这种容器的完整用法（不随开屏自动给，要看自己取）；close=关闭容器"
                     },
                     "from": { "type": "integer", "description": "move 用：来源格号（当前容器的格空间）" },
                     "to": { "type": "integer", "description": "move 用：目标格号——空=移过去、同种物品=倒入合堆、不同物品=整组对调；99=把 from 整格丢出去" },
@@ -195,8 +210,8 @@ impl dispatch::ToolProvider for ContainerScreen {
         );
         definition.description = Some(
             "当前开着的容器界面（工作台、箱子、熔炉等共用）。没有 open：对容器方块\
-使用（hand use_on）后界面由服务器打开，你会收到格位清单与用法；开着期间用 move \
-搬动/合堆/摆料/取物，close 关闭。开着时无法移动或与世界交互。"
+使用（hand use_on）后界面由服务器打开，你会收到格位清单；不确定这种容器怎么用就 \
+describe。开着期间用 move 搬动/合堆/摆料/取物，close 关闭。开着时无法移动或与世界交互。"
                 .to_owned(),
         );
         vec![(
@@ -223,8 +238,12 @@ impl dispatch::ToolProvider for ContainerScreen {
                     )
                     .await
                 }
+                Some("describe") => self.describe(call_id),
                 Some("close") => self.close(call_id).await,
-                _ => ToolResult::failure(call_id, "action 必须是 move/close 之一；请改写调用"),
+                _ => ToolResult::failure(
+                    call_id,
+                    "action 必须是 move/describe/close 之一；请改写调用",
+                ),
             }
         })
     }
@@ -286,6 +305,22 @@ mod tests {
                 1,
                 world::ConnectionPhase::Ready,
             ))
+        }
+    }
+
+    /// 开着某种容器的快照：describe 的种类从这里读，不用模型自报。
+    struct OpenSnapshots(&'static str);
+
+    impl SnapshotSource for OpenSnapshots {
+        fn latest(&self) -> Arc<world::TickSnapshot> {
+            let mut snapshot =
+                world::TickSnapshot::empty(world::Epoch(1), 1, world::ConnectionPhase::Ready);
+            snapshot.open_screen = Some(world::OpenScreenState {
+                kind: self.0.to_owned(),
+                container_id: 1,
+                title: None,
+            });
+            Arc::new(snapshot)
         }
     }
 
@@ -429,6 +464,38 @@ mod tests {
             state.server_open(ScreenKind::Container),
             Some(ScreenKind::Chat)
         );
+    }
+
+    /// 用法按需取，种类从当前开着的屏读——模型不用也不该自己报种类。
+    #[tokio::test]
+    async fn describe_returns_the_usage_of_the_currently_open_kind() {
+        let occupancy = Arc::new(Occupancy::new());
+        let state = Arc::new(ScreenState::new());
+        let screen = ContainerScreen::new(
+            occupancy,
+            state,
+            Arc::new(RecordingDoor::default()),
+            Arc::new(OpenSnapshots("furnace")),
+        );
+        let result = dispatch::ToolProvider::call(
+            &screen,
+            ToolCall::new("call-1", TOOL_NAME, json!({"action": "describe"})),
+        )
+        .await;
+        assert_eq!(result.status, ToolResultStatus::Success);
+        let text = text_of(&result);
+        assert!(text.contains("容器界面用法"), "{text}");
+        // 熔炉的种类补充要在，否则 describe 等于只给了通用段。
+        assert!(text.contains("燃料"), "{text}");
+    }
+
+    /// 没有开着的屏就如实拒绝，不编一份通用用法糊弄过去。
+    #[tokio::test]
+    async fn describe_without_an_open_screen_is_rejected() {
+        let fixture = fixture(false);
+        let result = invoke(&fixture, json!({"action": "describe"})).await;
+        assert_eq!(result.status, ToolResultStatus::Error);
+        assert!(text_of(&result).contains("没有开着的容器界面"));
     }
 
     #[test]
