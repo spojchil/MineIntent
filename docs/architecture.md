@@ -44,6 +44,7 @@
 | `perception` | 主动看（`scan`） | 薄壳：几何全在 world 的视口内核 |
 | `screens` | 界面互斥域（`chat_box`/`inventory`/`crafting_table`） | 屏的状态转换在此，占用账本在 dispatch；容器屏真相在服务端，组合根随屏事实翻转 |
 | `motion` / `hand` | 位移朝向 / 攻挖用 | 工具只表达意图立刻返回，合法性由原版物理自我仲裁 |
+| `presence` | 生死去留（`respawn`） | 死亡时唯一还放行的一类（`ToolClass::Vital`）；自动重生已关，起不起来是模型自己的事 |
 | `memory` | 单文件长期记忆 | 一个文件、两张脸（工具面 `remember` 与策略面落盘）、一个出口 |
 | `context` | 提示装配与压缩 | 受保护三段每轮现拉、永不参与压缩 |
 | `dispatch` | 工具编排 | 互斥域账本归此层；工具模块只做状态转换 |

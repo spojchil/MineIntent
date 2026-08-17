@@ -22,7 +22,8 @@ const TOOL_NAME: &str = "container";
 
 /// 所有容器共用的动词说明。开屏通知 = 种类名 + 格位清单 + 本文 +
 /// 种类补充（[`container_usage`] 汇总）。公开以便模型可见面导出评审。
-pub const CONTAINER_USAGE: &str = "容器界面用法：格号即协议号，属于当前界面（物品栏屏的格号在这里不适用）。\
+pub const CONTAINER_USAGE: &str =
+    "容器界面用法：格号即协议号，属于当前界面（物品栏屏的格号在这里不适用）。\
 {action:\"move\", from, to} 把 from 格的东西弄到 to 格，语义随 to 现状：to 为空=移过去\
 （可加 count 只挪几个，拆栈）；to 是同种物品=倒入合堆（可加 count 只倒几个，装不下的留在原格）；\
 to 是不同物品=整组对调（count 不适用）；to 用 99=把 from 整格丢出去。\
@@ -317,8 +318,11 @@ mod tests {
     }
 
     async fn invoke(fixture: &Fixture, arguments: serde_json::Value) -> ToolResult {
-        dispatch::ToolProvider::call(&fixture.screen, ToolCall::new("call-1", TOOL_NAME, arguments))
-            .await
+        dispatch::ToolProvider::call(
+            &fixture.screen,
+            ToolCall::new("call-1", TOOL_NAME, arguments),
+        )
+        .await
     }
 
     fn text_of(result: &ToolResult) -> String {
@@ -362,13 +366,19 @@ mod tests {
     async fn count_passes_through_to_the_door_but_not_with_discard() {
         let fixture = fixture(false);
         server_opens(&fixture);
-        let moved =
-            invoke(&fixture, json!({"action": "move", "from": 37, "to": 2, "count": 1})).await;
+        let moved = invoke(
+            &fixture,
+            json!({"action": "move", "from": 37, "to": 2, "count": 1}),
+        )
+        .await;
         assert_eq!(moved.status, ToolResultStatus::Success);
         assert_eq!(*fixture.door.calls.lock().unwrap(), vec!["move(37,2,1)"]);
 
-        let bad =
-            invoke(&fixture, json!({"action": "move", "from": 37, "to": 99, "count": 2})).await;
+        let bad = invoke(
+            &fixture,
+            json!({"action": "move", "from": 37, "to": 99, "count": 2}),
+        )
+        .await;
         assert_eq!(bad.status, ToolResultStatus::Error);
         assert!(text_of(&bad).contains("不能与 99 丢弃连用"));
     }

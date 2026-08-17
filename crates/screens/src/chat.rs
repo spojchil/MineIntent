@@ -84,9 +84,12 @@ impl ChatBox {
 
     /// 跨屏互斥：别的屏开着时聊天动词如实拒绝（原版一次只有一个屏）。
     fn claim_chat_screen(&self) -> Result<(), String> {
-        self.state
-            .open(ScreenKind::Chat)
-            .map_err(|existing| format!("{}开着，先关闭它再用聊天框", super::inventory::kind_word(existing)))
+        self.state.open(ScreenKind::Chat).map_err(|existing| {
+            format!(
+                "{}开着，先关闭它再用聊天框",
+                super::inventory::kind_word(existing)
+            )
+        })
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {

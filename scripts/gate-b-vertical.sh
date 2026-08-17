@@ -21,13 +21,17 @@
 #      能落盘的产品事实只剩记忆文件，改判它。
 #   3. 版本锚（agent-context.v5 / viewport.v2 / tool-result.v1）没了——
 #      新栈既不落 model-io 请求原文，源码里也没有锚常量，没有可断言的对象。
-#   4. respawn 工具没了——新栈保留 azalea 自动重生（machine/connect.rs 的
-#      v1 裁定：没有复活路径时死亡即永久），死亡恢复不经模型。死亡场景
-#      改判「自动重生真的生效」+「死后仍能被唤醒说话」，后者才是历史故障
-#      （死后失聪）的回归目标。
+#   4. 旧的 respawn 工具没了。死亡场景改判「死亡是持续状态」+「模型自己
+#      决定复活并生效」+「复活后仍能被唤醒说话」，最后一条是历史故障
+#      （死后失聪）的回归目标。见下面死亡段的原地说明。
 #
 # 另有两处旧断言在此重写而非照搬：位移与朝向此前只判「读得到 Rotation」，
 # 那对任何活着的实体都成立，是句空话；现在两者都取前后差值。
+#
+# ── 2026-08-17 第二次改动：死亡成为模型自己的事 ──────────────────────
+# 自动重生（azalea 的 AutoRespawnPlugin）已在 machine/connect.rs 关掉，
+# 死亡期间的动作面按原版收窄（dispatch 的生命闸门）。死亡段的判据随之从
+# 「自动重生生效」翻成「躺得住 + 自己起得来」，理由写在该段原地。
 
 set -uo pipefail
 
@@ -53,7 +57,7 @@ MODEL_NAME="${MODEL_NAME:-}"
 # 一轮对话的观察窗：真模型往返 + 工具执行 + 服务端落日志。
 OBSERVE_SECS="${OBSERVE_SECS:-120}"
 PORT="${PORT:-25565}"
-# 死亡恢复场景：plain=怪物致死后由 azalea 自动重生；off=跳过。
+# 死亡场景：plain=怪物致死后看模型自己决定复活；off=跳过。
 DEATH_SCENARIO="${DEATH_SCENARIO:-plain}"
 
 PHASE="(未开始)"
@@ -389,12 +393,12 @@ phase "交叉印证（同伴自述，不构成通过条件）"
 
 if TOOLS=$(grep -oE '\[组合根\] 工具表：.*' "$APP_LOG" | tail -1) && [ -n "$TOOLS" ]; then
   MISSING=""
-  for t in chat_box inventory container remember motion look hand scan; do
+  for t in chat_box inventory container remember motion look hand scan presence; do
     printf '%s' "$TOOLS" | grep -q "\"$t\"" || MISSING="$MISSING $t"
   done
   if [ -z "$MISSING" ]; then
-    note "工具表八件齐全：chat_box inventory container remember motion look hand scan"
-    RESULTS+=("交叉印证|工具表八件齐全|同伴 stdout|$TOOLS")
+    note "工具表九件齐全：chat_box inventory container remember motion look hand scan presence"
+    RESULTS+=("交叉印证|工具表九件齐全|同伴 stdout|$TOOLS")
   else
     note "工具表缺:$MISSING"
     RESULTS+=("交叉印证|工具表缺齐全性|同伴 stdout|缺:$MISSING")
@@ -425,25 +429,24 @@ else
   RESULTS+=("交叉印证|remember 未调用|记忆文件|文件为空或不存在")
 fi
 
-# ------------------------------------------- 死亡恢复（自动重生 + 死后可唤醒）
+# --------------------------------------- 死亡（持续状态 + 模型自己决定复活）
 # 用怪物打死而不是 /kill：伤害→掉血→死亡整条观察链都要真实经过。
 #
-# 死亡在新栈里有两条呈现，判据只能挂在后一条上：
+# 2026-08-17 起自动重生已关（machine/connect.rs），死亡是**持续状态**：
+# 不调 presence 工具就一直躺着。这把判据从「自动重生生效」翻成了两条更强的：
 #
-#   状态：SelfState.alive（capture.rs 读 azalea 的 Dead 组件），渲染成
-#   「你已经死亡。」顶掉整行体征。但它走**每 tick 采样**，而 state.rs 的
-#   track_health 自己写着：自动重生把 14→0→20 压进一个 tick，采样会整个
-#   错过 0（实测发生）。同一个压缩同样吞掉 Dead 组件的存在窗口——这个状态
-#   在真实运行里多半根本采不到。而且它 gate 不了任何东西：全仓只有
-#   render_vitals 一处读 alive，dispatch 从不看它，死亡期间没有工具被拦。
+#   一、躺得住：致死后一段时间内服务端 Health 保持 0。这是自动重生真的关掉了
+#       的唯一服务端侧证据。它同时让状态呈现变得可观察——自动重生在时，
+#       14→0→20 压在一个 tick 里，每 tick 采样的 alive 几乎必然错过 false
+#       （state.rs 的 track_health 为此把伤害改成包驱动）。
+#   二、自己起得来：随后 Health 由 0 回满。自动重生既然关了，复活包的唯一
+#       发出者就是模型调的 presence——服务端看到回满即证明那条链走通了。
+#       比旧脚本的「自动重生生效」强得多：那条连模型都不经过。
 #
-#   事件：伤害窗（由 ClientboundSetHealth 包驱动，不采样故不漏），
-#   render_damage_entry 在 health_after <= 0 时追一句「你死了。」。
-#
-# 所以：服务端侧判自动重生生效，同伴侧只交叉印证**事件**到没到模型面前，
-# 不去断言那个多半采不到的状态。旧脚本的 respawn 工具判据则整个不存在了
-# ——azalea 自动重生被有意保留（machine/connect.rs 的 v1 裁定），恢复不经模型。
-# 另判历史故障「死后失聪」的回归：重生后同伴还能被唤醒说话。
+# 死亡期间的动作面按原版收窄（26.1.2 客户端字节码考证）：看得见世界、听得见
+# 声音、收得到别人说话（死亡屏不暂停），但开不了口（handleKeybinds 只在
+# screen == null 时调用）。所以下面「说话」这条只可能发生在复活之后——
+# 它同时是历史故障「死后失聪」的回归。
 if [ "$DEATH_SCENARIO" != "off" ]; then
   phase "死亡恢复"
   [ -n "$FAKE_PID" ] && kill -TERM "$FAKE_PID" 2>/dev/null; FAKE_PID=""
@@ -472,35 +475,56 @@ if [ "$DEATH_SCENARIO" != "off" ]; then
   console "kill @e[type=minecraft:zombie]" 1
 
   if [ "$DIED" -ne 0 ]; then
-    # 前提不成立时这两条判定无意义：活着的实体本来就满血、本来就能说话，
+    # 前提不成立时这三条判定无意义：活着的实体本来就满血、本来就能说话，
     # 据此判过是假阳性。
-    unproven "自动重生把生命值恢复" "未致死，前提不成立"
-    unproven "死后仍能被唤醒说话" "未致死，前提不成立"
+    unproven "死亡是持续状态（不会自己恢复）" "未致死，前提不成立"
+    unproven "模型自己决定复活并生效" "未致死，前提不成立"
+    unproven "复活后仍能被唤醒说话" "未致死，前提不成立"
   else
-    # 判据是服务端的 Health 由 0 回到满值。不用「公屏上出现某句话」间接证明：
-    # 实测重生会把作用域推到下一代，重生前入队的发言作为旧作用域遗留被正确
-    # 拦掉，拿一个必然失败的现象当判据是错的。
+    # 一、躺得住。自动重生若还开着，Health 会在死亡同一个 tick 内就回满，
+    # 这一轮轮询必然当场看到满值。所以「一段时间内保持 0」就是它确实关了。
+    STAYED_DEAD=0
+    for _ in $(seq 1 10); do
+      console "data get entity $BOT_NAME Health" 1
+      if entity_data | grep -qE ' (20|19|18|17|16)\.[0-9]+f'; then
+        STAYED_DEAD=1; break
+      fi
+    done
+    if [ "$STAYED_DEAD" -eq 0 ]; then
+      assert "死亡是持续状态（不会自己恢复）" "服务端 data get Health（10 次轮询）" 0 \
+        "十余秒内 Health 未自行回满"
+    else
+      assert "死亡是持续状态（不会自己恢复）" "服务端 data get Health（10 次轮询）" 1 \
+        "生命值自行回满了，自动重生疑似仍开着：$(entity_data)"
+    fi
+
+    # 二、自己起得来。自动重生已关，复活包的唯一发出者就是模型调的 presence；
+    # 服务端看到 Health 由 0 回满，即证明「死亡入模型 → 模型决定 → 工具 →
+    # 世界」整条链走通了。不用「公屏上出现某句话」间接证明：实测重生会把
+    # 作用域推到下一代，重生前入队的发言作为旧作用域遗留被正确拦掉，
+    # 拿一个必然失败的现象当判据是错的。
     RESPAWNED=1
-    for _ in $(seq 1 30); do
+    for _ in $(seq 1 "$OBSERVE_SECS"); do
       console "data get entity $BOT_NAME Health" 1
       if entity_data | grep -qE ' (20|19|18|17|16)\.[0-9]+f'; then
         RESPAWNED=0; break
       fi
     done
     if [ "$RESPAWNED" -eq 0 ]; then
-      assert "自动重生把生命值恢复" "服务端 data get Health" 0 \
+      assert "模型自己决定复活并生效" "服务端 data get Health（自动重生已关）" 0 \
         "$(entity_data | grep -oE '[0-9.]+f' | tail -1)"
     else
-      assert "自动重生把生命值恢复" "服务端 data get Health" 1 \
-        "30 次轮询仍未回满：$(entity_data)"
+      assert "模型自己决定复活并生效" "服务端 data get Health（自动重生已关）" 1 \
+        "${OBSERVE_SECS} 次轮询仍未回满，模型未复活：$(entity_data)"
     fi
 
     # 交叉印证：死亡作为**事件**有没有到模型面前。伤害窗是包驱动的，
     # 按 state.rs 的说法它不该漏；漏了就说明那条「不采样所以不漏」的
     # 理由在实盘上不成立，是要查的事。不判失败，如实记。
     #
-    # 只印证事件不印证状态：状态（alive → 「你已经死亡。」）走每 tick
-    # 采样，多半被自动重生压掉，且它只进上下文不进 stdout，本脚本看不到。
+    # 状态那条（alive → 「你已经死亡。」）本脚本仍看不到——它只进上下文不进
+    # stdout。但自动重生关掉之后它至少变得**采得到**了，要验它得先有
+    # model-io 落盘。
     if grep -q '你死了' "$APP_LOG" 2>/dev/null; then
       note "死亡事件已投给模型：$(grep -oE '→ .*你死了。*' "$APP_LOG" | tail -1)"
       RESULTS+=("交叉印证|死亡事件到达模型|同伴 stdout 的投递原文|$(grep -oE '→ .*你死了[^⏎]*' "$APP_LOG" | tail -1)")
@@ -511,6 +535,10 @@ if [ "$DEATH_SCENARIO" != "off" ]; then
 
     # 回归目标：历史上死过一次之后同伴就再也不响应了（死后失聪）。
     # 判据仍是服务端看到它公屏发言，且必须是死亡消息之后的新发言。
+    #
+    # 注意这条现在依赖上一条：死亡期间 chat_box 被生命闸门拦着（对齐原版，
+    # 死人开不了口），所以只有复活了才可能说话。上一条不过，这条必然不过——
+    # 那不是重复判定，是「聋」与「哑」两件事在新口径下的先后关系。
     console "difficulty easy" 1
     console "time set day" 1
     REPLIES_BEFORE=$(srvlog | grep -cE "<$BOT_NAME> ")

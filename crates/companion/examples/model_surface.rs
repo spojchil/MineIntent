@@ -335,6 +335,7 @@ fn class_word(class: ToolClass) -> String {
     match class {
         ToolClass::Free => "Free（不占域、不受屏压制）".to_owned(),
         ToolClass::Body { domain } => format!("Body（域：{domain:?}，屏开时被压制）"),
+        ToolClass::Vital => "Vital（生死去留；死亡时唯一还放行的一类）".to_owned(),
     }
 }
 

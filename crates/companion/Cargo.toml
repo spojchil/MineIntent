@@ -13,6 +13,7 @@ dispatch = { path = "../dispatch" }
 hand = { path = "../hand" }
 motion = { path = "../motion" }
 perception = { path = "../perception" }
+presence = { path = "../presence" }
 memory = { path = "../memory" }
 render = { path = "../render" }
 serde_json = "1"

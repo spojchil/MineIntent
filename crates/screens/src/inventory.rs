@@ -274,10 +274,7 @@ impl dispatch::ToolProvider for InventoryScreen {
                     .await
                 }
                 Some("close") => self.close(call_id),
-                _ => ToolResult::failure(
-                    call_id,
-                    "action 必须是 open/move/close 之一；请改写调用",
-                ),
+                _ => ToolResult::failure(call_id, "action 必须是 open/move/close 之一；请改写调用"),
             }
         })
     }
@@ -331,11 +328,8 @@ mod tests {
 
     impl SnapshotSource for FixedSnapshots {
         fn latest(&self) -> std::sync::Arc<world::TickSnapshot> {
-            let mut snap = world::TickSnapshot::empty(
-                world::Epoch(1),
-                100,
-                world::ConnectionPhase::Ready,
-            );
+            let mut snap =
+                world::TickSnapshot::empty(world::Epoch(1), 100, world::ConnectionPhase::Ready);
             snap.self_state.inventory.slots.push(world::InventorySlot {
                 slot: 10,
                 item_name: "diamond".to_owned(),
@@ -417,8 +411,11 @@ mod tests {
         invoke(&fixture, json!({"action": "open"})).await;
         let moved = invoke(&fixture, json!({"action": "move", "from": 10, "to": 38})).await;
         assert_eq!(moved.status, ToolResultStatus::Success);
-        let counted =
-            invoke(&fixture, json!({"action": "move", "from": 10, "to": 20, "count": 3})).await;
+        let counted = invoke(
+            &fixture,
+            json!({"action": "move", "from": 10, "to": 20, "count": 3}),
+        )
+        .await;
         assert_eq!(counted.status, ToolResultStatus::Success);
         let thrown = invoke(&fixture, json!({"action": "move", "from": 10, "to": 99})).await;
         assert_eq!(thrown.status, ToolResultStatus::Success);

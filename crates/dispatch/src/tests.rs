@@ -59,7 +59,30 @@ struct Fixture {
     occupancy: Arc<Occupancy>,
 }
 
+/// 可翻转的生命闸门：测死亡压制用。
+struct SwitchableLife(std::sync::atomic::AtomicBool);
+
+impl SwitchableLife {
+    fn alive() -> Arc<Self> {
+        Arc::new(Self(std::sync::atomic::AtomicBool::new(true)))
+    }
+
+    fn kill(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl LifeGate for SwitchableLife {
+    fn alive(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 fn fixture() -> Fixture {
+    fixture_with_life(Arc::new(AlwaysAlive)).0
+}
+
+fn fixture_with_life(life: Arc<dyn LifeGate>) -> (Fixture, Arc<StdMutex<Vec<String>>>) {
     let log = Arc::new(StdMutex::new(Vec::new()));
     let occupancy = Arc::new(Occupancy::new());
     let providers: Vec<Arc<dyn ToolProvider>> = vec![
@@ -78,13 +101,17 @@ fn fixture() -> Fixture {
             log.clone(),
         ),
         FakeProvider::new("remember", ToolClass::Free, log.clone()),
+        FakeProvider::new("presence", ToolClass::Vital, log.clone()),
     ];
-    let dispatcher = Dispatcher::new(providers, occupancy.clone()).unwrap();
-    Fixture {
-        dispatcher,
+    let dispatcher = Dispatcher::new(providers, occupancy.clone(), life).unwrap();
+    (
+        Fixture {
+            dispatcher,
+            log: log.clone(),
+            occupancy,
+        },
         log,
-        occupancy,
-    }
+    )
 }
 
 fn batch(calls: Vec<ToolCall>) -> ToolCallBatch {
@@ -232,10 +259,106 @@ fn duplicate_tool_names_fail_at_registration() {
         },
         log,
     );
-    let error = Dispatcher::new(vec![first, second], Arc::new(Occupancy::new()))
-        .err()
-        .expect("重名注册必须失败");
+    let error = Dispatcher::new(
+        vec![first, second],
+        Arc::new(Occupancy::new()),
+        Arc::new(AlwaysAlive),
+    )
+    .err()
+    .expect("重名注册必须失败");
     assert!(error.summary.contains("chat_box"));
+}
+
+/// 死亡拦身体类、放行感知与内心。口径对齐原版：死人看得见世界
+/// （死亡屏不暂停），但开不了口（聊天键只在无屏时处理）。
+#[tokio::test]
+async fn death_blocks_body_tools_but_not_perception_or_memory() {
+    let life = SwitchableLife::alive();
+    let (fixture, log) = fixture_with_life(life.clone());
+    life.kill();
+
+    let results = fixture
+        .dispatcher
+        .dispatch(batch(vec![
+            call("a", "go_to"),
+            call("b", "chat_box"),
+            call("c", "remember"),
+        ]))
+        .await
+        .unwrap();
+
+    assert_eq!(results.results[0].status, agent::ToolResultStatus::Error);
+    assert_eq!(results.results[1].status, agent::ToolResultStatus::Error);
+    assert_eq!(results.results[2].status, agent::ToolResultStatus::Success);
+    // 被拦的两件根本没到供应者手里——拒绝不是"执行了但失败"。
+    assert_eq!(log.lock().unwrap().as_slice(), ["remember"]);
+}
+
+/// Vital 类不受生命闸门压制。归错类的话，死了就没有出路了。
+#[tokio::test]
+async fn death_still_lets_vital_tools_through() {
+    let life = SwitchableLife::alive();
+    let (fixture, log) = fixture_with_life(life.clone());
+    life.kill();
+
+    let results = fixture
+        .dispatcher
+        .dispatch(batch(vec![call("a", "presence")]))
+        .await
+        .unwrap();
+
+    assert_eq!(results.results[0].status, agent::ToolResultStatus::Success);
+    assert_eq!(log.lock().unwrap().as_slice(), ["presence"]);
+}
+
+/// 生命闸门先于界面压制：死了连屏都开不了，报"有界面开着"是答非所问。
+#[tokio::test]
+async fn death_message_takes_precedence_over_screen_suppression() {
+    let life = SwitchableLife::alive();
+    let (fixture, _log) = fixture_with_life(life.clone());
+    fixture.occupancy.occupy(Domain::Screen);
+    life.kill();
+
+    let results = fixture
+        .dispatcher
+        .dispatch(batch(vec![call("a", "go_to")]))
+        .await
+        .unwrap();
+
+    let text: String = results.results[0]
+        .content
+        .iter()
+        .filter_map(|part| match part {
+            agent::ContentPart::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(text.contains("已经死亡"), "{text}");
+    assert!(!text.contains("界面开着"), "{text}");
+}
+
+/// 活着时闸门完全不出现在路径上——不能因为加了闸门就改变原有行为。
+#[tokio::test]
+async fn alive_leaves_every_class_untouched() {
+    let (fixture, log) = fixture_with_life(SwitchableLife::alive());
+    let results = fixture
+        .dispatcher
+        .dispatch(batch(vec![
+            call("a", "go_to"),
+            call("b", "remember"),
+            call("c", "presence"),
+        ]))
+        .await
+        .unwrap();
+
+    assert!(results
+        .results
+        .iter()
+        .all(|result| result.status == agent::ToolResultStatus::Success));
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        ["go_to", "remember", "presence"]
+    );
 }
 
 #[test]
@@ -247,5 +370,5 @@ fn definitions_concatenate_all_providers() {
         .into_iter()
         .map(|definition| definition.name.into_inner())
         .collect();
-    assert_eq!(names, vec!["chat_box", "go_to", "remember"]);
+    assert_eq!(names, vec!["chat_box", "go_to", "remember", "presence"]);
 }

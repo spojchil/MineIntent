@@ -939,6 +939,7 @@ dependencies = [
  "midturn",
  "motion",
  "perception",
+ "presence",
  "render",
  "screens",
  "serde_json",
@@ -2444,6 +2445,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy",
+]
+
+[[package]]
+name = "presence"
+version = "0.0.1"
+dependencies = [
+ "dispatch",
+ "midturn",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

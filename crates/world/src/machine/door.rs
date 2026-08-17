@@ -14,6 +14,7 @@ use azalea::inventory::operations::{ClickOperation, PickupClick, SwapClick, Thro
 use azalea::pathfinder::goals::BlockPosGoal;
 use azalea::pathfinder::{PathfinderClientExt, PathfinderOpts};
 use azalea::protocol::packets::game::s_player_action;
+use azalea::respawn::PerformRespawnEvent;
 use azalea::{BlockPos, Client, SprintDirection, WalkDirection};
 use tokio::sync::oneshot;
 
@@ -67,6 +68,8 @@ pub enum DoorCommand {
     ThrowSlot(u16),
     /// 关闭当前开着的服务端容器（发 ContainerClose 并清本地菜单）。
     CloseContainer,
+    /// 复活。自动重生已关（connect.rs），死亡是持续状态，由模型自己决定何时起来。
+    Respawn,
 }
 
 pub(super) struct PendingCommand {
@@ -306,6 +309,21 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             }
             inner.mark_expected_close();
             ContainerHandleRef::new(geometry.container_id, bot.clone()).close();
+            Ok(())
+        }
+        DoorCommand::Respawn => {
+            // 活着时发这个包，服务端 handleClientCommand 见 getHealth() > 0
+            // 直接 return——一次静默空操作。与其让工具面收到"成功"，不如
+            // 在这里如实拒绝：机器知道自己是死是活。
+            let dead = bot
+                .get_component::<azalea::entity::metadata::Health>()
+                .is_some_and(|health| health.0 <= 0.0);
+            if !dead {
+                return Err("你还活着，没有可复活的".to_owned());
+            }
+            bot.ecs
+                .write()
+                .write_message(PerformRespawnEvent { entity: bot.entity });
             Ok(())
         }
     }

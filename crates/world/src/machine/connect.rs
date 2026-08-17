@@ -15,6 +15,7 @@ use std::sync::Arc;
 use azalea::accept_resource_packs::AcceptResourcePacksPlugin;
 use azalea::app::{App, AppExit, Plugin, PluginGroup, Update};
 use azalea::auto_reconnect::AutoReconnectPlugin;
+use azalea::auto_respawn::AutoRespawnPlugin;
 use azalea::bot::DefaultBotPlugins;
 use azalea::ecs::message::MessageWriter;
 use azalea::ecs::system::Res;
@@ -97,12 +98,18 @@ pub(super) async fn run_swarm(inner: Arc<Inner>, config: ConnectionConfig) {
     };
     let plugins = (
         DefaultPlugins.build(),
-        // v1 保留自动重生：没有任何复活路径时死亡即永久（实盘死在虚空里
-        // 只会一直坠落）。"死亡作为要保持的事实"如何进产品，随死亡处理裁定。
+        // 2026-08-17 关掉自动重生（此前为「没有复活路径时死亡即永久」而保留）：
+        // 复活成了模型自己的决定（presence 工具），自动重生会把那个决定抢走。
+        //
+        // 附带效果值得记一笔：自动重生在时，死亡瞬间的 14→0→20 压在一个 tick
+        // 里，每 tick 采样的 `SelfState.alive` 几乎必然错过 false（state.rs 的
+        // track_health 为此把伤害改成了包驱动）。关掉之后死亡是**持续状态**，
+        // alive 采得到，"你已经死亡。"这行体征才真正到得了模型面前。
         DefaultBotPlugins
             .build()
             .disable::<AcceptResourcePacksPlugin>()
-            .disable::<AutoReconnectPlugin>(),
+            .disable::<AutoReconnectPlugin>()
+            .disable::<AutoRespawnPlugin>(),
         MachineShutdownPlugin,
         DefaultSwarmPlugins,
     );

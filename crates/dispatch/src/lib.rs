@@ -18,11 +18,41 @@ use agent::{
 };
 
 /// 编排眼中的工具类别。内心与感知合并为 Free（都不受压制、不占域）；
-/// 身体类带互斥域，受界面压制。
+/// 身体类带互斥域，受界面压制；生死去留自成一类，死亡时唯一还放行的。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolClass {
     Free,
-    Body { domain: Domain },
+    Body {
+        domain: Domain,
+    },
+    /// 生死去留。不占域、不受界面压制，也**不受生命闸门压制**——死了之后
+    /// 能做的就只剩这一类，把它也拦掉就没有出路了。
+    Vital,
+}
+
+/// 生命闸门：死亡时大部分动作做不了。
+///
+/// 判据（`SelfState.alive`）在 world 的快照里，但本层不认识 world——
+/// 由组合根注入这个端口，与 [`Occupancy`] 一样，判断只发生在编排内部。
+///
+/// 口径对齐原版（26.1.2 客户端字节码考证）：死亡屏不暂停游戏
+/// （`DeathScreen.isPauseScreen()` 恒 false；多人下 `Minecraft.pause`
+/// 的第一道闸 `hasSingleplayerServer()` 本就为 false），所以死人**看得见
+/// 世界、听得见声音、看得见聊天**——`Free` 类（scan/remember）照常放行。
+/// 但 `handleKeybinds()` 只在 `screen == null` 时调用，死亡屏是非空 screen，
+/// 所以死人**开不了口**——chat_box 连同其余 `Body` 类一起拦。
+pub trait LifeGate: Send + Sync {
+    /// 活着为 true。
+    fn alive(&self) -> bool;
+}
+
+/// 没有闸门时的默认：永远活着。用于不关心生死的装配（如单元测试）。
+pub struct AlwaysAlive;
+
+impl LifeGate for AlwaysAlive {
+    fn alive(&self) -> bool {
+        true
+    }
 }
 
 /// 身体互斥域。2026-08-10 客户端考证裁定：手（攻击/挖掘/使用三态彼此互斥）
@@ -92,12 +122,14 @@ pub struct Dispatcher {
     /// 工具名 → (供应者下标, 类别)。
     routes: HashMap<ToolName, (usize, ToolClass)>,
     occupancy: Arc<Occupancy>,
+    life: Arc<dyn LifeGate>,
 }
 
 impl Dispatcher {
     pub fn new(
         providers: Vec<Arc<dyn ToolProvider>>,
         occupancy: Arc<Occupancy>,
+        life: Arc<dyn LifeGate>,
     ) -> Result<Self, RegistrationError> {
         let mut routes = HashMap::new();
         for (index, provider) in providers.iter().enumerate() {
@@ -116,6 +148,7 @@ impl Dispatcher {
             providers,
             routes,
             occupancy,
+            life,
         })
     }
 
@@ -129,6 +162,15 @@ impl Dispatcher {
                 ),
             );
         };
+
+        // 生命闸门先于界面压制：死了连屏都开不了，讨论谁占着屏没有意义。
+        if matches!(class, ToolClass::Body { .. }) && !self.life.alive() {
+            return ToolResult::failure(
+                call.id,
+                "你已经死亡，做不了这件事——死着的时候只看得见、听得见、想得起来，\
+动不了也开不了口。要重新行动就先复活。",
+            );
+        }
 
         if let ToolClass::Body { domain } = class {
             if *domain != Domain::Screen && self.occupancy.is_occupied(Domain::Screen) {

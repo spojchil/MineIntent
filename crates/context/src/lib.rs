@@ -187,11 +187,8 @@ impl Compaction for ContextStrategy {
             // 耐久事实（中断回执、effect 对账等）说的是「外界真的发生过什么」，
             // 内核要求逐项原样保留并校验序列一致，否则整个压缩结果被丢弃。
             // 摘要在前，耐久事实按原相对顺序跟在后面。
-            let mut replaced: Vec<TranscriptItem> = vec![InputMessage::text(
-                "user",
-                format!("{SUMMARY_PREFIX}\n{summary}"),
-            )
-            .into()];
+            let mut replaced: Vec<TranscriptItem> =
+                vec![InputMessage::text("user", format!("{SUMMARY_PREFIX}\n{summary}")).into()];
             replaced.extend(
                 conversation
                     .iter()

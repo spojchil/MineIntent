@@ -13,11 +13,12 @@ use std::time::Duration;
 use agent::adapters::http::{HttpModel, HttpModelConfig, Protocol};
 use agent::{AgentSession, InputMessage, MailboxInput, SessionConfig};
 use context::ContextStrategy;
-use dispatch::{Dispatcher, Occupancy, ToolProvider};
+use dispatch::{Dispatcher, LifeGate, Occupancy, ToolProvider};
 use hand::{HandDoor, HandTools};
 use memory::{MemoryFile, MemoryTools};
 use motion::{MotionDoor, MotionTools};
 use perception::{PerceptionTools, ViewportDoor};
+use presence::{PresenceDoor, PresenceTools};
 use screens::{
     container_usage, ChatBox, ChatDoor, ChatHistory, ChatReadMark, ContainerScreen, InventoryDoor,
     InventoryScreen, ScreenKind, ScreenState,
@@ -143,6 +144,28 @@ impl HandDoor for ModuleHandDoor {
     }
     fn select_slot<'a>(&'a self, slot: u8) -> agent::PortFuture<'a, Result<(), String>> {
         Box::pin(async move { self.0.execute(DoorCommand::SelectSlot(slot)).await })
+    }
+}
+
+/// 生死去留门：当前只有复活。
+struct ModulePresenceDoor(Arc<Module>);
+
+impl PresenceDoor for ModulePresenceDoor {
+    fn respawn<'a>(&'a self) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::Respawn).await })
+    }
+}
+
+/// 生命闸门的判据来源：快照里的 `alive`。
+///
+/// dispatch 不认识 world，所以这条窄化在组合根落地。取的是**最新快照**而
+/// 不是缓存的标志——工具执行与 tick 采样是两条线，缓存会让「刚死就还能挥手」
+/// 这类窗口打开。
+struct SnapshotLifeGate(Arc<dyn SnapshotSource>);
+
+impl LifeGate for SnapshotLifeGate {
+    fn alive(&self) -> bool {
+        self.0.latest().self_state.alive
     }
 }
 
@@ -312,9 +335,14 @@ async fn main() -> Result<(), String> {
             }),
             block_memory.clone(),
         )),
+        Arc::new(PresenceTools::new(Arc::new(ModulePresenceDoor(
+            module.clone(),
+        )))),
     ];
-    let dispatcher =
-        Arc::new(Dispatcher::new(providers, occupancy.clone()).map_err(|error| error.to_string())?);
+    let life: Arc<dyn LifeGate> = Arc::new(SnapshotLifeGate(snapshots.clone()));
+    let dispatcher = Arc::new(
+        Dispatcher::new(providers, occupancy.clone(), life).map_err(|error| error.to_string())?,
+    );
     {
         use agent::ToolRuntime;
         let names: Vec<String> = dispatcher

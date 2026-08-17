@@ -11,6 +11,7 @@ MineIntent 的全 Rust 单进程实现。目标服务端 **Paper 26.1.2 / 协议
 | [`crates/screens`](../../crates/screens) | 界面互斥域：`chat_box` / `inventory` / `container` |
 | [`crates/motion`](../../crates/motion) / [`hand`](../../crates/hand) | 位移朝向 / 攻挖用 |
 | [`crates/memory`](../../crates/memory) | 单文件长期记忆：`remember` |
+| [`crates/presence`](../../crates/presence) | 生死去留：`presence`（当前只有 `respawn`） |
 | [`crates/context`](../../crates/context) | 提示装配与压缩策略 |
 | [`crates/dispatch`](../../crates/dispatch) | 工具编排与互斥域账本 |
 | [`crates/companion`](../../crates/companion) | 组合根，唯一可执行 |
@@ -98,8 +99,25 @@ git 依赖、不再是工作区成员，那个示例**跑不到本仓**（`cargo
 伤害窗由 `ClientboundSetHealth` 包驱动，不做每 tick 采样——自动重生会把
 死亡瞬间的 `14→0→20` 压进一个 tick，采样会整个错过 0（实测发生）。
 
-v1 保留 azalea 的自动重生（没有任何复活路径时死亡即永久）；
-自动重连与资源包接受保持关闭。
+## 死亡
+
+**自动重生已关**（2026-08-17）：死亡是持续状态，起不起来由模型自己用
+`presence` 工具决定。附带效果是 `SelfState.alive` 终于采得到了——自动重生
+在时那个 false 几乎必然被上面那个单 tick 压缩吞掉。
+
+死亡期间的动作面按原版收窄（`dispatch` 的 `LifeGate`，26.1.2 客户端字节码
+考证）：
+
+| | 死亡期间 | 依据 |
+|---|---|---|
+| 看世界、听声音 | **可以**（`Free` 类照常） | 死亡屏不暂停：`DeathScreen.isPauseScreen()` 恒 false，且多人下 `Minecraft.pause` 的第一道闸 `hasSingleplayerServer()` 本就为 false |
+| 收到别人说话 | **可以**（唤醒与轮末帧照常走） | 聊天 HUD 归 `Gui` 渲染，不经 screen |
+| 说话、移动、动手、开屏 | **不可以**（`Body` 类全拦） | `handleKeybinds()` 只在 `screen == null` 时调用，死亡屏是非空 screen |
+| 复活 | **可以**（`Vital` 类不受闸门压制） | 归进 `Body` 就没有出路了 |
+
+自动重连与资源包接受保持关闭。下线/上线尚未实现——接入模块还是一次性的
+（`Module::start` 起线程、`stop` 合流即终，`EPOCH` 是硬常量），且离线期间
+没有 tick，唤醒循环整个停摆。
 
 ## 视口
 
