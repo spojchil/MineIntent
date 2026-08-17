@@ -6,7 +6,7 @@
 //! 而各读方的游标互不干扰。tick 在同一游戏刻内会重复，要「恰好一次」地
 //! 消费必须用 seq 做游标。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -30,6 +30,12 @@ use crate::{
 /// 动作的回声（Commanded）。服务器确认通常一两个 tick 内到达。
 const EXPECTED_SLOT_TICKS: u64 = 40;
 
+/// 一格的内容：物品名（`None` = 空）与数量。
+type SlotContents = (Option<String>, u32);
+
+/// 格位账：(容器 id, 菜单号) → 上一个已知内容。
+type SlotLedger = HashMap<(i32, u16), SlotContents>;
+
 /// 机器与外界的共享面。纯状态转换都在这里，可脱离 azalea 单测。
 pub(crate) struct Inner {
     pub(super) latest: RwLock<Arc<TickSnapshot>>,
@@ -42,6 +48,11 @@ pub(crate) struct Inner {
     /// 在途移动任务（单意图槽）。
     pub(super) movement_job: Mutex<Option<MovementJob>>,
     pub(super) inventory_window: Mutex<VecDeque<InventoryChangeEntry>>,
+    /// 各格上一个已知内容：(容器 id, 菜单号) → (物品名, 数量)。
+    /// 服务端重发同值不算变化——判据在 [`Inner::push_inventory_change`]。
+    /// 关屏时按容器 id 清账：菜单号只在自己那个界面里有意义，且服务端会复用
+    /// 容器 id，留着旧账会把新容器的真变化误判成重发。
+    pub(super) last_slot_contents: Mutex<SlotLedger>,
     /// 预期会变的格位（我们刚 swap/丢弃过）：(菜单号, 失效 tick)。
     pub(super) expected_slots: Mutex<Vec<(u16, u64)>>,
     /// 当前开着的服务端容器（每 tick 与 ECS 组件对账，变迁产屏事实）。
@@ -85,6 +96,7 @@ impl Inner {
             last_health: Mutex::new(None),
             movement_job: Mutex::new(None),
             inventory_window: Mutex::new(VecDeque::new()),
+            last_slot_contents: Mutex::new(SlotLedger::new()),
             expected_slots: Mutex::new(Vec::new()),
             open_screen: Mutex::new(None),
             screens_window: Mutex::new(VecDeque::new()),
@@ -168,6 +180,12 @@ impl Inner {
         let previous = std::mem::replace(&mut *open, current.clone());
         drop(open);
         if let Some(previous) = previous {
+            // 该容器的格位账随屏作废：菜单号只在自己那个界面里有意义，
+            // 而服务端会复用容器 id——留着旧账会把新容器的真变化误判成重发。
+            let closed_id = previous.container_id;
+            self.last_slot_contents
+                .lock()
+                .retain(|(container_id, _), _| *container_id != closed_id);
             let tick = self.tick.load(Ordering::Acquire);
             let source = {
                 let mut expected = self.expected_close.lock();
@@ -230,6 +248,20 @@ impl Inner {
     /// 格位变化入窗（ContainerSetSlot 包直译；容器 0=玩家物品栏屏，
     /// 其他=当时开着的服务端容器）。在预期时限内的格标 Commanded
     /// （自己动作的回声），其余 ServerObserved。
+    /// 格位变化入窗。**重发不是变化**——先与上一个已知值比较。
+    ///
+    /// 2026-08-17 补。生产方是包驱动的（`SetSlot` / `SetPlayerInventory`），
+    /// 而服务端会反复重发同一个格子的同一个值（整柜同步、周期性对账）。此前
+    /// 不比较，于是每一次重发都记成一次变化：一次 GUI 实盘里「物品栏格 45
+    /// 变空了」被投递了 **28 次，无一是真变化**，而且它们全是 `ServerObserved`，
+    /// 正好穿过唤醒判据「只有预期之外的才吵」那道闸——闸门没错，错在生产方
+    /// 把「重复同步」当成了「预期之外的变化」。
+    ///
+    /// 同一个文件里的 `track_health` 一直是有比较的（阈值挡浮点噪声）；这里
+    /// 只是把同一条纪律补齐。
+    ///
+    /// 首见即空不入窗：没见过它有东西，就谈不上「变空了」。这同时挡掉进服时
+    /// 整份物品栏同步带来的一串空格通知。
     pub(super) fn push_inventory_change(
         &self,
         container_id: i32,
@@ -237,6 +269,21 @@ impl Inner {
         item_name: Option<String>,
         count: u32,
     ) {
+        {
+            let mut known = self.last_slot_contents.lock();
+            let key = (container_id, slot);
+            let now = (item_name.clone(), count);
+            match known.get(&key) {
+                Some(previous) if *previous == now => return,
+                None if item_name.is_none() => {
+                    known.insert(key, now);
+                    return;
+                }
+                _ => {
+                    known.insert(key, now);
+                }
+            }
+        }
         let tick = self.tick.load(Ordering::Acquire);
         let source = {
             let mut expected = self.expected_slots.lock();
@@ -573,5 +620,72 @@ mod tests {
         let outcome = receiver.await.expect("ack 应送达");
         assert!(outcome.is_err());
         assert!(inner.pending.lock().is_empty());
+    }
+
+    /// 服务端重发同一个值不是变化。实盘教训：不比较时「物品栏格 45 变空了」
+    /// 一次实验里被投递 28 次，无一是真变化。
+    #[test]
+    fn resent_identical_slot_values_are_not_changes() {
+        let inner = Inner::new();
+        inner.push_inventory_change(0, 36, Some("oak_planks".to_owned()), 32);
+        inner.push_inventory_change(0, 36, Some("oak_planks".to_owned()), 32);
+        inner.push_inventory_change(0, 36, Some("oak_planks".to_owned()), 32);
+        assert_eq!(inner.inventory_window_now().entries.len(), 1);
+
+        // 数量变了是真变化。
+        inner.push_inventory_change(0, 36, Some("oak_planks".to_owned()), 31);
+        // 物品变了也是。
+        inner.push_inventory_change(0, 36, Some("stick".to_owned()), 4);
+        // 变空是。
+        inner.push_inventory_change(0, 36, None, 0);
+        // 再重发这个空值不是。
+        inner.push_inventory_change(0, 36, None, 0);
+        assert_eq!(inner.inventory_window_now().entries.len(), 4);
+    }
+
+    /// 首见即空不入窗：没见过它有东西，就谈不上「变空了」。
+    /// 这挡掉进服时整份物品栏同步带来的一串空格通知。
+    #[test]
+    fn a_slot_first_seen_empty_is_not_announced() {
+        let inner = Inner::new();
+        for slot in 0..46u16 {
+            inner.push_inventory_change(0, slot, None, 0);
+        }
+        assert!(inner.inventory_window_now().entries.is_empty());
+
+        // 但首见即有东西是新闻。
+        inner.push_inventory_change(0, 10, Some("diamond".to_owned()), 1);
+        assert_eq!(inner.inventory_window_now().entries.len(), 1);
+    }
+
+    /// 关屏清掉该容器的格位账：服务端复用容器 id，留旧账会把新容器的真变化
+    /// 误判成重发。
+    #[test]
+    fn closing_a_container_forgets_its_slot_ledger() {
+        let inner = Inner::new();
+        let open = |id: i32| {
+            Some(OpenScreenState {
+                kind: "crafting".to_owned(),
+                container_id: id,
+                title: None,
+            })
+        };
+        inner.track_open_screen(open(1));
+        inner.push_inventory_change(1, 5, Some("oak_planks".to_owned()), 1);
+        assert_eq!(inner.inventory_window_now().entries.len(), 1);
+
+        inner.track_open_screen(None);
+        // 同一个 id 被复用给下一个容器：同样的值必须重新算作变化。
+        inner.track_open_screen(open(1));
+        inner.push_inventory_change(1, 5, Some("oak_planks".to_owned()), 1);
+        assert_eq!(
+            inner
+                .inventory_window_now()
+                .entries
+                .iter()
+                .filter(|entry| entry.container_id == 1)
+                .count(),
+            2
+        );
     }
 }

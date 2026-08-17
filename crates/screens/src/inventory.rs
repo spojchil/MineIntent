@@ -203,26 +203,12 @@ impl InventoryScreen {
         if let Err(reason) = outcome {
             return ToolResult::failure(call_id, reason);
         }
-        // 点击本地预演即时生效，本 tick 的快照已含搬动后内容。
-        let snapshot = self.snapshots.latest();
-        let describe = |slot: u16| -> String {
-            snapshot
-                .self_state
-                .inventory
-                .slots
-                .iter()
-                .find(|entry| entry.slot == u32::from(slot))
-                .map(|entry| format!("{} ×{}", entry.item_name, entry.count))
-                .unwrap_or_else(|| "空".to_owned())
-        };
+        // 回执只说动作结论，不报格位现状（理由见 container.rs 同处注释：
+        // 读的是上一 tick 的快照，且格位现状是事实、归快照与格位变化窗）。
         let summary = if to == DISCARD_SLOT {
-            format!("已丢弃；格 {from} 现在：{}", describe(from))
+            format!("已丢弃格 {from}")
         } else {
-            format!(
-                "已完成；格 {from}：{}，格 {to}：{}",
-                describe(from),
-                describe(to)
-            )
+            "已完成".to_owned()
         };
         ToolResult::success_json(call_id, json!({ "done": summary }))
     }
@@ -256,7 +242,8 @@ impl dispatch::ToolProvider for InventoryScreen {
         );
         definition.description = Some(
             "物品栏。打开才能看到格位并整理（搬动/合堆/穿装备/摆随身合成/丢弃）；\
-打开期间无法移动或与世界交互，看完记得关。"
+打开期间无法移动或与世界交互，看完记得关。\
+与服务端交互有延迟：回执只说明点击已发出并被本地菜单接受，世界的反应要过一小会儿（实测约 2~3 游戏刻，一百多毫秒，且会浮动）才回来，并作为格位变化通知送到你这里。刚做完就去读格位，读到的多半还是旧的——**以通知为准，不要因为「立刻没看到变化」就判断动作失败而重做**。"
                 .to_owned(),
         );
         vec![(

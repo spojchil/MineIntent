@@ -137,26 +137,27 @@ impl ContainerScreen {
         if let Err(reason) = outcome {
             return ToolResult::failure(call_id, reason);
         }
-        // 点击本地预演即时生效，本 tick 的快照已按容器格空间更新。
-        let snapshot = self.snapshots.latest();
-        let describe = |slot: u16| -> String {
-            snapshot
-                .self_state
-                .inventory
-                .slots
-                .iter()
-                .find(|entry| entry.slot == u32::from(slot))
-                .map(|entry| format!("{} ×{}", entry.item_name, entry.count))
-                .unwrap_or_else(|| "空".to_owned())
-        };
+        // 回执只说动作结论，不报格位现状。
+        //
+        // 2026-08-17 删掉了原来的「格 from：…，格 to：…」摘要。两个理由，
+        // 后一个才是根本的：
+        //
+        // 1. 回执发出时真相还没到。机器级探针三跑一致（craft_timing_probe）：
+        //    写口回执当下成品格必然还是旧值，服务端确认要 **2~3 游戏刻**才回来，
+        //    而且会浮动。这不是本层的 bug——点击包要往返一趟，服务端每 tick 报的
+        //    是它已经处理完的。实盘后果：目标格显示为空，模型合理地判断没生效，
+        //    于是每一步都做了两遍（一次 GUI 实验里 13 次 move 近一半是这么来的）。
+        //    预判会说谎、空等没有上限，所以按维护者裁定改为**把延迟告诉模型**
+        //    （见本工具 description）。
+        // 2. 就算读对了也没意义——格位现状是**事实**，归快照与格位变化窗；
+        //    工具只表达意图、回执只说结论（与 motion/hand 的 `accepted` 同款）。
+        //    真正要紧的那件事——摆料之后成品格冒出什么——本来就走信箱：
+        //    自己点的两格是 Commanded 回声（不吵），成品格是 ServerObserved
+        //    （预期之外，投递）。回执再报一遍格位既重复又落后。
         let summary = if to == DISCARD_SLOT {
-            format!("已丢弃；格 {from} 现在：{}", describe(from))
+            format!("已丢弃格 {from}")
         } else {
-            format!(
-                "已完成；格 {from}：{}，格 {to}：{}",
-                describe(from),
-                describe(to)
-            )
+            "已完成".to_owned()
         };
         ToolResult::success_json(call_id, json!({ "done": summary }))
     }
@@ -211,7 +212,8 @@ impl dispatch::ToolProvider for ContainerScreen {
         definition.description = Some(
             "当前开着的容器界面（工作台、箱子、熔炉等共用）。没有 open：对容器方块\
 使用（hand use_on）后界面由服务器打开，你会收到格位清单；不确定这种容器怎么用就 \
-describe。开着期间用 move 搬动/合堆/摆料/取物，close 关闭。开着时无法移动或与世界交互。"
+describe。开着期间用 move 搬动/合堆/摆料/取物，close 关闭。开着时无法移动或与世界交互。\
+与服务端交互有延迟：回执只说明点击已发出并被本地菜单接受，世界的反应要过一小会儿（实测约 2~3 游戏刻，一百多毫秒，且会浮动）才回来，并作为格位变化通知送到你这里。刚做完就去读格位，读到的多半还是旧的——**以通知为准，不要因为「立刻没看到变化」就判断动作失败而重做**。"
                 .to_owned(),
         );
         vec![(
