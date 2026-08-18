@@ -64,7 +64,7 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
                                     │
                                   render（纯函数）
                                     │
-                                  context（受保护三段之一：处境）
+                       companion::situation（随帧追加，不进前缀）
                                     │
                                   agent → 模型
 ```

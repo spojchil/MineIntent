@@ -25,8 +25,10 @@ use screens::{
 };
 use world::{ConnectionConfig, DoorCommand, Module, SnapshotSource};
 
+mod situation;
 mod wake;
 
+use situation::SituationTracker;
 use wake::{ScreenDirective, SelfIdentity, WakeCursors};
 
 /// 人设占位（Q01 未裁；正式文本由维护者给出后替换）。
@@ -263,6 +265,28 @@ impl ViewportDoor for ModuleViewportDoor {
 ///
 /// 不记 `ModelRequestTranscript`——那是每次请求的整份上下文，量级完全不同，
 /// 要看那个另说。这里只回答「它做了什么」。
+/// 把事件分发给多个观察者。内核只留一个观察者槽位，而组合根有两件事要看。
+struct FanOut(Vec<Arc<dyn agent::Observer>>);
+
+impl agent::Observer for FanOut {
+    fn observe(&self, event: &agent::AgentEvent) {
+        for observer in &self.0 {
+            observer.observe(event);
+        }
+    }
+}
+
+/// 只看一件事：压缩完成了没有。
+struct CompactionFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl agent::Observer for CompactionFlag {
+    fn observe(&self, event: &agent::AgentEvent) {
+        if matches!(event, agent::AgentEvent::CompactionFinished { .. }) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 struct TraceObserver(std::sync::Mutex<std::fs::File>);
 
 impl TraceObserver {
@@ -577,11 +601,9 @@ async fn main() -> Result<(), String> {
         .map_err(|error| format!("模型适配器构造失败：{error}"))?,
     );
 
-    let strategy = Arc::new(
-        ContextStrategy::new(persona, memory_file)
-            .with_situation(snapshots.clone(), read_mark.clone())
-            .with_model(model.clone()),
-    );
+    // 前缀只有人设与记忆——两者都不逐轮变，吃满前缀缓存。处境不在这里：
+    // 它每轮都变，随帧追加在对话末尾（见 `situation` 模块的账）。
+    let strategy = Arc::new(ContextStrategy::new(persona, memory_file).with_model(model.clone()));
     // 轮末帧（维护者裁定：模式=增量）：每轮模型响应落定后收集一次
     // 「与记忆的差异」，非空则以 Passive 投递——Passive 不叫醒空闲会话
     // （帧从不引发轮，只搭现有轮的车），信箱耐久故收集时即推进记忆。
@@ -594,20 +616,30 @@ async fn main() -> Result<(), String> {
         SessionConfig::default(),
     )
     .with_stream_observer(Arc::new(RoundEndSignal(round_end_tx)));
+    // 压缩完成的旗子：压缩把对话换成摘要，先前追加的处境随之消失，
+    // 下一帧要把处境从头说一遍。
+    let compacted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut observers: Vec<Arc<dyn agent::Observer>> =
+        vec![Arc::new(CompactionFlag(compacted.clone()))];
     if let Ok(path) = std::env::var("MINEINTENT_TRACE_FILE") {
         let trace = Arc::new(TraceObserver::open(&path)?);
-        assembled = assembled
-            .with_content_observer(trace.clone())
-            .with_observer(trace);
+        assembled = assembled.with_content_observer(trace.clone());
+        observers.push(trace);
         println!("[组合根] 诊断轨迹：{path}（内容未脱敏）");
     }
+    // 内核的观察者是单槽（装第二个会顶掉第一个），所以这里自己分发。
+    assembled = assembled.with_observer(Arc::new(FanOut(observers)));
     let session = Arc::new(assembled);
     {
         let session = session.clone();
         let module = module.clone();
         let block_memory = block_memory.clone();
+        let snapshots = snapshots.clone();
+        let read_mark = read_mark.clone();
+        let compacted = compacted.clone();
         tokio::spawn(async move {
             let mut pace = FramePace::new();
+            let mut situation = SituationTracker::new();
             loop {
                 // 两个触发源，谁先到算谁：
                 //   一、模型响应落定（工具刚跑完，世界多半刚变）；
@@ -659,9 +691,21 @@ async fn main() -> Result<(), String> {
                 if changes.is_empty() {
                     continue;
                 }
-                let text = render::render_block_changes(&changes);
+                // 处境搭这趟车。**触发仍然只看方块差异**：处境里的位置与附近实体
+                // 几乎每帧都变，让它自己触发就等于在原地站着也每 250ms 叫醒一次。
+                // 这里保守——「日常与事件的分界画在通道上」那条待裁（见
+                // docs/wake-criterion-decision.md §9）定了之后再谈分级。
+                if compacted.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    // 摘要按指令不含世界状态，先前追加的处境也随对话一起没了。
+                    situation.request_full_resend();
+                }
+                let mut sections =
+                    situation.take(render::render_situation_lines(&snapshots.latest(), read_mark.position()));
+                let situation_lines = sections.len();
+                sections.push(render::render_block_changes(&changes));
+                let text = sections.join("\n");
                 println!(
-                    "[组合根] 增量帧：{} 条差异（投影 {}ms，含排队 {}ms，均值 {}ms，下次间隔 {}ms）",
+                    "[组合根] 增量帧：{} 条差异 + {situation_lines} 行处境（投影 {}ms，含排队 {}ms，均值 {}ms，下次间隔 {}ms）",
                     changes.len(),
                     work.as_millis(),
                     round.as_millis(),

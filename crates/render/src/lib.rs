@@ -8,34 +8,67 @@
 
 use world::{ConnectionPhase, EntitySnapshot, TickSnapshot, Window};
 
-/// 每轮开场处境的总装。`chat_read` 是聊天已读水位 (epoch, tick)，
+/// 处境的一行是哪一行。
+///
+/// 帧只投**变了的那几行**，所以呈现层必须按行给出身份，而不是只给一整段文本：
+/// 「位置变了」和「天黑了」是两件事，合成一段就只能整段重发。
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SituationLine {
+    /// 非就绪时唯一的一行：只说连接事实。
+    Connection,
+    Identity,
+    Environment,
+    Position,
+    Vitals,
+    Nearby,
+    Unread,
+}
+
+/// 处境逐行拆解。`chat_read` 是聊天已读水位 (epoch, tick)，
 /// 未读数 = 聊天窗里晚于水位的条数（重连换纪元后整窗算新）。
-pub fn render_situation(snap: &TickSnapshot, chat_read: (u64, u64)) -> String {
+///
+/// 空行不出现在结果里——「没话可说」与「说了一句空话」对差异比对是两回事。
+pub fn render_situation_lines(
+    snap: &TickSnapshot,
+    chat_read: (u64, u64),
+) -> Vec<(SituationLine, String)> {
     // 非就绪状态下世界数据是旧的，处境只说连接事实，不拿旧世界冒充现在。
-    match &snap.phase {
-        ConnectionPhase::Ready => {}
-        ConnectionPhase::Connecting => return "正在连接服务器。".to_owned(),
-        ConnectionPhase::Disconnected { reason } => {
-            return format!("已断线：{reason}");
-        }
-        ConnectionPhase::Stopped { reason } => {
-            return format!("连接已停止：{reason}");
-        }
+    let connection = match &snap.phase {
+        ConnectionPhase::Ready => None,
+        ConnectionPhase::Connecting => Some("正在连接服务器。".to_owned()),
+        ConnectionPhase::Disconnected { reason } => Some(format!("已断线：{reason}")),
+        ConnectionPhase::Stopped { reason } => Some(format!("连接已停止：{reason}")),
+    };
+    if let Some(text) = connection {
+        return vec![(SituationLine::Connection, text)];
     }
 
     let mut lines = vec![
-        render_self_identity(snap),
-        render_environment(snap),
-        render_position(snap),
-        render_vitals(snap),
-        render_nearby(snap),
+        (SituationLine::Identity, render_self_identity(snap)),
+        (SituationLine::Environment, render_environment(snap)),
+        (SituationLine::Position, render_position(snap)),
+        (SituationLine::Vitals, render_vitals(snap)),
+        (SituationLine::Nearby, render_nearby(snap)),
     ];
     let unread = unread_chat_count(snap, chat_read);
     if unread > 0 {
-        lines.push(format!("聊天有 {unread} 条新消息。"));
+        lines.push((
+            SituationLine::Unread,
+            format!("聊天有 {unread} 条新消息。"),
+        ));
     }
-    lines.retain(|line| !line.is_empty());
-    lines.join("\n")
+    lines.retain(|(_, line)| !line.is_empty());
+    lines
+}
+
+/// 处境全文（开局与压缩之后投的那一份）。逐行拆解的直接拼接——
+/// 两者共用一个来源，不可能对不上。
+pub fn render_situation(snap: &TickSnapshot, chat_read: (u64, u64)) -> String {
+    render_situation_lines(snap, chat_read)
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 自称一行：你在这个世界里叫什么。

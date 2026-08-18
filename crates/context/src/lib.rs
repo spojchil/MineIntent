@@ -1,10 +1,12 @@
 //! 上下文策略：内核提示（`PromptSource`）与压缩（`Compaction`）端口的实现方。
 //!
-//! 受保护上下文三段：人设（系统提示词）、记忆全文、处境（渲染后的世界快照）。
-//! 全部每轮现拉、永不参与压缩——压缩只碰会话区，位置本身就是豁免。
-//! 稳定前缀在前（人设、记忆），易变处境在尾，不搅动提示缓存。
+//! 受保护上下文**两段**：人设（系统提示词）、记忆全文。两段都不逐轮变，
+//! 所以放在最前面吃满前缀缓存；它们也永不参与压缩——位置本身就是豁免。
 //!
-//! 压缩金律：可重导出的世界状态直接扔（处境下轮现拉）；值得留的经历
+//! 处境（渲染后的世界快照）**不在这里**。它每轮都变，放前缀等于每轮把整条
+//! 对话赶出缓存；它随帧追加在对话末尾，见 `companion::situation`。
+//!
+//! 压缩金律：可重导出的世界状态直接扔；值得留的经历
 //! **先经记忆落盘再入摘要**——落盘失败就保持原对话，不丢没存下的东西。
 
 use std::sync::Arc;
@@ -15,8 +17,6 @@ use agent::{
     TranscriptItem,
 };
 use memory::MemoryFile;
-use screens::ChatReadMark;
-use world::SnapshotSource;
 
 /// 压缩指令：要求模型同时交回记忆增补与对话摘要。公开以便模型可见面导出评审。
 pub const COMPACTION_INSTRUCTIONS: &str = "\
@@ -28,7 +28,7 @@ pub const COMPACTION_INSTRUCTIONS: &str = "\
   记住的经历（承诺、关系变化、重要事件与教训）以第一人称并入；没有就原样交回。
 - summary 用第一人称、过去式，写清对话里发生了什么、说过什么重要的话、
   哪些事做到一半。工具调用的机械细节可以丢，正在进行的意图不能丢。
-- 世界状态（位置、血量、天色等）不要写入摘要——下一轮会重新看到。
+- 世界状态（位置、血量、天色等）不要写入摘要——压缩后会重新投一份处境给你。
 只输出这个 JSON 对象，不要其他文字。";
 
 /// 压缩摘要在新对话里的包裹头。公开以便模型可见面导出评审。
@@ -37,15 +37,8 @@ pub const SUMMARY_PREFIX: &str = "【我此前的经历记述（同伴第一人�
 pub struct ContextStrategy {
     persona: String,
     memory: Arc<MemoryFile>,
-    /// 处境来源；组合根接线前可缺席（此时 base_context 只有人设+记忆）。
-    situation: Option<SituationInputs>,
     /// 摘要请求自持的模型依赖；缺席时压缩退化为"不压"（原样交回）。
     model: Option<Arc<dyn Model>>,
-}
-
-struct SituationInputs {
-    snapshots: Arc<dyn SnapshotSource>,
-    chat_read: Arc<ChatReadMark>,
 }
 
 impl ContextStrategy {
@@ -53,22 +46,8 @@ impl ContextStrategy {
         Self {
             persona: persona.into(),
             memory,
-            situation: None,
             model: None,
         }
-    }
-
-    /// 接上处境来源：快照 + 聊天已读水位（未读数渲染进开场处境）。
-    pub fn with_situation(
-        mut self,
-        snapshots: Arc<dyn SnapshotSource>,
-        chat_read: Arc<ChatReadMark>,
-    ) -> Self {
-        self.situation = Some(SituationInputs {
-            snapshots,
-            chat_read,
-        });
-        self
     }
 
     /// 接上压缩用的模型。
@@ -89,16 +68,6 @@ impl ContextStrategy {
         InputMessage::text("system", text)
     }
 
-    fn situation_message(&self) -> Option<InputMessage> {
-        let situation = self.situation.as_ref()?;
-        let snapshot = situation.snapshots.latest();
-        let text = render::render_situation(&snapshot, situation.chat_read.position());
-        Some(InputMessage::text(
-            "system",
-            format!("【当前处境】\n{text}"),
-        ))
-    }
-
     /// 从模型回复里取出压缩结论。返回 None = 这次压缩作废（原样保留对话）。
     ///
     /// `memory_full_text` 是必填：缺了它无法证明"值得留的已落盘"，宁可不压
@@ -117,15 +86,24 @@ impl ContextStrategy {
 }
 
 impl PromptSource for ContextStrategy {
+    /// 只放**不逐轮变**的东西。
+    ///
+    /// 内核把本方法的返回值放在每次请求最前面，而前缀缓存按最长公共前缀命中——
+    /// 这里放一样逐轮变的东西，缓存就在它那一项断掉，整条对话每轮全额重算。
+    ///
+    /// 2026-08-11 到 08-18 这里第三项是「当前处境」（位置、附近实体、天色……），
+    /// 每轮现拉。实盘 30 分钟 456 次请求的账：13 次轮首未命中 367,984 token，
+    /// 占全跑未命中的 75%，而轮内 443 次平均只有 272。命中值是 `0 / 256 / 640`
+    /// ——不是没命中，是只命中了人设加半截记忆就断在处境开头。
+    ///
+    /// 处境现在走信箱，随帧追加在对话末尾（`companion::situation`）。这正是旧栈
+    /// PR #93「稳定前缀 + 追加帧」立下、迁移时丢掉的分工：**追加一次是免费的，
+    /// 同一段东西每轮重渲染是致命的**。
     fn base_context(&self) -> Result<Vec<TranscriptItem>, AgentError> {
-        let mut items = vec![
+        Ok(vec![
             InputMessage::text("system", self.persona.clone()).into(),
             self.memory_message().into(),
-        ];
-        if let Some(situation) = self.situation_message() {
-            items.push(situation.into());
-        }
-        Ok(items)
+        ])
     }
 }
 
@@ -291,42 +269,31 @@ mod tests {
         assert!(!memory_text.contains("还没有记忆"));
     }
 
-    struct FixedSnapshots(world::TickSnapshot);
-
-    impl world::SnapshotSource for FixedSnapshots {
-        fn latest(&self) -> Arc<world::TickSnapshot> {
-            Arc::new(self.0.clone())
-        }
-    }
-
-    fn ready_snapshot() -> world::TickSnapshot {
-        let mut snap =
-            world::TickSnapshot::empty(world::Epoch(1), 40, world::ConnectionPhase::Ready);
-        snap.world_meta.dimension = "minecraft:overworld".to_owned();
-        snap.world_meta.day_time = 6_000;
-        snap.self_state.alive = true;
-        snap.self_state.health = 20.0;
-        snap.self_state.food = 20.0;
-        snap
-    }
-
+    /// 前缀里**没有**逐轮变的东西。
+    ///
+    /// 这条测试是反过来写的：它的前身叫 `situation_is_appended_after_the_stable_prefix`，
+    /// 断言 `base.len() == 3` 且第三项是「【当前处境】」——名字表达的意图（追加在
+    /// 稳定前缀之后就不搅缓存）本身是错的：追到 `base_context` 的尾巴，仍然在**整条
+    /// 对话之前**，缓存照断。那条测试一直是绿的，守卫的是一个错误理解。
+    ///
+    /// 现在守卫的是结论：前缀只有两项，处境不在其中。
     #[test]
-    fn situation_is_appended_after_the_stable_prefix() {
+    fn base_context_carries_nothing_that_changes_every_turn() {
         let strategy = ContextStrategy::new(
             "人设",
             Arc::new(MemoryFile::new(scratch_dir().join("memory.md"))),
-        )
-        .with_situation(
-            Arc::new(FixedSnapshots(ready_snapshot())),
-            Arc::new(ChatReadMark::new()),
         );
 
         let base = strategy.base_context().unwrap();
-        assert_eq!(base.len(), 3);
-        let (role, text) = text_of(&base[2]);
-        assert_eq!(role, "system");
-        assert!(text.contains("【当前处境】"));
-        assert!(text.contains("正午前后"), "{text}");
+        assert_eq!(base.len(), 2, "前缀只该有人设与记忆");
+        for item in &base {
+            let (role, text) = text_of(item);
+            assert_eq!(role, "system");
+            assert!(
+                !text.contains("【当前处境】"),
+                "处境不能回到前缀里：它每轮都变，会把整条对话赶出缓存"
+            );
+        }
     }
 
     struct CannedModel(String);

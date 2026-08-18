@@ -379,16 +379,17 @@ async fn main() {
     println!("> 由 `cargo run -p companion --example model_surface` 生成；除人设为复制件外，");
     println!("> 所有文本由真实代码路径产出，与运行时发给模型的内容逐字一致。\n");
 
-    // ---- 一、基础上下文（每轮免压缩三段） ----
-    println!("## 一、基础上下文（每轮开场，免压缩，全部 system 角色）\n");
+    // ---- 一、基础上下文（受保护前缀两段） ----
+    println!("## 一、基础上下文（受保护前缀，免压缩，全部 system 角色）\n");
+    println!("> 只有不逐轮变的东西进得来——前缀缓存按最长公共前缀命中，这里放易变量");
+    println!("> 会让整条对话每轮全额重算。处境因此不在这里，见第二节。\n");
     let memory_file = Arc::new(MemoryFile::new(scratch.join("memory.md")));
     memory_file
         .write("我叫 companion。tester 最喜欢的方块是青金石块。")
         .unwrap();
     let read_mark = Arc::new(ChatReadMark::new());
     read_mark.mark_read(1, 2_300); // 看过第一条，第二条未读
-    let strategy = context::ContextStrategy::new(PLACEHOLDER_PERSONA, memory_file.clone())
-        .with_situation(snapshots.clone(), read_mark.clone());
+    let strategy = context::ContextStrategy::new(PLACEHOLDER_PERSONA, memory_file.clone());
     for (index, item) in agent::PromptSource::base_context(&strategy)
         .unwrap()
         .iter()
@@ -711,6 +712,13 @@ async fn main() {
 
     // ---- 五、通知措辞（唤醒时以 user 角色投递） ----
     println!("## 五、唤醒投递的措辞（user 角色）\n");
+    println!("### 处境（随增量帧追加，不在前缀里）\n");
+    println!("> 开局与压缩之后投全量，其余时候只投变了的那几行。\n");
+    println!("```text");
+    for (_, line) in render::render_situation_lines(&snapshot, read_mark.position()) {
+        println!("{line}");
+    }
+    println!("```\n");
     println!("聊天：`alice: 过来一下`（发言者名: 原文）\n");
     println!("任务通知（render_job_entry 全谱）：\n");
     for outcome in [
