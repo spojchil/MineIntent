@@ -576,18 +576,41 @@ pub fn render_directed(projection: &world::DirectedProjection) -> String {
 
 /// 任务变化的通知措辞。哪些值得投递是己的判据，这里只管怎么说。
 pub fn render_job_entry(entry: &world::JobEntry) -> String {
-    let world::JobKind::MoveTo {
-        destination: [x, y, z],
-    } = &entry.job;
-    match entry.outcome {
-        world::JobOutcome::Arrived => format!("你到达了目的地 ({x}, {y}, {z})。"),
-        world::JobOutcome::Replaced => "先前的移动被新的目标顶替了。".to_owned(),
-        world::JobOutcome::Stopped => "你停下了移动。".to_owned(),
-        world::JobOutcome::PathEnded => {
-            format!("你没能到达 ({x}, {y}, {z})——路走到了尽头，目的地过不去。")
-        }
-        world::JobOutcome::Stalled => {
-            format!("你在前往 ({x}, {y}, {z}) 的路上卡住了一阵子，一直没有进展。")
+    match &entry.job {
+        world::JobKind::MoveTo {
+            destination: [x, y, z],
+        } => match entry.outcome {
+            world::JobOutcome::Arrived => format!("你到达了目的地 ({x}, {y}, {z})。"),
+            world::JobOutcome::Replaced => "先前的移动被新的目标顶替了。".to_owned(),
+            world::JobOutcome::Stopped => "你停下了移动。".to_owned(),
+            world::JobOutcome::PathEnded => {
+                format!("你没能到达 ({x}, {y}, {z})——路走到了尽头，目的地过不去。")
+            }
+            world::JobOutcome::Stalled => {
+                format!("你在前往 ({x}, {y}, {z}) 的路上卡住了一阵子，一直没有进展。")
+            }
+            // 挖掘结局落在移动任务上是不可能的；真出现了如实说破，不编。
+            other => format!("移动任务收到了不属于它的结局：{other:?}。"),
+        },
+        world::JobKind::Mine { targets, done } => {
+            let total = targets.len();
+            match entry.outcome {
+                world::JobOutcome::Mined => format!("你挖完了这一串 {total} 块方块。"),
+                world::JobOutcome::MineBlocked => match targets.get(*done) {
+                    Some([x, y, z]) => format!(
+                        "挖到第 {} 块就卡住了：({x}, {y}, {z}) 迟迟不碎——多半是够不着、被挡住，或者手上的工具挖不动它。前面 {done} 块已经挖掉了。",
+                        done + 1
+                    ),
+                    None => format!("挖掘卡住了（已挖掉 {done}/{total} 块）。"),
+                },
+                world::JobOutcome::Replaced => {
+                    format!("先前的挖掘被新的队列顶替了（已挖掉 {done}/{total} 块）。")
+                }
+                world::JobOutcome::Stopped => {
+                    format!("你停下了挖掘（已挖掉 {done}/{total} 块）。")
+                }
+                other => format!("挖掘任务收到了不属于它的结局：{other:?}。"),
+            }
         }
     }
 }

@@ -161,7 +161,11 @@ fn advance(cursor: &mut Option<u64>, seq: u64) -> bool {
 fn wakes_on(outcome: JobOutcome) -> bool {
     matches!(
         outcome,
-        JobOutcome::Arrived | JobOutcome::PathEnded | JobOutcome::Stalled
+        JobOutcome::Arrived
+            | JobOutcome::PathEnded
+            | JobOutcome::Stalled
+            | JobOutcome::Mined
+            | JobOutcome::MineBlocked
     )
 }
 

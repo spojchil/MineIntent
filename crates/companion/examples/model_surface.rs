@@ -90,8 +90,11 @@ impl hand::HandDoor for NoDoor {
     fn attack<'a>(&'a self, _k: &'a str) -> PortFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
-    fn mine<'a>(&'a self, _b: [i32; 3]) -> PortFuture<'a, Result<(), String>> {
+    fn mine<'a>(&'a self, _b: Vec<[i32; 3]>) -> PortFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
+    }
+    fn mining_status<'a>(&'a self) -> PortFuture<'a, Option<hand::MiningStatus>> {
+        Box::pin(async { None })
     }
     fn place<'a>(&'a self, _b: [i32; 3]) -> PortFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })

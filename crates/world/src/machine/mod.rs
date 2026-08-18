@@ -21,6 +21,7 @@ mod blocks;
 mod capture;
 mod connect;
 mod door;
+mod mining;
 mod movement;
 mod state;
 
@@ -44,6 +45,10 @@ const MOVEMENT_ARM_GRACE_TICKS: u64 = 100;
 /// 卡住通知阈值：与 azalea 自己的补路超时同量级（它 3–7 秒就会自救，
 /// 超过 10 秒还没推进说明自救也没起色，值得让模型知道）。
 const MOVEMENT_STALL_TICKS: usize = 200;
+
+/// 一块挖不碎的时限。徒手挖石头约 15 秒（300 tick）是原版量级；取 400 tick
+/// 留足余量——超过它仍不碎，多半是够不着、被挡或工具不对，不是慢。
+const MINING_STALL_TICKS: u64 = 400;
 
 /// 连接配置。v1 只有离线身份、重连固定 Never。
 #[derive(Clone, Debug)]
@@ -277,6 +282,14 @@ impl Module {
         )?;
         memory.apply(&changes);
         Ok(changes)
+    }
+
+    /// 在途挖掘队列现状：(已挖块数, 总块数, 正在挖的那块)。None = 没在挖。
+    pub fn mining_status(&self) -> Option<(usize, usize, [i32; 3])> {
+        let job = self.inner.mining_job.lock();
+        let job = job.as_ref()?;
+        let current = job.targets.get(job.cursor).copied()?;
+        Some((job.cursor, job.targets.len(), current))
     }
 
     /// 聊天窗读取：最近 count 条，旧在前新在后。

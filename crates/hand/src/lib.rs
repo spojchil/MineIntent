@@ -20,7 +20,11 @@ use serde_json::{json, Value};
 /// （Minecraft.startUseItem 遍历 InteractionHand），副手内容经 swap_offhand 调换。
 pub trait HandDoor: Send + Sync {
     fn attack<'a>(&'a self, entity_key: &'a str) -> PortFuture<'a, Result<(), String>>;
-    fn mine<'a>(&'a self, block: [i32; 3]) -> PortFuture<'a, Result<(), String>>;
+    /// 按顺序挖一串方块。**队列**：机器逐块挖完，新队列顶替旧队列。
+    /// 单块也走这里（长度 1 的数组）。
+    fn mine<'a>(&'a self, blocks: Vec<[i32; 3]>) -> PortFuture<'a, Result<(), String>>;
+    /// 在途挖掘队列的现状。`None` = 现在没有在挖。
+    fn mining_status<'a>(&'a self) -> PortFuture<'a, Option<MiningStatus>>;
     /// 把手持方块放到目标空位（目标须紧挨已有方块；依附面由机器代选）。
     fn place<'a>(&'a self, block: [i32; 3]) -> PortFuture<'a, Result<(), String>>;
     fn use_on_block<'a>(&'a self, block: [i32; 3]) -> PortFuture<'a, Result<(), String>>;
@@ -31,6 +35,15 @@ pub trait HandDoor: Send + Sync {
     fn drop_item<'a>(&'a self, whole_stack: bool) -> PortFuture<'a, Result<(), String>>;
     fn swap_offhand<'a>(&'a self) -> PortFuture<'a, Result<(), String>>;
     fn select_slot<'a>(&'a self, slot: u8) -> PortFuture<'a, Result<(), String>>;
+}
+
+/// 在途挖掘队列的现状（只读）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MiningStatus {
+    pub done: usize,
+    pub total: usize,
+    /// 正在挖的那一块。
+    pub current: [i32; 3],
 }
 
 const TOOL_NAME: &str = "hand";
@@ -57,8 +70,21 @@ impl HandTools {
                     return ToolResult::failure(call_id, "attack 需要字符串参数 entity；请改写调用")
                 }
             },
-            Some("mine") => match read_block(arguments.get("block")) {
-                Ok(block) => self.door.mine(block).await,
+            Some("mining_status") => {
+                return match self.door.mining_status().await {
+                    Some(status) => ToolResult::success_json(
+                        call_id,
+                        json!({
+                            "done": status.done,
+                            "total": status.total,
+                            "current": status.current,
+                        }),
+                    ),
+                    None => ToolResult::success_json(call_id, json!({"state": "idle"})),
+                };
+            }
+            Some("mine") => match read_blocks(arguments.get("blocks").or(arguments.get("block"))) {
+                Ok(blocks) => self.door.mine(blocks).await,
                 Err(reason) => return ToolResult::failure(call_id, reason),
             },
             Some("place") => match read_block(arguments.get("block")) {
@@ -127,6 +153,25 @@ impl HandTools {
     }
 }
 
+/// 一串坐标。兼容单块写法（`[x,y,z]`）——模型给一块时不必包成数组的数组。
+fn read_blocks(value: Option<&Value>) -> Result<Vec<[i32; 3]>, String> {
+    let Some(array) = value.and_then(Value::as_array) else {
+        return Err("mine 需要 blocks：坐标数组，如 [[37,63,-10]]；请改写调用".to_owned());
+    };
+    if array.is_empty() {
+        return Err("blocks 是空的，没有要挖的".to_owned());
+    }
+    // 单块写法 [x,y,z]：三个整数。
+    if array.iter().all(Value::is_number) {
+        return read_block(value).map(|block| vec![block]);
+    }
+    array
+        .iter()
+        .map(|item| read_block(Some(item)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "blocks 里每一项都要是 [x, y, z] 三个整数；请改写调用".to_owned())
+}
+
 fn read_block(value: Option<&Value>) -> Result<[i32; 3], String> {
     let coords: Option<Vec<i64>> = value
         .and_then(Value::as_array)
@@ -151,10 +196,11 @@ impl ToolProvider for HandTools {
                     "action": {
                         "type": "string",
                         "enum": ["attack", "mine", "place", "use_on", "use_item", "release", "drop", "swap_offhand", "select_slot"],
-                        "description": "attack=攻击实体；mine=挖掉一格方块（要挖一阵子，可用 release 中途停手）；place=把手持方块放到目标空位（目标须紧挨已有方块）；use_on=对方块/实体使用（右键）；use_item=使用手持物品（吃/喝/举盾，持续到用完或 release）；release=松手；drop=丢手持物；swap_offhand=主副手对调；select_slot=选快捷栏格"
+                        "description": "attack=攻击实体；mine=按顺序挖掉一串方块（blocks 给坐标数组，机器逐块挖完；挖穿要时间，别急着发下一个——再发一次 mine 会放弃当前这串。可用 release 停手）；place=把手持方块放到目标空位（目标须紧挨已有方块）；use_on=对方块/实体使用（右键）；use_item=使用手持物品（吃/喝/举盾，持续到用完或 release）；mining_status=看一眼在途挖掘队列（**不要轮询**：挖完或卡住都会主动通知你，这个动作只在你确实拿不准时用一次）；release=松手；drop=丢手持物；swap_offhand=主副手对调；select_slot=选快捷栏格"
                     },
                     "entity": { "type": "string", "description": "attack/use_on 用：目标实体的 entity_key" },
-                    "block": { "type": "array", "items": {"type": "integer"}, "description": "mine/place/use_on 用：方块坐标 [x, y, z]" },
+                    "block": { "type": "array", "items": {"type": "integer"}, "description": "place/use_on 用：方块坐标 [x, y, z]" },
+                    "blocks": { "type": "array", "items": {"type": "array", "items": {"type": "integer"}}, "description": "mine 用：要按顺序挖的坐标数组，如 [[37,63,-10],[37,64,-10]]；不必先确认那里有什么，空气会被如实拒绝" },
                     "stack": { "type": "boolean", "description": "drop 用：true 丢整组，默认丢一个" },
                     "slot": { "type": "integer", "minimum": 0, "maximum": 8, "description": "select_slot 用：快捷栏格号" }
                 },
@@ -213,8 +259,11 @@ mod tests {
         fn attack<'a>(&'a self, entity_key: &'a str) -> PortFuture<'a, Result<(), String>> {
             self.log(format!("attack({entity_key})"))
         }
-        fn mine<'a>(&'a self, block: [i32; 3]) -> PortFuture<'a, Result<(), String>> {
-            self.log(format!("mine{block:?}"))
+        fn mine<'a>(&'a self, blocks: Vec<[i32; 3]>) -> PortFuture<'a, Result<(), String>> {
+            self.log(format!("mine{blocks:?}"))
+        }
+        fn mining_status<'a>(&'a self) -> PortFuture<'a, Option<MiningStatus>> {
+            Box::pin(async { None })
         }
         fn place<'a>(&'a self, block: [i32; 3]) -> PortFuture<'a, Result<(), String>> {
             self.log(format!("place{block:?}"))
@@ -277,7 +326,7 @@ mod tests {
             *door.calls.lock().unwrap(),
             vec![
                 "attack(zombie-7)",
-                "mine[10, 64, -3]",
+                "mine[[10, 64, -3]]",
                 "place[11, 64, -3]",
                 "use_on_block[10, 65, -3]",
                 "use_on_entity(villager-2)",
@@ -296,6 +345,7 @@ mod tests {
         let (tools, door) = tools(None);
         for arguments in [
             json!({"action": "attack"}),
+            json!({"action": "mine", "blocks": []}),
             json!({"action": "mine", "block": [1, 2]}),
             json!({"action": "mine", "block": [1.5, 2.0, 3.0]}),
             json!({"action": "place"}),

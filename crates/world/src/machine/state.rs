@@ -16,6 +16,7 @@ use parking_lot::{Mutex, RwLock};
 use tokio::sync::{oneshot, watch, Notify};
 
 use super::door::{DoorCommand, PendingCommand};
+use super::mining::MiningJob;
 use super::movement::MovementJob;
 use super::{
     DAMAGE_WINDOW_ENTRIES, INVENTORY_WINDOW_ENTRIES, JOBS_WINDOW_ENTRIES, SCREEN_WINDOW_ENTRIES,
@@ -47,6 +48,8 @@ pub(crate) struct Inner {
     pub(super) last_health: Mutex<Option<f64>>,
     /// 在途移动任务（单意图槽）。
     pub(super) movement_job: Mutex<Option<MovementJob>>,
+    /// 在途挖掘任务（单意图槽，内含坐标队列）。
+    pub(super) mining_job: Mutex<Option<MiningJob>>,
     pub(super) inventory_window: Mutex<VecDeque<InventoryChangeEntry>>,
     /// 各格上一个已知内容：(容器 id, 菜单号) → (物品名, 数量)。
     /// 服务端重发同值不算变化——判据在 [`Inner::push_inventory_change`]。
@@ -95,6 +98,7 @@ impl Inner {
             jobs_window: Mutex::new(VecDeque::new()),
             last_health: Mutex::new(None),
             movement_job: Mutex::new(None),
+            mining_job: Mutex::new(None),
             inventory_window: Mutex::new(VecDeque::new()),
             last_slot_contents: Mutex::new(SlotLedger::new()),
             expected_slots: Mutex::new(Vec::new()),
@@ -343,11 +347,15 @@ impl Inner {
     }
 
     pub(super) fn push_job(&self, destination: [i32; 3], outcome: JobOutcome) {
+        self.push_job_kind(JobKind::MoveTo { destination }, outcome);
+    }
+
+    pub(super) fn push_job_kind(&self, job: JobKind, outcome: JobOutcome) {
         let entry = JobEntry {
             seq: self.fact_seq.fetch_add(1, Ordering::AcqRel),
             tick: self.tick.load(Ordering::Acquire),
             occurred_at: SystemTime::now(),
-            job: JobKind::MoveTo { destination },
+            job,
             outcome,
         };
         let mut window = self.jobs_window.lock();
@@ -369,6 +377,46 @@ impl Inner {
             armed: false,
             stall_notified: false,
         });
+    }
+
+    /// 挖掘任务开槽：与移动同款的**单意图槽**——新队列顶替旧队列，旧的如实出窗。
+    ///
+    /// 顶替而非追加，是为了与 motion 的「新意图顶替旧意图」一致：模型改主意时
+    /// 重发一次完整数组即可，不必再有增删改查那一套。
+    pub(super) fn begin_mining_job(&self, targets: Vec<[i32; 3]>) {
+        let mut slot = self.mining_job.lock();
+        if let Some(job) = slot.take() {
+            self.push_job_kind(
+                JobKind::Mine {
+                    targets: job.targets,
+                    done: job.cursor,
+                },
+                JobOutcome::Replaced,
+            );
+        }
+        *slot = Some(MiningJob {
+            targets,
+            cursor: 0,
+            since_tick: self.tick.load(Ordering::Acquire),
+        });
+    }
+
+    /// 挖掘任务收槽并出窗（挖完、卡住都走这里）。
+    pub(super) fn end_mining_job(&self, outcome: JobOutcome) {
+        if let Some(job) = self.mining_job.lock().take() {
+            self.push_job_kind(
+                JobKind::Mine {
+                    targets: job.targets,
+                    done: job.cursor,
+                },
+                outcome,
+            );
+        }
+    }
+
+    /// release 停手：在途挖掘如实出窗。没任务时不是错误。
+    pub(super) fn end_mining_job_stopped(&self) {
+        self.end_mining_job(JobOutcome::Stopped);
     }
 
     /// 停止动词：在途任务如实出窗。没任务时不是错误。

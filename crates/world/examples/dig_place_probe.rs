@@ -46,26 +46,71 @@ async fn main() -> Result<(), String> {
 
     // 手持圆石，贴垫块放第一块，再往上摞第二块。
     step(&module, "选中 0 号格（圆石）", DoorCommand::SelectSlot(0)).await;
-    step(&module, "放 A (-6,73,7)", DoorCommand::PlaceBlock([-6, 73, 7])).await;
+    step(
+        &module,
+        "放 A (-6,73,7)",
+        DoorCommand::PlaceBlock([-6, 73, 7]),
+    )
+    .await;
     tokio::time::sleep(Duration::from_secs(2)).await;
-    step(&module, "放 B (-6,74,7)", DoorCommand::PlaceBlock([-6, 74, 7])).await;
+    step(
+        &module,
+        "放 B (-6,74,7)",
+        DoorCommand::PlaceBlock([-6, 74, 7]),
+    )
+    .await;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // 如实拒绝三连：已占用、悬空、太远。
-    step(&module, "重放 A（应拒：已有方块）", DoorCommand::PlaceBlock([-6, 73, 7])).await;
-    step(&module, "悬空 (-8,78,7)（应拒：无依附）", DoorCommand::PlaceBlock([-8, 78, 7])).await;
-    step(&module, "远处 (-6,85,20)（应拒：太远）", DoorCommand::PlaceBlock([-6, 85, 20])).await;
-    step(&module, "挖空气 (-6,80,7)（应拒：是空气）", DoorCommand::Mine([-6, 80, 7])).await;
+    step(
+        &module,
+        "重放 A（应拒：已有方块）",
+        DoorCommand::PlaceBlock([-6, 73, 7]),
+    )
+    .await;
+    step(
+        &module,
+        "悬空 (-8,78,7)（应拒：无依附）",
+        DoorCommand::PlaceBlock([-8, 78, 7]),
+    )
+    .await;
+    step(
+        &module,
+        "远处 (-6,85,20)（应拒：太远）",
+        DoorCommand::PlaceBlock([-6, 85, 20]),
+    )
+    .await;
+    step(
+        &module,
+        "挖空气 (-6,80,7)（应拒：是空气）",
+        DoorCommand::Mine(vec![[-6, 80, 7]]),
+    )
+    .await;
 
     // 换钻镐挖掉 B。
     step(&module, "选中 1 号格（钻镐）", DoorCommand::SelectSlot(1)).await;
-    step(&module, "挖 B (-6,74,7)", DoorCommand::Mine([-6, 74, 7])).await;
+    step(
+        &module,
+        "挖 B (-6,74,7)",
+        DoorCommand::Mine(vec![[-6, 74, 7]]),
+    )
+    .await;
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // release 停挖路径：换回圆石（等于徒手，挖圆石要 10 秒），开挖 A 后
     // 一秒松手，A 应保留（rcon 查证）。钻镐会秒穿，留不住证据。
-    step(&module, "换回 0 号格（徒手速度）", DoorCommand::SelectSlot(0)).await;
-    step(&module, "开挖 A (-6,73,7)", DoorCommand::Mine([-6, 73, 7])).await;
+    step(
+        &module,
+        "换回 0 号格（徒手速度）",
+        DoorCommand::SelectSlot(0),
+    )
+    .await;
+    step(
+        &module,
+        "开挖 A (-6,73,7)",
+        DoorCommand::Mine(vec![[-6, 73, 7]]),
+    )
+    .await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     step(&module, "松手（停挖）", DoorCommand::ReleaseHand).await;
 

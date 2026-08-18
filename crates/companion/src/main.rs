@@ -14,7 +14,7 @@ use agent::adapters::http::{HttpModel, HttpModelConfig, Protocol};
 use agent::{AgentSession, InputMessage, MailboxInput, SessionConfig};
 use context::ContextStrategy;
 use dispatch::{Dispatcher, LifeGate, Occupancy, ToolProvider};
-use hand::{HandDoor, HandTools};
+use hand::{HandDoor, HandTools, MiningStatus};
 use memory::{MemoryFile, MemoryTools};
 use motion::{MotionDoor, MotionTools};
 use perception::{PerceptionTools, ViewportDoor};
@@ -112,8 +112,19 @@ impl HandDoor for ModuleHandDoor {
                 .await
         })
     }
-    fn mine<'a>(&'a self, block: [i32; 3]) -> agent::PortFuture<'a, Result<(), String>> {
-        Box::pin(async move { self.0.execute(DoorCommand::Mine(block)).await })
+    fn mine<'a>(&'a self, blocks: Vec<[i32; 3]>) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::Mine(blocks)).await })
+    }
+    fn mining_status<'a>(&'a self) -> agent::PortFuture<'a, Option<MiningStatus>> {
+        Box::pin(async move {
+            self.0
+                .mining_status()
+                .map(|(done, total, current)| MiningStatus {
+                    done,
+                    total,
+                    current,
+                })
+        })
     }
     fn place<'a>(&'a self, block: [i32; 3]) -> agent::PortFuture<'a, Result<(), String>> {
         Box::pin(async move { self.0.execute(DoorCommand::PlaceBlock(block)).await })

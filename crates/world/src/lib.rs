@@ -289,11 +289,21 @@ pub struct JobEntry {
     pub outcome: JobOutcome,
 }
 
-/// 任务身份。v1 只有移动；挖掘等持续任务随后加入。
+/// 任务身份。持续任务共用一套「单意图槽 + 每 tick 轮询 + 终局出窗」。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JobKind {
     /// 寻路移动（go_to 与 forward 共用——forward 化归为寻路目标）。
     MoveTo { destination: [i32; 3] },
+    /// 按顺序挖一串方块。**队列而非单块**：模型一次给出坐标数组，机器逐块挖完。
+    ///
+    /// 之所以是队列，是因为 `start_mining` 是单目标槽——换目标即放弃上一个。
+    /// 旧接口一次只收一块，模型以为自己在排队，实测连发四次把四块全掐断了，
+    /// 一块没挖掉（2026-08-18 长跑）。
+    Mine {
+        targets: Vec<[i32; 3]>,
+        /// 已经挖碎的块数（终局措辞用：挖了几块、卡在第几块）。
+        done: usize,
+    },
 }
 
 /// 任务变化。Stalled 不是终局：任务还在跑，只是值得知道。
@@ -309,6 +319,10 @@ pub enum JobOutcome {
     PathEnded,
     /// 卡住：较长时间没有推进（寻路器还在自救，任务未结束）。
     Stalled,
+    /// 挖掘：整队挖完。
+    Mined,
+    /// 挖掘：卡在某一块上（够不着、迟迟不碎、读不到）。队列就此停下。
+    MineBlocked,
 }
 
 /// 物品栏格位变化：菜单协议号（0-45）上的内容更替。

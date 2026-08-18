@@ -45,7 +45,10 @@ pub enum DoorCommand {
         entity_key: String,
     },
     /// 挖掉一格方块（异步持续：挖穿与否由世界变化通知证实）。
-    Mine([i32; 3]),
+    /// 按顺序挖一串方块。**队列**：`start_mining` 是单目标槽，一次只收一块
+    /// 会让模型以为在排队、实则每发一次就掐断上一块（2026-08-18 长跑实证）。
+    /// 新队列顶替旧队列（与移动的单意图槽同款）。
+    Mine(Vec<[i32; 3]>),
     UseOnBlock([i32; 3]),
     /// 把手持方块放到目标空位（目标须紧挨已有方块，被点的是共享面）。
     PlaceBlock([i32; 3]),
@@ -168,17 +171,20 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             bot.attack(entity);
             Ok(())
         }
-        DoorCommand::Mine([x, y, z]) => {
-            let target = BlockPos::new(x, y, z);
+        DoorCommand::Mine(targets) => {
+            if targets.is_empty() {
+                return Err("没给要挖的坐标".to_owned());
+            }
+            // 只校验第一块：后面的等轮到它时再看。中途世界会变（自己挖塌、
+            // 别人动土），提前校验全部等于拿过期事实拒绝一个还没发生的动作。
+            let [x, y, z] = targets[0];
             let (name, _) = read_target_block(inner, [x, y, z])?;
             if crate::is_air_name(&name) {
                 return Err(format!("({x},{y},{z}) 没有方块，是空气"));
             }
-            check_reach(bot, target.center())?;
-            // 挖什么看什么（原版机制）：开挖前看一眼目标。azalea 在事件处理
-            // 时若发现视线正落在目标上会用真实命中面，否则填 Down 兜底。
-            bot.look_at(target.center());
-            bot.start_mining(target);
+            check_reach(bot, BlockPos::new(x, y, z).center())?;
+            inner.begin_mining_job(targets.clone());
+            begin_mining(bot, targets[0]);
             Ok(())
         }
         DoorCommand::UseOnBlock([x, y, z]) => {
@@ -260,6 +266,8 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
                     .write()
                     .write_message(azalea::mining::StopMiningBlockEvent { entity: bot.entity });
             }
+            // 队列也要收：不收的话轮询会不停重发 start_mining，release 等于没停。
+            inner.end_mining_job_stopped();
             bot.write_packet(s_player_action::ServerboundPlayerAction {
                 action: s_player_action::Action::ReleaseUseItem,
                 pos: BlockPos::new(0, 0, 0),
@@ -765,6 +773,19 @@ pub(super) fn find_entity_by_key(
         .iter(&ecs)
         .find(|(_, id, loaded_by)| ***id == protocol_id && loaded_by.contains(&bot.entity))
         .map(|(entity, _, _)| entity)
+}
+
+/// 开挖一块：挖什么看什么（原版机制——azalea 在事件处理时若发现视线正落在
+/// 目标上会用真实命中面，否则填 Down 兜底），然后交给 azalea 持续挖。
+pub(super) fn begin_mining(bot: &Client, [x, y, z]: [i32; 3]) {
+    let target = BlockPos::new(x, y, z);
+    bot.look_at(target.center());
+    bot.start_mining(target);
+}
+
+/// 某格现在是不是空气。挖碎的唯一判据——不按时间猜。
+pub(super) fn block_is_air(inner: &Inner, at: [i32; 3]) -> Result<bool, String> {
+    read_target_block(inner, at).map(|(name, _)| crate::is_air_name(&name))
 }
 
 #[cfg(test)]
