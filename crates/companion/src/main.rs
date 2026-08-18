@@ -724,8 +724,10 @@ async fn main() -> Result<(), String> {
                     // 摘要按指令不含世界状态，先前追加的处境也随对话一起没了。
                     situation.request_full_resend();
                 }
-                let mut sections =
-                    situation.take(render::render_situation_lines(&snapshots.latest(), read_mark.position()));
+                let mut sections = situation.take(render::render_situation_lines(
+                    &snapshots.latest(),
+                    read_mark.position(),
+                ));
                 let situation_lines = sections.len();
                 sections.push(render::render_block_changes(&changes));
                 let text = sections.join("\n");

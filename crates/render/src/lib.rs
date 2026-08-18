@@ -52,10 +52,7 @@ pub fn render_situation_lines(
     ];
     let unread = unread_chat_count(snap, chat_read);
     if unread > 0 {
-        lines.push((
-            SituationLine::Unread,
-            format!("聊天有 {unread} 条新消息。"),
-        ));
+        lines.push((SituationLine::Unread, format!("聊天有 {unread} 条新消息。")));
     }
     lines.retain(|(_, line)| !line.is_empty());
     lines

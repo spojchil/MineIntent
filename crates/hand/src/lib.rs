@@ -140,7 +140,7 @@ impl HandTools {
             _ => {
                 return ToolResult::failure(
                     call_id,
-                    "action 必须是 attack/mine/place/use_on/use_item/release/drop/swap_offhand/select_slot 之一；请改写调用",
+                    "action 必须是 attack/mine/mining_status/place/use_on/use_item/release/drop/swap_offhand/select_slot 之一；请改写调用",
                 )
             }
         };
@@ -195,7 +195,7 @@ impl ToolProvider for HandTools {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["attack", "mine", "place", "use_on", "use_item", "release", "drop", "swap_offhand", "select_slot"],
+                        "enum": ["attack", "mine", "mining_status", "place", "use_on", "use_item", "release", "drop", "swap_offhand", "select_slot"],
                         "description": "attack=攻击实体；mine=按顺序挖掉一串方块（blocks 给坐标数组，机器逐块挖完；挖穿要时间，别急着发下一个——再发一次 mine 会放弃当前这串。可用 release 停手）；place=把手持方块放到目标空位（目标须紧挨已有方块）；use_on=对方块/实体使用（右键）；use_item=使用手持物品（吃/喝/举盾，持续到用完或 release）；mining_status=看一眼在途挖掘队列（**不要轮询**：挖完或卡住都会主动通知你，这个动作只在你确实拿不准时用一次）；release=松手；drop=丢手持物；swap_offhand=主副手对调；select_slot=选快捷栏格"
                     },
                     "entity": { "type": "string", "description": "attack/use_on 用：目标实体的 entity_key" },
@@ -391,5 +391,49 @@ mod tests {
                 domain: Domain::Hand
             }
         );
+    }
+
+    /// 描述里讲了的动作，schema 必须也放行。
+    ///
+    /// mining_status 曾经实现了、描述里也写了，却漏在 enum 之外——严格模式的
+    /// 服务商会照 enum 挡掉，模型看得见却调不出来。这正是本工具自己在修的
+    /// 「工具说了谎」，用测试钉住。
+    #[test]
+    fn every_action_the_description_mentions_is_allowed_by_the_schema() {
+        let (tools, _) = tools(None);
+        let registered = ToolProvider::tools(&tools);
+        let definition = &registered[0].0;
+        let allowed: Vec<&str> = definition.input_schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action 应有 enum")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let described = definition.input_schema["properties"]["action"]["description"]
+            .as_str()
+            .expect("action 应有描述");
+        // 动作名写成 `名字=解释`，名字是 ASCII 标识符；解释里的中文分号
+        // （括号内的补充说明）不构成新动作，靠这条形状过滤掉。
+        let mentioned: Vec<&str> = described
+            .split('；')
+            .filter_map(|clause| clause.split('=').next())
+            .map(str::trim)
+            .filter(|name| {
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|character| character.is_ascii_lowercase() || character == '_')
+            })
+            .collect();
+        assert!(
+            mentioned.len() >= allowed.len(),
+            "描述漏讲了动作：讲了 {mentioned:?}，schema 放行 {allowed:?}"
+        );
+        for action in mentioned {
+            assert!(
+                allowed.contains(&action),
+                "描述里讲了 {action}，schema 的 enum 却没放行：{allowed:?}"
+            );
+        }
     }
 }
