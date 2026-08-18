@@ -24,6 +24,7 @@ pub fn render_situation(snap: &TickSnapshot, chat_read: (u64, u64)) -> String {
     }
 
     let mut lines = vec![
+        render_self_identity(snap),
         render_environment(snap),
         render_position(snap),
         render_vitals(snap),
@@ -35,6 +36,23 @@ pub fn render_situation(snap: &TickSnapshot, chat_read: (u64, u64)) -> String {
     }
     lines.retain(|line| !line.is_empty());
     lines.join("\n")
+}
+
+/// 自称一行：你在这个世界里叫什么。
+///
+/// 2026-08-18 实盘教训：人设是静态配置，不知道运行时用户名；处境此前也不自称。
+/// 于是模型在聊天窗里读到「MineIntentBot joined the game」与「Alice: MineIntentBot
+/// 帮我弄一把铁镐」，**两条都当成了关于第三方的话**——它给自己取名「小雨」，
+/// 跟自己打了招呼，然后判断这活儿是派给别人的，自己旁观。整跑就此停滞。
+///
+/// 防自激那套（按 UUID 比对发言者）只挡得住「别把自己说的话当成别人说的」，
+/// 挡不住「不知道自己是谁」。名字每轮随快照现拉，天然跟着用户名走。
+pub fn render_self_identity(snap: &TickSnapshot) -> String {
+    let name = &snap.self_state.username;
+    if name.is_empty() {
+        return String::new();
+    }
+    format!("你在这个世界里的名字是 {name}——别人叫这个名字就是在叫你。")
 }
 
 /// 环境一行：维度、时段，有雨雪雷才提天气。

@@ -65,14 +65,30 @@ fn chat_entry(tick: u64) -> ChatEntry {
 }
 
 #[test]
-fn situation_covers_environment_position_vitals_in_order() {
+fn situation_covers_identity_environment_position_vitals_in_order() {
     let text = render_situation(&snapshot(), (1, 100));
     let lines: Vec<&str> = text.lines().collect();
 
-    assert_eq!(lines[0], "主世界，下午。");
-    assert_eq!(lines[1], "位置 (120, 64, -36)，面朝西。");
-    assert_eq!(lines[2], "生命 18/20，饥饿 15/20。");
-    assert_eq!(lines.len(), 3, "没实体没未读时不该有第四行：{text}");
+    // 自称在最前：不知道自己叫什么的话，点名的聊天会被当成关于第三方的话
+    // （2026-08-18 实盘：模型给自己取名「小雨」，旁观了派给自己的任务）。
+    assert_eq!(
+        lines[0],
+        "你在这个世界里的名字是 xiaoming——别人叫这个名字就是在叫你。"
+    );
+    assert_eq!(lines[1], "主世界，下午。");
+    assert_eq!(lines[2], "位置 (120, 64, -36)，面朝西。");
+    assert_eq!(lines[3], "生命 18/20，饥饿 15/20。");
+    assert_eq!(lines.len(), 4, "没实体没未读时不该有第五行：{text}");
+}
+
+/// 用户名缺席（未就绪等）时不硬编一行空自称。
+#[test]
+fn identity_line_is_omitted_when_the_name_is_unknown() {
+    let mut snap = snapshot();
+    snap.self_state.username = String::new();
+    let text = render_situation(&snap, (1, 100));
+    assert!(!text.contains("名字是"), "{text}");
+    assert!(text.starts_with("主世界"), "{text}");
 }
 
 #[test]
