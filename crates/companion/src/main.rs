@@ -265,6 +265,31 @@ impl ViewportDoor for ModuleViewportDoor {
 ///
 /// 不记 `ModelRequestTranscript`——那是每次请求的整份上下文，量级完全不同，
 /// 要看那个另说。这里只回答「它做了什么」。
+/// 压缩线：序列化转录超过它就在下一个安全边界压缩。
+///
+/// 内核默认 256 KiB。实盘 30 分钟撞了 **3 次**（转录 316 / 381 / 300 条被换成一段
+/// 摘要），而那一跑的上下文开销另有主因——处境待在受保护前缀里，每轮把整条对话赶出
+/// 缓存。先把线抬到 1 MiB，让压缩不再是变量，再去量前缀那一改的实际收益。
+///
+/// ⚠ 这条线**不管服务商的窗口**。按那一跑实测约 3.6 字节/token，1 MiB 折合 29 万
+/// token，远超 DeepSeek 的上下文窗口——真长到那个量级会先收到服务商的长度报错，而不是
+/// 触发压缩。所以这是一个**调试用的高位**，不是长期设置；长期该配的是
+/// `compact_above_tokens`（服务商报的输入 token，比字节估算准），等这次测完再定。
+///
+/// `MINEINTENT_COMPACT_ABOVE_BYTES` 可覆盖，好在实盘里试值。
+fn session_config() -> SessionConfig {
+    let mut config = SessionConfig::default();
+    config.budget.context.compact_above_bytes = std::env::var("MINEINTENT_COMPACT_ABOVE_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(1024 * 1024);
+    println!(
+        "[组合根] 压缩线：转录超过 {} KiB 时压缩",
+        config.budget.context.compact_above_bytes / 1024
+    );
+    config
+}
+
 /// 把事件分发给多个观察者。内核只留一个观察者槽位，而组合根有两件事要看。
 struct FanOut(Vec<Arc<dyn agent::Observer>>);
 
@@ -613,7 +638,7 @@ async fn main() -> Result<(), String> {
         dispatcher,
         strategy,
         model,
-        SessionConfig::default(),
+        session_config(),
     )
     .with_stream_observer(Arc::new(RoundEndSignal(round_end_tx)));
     // 压缩完成的旗子：压缩把对话换成摘要，先前追加的处境随之消失，
