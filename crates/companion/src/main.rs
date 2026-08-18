@@ -271,6 +271,48 @@ impl TraceObserver {
     }
 }
 
+/// 每次模型请求一行：这一份上下文有多大、命中了多少、花了多久。
+///
+/// 轮级的 `ModelUsage` 是**累加**的（midturn `types.rs` 的 merge），回答不了
+/// 「单次请求的上下文多大」——那正是评估上下文时唯一要看的数。逐请求的
+/// `ModelRequestFinished` 才带真实数字。
+impl agent::Observer for TraceObserver {
+    fn observe(&self, event: &agent::AgentEvent) {
+        match event {
+            agent::AgentEvent::ModelRequestStarted {
+                request_index,
+                transcript_items,
+                function_tools,
+                ..
+            } => self.write(&format!(
+                "[请求#{request_index}] 转录条目={transcript_items} 工具={function_tools}"
+            )),
+            agent::AgentEvent::ModelRequestFinished {
+                request_index,
+                duration_ms,
+                usage,
+                ..
+            } => {
+                let (input, cached, output) = usage
+                    .as_ref()
+                    .map(|u| {
+                        (
+                            u.input_tokens.unwrap_or(0),
+                            u.cached_input_tokens.unwrap_or(0),
+                            u.output_tokens.unwrap_or(0),
+                        )
+                    })
+                    .unwrap_or((0, 0, 0));
+                self.write(&format!(
+                    "[用量#{request_index}] 输入={input} 命中={cached} 未命中={} 输出={output} 耗时={duration_ms}ms",
+                    input.saturating_sub(cached)
+                ));
+            }
+            _ => {}
+        }
+    }
+}
+
 impl agent::ContentObserver for TraceObserver {
     fn observe(&self, event: &agent::ContentEvent) {
         match event {
@@ -443,7 +485,10 @@ async fn main() -> Result<(), String> {
     )
     .with_stream_observer(Arc::new(RoundEndSignal(round_end_tx)));
     if let Ok(path) = std::env::var("MINEINTENT_TRACE_FILE") {
-        assembled = assembled.with_content_observer(Arc::new(TraceObserver::open(&path)?));
+        let trace = Arc::new(TraceObserver::open(&path)?);
+        assembled = assembled
+            .with_content_observer(trace.clone())
+            .with_observer(trace);
         println!("[组合根] 诊断轨迹：{path}（内容未脱敏）");
     }
     let session = Arc::new(assembled);
