@@ -382,7 +382,7 @@ async fn main() {
     // ---- 一、基础上下文（受保护前缀两段） ----
     println!("## 一、基础上下文（受保护前缀，免压缩，全部 system 角色）\n");
     println!("> 只有不逐轮变的东西进得来——前缀缓存按最长公共前缀命中，这里放易变量");
-    println!("> 会让整条对话每轮全额重算。处境因此不在这里，见第二节。\n");
+    println!("> 会让整条对话每轮全额重算。处境因此不在这里，它随增量帧追加，见第五节。\n");
     let memory_file = Arc::new(MemoryFile::new(scratch.join("memory.md")));
     memory_file
         .write("我叫 companion。tester 最喜欢的方块是青金石块。")
@@ -443,35 +443,6 @@ async fn main() {
             .collect();
         println!("- 读取失败时：`{text}`\n");
     }
-    println!("处境的其他相位：\n");
-    for (name, phase) in [
-        ("连接中", world::ConnectionPhase::Connecting),
-        (
-            "断线",
-            world::ConnectionPhase::Disconnected {
-                reason: "与服务器的连接已断开".to_owned(),
-            },
-        ),
-        (
-            "已停止",
-            world::ConnectionPhase::Stopped {
-                reason: "维护者停机".to_owned(),
-            },
-        ),
-    ] {
-        let mut other = snapshot.clone();
-        other.phase = phase;
-        println!(
-            "- {name}：`{}`",
-            render::render_situation(&other, read_mark.position())
-        );
-    }
-    {
-        let mut dead = snapshot.clone();
-        dead.self_state.alive = false;
-        println!("- 死亡时体征行：`{}`\n", render::render_vitals(&dead));
-    }
-
     // ---- 二、工具表 ----
     println!("## 二、工具表（模型收到的定义原文）\n");
     let occupancy = Arc::new(Occupancy::new());
@@ -719,6 +690,36 @@ async fn main() {
         println!("{line}");
     }
     println!("```\n");
+    {
+        let mut dead = snapshot.clone();
+        dead.self_state.alive = false;
+        println!("- 死亡时体征行：`{}`\n", render::render_vitals(&dead));
+    }
+
+    println!("处境的其他相位：\n");
+    for (name, phase) in [
+        ("连接中", world::ConnectionPhase::Connecting),
+        (
+            "断线",
+            world::ConnectionPhase::Disconnected {
+                reason: "与服务器的连接已断开".to_owned(),
+            },
+        ),
+        (
+            "已停止",
+            world::ConnectionPhase::Stopped {
+                reason: "维护者停机".to_owned(),
+            },
+        ),
+    ] {
+        let mut other = snapshot.clone();
+        other.phase = phase;
+        println!(
+            "- {name}：`{}`",
+            render::render_situation(&other, read_mark.position())
+        );
+    }
+    println!();
     println!("聊天：`alice: 过来一下`（发言者名: 原文）\n");
     println!("任务通知（render_job_entry 全谱）：\n");
     for outcome in [
