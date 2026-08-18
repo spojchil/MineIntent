@@ -375,6 +375,11 @@ struct FramePace {
     min: Duration,
     max: Duration,
     factor: u32,
+    /// 全程统计（含空 diff 的那些）。滑窗管节律，这几个管「到底多久」。
+    total: u64,
+    sum: Duration,
+    fastest: Duration,
+    slowest: Duration,
 }
 
 impl FramePace {
@@ -393,6 +398,10 @@ impl FramePace {
             min: Duration::from_millis(ms("MINEINTENT_FRAME_MIN_MS", 250)),
             max: Duration::from_millis(ms("MINEINTENT_FRAME_MAX_MS", 5_000)),
             factor: ms("MINEINTENT_FRAME_FACTOR", 4) as u32,
+            total: 0,
+            sum: Duration::ZERO,
+            fastest: Duration::MAX,
+            slowest: Duration::ZERO,
         }
     }
 
@@ -401,6 +410,28 @@ impl FramePace {
             self.recent.pop_front();
         }
         self.recent.push_back(elapsed);
+        // 全程分布另记一份：滑窗只有最近 8 次，回答不了「各种场景下多久」。
+        self.total += 1;
+        self.sum += elapsed;
+        self.slowest = self.slowest.max(elapsed);
+        self.fastest = self.fastest.min(elapsed);
+    }
+
+    /// 每这么多次投影汇报一次分布。**空 diff 的投影不投递也不打帧日志**，
+    /// 只按非空帧统计会漏掉「无事发生时多久」那一半——那正是常态。
+    const REPORT_EVERY: u64 = 40;
+
+    fn due_report(&self) -> Option<String> {
+        if self.total == 0 || !self.total.is_multiple_of(Self::REPORT_EVERY) {
+            return None;
+        }
+        Some(format!(
+            "[组合根] 投影分布：{} 次，最快 {}ms，均值 {}ms，最慢 {}ms（含空 diff）",
+            self.total,
+            self.fastest.as_millis(),
+            (self.sum / self.total as u32).as_millis(),
+            self.slowest.as_millis()
+        ))
     }
 
     fn average(&self) -> Duration {
@@ -594,6 +625,9 @@ async fn main() -> Result<(), String> {
                 .await;
                 let elapsed = started.elapsed();
                 pace.record(elapsed);
+                if let Some(report) = pace.due_report() {
+                    println!("{report}");
+                }
 
                 // 未连接/世界未就绪等如实拒绝：静默跳过，不是错误。
                 let Ok(Ok(changes)) = changes else { continue };
