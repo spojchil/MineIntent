@@ -357,6 +357,65 @@ impl agent::ContentObserver for TraceObserver {
     }
 }
 
+/// 增量帧的自适应节律。
+///
+/// 一次增量就是一整幅视口投影——纯 CPU 重活，耗时随视野里方块多少浮动，
+/// 拍一个常数（比如「每 5 tick」）在密林里会把 tick 处理拖垮，在旷野里又
+/// 白等。所以按**实测**来：每次投影计时，取近几次均值，下一次间隔 = 均值 ×
+/// 倍率，再夹到 [最短, 最长] 之间。
+///
+/// 倍率的含义是「投影占用的时间份额」：×4 即最多花 1/5 的时间在投影上，
+/// 剩下留给 tick 处理与模型往返。
+///
+/// 三个数都能用环境变量调，好在实盘里对着日志找合适值：
+/// `MINEINTENT_FRAME_MIN_MS`（默认 250）、`MINEINTENT_FRAME_MAX_MS`（默认 5000）、
+/// `MINEINTENT_FRAME_FACTOR`（默认 4）。
+struct FramePace {
+    recent: std::collections::VecDeque<Duration>,
+    min: Duration,
+    max: Duration,
+    factor: u32,
+}
+
+impl FramePace {
+    /// 均值取最近这么多次：够平滑，又能跟上场景切换（进洞、出林）。
+    const WINDOW: usize = 8;
+
+    fn new() -> Self {
+        let ms = |name: &str, fallback: u64| -> u64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(fallback)
+        };
+        Self {
+            recent: std::collections::VecDeque::with_capacity(Self::WINDOW),
+            min: Duration::from_millis(ms("MINEINTENT_FRAME_MIN_MS", 250)),
+            max: Duration::from_millis(ms("MINEINTENT_FRAME_MAX_MS", 5_000)),
+            factor: ms("MINEINTENT_FRAME_FACTOR", 4) as u32,
+        }
+    }
+
+    fn record(&mut self, elapsed: Duration) {
+        if self.recent.len() == Self::WINDOW {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(elapsed);
+    }
+
+    fn average(&self) -> Duration {
+        if self.recent.is_empty() {
+            return Duration::ZERO;
+        }
+        self.recent.iter().sum::<Duration>() / self.recent.len() as u32
+    }
+
+    /// 下次定时触发的间隔。还没测过时先用最短间隔起步。
+    fn next_interval(&self) -> Duration {
+        (self.average() * self.factor).clamp(self.min, self.max)
+    }
+}
+
 /// 轮末帧观察端：只在一轮模型响应落定（AttemptCommitted）时发信号；
 /// 收集与投递在旁路任务做——观察端契约要求快速返回。
 struct RoundEndSignal(tokio::sync::mpsc::UnboundedSender<()>);
@@ -508,25 +567,53 @@ async fn main() -> Result<(), String> {
         let module = module.clone();
         let block_memory = block_memory.clone();
         tokio::spawn(async move {
-            while round_end_rx.recv().await.is_some() {
-                // 合并积压信号：连续几轮落定只收集一次，diff 是累积的不丢事。
-                while round_end_rx.try_recv().is_ok() {}
+            let mut pace = FramePace::new();
+            loop {
+                // 两个触发源，谁先到算谁：
+                //   一、模型响应落定（工具刚跑完，世界多半刚变）；
+                //   二、定时——**间隔由上几次实测耗时自适应**，不是拍脑袋的常数。
+                // 世界不变就没有 diff，也就不投递、不唤醒；固定心跳会为无事发生
+                // 烧轮，这里不会。
+                tokio::select! {
+                    signal = round_end_rx.recv() => {
+                        if signal.is_none() {
+                            break;
+                        }
+                        // 合并积压：连续几轮落定只收集一次，diff 是累积的不丢事。
+                        while round_end_rx.try_recv().is_ok() {}
+                    }
+                    _ = tokio::time::sleep(pace.next_interval()) => {}
+                }
+
                 let scan_module = module.clone();
                 let scan_memory = block_memory.clone();
+                let started = std::time::Instant::now();
                 let changes = tokio::task::spawn_blocking(move || {
                     scan_module.scan_changes(&scan_memory, &world::ViewportOptions::default())
                 })
                 .await;
-                // 未连接/世界未就绪等如实拒绝：轮末帧静默跳过，不是错误。
+                let elapsed = started.elapsed();
+                pace.record(elapsed);
+
+                // 未连接/世界未就绪等如实拒绝：静默跳过，不是错误。
                 let Ok(Ok(changes)) = changes else { continue };
                 if changes.is_empty() {
                     continue;
                 }
                 let text = render::render_block_changes(&changes);
-                println!("[组合根] 轮末帧：{} 条差异", changes.len());
+                println!(
+                    "[组合根] 增量帧：{} 条差异（本次投影 {}ms，均值 {}ms，下次间隔 {}ms）",
+                    changes.len(),
+                    elapsed.as_millis(),
+                    pace.average().as_millis(),
+                    pace.next_interval().as_millis()
+                );
                 let item: agent::TranscriptItem = InputMessage::text("user", text).into();
-                if let Err(rejected) = session.enqueue(MailboxInput::passive(vec![item])).await {
-                    eprintln!("[组合根] 轮末帧被拒：{:?}", rejected.reason);
+                // WhenIdle 而非 Passive：世界真的变了就值得叫醒空闲的同伴——
+                // 挖穿、别人动土、熔炉灭火都在这条通道上。忙时它排在轮末，
+                // 天然与进行中的轮合并，不插队。
+                if let Err(rejected) = session.enqueue(MailboxInput::when_idle(vec![item])).await {
+                    eprintln!("[组合根] 增量帧被拒：{:?}", rejected.reason);
                 }
             }
         });
