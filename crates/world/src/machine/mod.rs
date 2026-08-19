@@ -51,6 +51,12 @@ const MOVEMENT_STALL_TICKS: usize = 200;
 /// 留足余量——超过它仍不碎，多半是够不着、被挡或工具不对，不是慢。
 const MINING_STALL_TICKS: u64 = 400;
 
+/// 一趟行走最多分几程。
+///
+/// 按观察到的地图规划必然是多段的：先走到知识边界，看到更多再往前。上限只是
+/// 防跑飞——每一程都要求真的往前挪了才算数，所以正常情况下远远撞不到它。
+const MAX_MOVEMENT_LEGS: usize = 32;
+
 /// 连接配置。v1 只有离线身份、重连固定 Never。
 #[derive(Clone, Debug)]
 pub struct ConnectionConfig {

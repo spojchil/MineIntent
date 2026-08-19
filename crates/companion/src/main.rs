@@ -595,6 +595,10 @@ async fn main() -> Result<(), String> {
     // 方块记忆：同伴「已知道什么」的共享认知状态。当前由 scan 回执喂入；
     // 增量呈现与寻路合法域随后也读写这一本。
     let block_memory = Arc::new(std::sync::Mutex::new(world::BlockMemory::new()));
+    // 合法寻路：寻路只按这本记忆里观察过的方块规划，不再读服务端推来的全量世界。
+    // 必须是同一本——轮末帧每 250ms 往里推进增量，寻路要看到的正是那一份。
+    module.use_observed_pathfinding(block_memory.clone());
+    println!("[组合根] 合法寻路：只按观察过的方块规划路线");
     let read_mark = Arc::new(ChatReadMark::new());
     let memory_file = Arc::new(MemoryFile::new(memory_path));
     let snapshots: Arc<dyn SnapshotSource> = module.clone();
@@ -697,6 +701,9 @@ async fn main() -> Result<(), String> {
         tokio::spawn(async move {
             let mut pace = FramePace::new();
             let mut situation = SituationTracker::new();
+            // job 进展的游标，与 wake 那条各走各的：进展是「还在走」，不该叫醒，
+            // 由帧搭车呈现；终局才是事件，走 wake。
+            let mut progress_seq: Option<u64> = None;
             loop {
                 // 两个触发源，谁先到算谁：
                 //   一、模型响应落定（工具刚跑完，世界多半刚变）；
@@ -760,6 +767,17 @@ async fn main() -> Result<(), String> {
                     &snapshots.latest(),
                     read_mark.position(),
                 ));
+                // 在途 job 的进展：多段行走每一程的终点、挖掘每碎一块。
+                let snapshot = snapshots.latest();
+                for entry in &snapshot.jobs.entries {
+                    if progress_seq.is_some_and(|seen| entry.seq <= seen) {
+                        continue;
+                    }
+                    progress_seq = Some(entry.seq);
+                    if matches!(entry.event, world::JobEvent::Progress(_)) {
+                        sections.push(render::render_job_entry(entry));
+                    }
+                }
                 let situation_lines = sections.len();
                 sections.push(render::render_block_changes(&changes));
                 let text = sections.join("\n");

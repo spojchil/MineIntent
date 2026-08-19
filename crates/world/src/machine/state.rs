@@ -355,12 +355,21 @@ impl Inner {
     }
 
     pub(super) fn push_job_kind(&self, job: JobKind, outcome: JobOutcome) {
+        self.push_job_event(job, crate::JobEvent::Finished(outcome));
+    }
+
+    /// 进行中的进展：落一条事实，**不结束 job**。
+    pub(super) fn push_job_progress(&self, job: JobKind, progress: crate::JobProgress) {
+        self.push_job_event(job, crate::JobEvent::Progress(progress));
+    }
+
+    fn push_job_event(&self, job: JobKind, event: crate::JobEvent) {
         let entry = JobEntry {
             seq: self.fact_seq.fetch_add(1, Ordering::AcqRel),
             tick: self.tick.load(Ordering::Acquire),
             occurred_at: SystemTime::now(),
             job,
-            outcome,
+            event,
         };
         let mut window = self.jobs_window.lock();
         window.push_back(entry);
@@ -380,6 +389,9 @@ impl Inner {
             started_tick: self.tick.load(Ordering::Acquire),
             armed: false,
             stall_notified: false,
+            announced_leg_end: None,
+            leg_started_at: [i32::MIN, i32::MIN, i32::MIN],
+            legs: 0,
         });
     }
 
@@ -551,7 +563,14 @@ mod tests {
         inner.end_movement_job_stopped(); // 没任务时不是事件
 
         let window = inner.jobs_window_now();
-        let outcomes: Vec<JobOutcome> = window.entries.iter().map(|entry| entry.outcome).collect();
+        let outcomes: Vec<JobOutcome> = window
+            .entries
+            .iter()
+            .filter_map(|entry| match entry.event {
+                crate::JobEvent::Finished(outcome) => Some(outcome),
+                crate::JobEvent::Progress(_) => None,
+            })
+            .collect();
         assert_eq!(outcomes, vec![JobOutcome::Replaced, JobOutcome::Stopped]);
         assert_eq!(
             window.entries[0].job,

@@ -11,7 +11,8 @@
 //! 不会漏——tick 会重复，seq 不会。
 
 use world::{
-    DamageEntry, FactSource, InventoryChangeEntry, JobEntry, JobOutcome, ScreenEvent, TickSnapshot,
+    DamageEntry, FactSource, InventoryChangeEntry, JobEntry, JobEvent, JobOutcome, ScreenEvent,
+    TickSnapshot,
 };
 
 /// 屏事实要组合根做的事：状态翻转与占域是副作用，出纯函数交给外面。
@@ -103,8 +104,15 @@ impl WakeCursors {
         }
 
         for entry in &snapshot.jobs.entries {
-            if advance(&mut self.jobs, entry.seq) && wakes_on(entry.outcome) {
-                lines.push(render_job(entry));
+            if !advance(&mut self.jobs, entry.seq) {
+                continue;
+            }
+            // 进展不走这条通道：它是「还在走」，不是「出事了」，由轮末帧搭车呈现
+            // （组合根另有一个游标）。这里只管终局。
+            if let JobEvent::Finished(outcome) = entry.event {
+                if wakes_on(outcome) {
+                    lines.push(render_job(entry));
+                }
             }
         }
 
@@ -241,7 +249,7 @@ mod tests {
             job: JobKind::MoveTo {
                 destination: [1, 2, 3],
             },
-            outcome,
+            event: JobEvent::Finished(outcome),
         }
     }
 

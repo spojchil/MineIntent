@@ -98,14 +98,7 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             inner.begin_movement_job(destination);
             // 禁止寻路器隐式挖方块：挖掘是模型的显式动作（hand mine），
             // 不是移动的副作用——实测它会把作为目的地的工作台整个挖掉。
-            bot.start_goto_with_opts(
-                BlockPosGoal(BlockPos::new(
-                    destination[0],
-                    destination[1],
-                    destination[2],
-                )),
-                PathfinderOpts::new().allow_mining(false),
-            );
+            begin_goto(bot, destination);
             Ok(())
         }
         DoorCommand::Forward(blocks) => {
@@ -777,6 +770,17 @@ pub(super) fn find_entity_by_key(
 
 /// 开挖一块：挖什么看什么（原版机制——azalea 在事件处理时若发现视线正落在
 /// 目标上会用真实命中面，否则填 Down 兜底），然后交给 azalea 持续挖。
+/// 下一个寻路目标。**禁止寻路器隐式挖方块**：挖掘是模型的显式动作（hand mine），
+/// 不是移动的副作用——实测它会把作为目的地的工作台整个挖掉。
+///
+/// 多段行走每一程都经这里重发，所以口径只有一处。
+pub(super) fn begin_goto(bot: &Client, [x, y, z]: [i32; 3]) {
+    bot.start_goto_with_opts(
+        BlockPosGoal(BlockPos::new(x, y, z)),
+        PathfinderOpts::new().allow_mining(false),
+    );
+}
+
 pub(super) fn begin_mining(bot: &Client, [x, y, z]: [i32; 3]) {
     let target = BlockPos::new(x, y, z);
     bot.look_at(target.center());

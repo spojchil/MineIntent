@@ -736,7 +736,7 @@ async fn main() {
             job: world::JobKind::MoveTo {
                 destination: [35, 72, 3],
             },
-            outcome,
+            event: world::JobEvent::Finished(outcome),
         };
         let delivered = matches!(
             outcome,

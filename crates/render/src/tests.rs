@@ -251,7 +251,7 @@ fn job_entries_render_each_outcome_in_world_language() {
         job: world::JobKind::MoveTo {
             destination: [10, 64, -3],
         },
-        outcome,
+        event: world::JobEvent::Finished(outcome),
     };
     assert_eq!(
         render_job_entry(&entry(world::JobOutcome::Arrived)),

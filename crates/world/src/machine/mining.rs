@@ -97,13 +97,27 @@ pub(super) fn poll_mining_job(inner: &Inner, bot: &Client) {
             }
         }
         MiningPollStep::Advance => {
-            let next = {
+            let (next, progress) = {
                 let mut job = inner.mining_job.lock();
                 let Some(job) = job.as_mut() else { return };
                 job.cursor += 1;
                 job.since_tick = tick;
-                job.targets.get(job.cursor).copied()
+                (
+                    job.targets.get(job.cursor).copied(),
+                    (
+                        crate::JobKind::Mine {
+                            targets: job.targets.clone(),
+                            done: job.cursor,
+                        },
+                        crate::JobProgress::Mined {
+                            done: job.cursor,
+                            total: job.targets.len(),
+                        },
+                    ),
+                )
             };
+            // 一块碎了就说一句：整队挖完才是终局，中途不该沉默到底。
+            inner.push_job_progress(progress.0, progress.1);
             if let Some(next) = next {
                 super::door::begin_mining(bot, next);
             }

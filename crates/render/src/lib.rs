@@ -622,12 +622,51 @@ pub fn render_directed(projection: &world::DirectedProjection) -> String {
     }
 }
 
+/// 进行中的进展措辞。
+///
+/// 一趟远路是多段的——按自己观察到的地图规划，只能先走到知识边界，到了看到更多
+/// 再往前。每段开始说一句这一程走到哪，模型才知道自己为什么走走停停；不说，它
+/// 看到的就是「走了一段莫名其妙停下」，然后去 scan 找补。
+///
+/// **不解释为什么到此为止**：路径是被知识边界截断还是被超时截断，`is_partial`
+/// 分不出，说了就是把未知讲成已知。
+pub fn render_job_progress(job: &world::JobKind, progress: &world::JobProgress) -> String {
+    match (job, progress) {
+        (
+            world::JobKind::MoveTo {
+                destination: [dx, dy, dz],
+            },
+            world::JobProgress::Leg { to: [x, y, z] },
+        ) => {
+            if [*x, *y, *z] == [*dx, *dy, *dz] {
+                format!("这一程直接走到 ({dx}, {dy}, {dz})。")
+            } else {
+                format!(
+                    "去 ({dx}, {dy}, {dz})：这一程先走到 ({x}, {y}, {z})，到了再看能不能接着走。"
+                )
+            }
+        }
+        (world::JobKind::Mine { .. }, world::JobProgress::Mined { done, total }) => {
+            format!(
+                "挖掉了第 {done} 块，还剩 {} 块。",
+                total.saturating_sub(*done)
+            )
+        }
+        // 类别对不上就如实说破，不编。
+        (job, progress) => format!("任务收到了不属于它的进展：{job:?} / {progress:?}。"),
+    }
+}
+
 /// 任务变化的通知措辞。哪些值得投递是己的判据，这里只管怎么说。
 pub fn render_job_entry(entry: &world::JobEntry) -> String {
+    let outcome = match &entry.event {
+        world::JobEvent::Finished(outcome) => *outcome,
+        world::JobEvent::Progress(progress) => return render_job_progress(&entry.job, progress),
+    };
     match &entry.job {
         world::JobKind::MoveTo {
             destination: [x, y, z],
-        } => match entry.outcome {
+        } => match outcome {
             world::JobOutcome::Arrived => format!("你到达了目的地 ({x}, {y}, {z})。"),
             world::JobOutcome::Replaced => "先前的移动被新的目标顶替了。".to_owned(),
             world::JobOutcome::Stopped => "你停下了移动。".to_owned(),
@@ -642,7 +681,7 @@ pub fn render_job_entry(entry: &world::JobEntry) -> String {
         },
         world::JobKind::Mine { targets, done } => {
             let total = targets.len();
-            match entry.outcome {
+            match outcome {
                 world::JobOutcome::Mined => format!("你挖完了这一串 {total} 块方块。"),
                 world::JobOutcome::MineBlocked => match targets.get(*done) {
                     Some([x, y, z]) => format!(

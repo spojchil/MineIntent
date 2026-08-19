@@ -287,7 +287,33 @@ pub struct JobEntry {
     pub tick: u64,
     pub occurred_at: Timestamp,
     pub job: JobKind,
-    pub outcome: JobOutcome,
+    pub event: JobEvent,
+}
+
+/// job 说的是「进行中的一段落定」还是「整件事结束了」。
+///
+/// 分开的理由：一趟远路是**多段**的——按自己观察到的地图规划，只能先走到知识
+/// 边界，到了看到更多再往前。每段开始时该告诉模型这一程走到哪，但那不是终局，
+/// job 还在。压成一个终局枚举就只能二选一：要么每段都报「结束了」（撒谎），
+/// 要么整趟不吭声（模型看到自己走走停停，不知道为什么）。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JobEvent {
+    /// 进行中：job 未结束。
+    Progress(JobProgress),
+    /// 终局：job 就此出窗清槽。
+    Finished(JobOutcome),
+}
+
+/// 进行中的进展。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JobProgress {
+    /// 多段行走：这一程打算走到哪。
+    ///
+    /// **不说为什么到此为止**——路径是不是被知识边界截断，`is_partial` 分不出
+    /// 超时与边界，说了就是把未知讲成已知。
+    Leg { to: [i32; 3] },
+    /// 挖掘：又碎了一块。
+    Mined { done: usize, total: usize },
 }
 
 /// 任务身份。持续任务共用一套「单意图槽 + 每 tick 轮询 + 终局出窗」。
