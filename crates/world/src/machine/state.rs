@@ -69,6 +69,9 @@ pub(crate) struct Inner {
     /// azalea 世界模型句柄（Spawn 登记）。方块读取走它的读锁，
     /// 可在任意线程进行——世界模型不是 ECS。
     pub(super) world_handle: Mutex<Option<Arc<RwLock<azalea::world::World>>>>,
+    /// 合法寻路的知识面。`None` = 没开，寻路照旧读全量世界。
+    /// 由 `Module::use_observed_pathfinding` 装上，连接层每 tick 推进它的脚下格。
+    pub(super) observed: Mutex<Option<Arc<super::observed::ObservedBlocks>>>,
     pub(super) stopping: AtomicBool,
     pub(super) shutdown: Notify,
     pub(super) tick: AtomicU64,
@@ -108,6 +111,7 @@ impl Inner {
             pending: Mutex::new(Vec::new()),
             jump_reset: AtomicBool::new(false),
             world_handle: Mutex::new(None),
+            observed: Mutex::new(None),
             stopping: AtomicBool::new(false),
             shutdown: Notify::new(),
             tick: AtomicU64::new(0),

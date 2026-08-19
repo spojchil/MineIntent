@@ -66,3 +66,9 @@ unsafe_code = "deny"
 [workspace.lints.clippy]
 # 与既有代码风格一致：字符串字面量统一 to_owned。
 str_to_string = "warn"
+
+# ⚠ 临时：合法寻路施工期指向本机 fork 工作副本，好在不推送的情况下迭代。
+# 定稿前必须删掉，改为把 fork 分支推上去、把上面的 rev 换掉——
+# 留着它别人 clone 下来就构建不了。
+[patch."https://github.com/spojchil/azalea"]
+azalea = { path = "/Users/mac/Desktop/cc/tmp/azalea/azalea" }

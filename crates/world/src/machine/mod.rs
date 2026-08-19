@@ -23,6 +23,7 @@ mod connect;
 mod door;
 mod mining;
 mod movement;
+pub(crate) mod observed;
 mod state;
 
 pub use door::DoorCommand;
@@ -248,6 +249,27 @@ impl Module {
 
     /// 增量视口投影：对比方块记忆只报变化，并当场推进记忆（回执走内核
     /// settled 通道必达模型，产出即送达）。约束同 [`Module::scan`]。
+    /// 开启**合法寻路**：寻路只按 `memory` 里观察过的方块规划路线。
+    ///
+    /// 不调用就是原样——azalea 读服务端推来的全部已加载区块，包括同伴从没看过的
+    /// 地方。裁定与理由见 `docs/pathfinding-legality-decision.md`。
+    ///
+    /// 传进来的必须是**组合根那一份**记忆：轮末帧每 250ms 往里推进增量，寻路要
+    /// 看到的正是同一份，两份会各说各话。
+    pub fn use_observed_pathfinding(
+        &self,
+        memory: std::sync::Arc<std::sync::Mutex<crate::BlockMemory>>,
+    ) {
+        let world = self.inner.world_handle.lock().clone();
+        let Some(world) = world else {
+            // 世界还没就绪：装不上就如实什么都不做，调用方在 wait_ready 之后再叫一次。
+            return;
+        };
+        *self.inner.observed.lock() = Some(std::sync::Arc::new(
+            crate::machine::observed::ObservedBlocks::new(memory, world),
+        ));
+    }
+
     pub fn scan_changes(
         &self,
         memory: &std::sync::Mutex<crate::BlockMemory>,
