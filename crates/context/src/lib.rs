@@ -6,39 +6,17 @@
 //! 处境（渲染后的世界快照）**不在这里**。它每轮都变，放前缀等于每轮把整条
 //! 对话赶出缓存；它随帧追加在对话末尾，见 `companion::situation`。
 //!
-//! 压缩金律：可重导出的世界状态直接扔；值得留的经历
-//! **先经记忆落盘再入摘要**——落盘失败就保持原对话，不丢没存下的东西。
+//! 压缩当前是**空实现**（原样交回）——做过的那一版形态错了，摘掉再重设计。
+//! 理由与重设计材料见 `Compaction` 的实现注释与 `docs/compaction-decision.md`。
 
 use std::sync::Arc;
 
-use agent::persistence::SessionId;
-use agent::{
-    AgentError, Compaction, InputMessage, Model, ModelRequest, PortFuture, PromptSource, RunId,
-    TranscriptItem,
-};
+use agent::{AgentError, Compaction, InputMessage, PortFuture, PromptSource, TranscriptItem};
 use memory::MemoryFile;
-
-/// 压缩指令：要求模型同时交回记忆增补与对话摘要。公开以便模型可见面导出评审。
-pub const COMPACTION_INSTRUCTIONS: &str = "\
-你在为一个 Minecraft 世界里的同伴压缩对话历史。下面是它的长期记忆全文与将被
-压缩的对话。请输出一个 JSON 对象，恰好两个字段：
-{\"memory_full_text\": \"更新后的记忆完整全文\", \"summary\": \"对话摘要\"}
-规则：
-- memory_full_text 是记忆文件的完整新全文：保留原有内容，把对话里值得长期
-  记住的经历（承诺、关系变化、重要事件与教训）以第一人称并入；没有就原样交回。
-- summary 用第一人称、过去式，写清对话里发生了什么、说过什么重要的话、
-  哪些事做到一半。工具调用的机械细节可以丢，正在进行的意图不能丢。
-- 世界状态（位置、血量、天色等）不要写入摘要——压缩后会重新投一份处境给你。
-只输出这个 JSON 对象，不要其他文字。";
-
-/// 压缩摘要在新对话里的包裹头。公开以便模型可见面导出评审。
-pub const SUMMARY_PREFIX: &str = "【我此前的经历记述（同伴第一人称，压缩自更早的对话）】";
 
 pub struct ContextStrategy {
     persona: String,
     memory: Arc<MemoryFile>,
-    /// 摘要请求自持的模型依赖；缺席时压缩退化为"不压"（原样交回）。
-    model: Option<Arc<dyn Model>>,
 }
 
 impl ContextStrategy {
@@ -46,14 +24,7 @@ impl ContextStrategy {
         Self {
             persona: persona.into(),
             memory,
-            model: None,
         }
-    }
-
-    /// 接上压缩用的模型。
-    pub fn with_model(mut self, model: Arc<dyn Model>) -> Self {
-        self.model = Some(model);
-        self
     }
 
     fn memory_message(&self) -> InputMessage {
@@ -66,22 +37,6 @@ impl ContextStrategy {
             ),
         };
         InputMessage::text("system", text)
-    }
-
-    /// 从模型回复里取出压缩结论。返回 None = 这次压缩作废（原样保留对话）。
-    ///
-    /// `memory_full_text` 是必填：缺了它无法证明"值得留的已落盘"，宁可不压
-    /// 也不拿摘要替换没备份过的对话（金律）。无须改动时模型按指令原样交回。
-    fn parse_compaction_reply(reply: &str) -> Option<(String, String)> {
-        let start = reply.find('{')?;
-        let end = reply.rfind('}')?;
-        let value: serde_json::Value = serde_json::from_str(&reply[start..=end]).ok()?;
-        let summary = value.get("summary")?.as_str()?.to_owned();
-        if summary.trim().is_empty() {
-            return None;
-        }
-        let memory_full_text = value.get("memory_full_text")?.as_str()?.to_owned();
-        Some((memory_full_text, summary))
     }
 }
 
@@ -108,73 +63,30 @@ impl PromptSource for ContextStrategy {
 }
 
 impl Compaction for ContextStrategy {
+    /// **空实现：原样交回，不压。**
+    ///
+    /// 不是「还没做」，是**做过的那一版形态错了**，先摘掉再重设计。原来那版每次
+    /// 压缩打一次模型、要它交回 `{memory_full_text, summary}`，把值得留的经历并进
+    /// 长期记忆、再用一段摘要替换整条对话。三个问题：
+    ///
+    /// 1. **压缩与长期记忆无关**（维护者裁定一）。把「这一跑发生了什么」写进长期
+    ///    记忆，是拿会话噪音污染一份该长期稳定的文件——实盘一跑写三次。
+    /// 2. **它自己就是缓存杀手**。内核在 `Compaction` 的文档里写着：压缩改写对话，
+    ///    服务商前缀缓存整体失效，下一次请求全额重算。省下的上下文要值回这笔钱，
+    ///    而当前形态没算过这笔账。
+    /// 3. **轮末帧的段结构还没立回来**。压缩该保留什么、能丢什么，取决于哪些事实
+    ///    可重导出；段结构没定之前定压缩规则，是在流沙上盖房子。
+    ///
+    /// 空实现期间压缩线设在**服务商上下文窗口的 95%**（组合根 `session_config`）。
+    /// 那条线现在只是一个观察点：越过它什么也不会发生，上下文继续长，最终由服务商
+    /// 的长度限制兜底。这是刻意的——先让「到底能撑多久」变成可观测的事实。
+    ///
+    /// 重设计的材料在 `docs/compaction-decision.md`（两条已下裁定 + 未裁清单）。
     fn compact<'a>(
         &'a self,
         conversation: &'a [TranscriptItem],
     ) -> PortFuture<'a, Result<Vec<TranscriptItem>, AgentError>> {
-        Box::pin(async move {
-            // 压缩失败一律降级为「不压」：返回 Err 会终止运行，而保持原对话总是安全的。
-            let unchanged = || Ok(conversation.to_vec());
-            let Some(model) = &self.model else {
-                return unchanged();
-            };
-            let Ok(memory_text) = self.memory.read() else {
-                // 读不到记忆就无法安全并入经历；保持原对话，下个边界再试。
-                return unchanged();
-            };
-
-            let mut transcript: Vec<TranscriptItem> = vec![InputMessage::text(
-                "system",
-                format!("{COMPACTION_INSTRUCTIONS}\n\n【长期记忆现文】\n{memory_text}"),
-            )
-            .into()];
-            transcript.extend(conversation.iter().cloned());
-            transcript.push(InputMessage::text("user", "请按上面的规则输出压缩 JSON。").into());
-
-            let session_id = match SessionId::new("compaction") {
-                Ok(id) => id,
-                Err(_) => return unchanged(),
-            };
-            let Ok(response) = model
-                .complete(ModelRequest {
-                    session_id,
-                    run_id: RunId::new("compaction"),
-                    request_index: 1,
-                    transcript,
-                    function_tools: Vec::new(),
-                })
-                .await
-            else {
-                return unchanged();
-            };
-            let Some((memory_full_text, summary)) =
-                Self::parse_compaction_reply(&response.output.text_content())
-            else {
-                return unchanged();
-            };
-            // 模型调用期间记忆可能被别的写入方（remember、维护者手改）更新；
-            // 压缩结论基于旧文，覆盖会吃掉新写入——检测到变化就放弃本次压缩。
-            match self.memory.read() {
-                Ok(current) if current == memory_text => {}
-                _ => return unchanged(),
-            }
-            if self.memory.write(&memory_full_text).is_err() {
-                // 落盘失败就不丢对话：金律是"落盘否则就丢"，反之亦然。
-                return unchanged();
-            }
-            // 耐久事实（中断回执、effect 对账等）说的是「外界真的发生过什么」，
-            // 内核要求逐项原样保留并校验序列一致，否则整个压缩结果被丢弃。
-            // 摘要在前，耐久事实按原相对顺序跟在后面。
-            let mut replaced: Vec<TranscriptItem> =
-                vec![InputMessage::text("user", format!("{SUMMARY_PREFIX}\n{summary}")).into()];
-            replaced.extend(
-                conversation
-                    .iter()
-                    .filter(|item| agent::durable_fact_kind(item).is_some())
-                    .cloned(),
-            );
-            Ok(replaced)
-        })
+        Box::pin(async move { Ok(conversation.to_vec()) })
     }
 }
 
@@ -294,108 +206,5 @@ mod tests {
                 "处境不能回到前缀里：它每轮都变，会把整条对话赶出缓存"
             );
         }
-    }
-
-    struct CannedModel(String);
-
-    impl Model for CannedModel {
-        fn complete<'a>(
-            &'a self,
-            _request: ModelRequest,
-        ) -> PortFuture<'a, Result<agent::ModelResponse, agent::AgentError>> {
-            Box::pin(async move {
-                Ok(agent::ModelResponse {
-                    output: agent::ModelOutput::text(self.0.clone()),
-                    ..agent::ModelResponse::default()
-                })
-            })
-        }
-    }
-
-    fn conversation() -> Vec<TranscriptItem> {
-        vec![
-            InputMessage::text("user", "alice: 你叫什么").into(),
-            TranscriptItem::ModelOutput(agent::ModelOutput::text("我叫小明。")),
-        ]
-    }
-
-    #[tokio::test]
-    async fn compaction_writes_memory_then_replaces_conversation_with_summary() {
-        let memory = Arc::new(MemoryFile::new(scratch_dir().join("memory.md")));
-        memory.write("旧记忆。").unwrap();
-        let strategy = ContextStrategy::new("人设", memory.clone()).with_model(Arc::new(
-            CannedModel(
-                "{\"memory_full_text\": \"旧记忆。\\n认识了 alice。\", \"summary\": \"我和 alice 互相认识了。\"}"
-                    .to_owned(),
-            ),
-        ));
-
-        let compacted = strategy.compact(&conversation()).await.unwrap();
-        assert_eq!(compacted.len(), 1);
-        let (role, text) = text_of(&compacted[0]);
-        assert_eq!(role, "user");
-        assert!(text.contains("我和 alice 互相认识了。"));
-        assert!(memory.read().unwrap().contains("认识了 alice。"));
-    }
-
-    #[tokio::test]
-    async fn unparseable_compaction_reply_keeps_the_conversation_untouched() {
-        let memory = Arc::new(MemoryFile::new(scratch_dir().join("memory.md")));
-        memory.write("旧记忆。").unwrap();
-        let strategy = ContextStrategy::new("人设", memory.clone())
-            .with_model(Arc::new(CannedModel("我不想输出 JSON。".to_owned())));
-
-        let original = conversation();
-        let compacted = strategy.compact(&original).await.unwrap();
-        assert_eq!(compacted, original);
-        assert_eq!(memory.read().unwrap(), "旧记忆。");
-    }
-
-    #[tokio::test]
-    async fn summary_without_memory_field_does_not_destroy_the_conversation() {
-        // 缺 memory_full_text 无法证明经历已落盘——金律要求放弃本次压缩。
-        let memory = Arc::new(MemoryFile::new(scratch_dir().join("memory.md")));
-        memory.write("旧记忆。").unwrap();
-        let strategy = ContextStrategy::new("人设", memory.clone()).with_model(Arc::new(
-            CannedModel("{\"summary\": \"只有摘要没有记忆。\"}".to_owned()),
-        ));
-
-        let original = conversation();
-        assert_eq!(strategy.compact(&original).await.unwrap(), original);
-        assert_eq!(memory.read().unwrap(), "旧记忆。");
-    }
-
-    #[tokio::test]
-    async fn compaction_preserves_durable_facts_verbatim() {
-        let memory = Arc::new(MemoryFile::new(scratch_dir().join("memory.md")));
-        memory.write("旧记忆。").unwrap();
-        let strategy = ContextStrategy::new("人设", memory).with_model(Arc::new(CannedModel(
-            "{\"memory_full_text\": \"旧记忆。\", \"summary\": \"摘要。\"}".to_owned(),
-        )));
-
-        // 中断回执是耐久事实：不保留它，内核会丢弃整个压缩结果。
-        let receipt: TranscriptItem = InputMessage::new(
-            "user",
-            vec![agent::ContentPart::json(serde_json::json!({
-                "kind": agent::DurableFactKind::InterruptedToolBatch.as_wire(),
-            }))],
-        )
-        .into();
-        let mut with_receipt = conversation();
-        with_receipt.push(receipt.clone());
-
-        let compacted = strategy.compact(&with_receipt).await.unwrap();
-        assert_eq!(compacted.len(), 2, "摘要一条 + 回执一条：{compacted:?}");
-        assert_eq!(compacted[1], receipt);
-    }
-
-    #[tokio::test]
-    async fn compaction_without_a_model_returns_the_conversation_as_is() {
-        let strategy = ContextStrategy::new(
-            "人设",
-            Arc::new(MemoryFile::new(scratch_dir().join("memory.md"))),
-        );
-        let original = conversation();
-        assert_eq!(strategy.compact(&original).await.unwrap(), original);
     }
 }

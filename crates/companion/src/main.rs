@@ -265,26 +265,36 @@ impl ViewportDoor for ModuleViewportDoor {
 ///
 /// 不记 `ModelRequestTranscript`——那是每次请求的整份上下文，量级完全不同，
 /// 要看那个另说。这里只回答「它做了什么」。
-/// 压缩线：序列化转录超过它就在下一个安全边界压缩。
+/// 压缩线设在**服务商上下文窗口的 95%**。
 ///
-/// 内核默认 256 KiB。实盘 30 分钟撞了 **3 次**（转录 316 / 381 / 300 条被换成一段
-/// 摘要），而那一跑的上下文开销另有主因——处境待在受保护前缀里，每轮把整条对话赶出
-/// 缓存。先把线抬到 1 MiB，让压缩不再是变量，再去量前缀那一改的实际收益。
+/// 压缩本身当前是空实现（`context::ContextStrategy` 的 `Compaction`），所以这条线现在
+/// 只是一个观察点：越过它什么也不会发生，上下文继续长，最终由服务商的长度限制兜底。
+/// 这是刻意的——先让「到底能撑多久」变成可观测的事实，再谈压缩该长什么样。
 ///
-/// ⚠ 这条线**不管服务商的窗口**。按那一跑实测约 3.6 字节/token，1 MiB 折合 29 万
-/// token，远超 DeepSeek 的上下文窗口——真长到那个量级会先收到服务商的长度报错，而不是
-/// 触发压缩。所以这是一个**调试用的高位**，不是长期设置；长期该配的是
-/// `compact_above_tokens`（服务商报的输入 token，比字节估算准），等这次测完再定。
+/// 用 `compact_above_tokens` 而不是字节：它读的是**服务商上报的输入 token**，比字节
+/// 估算准得多（实测约 3.6 字节/token，估算误差足以差出一整轮）。只有发过至少一次
+/// 请求、且服务商报了 usage 才有值，没有时内核回退到字节估算——所以字节线也留着，
+/// 当第一次请求之前的兜底。
 ///
-/// `MINEINTENT_COMPACT_ABOVE_BYTES` 可覆盖，好在实盘里试值。
+/// ⚠ `MINEINTENT_MODEL_CONTEXT_TOKENS` 是**唯一需要跟着模型手工改的数**：内核不知道
+/// 你配的模型窗口多大，配错了这条线就没有意义。启动时会打印出来，好当场看出配错。
 fn session_config() -> SessionConfig {
+    fn env_number(key: &str, fallback: u64) -> u64 {
+        std::env::var(key)
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(fallback)
+    }
+
+    let window = env_number("MINEINTENT_MODEL_CONTEXT_TOKENS", 128_000);
     let mut config = SessionConfig::default();
-    config.budget.context.compact_above_bytes = std::env::var("MINEINTENT_COMPACT_ABOVE_BYTES")
-        .ok()
-        .and_then(|raw| raw.parse().ok())
-        .unwrap_or(1024 * 1024);
+    config.budget.context.compact_above_tokens = Some(window * 95 / 100);
+    config.budget.context.compact_above_bytes =
+        env_number("MINEINTENT_COMPACT_ABOVE_BYTES", 1024 * 1024) as usize;
     println!(
-        "[组合根] 压缩线：转录超过 {} KiB 时压缩",
+        "[组合根] 压缩线：输入 token 超过 {} 时压缩（窗口 {window} 的 95%）；\
+         字节兜底 {} KiB。压缩当前是空实现，越线只是观察点。",
+        config.budget.context.compact_above_tokens.unwrap_or(0),
         config.budget.context.compact_above_bytes / 1024
     );
     config
@@ -628,7 +638,7 @@ async fn main() -> Result<(), String> {
 
     // 前缀只有人设与记忆——两者都不逐轮变，吃满前缀缓存。处境不在这里：
     // 它每轮都变，随帧追加在对话末尾（见 `situation` 模块的账）。
-    let strategy = Arc::new(ContextStrategy::new(persona, memory_file).with_model(model.clone()));
+    let strategy = Arc::new(ContextStrategy::new(persona, memory_file));
     // 轮末帧（维护者裁定：模式=增量）：每轮模型响应落定后收集一次
     // 「与记忆的差异」，非空则以 Passive 投递——Passive 不叫醒空闲会话
     // （帧从不引发轮，只搭现有轮的车），信箱耐久故收集时即推进记忆。
@@ -724,8 +734,10 @@ async fn main() -> Result<(), String> {
                     // 摘要按指令不含世界状态，先前追加的处境也随对话一起没了。
                     situation.request_full_resend();
                 }
-                let mut sections =
-                    situation.take(render::render_situation_lines(&snapshots.latest(), read_mark.position()));
+                let mut sections = situation.take(render::render_situation_lines(
+                    &snapshots.latest(),
+                    read_mark.position(),
+                ));
                 let situation_lines = sections.len();
                 sections.push(render::render_block_changes(&changes));
                 let text = sections.join("\n");

@@ -845,17 +845,13 @@ async fn main() {
     }
     println!("- 被服务器关闭（非自己 close 的回声）：`容器界面被关闭了（crafting）。`");
 
-    // ---- 六、压缩（上下文满时的模型交互） ----
-    println!("\n## 六、上下文压缩（满时对模型的指令与结果包裹）\n");
-    println!(
-        "压缩指令全文（system，后接【长期记忆现文】与被压缩对话）：\n\n```text\n{}\n```\n",
-        context::COMPACTION_INSTRUCTIONS
-    );
-    println!("收尾催告（user）：`请按上面的规则输出压缩 JSON。`\n");
-    println!(
-        "压缩成功后新对话开头的摘要包裹（user）：\n\n```text\n{}\n（摘要正文）\n```",
-        context::SUMMARY_PREFIX
-    );
+    // ---- 六、压缩 ----
+    println!("\n## 六、上下文压缩\n");
+    println!("**当前是空实现：对话原样交回，模型看不到任何压缩相关的文本。**\n");
+    println!("此处此前导出的是一份压缩指令（要模型交回 `{{memory_full_text, summary}}`），");
+    println!("那一版形态被判定为错——压缩与长期记忆无关，且改写对话本身就让前缀缓存整体");
+    println!("失效。摘掉后重设计，材料在 `docs/compaction-decision.md`。\n");
+    println!("压缩线设在服务商上下文窗口的 95%，越线当前什么也不会发生（观察点）。");
 
     let _ = std::fs::remove_dir_all(&scratch);
 }
