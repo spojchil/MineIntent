@@ -23,7 +23,7 @@ mod connect;
 mod door;
 mod mining;
 mod movement;
-pub(crate) mod observed;
+pub mod observed;
 mod state;
 
 pub use door::DoorCommand;
@@ -268,6 +268,39 @@ impl Module {
         *self.inner.observed.lock() = Some(std::sync::Arc::new(
             crate::machine::observed::ObservedBlocks::new(memory, world),
         ));
+    }
+
+    /// 诊断：同一目标，全量世界 vs 只按观察过的地图，各算一次路。
+    ///
+    /// 不产生移动，也不装组件——纯粹为了回答「合法之后还找不找得到路、路长多少、
+    /// 算多久」。返回 `(全量, 合法)`。
+    pub fn compare_paths(
+        &self,
+        memory: std::sync::Arc<std::sync::Mutex<crate::BlockMemory>>,
+        goal: [i32; 3],
+    ) -> Result<
+        (
+            crate::machine::observed::PathAttempt,
+            crate::machine::observed::PathAttempt,
+        ),
+        String,
+    > {
+        let snapshot = self.latest();
+        if !matches!(snapshot.phase, ConnectionPhase::Ready) {
+            return Err("尚未连接到世界".to_owned());
+        }
+        let position = &snapshot.self_state.position;
+        let start = azalea::BlockPos::new(
+            position.x.floor() as i32,
+            position.y.floor() as i32,
+            position.z.floor() as i32,
+        );
+        crate::machine::observed::compare(
+            &self.inner,
+            memory,
+            start,
+            azalea::BlockPos::new(goal[0], goal[1], goal[2]),
+        )
     }
 
     pub fn scan_changes(

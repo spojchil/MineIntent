@@ -109,3 +109,75 @@ fn floor_under(bot: &azalea::Client) -> Option<BlockPos> {
     .ok()
     .flatten()
 }
+
+/// 一次寻路的结果，只留能对比的三样。
+#[derive(Debug)]
+pub struct PathAttempt {
+    /// 找到路了吗。
+    pub found: bool,
+    /// 路径节点数；没找到是 0。
+    pub nodes: usize,
+    /// 只走到一半（超时或够不着）。
+    pub partial: bool,
+    /// 算了多久。
+    pub elapsed: std::time::Duration,
+}
+
+/// 同一个目标，**全量世界**与**只按观察过的地图**各算一次。
+///
+/// 这是诊断口，不是运行路径：它自己构造 `CalculatePathCtx` 直接调 A*，不经过
+/// 插件、不产生任何移动。
+pub(super) fn compare(
+    inner: &Inner,
+    memory: Arc<std::sync::Mutex<BlockMemory>>,
+    start: BlockPos,
+    goal: BlockPos,
+) -> Result<(PathAttempt, PathAttempt), String> {
+    use azalea::pathfinder::goals::BlockPosGoal;
+    use azalea::pathfinder::mining::MiningCache;
+    use azalea::pathfinder::{calculate_path, CalculatePathCtx, PathfinderOpts};
+
+    let world = inner
+        .world_handle
+        .lock()
+        .clone()
+        .ok_or_else(|| "世界模型尚未就绪".to_owned())?;
+
+    let observed = Arc::new(ObservedBlocks::new(memory, world.clone()));
+    // 站在地上才有本体感觉；探针里直接按「起点脚下」给，与运行时同义。
+    observed.set_floor(Some(start.down(1)));
+
+    let run = |source: Option<Arc<dyn BlockSource>>| {
+        let at = std::time::Instant::now();
+        let found = calculate_path(CalculatePathCtx {
+            entity: azalea::ecs::entity::Entity::PLACEHOLDER,
+            start,
+            goal: Arc::new(BlockPosGoal(goal)),
+            world_lock: world.clone(),
+            goto_id_atomic: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            mining_cache: MiningCache::new(None),
+            custom_state: Default::default(),
+            block_source: source,
+            opts: PathfinderOpts::new().allow_mining(false),
+        });
+        let elapsed = at.elapsed();
+        match found {
+            Some(event) => PathAttempt {
+                found: event.path.as_ref().is_some_and(|path| !path.is_empty()),
+                nodes: event.path.as_ref().map(|path| path.len()).unwrap_or(0),
+                partial: event.is_partial,
+                elapsed,
+            },
+            None => PathAttempt {
+                found: false,
+                nodes: 0,
+                partial: false,
+                elapsed,
+            },
+        }
+    };
+
+    let full = run(None);
+    let legal = run(Some(observed));
+    Ok((full, legal))
+}
