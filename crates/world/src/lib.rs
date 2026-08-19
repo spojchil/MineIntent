@@ -314,6 +314,8 @@ pub enum JobProgress {
     Leg { to: [i32; 3] },
     /// 挖掘：又碎了一块。
     Mined { done: usize, total: usize },
+    /// 垫柱：又垫上并站稳了一格。
+    Pillared { done: usize, total: usize },
 }
 
 /// 任务身份。持续任务共用一套「单意图槽 + 每 tick 轮询 + 终局出窗」。
@@ -331,6 +333,8 @@ pub enum JobKind {
         /// 已经挖碎的块数（终局措辞用：挖了几块、卡在第几块）。
         done: usize,
     },
+    /// 垫柱：跳起来在脚下放方块，站上去，重复。**临时工具**，放置那条线要重做。
+    PillarUp { total: usize, done: usize },
 }
 
 /// 任务变化。Stalled 不是终局：任务还在跑，只是值得知道。
@@ -350,6 +354,10 @@ pub enum JobOutcome {
     Mined,
     /// 挖掘：卡在某一块上（够不着、迟迟不碎、读不到）。队列就此停下。
     MineBlocked,
+    /// 垫柱：要的格数都垫完了。
+    Pillared,
+    /// 垫柱：卡在某一格上（跳不起来、放不上去、方块不出现）。
+    PillarBlocked,
 }
 
 /// 物品栏格位变化：菜单协议号（0-45）上的内容更替。

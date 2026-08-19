@@ -131,6 +131,10 @@ impl HandDoor for ModuleHandDoor {
     fn place<'a>(&'a self, block: [i32; 3]) -> agent::PortFuture<'a, Result<(), String>> {
         Box::pin(async move { self.0.execute(DoorCommand::PlaceBlock(block)).await })
     }
+
+    fn pillar_up<'a>(&'a self, count: usize) -> agent::PortFuture<'a, Result<(), String>> {
+        Box::pin(async move { self.0.execute(DoorCommand::PillarUp { count }).await })
+    }
     fn use_on_block<'a>(&'a self, block: [i32; 3]) -> agent::PortFuture<'a, Result<(), String>> {
         Box::pin(async move { self.0.execute(DoorCommand::UseOnBlock(block)).await })
     }

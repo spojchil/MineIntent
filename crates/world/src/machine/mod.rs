@@ -24,6 +24,7 @@ mod door;
 mod mining;
 mod movement;
 pub mod observed;
+mod pillar;
 mod state;
 
 pub use door::DoorCommand;
@@ -56,6 +57,10 @@ const MINING_STALL_TICKS: u64 = 400;
 /// 按观察到的地图规划必然是多段的：先走到知识边界，看到更多再往前。上限只是
 /// 防跑飞——每一程都要求真的往前挪了才算数，所以正常情况下远远撞不到它。
 const MAX_MOVEMENT_LEGS: usize = 32;
+
+/// 垫柱一格等多久算卡住。跳跃全程约 12 tick，给到 60 tick（3 秒）足够容下
+/// 一次往返延迟；再久就是真的没成，如实说破。
+const PILLAR_STALL_TICKS: u64 = 60;
 
 /// 连接配置。v1 只有离线身份、重连固定 Never。
 #[derive(Clone, Debug)]

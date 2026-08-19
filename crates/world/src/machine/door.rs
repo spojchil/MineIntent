@@ -52,6 +52,10 @@ pub enum DoorCommand {
     UseOnBlock([i32; 3]),
     /// 把手持方块放到目标空位（目标须紧挨已有方块，被点的是共享面）。
     PlaceBlock([i32; 3]),
+    /// 垫柱：跳起来在脚下放方块，站上去，重复 `count` 次。
+    PillarUp {
+        count: usize,
+    },
     UseOnEntity {
         entity_key: String,
     },
@@ -184,59 +188,41 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             bot.block_interact(BlockPos::new(x, y, z));
             Ok(())
         }
-        DoorCommand::PlaceBlock([x, y, z]) => {
+        DoorCommand::PlaceBlock(at) => place_block(inner, bot, at),
+        DoorCommand::PillarUp { count } => {
             use azalea::entity::inventory::Inventory as InventoryComponent;
+            if count == 0 {
+                return Err("要垫几格？给个大于 0 的数".to_owned());
+            }
+            // 手里没东西就当场拒绝：在途失败没有措辞的位置，能提前说的就提前说。
             let empty_handed = bot
                 .try_query_self::<&InventoryComponent, _>(|inventory| {
                     inventory.held_item().is_empty()
                 })
                 .map_err(|_| "读不到物品栏".to_owned())?;
             if empty_handed {
-                return Err("手里没拿东西，先用 select_slot 选中要放的方块".to_owned());
+                return Err("手里没拿东西，先用 select_slot 选中要垫的方块".to_owned());
             }
-            let (name, _) = read_target_block(inner, [x, y, z])?;
-            if !crate::is_air_name(&name) {
-                return Err(format!("({x},{y},{z}) 已经有方块：{name}"));
+            let on_ground = bot
+                .try_query_self::<&azalea::entity::Physics, _>(|physics| physics.on_ground())
+                .map_err(|_| "读不到自身状态".to_owned())?;
+            if !on_ground {
+                return Err("人还在空中，落地再垫".to_owned());
             }
-            let (eye, _) = eye_and_reach(bot)?;
-            check_reach(bot, BlockPos::new(x, y, z).center())?;
-            let support = {
-                let world = world_handle(inner)?;
-                let world = world.read();
-                pick_support_face([x, y, z], [eye.x, eye.y, eye.z], |position| {
-                    block_has_collision(&world, position)
+            let target = bot
+                .try_query_self::<&azalea::entity::Position, _>(|position| {
+                    [
+                        position.x.floor() as i32,
+                        position.y.floor() as i32,
+                        position.z.floor() as i32,
+                    ]
                 })
-            };
-            let Some((neighbor, direction, hit)) = support else {
-                return Err(format!(
-                    "({x},{y},{z}) 六面都没有可依附的方块，放不上去；先在旁边放好落脚块"
-                ));
-            };
-            let location = azalea::Vec3 {
-                x: hit[0],
-                y: hit[1],
-                z: hit[2],
-            };
-            // 人放方块是看着依附面点右键：看向命中点，然后自己构造真实命中
-            // 发包。不走 block_interact——它在视线没落到目标时会伪造
-            // 「中心点+Up 面」，放置会歪到依附块顶上。
-            bot.look_at(location);
-            let seq = bot
-                .try_query_self::<&mut azalea::interact::BlockStatePredictionHandler, _>(
-                    |mut handler| handler.start_predicting(),
-                )
-                .unwrap_or_default();
-            bot.write_packet(ServerboundUseItemOn {
-                hand: InteractionHand::MainHand,
-                block_hit: BlockHit {
-                    block_pos: BlockPos::new(neighbor[0], neighbor[1], neighbor[2]),
-                    direction,
-                    location,
-                    inside: false,
-                    world_border: false,
-                },
-                seq,
-            });
+                .map_err(|_| "读不到自身位置".to_owned())?;
+            inner.begin_pillar_job(count, target);
+            bot.set_jumping(true);
+            inner
+                .jump_reset
+                .store(true, std::sync::atomic::Ordering::Release);
             Ok(())
         }
         DoorCommand::UseOnEntity { entity_key } => {
@@ -770,6 +756,64 @@ pub(super) fn find_entity_by_key(
 
 /// 开挖一块：挖什么看什么（原版机制——azalea 在事件处理时若发现视线正落在
 /// 目标上会用真实命中面，否则填 Down 兜底），然后交给 azalea 持续挖。
+/// 把手持方块放到目标空位。
+///
+/// 抽出来是因为**垫柱要在机器持有的时序里调它**（跳起来、升过那一格、再放），
+/// 那个时序模型表达不了。判定与发包口径只有这一处。
+pub(super) fn place_block(inner: &Inner, bot: &Client, [x, y, z]: [i32; 3]) -> Result<(), String> {
+    use azalea::entity::inventory::Inventory as InventoryComponent;
+    let empty_handed = bot
+        .try_query_self::<&InventoryComponent, _>(|inventory| inventory.held_item().is_empty())
+        .map_err(|_| "读不到物品栏".to_owned())?;
+    if empty_handed {
+        return Err("手里没拿东西，先用 select_slot 选中要放的方块".to_owned());
+    }
+    let (name, _) = read_target_block(inner, [x, y, z])?;
+    if !crate::is_air_name(&name) {
+        return Err(format!("({x},{y},{z}) 已经有方块：{name}"));
+    }
+    let (eye, _) = eye_and_reach(bot)?;
+    check_reach(bot, BlockPos::new(x, y, z).center())?;
+    let support = {
+        let world = world_handle(inner)?;
+        let world = world.read();
+        pick_support_face([x, y, z], [eye.x, eye.y, eye.z], |position| {
+            block_has_collision(&world, position)
+        })
+    };
+    let Some((neighbor, direction, hit)) = support else {
+        return Err(format!(
+            "({x},{y},{z}) 六面都没有可依附的方块，放不上去；先在旁边放好落脚块"
+        ));
+    };
+    let location = azalea::Vec3 {
+        x: hit[0],
+        y: hit[1],
+        z: hit[2],
+    };
+    // 人放方块是看着依附面点右键：看向命中点，然后自己构造真实命中
+    // 发包。不走 block_interact——它在视线没落到目标时会伪造
+    // 「中心点+Up 面」，放置会歪到依附块顶上。
+    bot.look_at(location);
+    let seq = bot
+        .try_query_self::<&mut azalea::interact::BlockStatePredictionHandler, _>(|mut handler| {
+            handler.start_predicting()
+        })
+        .unwrap_or_default();
+    bot.write_packet(ServerboundUseItemOn {
+        hand: InteractionHand::MainHand,
+        block_hit: BlockHit {
+            block_pos: BlockPos::new(neighbor[0], neighbor[1], neighbor[2]),
+            direction,
+            location,
+            inside: false,
+            world_border: false,
+        },
+        seq,
+    });
+    Ok(())
+}
+
 /// 下一个寻路目标。**禁止寻路器隐式挖方块**：挖掘是模型的显式动作（hand mine），
 /// 不是移动的副作用——实测它会把作为目的地的工作台整个挖掉。
 ///
