@@ -276,8 +276,27 @@ impl ViewportDoor for ModuleViewportDoor {
 /// 请求、且服务商报了 usage 才有值，没有时内核回退到字节估算——所以字节线也留着，
 /// 当第一次请求之前的兜底。
 ///
-/// ⚠ `MINEINTENT_MODEL_CONTEXT_TOKENS` 是**唯一需要跟着模型手工改的数**：内核不知道
-/// 你配的模型窗口多大，配错了这条线就没有意义。启动时会打印出来，好当场看出配错。
+/// ⚠ `MINEINTENT_MODEL_CONTEXT_TOKENS` 是**唯一需要跟着模型手工改的数**：服务商的
+/// `/models` 不给这个值（DeepSeek 实测只返回 `id` / `object` / `owned_by`，`/models/{id}`
+/// 也一样），所以只能配。启动时打印出来，好当场看出配错。
+///
+/// # 怎么问出真实窗口
+///
+/// 服务商**只在越界报错时**说出这个数。两步，都不贵：
+///
+/// ```text
+/// # 一、问出输出上限（提示词只有几个 token，被拒，不计费）
+/// max_tokens: 99999999
+///   → "the valid range of max_tokens is [1, 393216]"
+///
+/// # 二、问出上下文窗口（超量投递，被拒，不计费）
+/// messages 里塞明显超量的文本
+///   → "This model's maximum context length is 1048576 tokens."
+/// ```
+///
+/// 2026-08-19 实测：`MODEL_NAME=deepseek-chat` 实际解析到 **`deepseek-v4-flash`**
+/// （回包的 `model` 字段自己说的），窗口 **1 048 576**（2^20），输出上限 393 216。
+/// 换模型时照上面两步重问一次，别猜。
 fn session_config() -> SessionConfig {
     fn env_number(key: &str, fallback: u64) -> u64 {
         std::env::var(key)
@@ -286,7 +305,7 @@ fn session_config() -> SessionConfig {
             .unwrap_or(fallback)
     }
 
-    let window = env_number("MINEINTENT_MODEL_CONTEXT_TOKENS", 128_000);
+    let window = env_number("MINEINTENT_MODEL_CONTEXT_TOKENS", 1_048_576);
     let mut config = SessionConfig::default();
     config.budget.context.compact_above_tokens = Some(window * 95 / 100);
     config.budget.context.compact_above_bytes =
