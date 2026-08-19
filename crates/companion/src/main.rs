@@ -277,26 +277,22 @@ impl ViewportDoor for ModuleViewportDoor {
 /// 当第一次请求之前的兜底。
 ///
 /// ⚠ `MINEINTENT_MODEL_CONTEXT_TOKENS` 是**唯一需要跟着模型手工改的数**：服务商的
-/// `/models` 不给这个值（DeepSeek 实测只返回 `id` / `object` / `owned_by`，`/models/{id}`
-/// 也一样），所以只能配。启动时打印出来，好当场看出配错。
+/// `/models` 不给这个值（DeepSeek 实测只返回 `id` / `object` / `owned_by`）。启动时
+/// 打印出来，好当场看出配错。
 ///
-/// # 怎么问出真实窗口
+/// # 换模型时去哪查
 ///
-/// 服务商**只在越界报错时**说出这个数。两步，都不贵：
+/// **先看文档**：<https://api-docs.deepseek.com/quick_start/pricing> 直接列了每个模型的
+/// Context Length 与 Max Output。文档没写时才用报错法——服务商在越界时会说出这个数，
+/// 两步都不计费：`max_tokens: 99999999` 问出输出上限，超量 messages 问出上下文窗口。
 ///
-/// ```text
-/// # 一、问出输出上限（提示词只有几个 token，被拒，不计费）
-/// max_tokens: 99999999
-///   → "the valid range of max_tokens is [1, 393216]"
+/// 2026-08-19 查证（文档与报错互相印证）：
 ///
-/// # 二、问出上下文窗口（超量投递，被拒，不计费）
-/// messages 里塞明显超量的文本
-///   → "This model's maximum context length is 1048576 tokens."
-/// ```
-///
-/// 2026-08-19 实测：`MODEL_NAME=deepseek-chat` 实际解析到 **`deepseek-v4-flash`**
-/// （回包的 `model` 字段自己说的），窗口 **1 048 576**（2^20），输出上限 393 216。
-/// 换模型时照上面两步重问一次，别猜。
+/// - `MODEL_NAME=deepseek-chat` 实际解析到 **`deepseek-v4-flash`**（回包的 `model` 字段
+///   自己说的）——配置里写的名字和真正在跑的模型不是同一个；
+/// - 窗口 **1 048 576**（2^20），输出上限 **393 216**；
+/// - 输入命中 **$0.007/M**、未命中 **$0.22/M**——**31 倍**。这个比值才是前缀缓存那笔账
+///   的真实分量：省下的不是 token 数，是 token 数乘以 31。
 fn session_config() -> SessionConfig {
     fn env_number(key: &str, fallback: u64) -> u64 {
         std::env::var(key)
@@ -305,16 +301,23 @@ fn session_config() -> SessionConfig {
             .unwrap_or(fallback)
     }
 
+    // 实测 3.6 字节/token（30 分钟长跑的转录）。取 4 是**故意往高了取**：字节线只在
+    // 第一次请求之前有效，宁可晚一点触发，也不要抢在 token 线前面把它架空。
+    const BYTES_PER_TOKEN: u64 = 4;
+
     let window = env_number("MINEINTENT_MODEL_CONTEXT_TOKENS", 1_048_576);
+    let tokens = window * 95 / 100;
     let mut config = SessionConfig::default();
-    config.budget.context.compact_above_tokens = Some(window * 95 / 100);
+    config.budget.context.compact_above_tokens = Some(tokens);
+    // 字节线跟着 token 线算，不单独配：两条线各配各的必然会错位——
+    // 先前 token 线 996 147、字节线 1 MiB（≈29 万 token），字节线永远先撞上，
+    // token 线等于不存在。
     config.budget.context.compact_above_bytes =
-        env_number("MINEINTENT_COMPACT_ABOVE_BYTES", 1024 * 1024) as usize;
+        env_number("MINEINTENT_COMPACT_ABOVE_BYTES", tokens * BYTES_PER_TOKEN) as usize;
     println!(
-        "[组合根] 压缩线：输入 token 超过 {} 时压缩（窗口 {window} 的 95%）；\
-         字节兜底 {} KiB。压缩当前是空实现，越线只是观察点。",
-        config.budget.context.compact_above_tokens.unwrap_or(0),
-        config.budget.context.compact_above_bytes / 1024
+        "[组合根] 压缩线：输入 token 超过 {tokens} 时压缩（窗口 {window} 的 95%）；\
+         首次请求前按字节兜底 {} MiB。压缩当前是空实现，越线只是观察点。",
+        config.budget.context.compact_above_bytes / (1024 * 1024)
     );
     config
 }
