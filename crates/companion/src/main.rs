@@ -775,10 +775,8 @@ async fn main() -> Result<(), String> {
 
                 // 未连接/世界未就绪等如实拒绝：静默跳过，不是错误。
                 let Ok(absorbed) = absorbed else { continue };
-                // 处境搭这趟车。**触发仍然只看方块差异**：处境里的位置与附近实体
-                // 几乎每帧都变，让它自己触发就等于在原地站着也每 250ms 叫醒一次。
-                // 这里保守——「日常与事件的分界画在通道上」那条待裁（见
-                // docs/wake-criterion-decision.md §9）定了之后再谈分级。
+                // 压缩旗子先收：`request_full_resend` 只置位，真正重投在下面的
+                // `take` 里发生——本轮没进展而提前返回，位也留着不会丢。
                 if compacted.swap(false, std::sync::atomic::Ordering::Relaxed) {
                     // 摘要按指令不含世界状态，先前追加的处境也随对话一起没了。
                     situation.request_full_resend();
