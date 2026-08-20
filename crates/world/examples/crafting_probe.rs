@@ -88,8 +88,8 @@ async fn main() -> Result<(), String> {
     println!("[探针] 木板在格 {planks}；swap({planks}, 2) 入摆料格");
     module
         .execute(DoorCommand::MoveSlots {
-            from: planks,
-            to: 2,
+            from: world::slots::SlotSpace::player().describe(planks),
+            to: world::slots::SlotSpace::player().describe(2),
             count: None,
         })
         .await
@@ -106,8 +106,8 @@ async fn main() -> Result<(), String> {
             println!("[探针] 第二组木板在格 {slot}；swap({slot}, 5)");
             module
                 .execute(DoorCommand::MoveSlots {
-                    from: slot,
-                    to: 5,
+                    from: world::slots::SlotSpace::player().describe(slot),
+                    to: world::slots::SlotSpace::player().describe(5),
                     count: None,
                 })
                 .await
@@ -136,11 +136,11 @@ async fn main() -> Result<(), String> {
         }
     );
     if result_filled {
-        println!("[探针] swap(0, 44) 取成品到快捷栏末格");
+        println!("[探针] result → hotbar 8 取成品");
         module
             .execute(DoorCommand::MoveSlots {
-                from: 0,
-                to: 44,
+                from: "result".to_owned(),
+                to: world::slots::SlotSpace::player().describe(44),
                 count: None,
             })
             .await

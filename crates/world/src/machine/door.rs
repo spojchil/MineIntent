@@ -72,13 +72,15 @@ pub enum DoorCommand {
     /// 合堆（count 可只倒几个，溢出留原格）；不同物品=整组对调
     /// （count 不适用）。只出格（成品格）只能整组取走、不能倒入。
     /// 全部编排为同 tick 多包点击，动词始末指针为空。
+    /// 挪格子。`from`/`to` 是[格位地址](crate::slots)（`hotbar 3`、`pack 0`、
+    /// `result`…），不是协议号——协议号只活在这一层以内。
     MoveSlots {
-        from: u16,
-        to: u16,
+        from: String,
+        to: String,
         count: Option<u32>,
     },
     /// 丢弃整格（屏内 Ctrl+Q 语义）。
-    ThrowSlot(u16),
+    ThrowSlot(String),
     /// 关闭当前开着的服务端容器（发 ContainerClose 并清本地菜单）。
     CloseContainer,
     /// 复活。自动重生已关（connect.rs），死亡是持续状态，由模型自己决定何时起来。
@@ -282,15 +284,12 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             Ok(())
         }
         DoorCommand::MoveSlots { from, to, count } => {
+            let space = active_slot_space(inner, bot);
             let geometry = active_menu_geometry(bot);
-            if from > geometry.max_slot || to > geometry.max_slot {
-                return Err(format!(
-                    "格号超出当前界面范围（0-{}）：{from}、{to}",
-                    geometry.max_slot
-                ));
-            }
+            let from = space.resolve(&from)?;
+            let to = space.resolve(&to)?;
             if from == to {
-                return Err("两个格号相同，没有可挪的".to_owned());
+                return Err("两个格子是同一个，没有可挪的".to_owned());
             }
             // 语义按两格现状分派：从活动菜单读（服务器已确认的本地镜像）。
             use azalea::entity::inventory::Inventory as InventoryComponent;
@@ -356,12 +355,7 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
         }
         DoorCommand::ThrowSlot(slot) => {
             let geometry = active_menu_geometry(bot);
-            if slot > geometry.max_slot {
-                return Err(format!(
-                    "格号 {slot} 超出当前界面范围（0-{}）",
-                    geometry.max_slot
-                ));
-            }
+            let slot = active_slot_space(inner, bot).resolve(&slot)?;
             inner.mark_expected_slots(&[slot]);
             ContainerHandleRef::new(geometry.container_id, bot.clone())
                 .click(ClickOperation::Throw(ThrowClick::All { slot }));
@@ -405,6 +399,29 @@ pub(super) struct MenuGeometry {
     pub(super) hotbar_start: u16,
     /// 副手格的菜单号。只有玩家物品栏屏有（45）。
     pub(super) offhand_slot: Option<u16>,
+}
+
+/// 当前屏的格位地址空间。
+///
+/// 协议号只活在这一层以内——可见面一律用 [`crate::slots`] 那套区名 + 序号。
+/// 自有区怎么叫要看容器种类，所以要读 `open_screen`（没开容器就是玩家屏）。
+pub(super) fn active_slot_space(inner: &Inner, bot: &Client) -> crate::slots::SlotSpace {
+    let geometry = active_menu_geometry(bot);
+    let own = match inner.open_screen.lock().as_ref() {
+        None => crate::slots::OwnArea::Player,
+        Some(open) => match open.kind.as_str() {
+            "crafting" => crate::slots::OwnArea::Crafting,
+            "furnace" | "blast_furnace" | "smoker" => crate::slots::OwnArea::Furnace,
+            // 其余按容器名整片编号（维护者裁定：映射按容器命名）。
+            other => crate::slots::OwnArea::Named(other.to_owned()),
+        },
+    };
+    crate::slots::SlotSpace::new(
+        geometry.hotbar_start,
+        geometry.max_slot,
+        geometry.offhand_slot,
+        own,
+    )
 }
 
 /// 玩家物品栏屏的几何（容器读不到时的兜底，也是无容器时的常态）。

@@ -50,13 +50,13 @@ impl ChatHistory for NoDoor {
 impl InventoryDoor for NoDoor {
     fn move_slots<'a>(
         &'a self,
-        _from: u16,
-        _to: u16,
+        _from: String,
+        _to: String,
         _count: Option<u32>,
     ) -> PortFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
-    fn throw_slot<'a>(&'a self, _slot: u16) -> PortFuture<'a, Result<(), String>> {
+    fn throw_slot<'a>(&'a self, _slot: String) -> PortFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
     fn close_container<'a>(&'a self) -> PortFuture<'a, Result<(), String>> {

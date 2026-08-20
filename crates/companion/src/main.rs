@@ -202,8 +202,8 @@ struct ModuleInventoryDoor(Arc<Module>);
 impl InventoryDoor for ModuleInventoryDoor {
     fn move_slots<'a>(
         &'a self,
-        from: u16,
-        to: u16,
+        from: String,
+        to: String,
         count: Option<u32>,
     ) -> agent::PortFuture<'a, Result<(), String>> {
         Box::pin(async move {
@@ -212,7 +212,7 @@ impl InventoryDoor for ModuleInventoryDoor {
                 .await
         })
     }
-    fn throw_slot<'a>(&'a self, slot: u16) -> agent::PortFuture<'a, Result<(), String>> {
+    fn throw_slot<'a>(&'a self, slot: String) -> agent::PortFuture<'a, Result<(), String>> {
         Box::pin(async move { self.0.execute(DoorCommand::ThrowSlot(slot)).await })
     }
     fn close_container<'a>(&'a self) -> agent::PortFuture<'a, Result<(), String>> {

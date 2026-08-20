@@ -289,7 +289,7 @@ fn damage_entries_say_the_drop_and_death_without_inventing_causes() {
 }
 
 #[test]
-fn player_menu_lists_sections_by_protocol_slot() {
+fn player_menu_lists_sections_by_slot_address() {
     let mut snap = snapshot();
     snap.self_state.inventory.selected_hotbar_slot = 2;
     snap.self_state.inventory.slots = vec![
@@ -316,14 +316,19 @@ fn player_menu_lists_sections_by_protocol_slot() {
         },
     ];
     let text = render_player_menu(&snap);
+    // 清单用**格位地址**：模型照这上面抄就能写 move，协议号不出现在可见面。
     assert!(
-        text.contains("盔甲·头/胸/腿/脚（5-8）：6=iron_chestplate ×1"),
+        text.contains("盔甲：armor chest=iron_chestplate ×1"),
         "{text}"
     );
-    assert!(text.contains("主背包（9-35）：10=diamond ×3"), "{text}");
-    assert!(text.contains("快捷栏（36-44）：38=bread ×7"), "{text}");
-    assert!(text.contains("随身合成（1-4）：空"), "{text}");
-    assert!(text.contains("手持的是快捷栏格 38（bread ×7）"), "{text}");
+    assert!(text.contains("主背包：pack 1=diamond ×3"), "{text}");
+    assert!(text.contains("快捷栏：hotbar 2=bread ×7"), "{text}");
+    assert!(text.contains("随身合成（craft 0-3）：空"), "{text}");
+    assert!(text.contains("手持的是 hotbar 2（bread ×7）"), "{text}");
+    assert!(
+        !text.contains("（36-44）"),
+        "协议号不该出现在清单里：{text}"
+    );
 }
 
 #[test]

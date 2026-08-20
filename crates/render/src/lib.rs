@@ -247,38 +247,42 @@ pub fn render_player_menu(snap: &TickSnapshot) -> String {
             .find(|entry| entry.slot == slot)
             .map(|entry| format!("{} ×{}", entry.item_name, entry.count))
     };
-    let section = |name: &str, range: std::ops::RangeInclusive<u32>| -> String {
+    // 清单用**格位地址**，不是协议号——模型要照这上面抄去写 move。
+    // 地址由映射生成（`world::slots`），协议号只活在机器层里。
+    let space = world::slots::SlotSpace::player();
+    let addressed = |name: &str, range: std::ops::RangeInclusive<u32>| {
         let filled: Vec<String> = range
             .clone()
-            .filter_map(|slot| item_at(slot).map(|text| format!("{slot}={text}")))
+            .filter_map(|slot| {
+                item_at(slot).map(|item| format!("{}={item}", space.describe(slot as u16)))
+            })
             .collect();
         if filled.is_empty() {
-            format!("{name}（{}-{}）：空", range.start(), range.end())
-        } else {
             format!(
-                "{name}（{}-{}）：{}",
-                range.start(),
-                range.end(),
-                filled.join("、")
+                "{name}（{}）：空",
+                space.legend_of(*range.start() as u16, *range.end() as u16)
             )
+        } else {
+            format!("{name}：{}", filled.join("、"))
         }
     };
     let held_menu_slot = 36 + u32::from(inventory.selected_hotbar_slot);
     let mut lines = vec![
         match item_at(0) {
-            Some(item) => format!("合成结果（0）：{item}"),
-            None => "合成结果（0）：空".to_owned(),
+            Some(item) => format!("result：{item}"),
+            None => "result：空".to_owned(),
         },
-        section("随身合成", 1..=4),
-        section("盔甲·头/胸/腿/脚", 5..=8),
-        section("主背包", 9..=35),
-        section("快捷栏", 36..=44),
+        addressed("随身合成", 1..=4),
+        addressed("盔甲", 5..=8),
+        addressed("主背包", 9..=35),
+        addressed("快捷栏", 36..=44),
         match item_at(45) {
-            Some(item) => format!("副手（45）：{item}"),
-            None => "副手（45）：空".to_owned(),
+            Some(item) => format!("offhand：{item}"),
+            None => "offhand：空".to_owned(),
         },
         format!(
-            "手持的是快捷栏格 {held_menu_slot}{}。",
+            "手持的是 {}{}。",
+            space.describe(held_menu_slot as u16),
             item_at(held_menu_slot)
                 .map(|item| format!("（{item}）"))
                 .unwrap_or_else(|| "（空手）".to_owned())

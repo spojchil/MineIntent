@@ -116,8 +116,8 @@ async fn main() -> Result<(), String> {
         println!("\n===== 第 {step} 步：格 {source} → 格 {target}（各放 1 块）=====");
         module
             .execute(DoorCommand::MoveSlots {
-                from: source,
-                to: target,
+                from: world::slots::SlotSpace::player().describe(source),
+                to: world::slots::SlotSpace::player().describe(target),
                 count: Some(1),
             })
             .await?;

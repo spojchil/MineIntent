@@ -18,6 +18,8 @@ mod viewport;
 
 pub use block::*;
 #[cfg(feature = "azalea")]
+pub mod slots;
+
 pub use machine::observed::PathAttempt;
 pub use machine::{ConnectionConfig, DoorCommand, Module};
 pub use viewport::*;
