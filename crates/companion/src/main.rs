@@ -783,21 +783,34 @@ async fn main() -> Result<(), String> {
                     // 摘要按指令不含世界状态，先前追加的处境也随对话一起没了。
                     situation.request_full_resend();
                 }
-                let mut sections = situation.take(render::render_situation_lines(
-                    &snapshots.latest(),
-                    read_mark.position(),
-                ));
                 // 在途 job 的进展：多段行走每一程的终点、挖掘每碎一块。
+                //
+                // **只有它触发投递。**处境里的位置走路时每帧都变，让它自己触发就等于
+                // 每 250ms 投一帧——2026-08-20 实测：1,646 次投递对 294 次请求，其中
+                // 1,323 次是单行的位置变化；模型忙着时它们全堆在信箱里，一次并进
+                // 855 条、+98k token。
                 let snapshot = snapshots.latest();
+                let mut progress = Vec::new();
                 for entry in &snapshot.jobs.entries {
                     if progress_seq.is_some_and(|seen| entry.seq <= seen) {
                         continue;
                     }
                     progress_seq = Some(entry.seq);
                     if matches!(entry.event, world::JobEvent::Progress(_)) {
-                        sections.push(render::render_job_entry(entry));
+                        progress.push(render::render_job_entry(entry));
                     }
                 }
+                if progress.is_empty() {
+                    continue;
+                }
+
+                // 处境搭这趟车。**取它必须在决定投递之后**——`take` 会立刻推进比对
+                // 基准，先取后放弃就等于把那次差异吞掉，模型再也听不到。
+                let mut sections = situation.take(render::render_situation_lines(
+                    &snapshot,
+                    read_mark.position(),
+                ));
+                sections.extend(progress);
                 // **方块信息不进会话区**（维护者裁定，2026-08-20）：diff 照常算、照常
                 // 推进记忆——那是给机器用的（寻路读它，`blocks` 工具查它）——但一格
                 // 都不推给模型。
@@ -808,9 +821,6 @@ async fn main() -> Result<(), String> {
                 //
                 // 模型要方块就自己 `scan`（睁眼，填记忆）再查记忆库——就像我改代码时
                 // 从不加载整个仓库，而是 grep 到行号再读那几行。
-                if sections.is_empty() {
-                    continue;
-                }
                 let text = sections.join("\n");
                 println!(
                     "[组合根] 投递 {} 行（本次看进记忆 {absorbed} 格；投影 {}ms，含排队 {}ms，均值 {}ms，下次间隔 {}ms）",
