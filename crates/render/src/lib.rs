@@ -298,9 +298,18 @@ pub fn render_inventory_change(entry: &world::InventoryChangeEntry) -> String {
         (0, slot) => format!("物品栏格 {slot} "),
         (_, slot) => format!("容器格 {slot} "),
     };
+    // **说「当前是」，不说「出现了」。**
+    //
+    // 写口的 ack 早于服务端确认 2~3 tick（2026-08-17 实测），所以这条通知到达时
+    // 说的往往是**上一步之后**的状态。「出现了 X」是在断言一次转变——模型会拿它
+    // 去对自己的第几个动作，对不上就以为系统在闪烁；实测里它因此认定合成回执
+    // 「严重对不上」，只能靠反复关掉重开物品栏来盘点（2026-08-20 长跑，模型自述）。
+    //
+    // 「当前是 X」只是读数：晚一拍的读数只是旧读数，不是假事件；后一条自然覆盖前
+    // 一条，不需要谁去合并或抑制。又是同一条纪律——机器给事实，不给解释。
     match &entry.item_name {
-        Some(name) => format!("{place}出现了 {name} ×{}。", entry.count),
-        None => format!("{place}变空了。"),
+        Some(name) => format!("{place}当前是 {name} ×{}。", entry.count),
+        None => format!("{place}当前是空的。"),
     }
 }
 

@@ -340,7 +340,7 @@ fn inventory_changes_name_the_slot_and_call_out_the_craft_result() {
     };
     assert_eq!(
         render_inventory_change(&entry),
-        "物品栏格 12 出现了 oak_planks ×4。"
+        "物品栏格 12 当前是 oak_planks ×4。"
     );
 
     let emptied = world::InventoryChangeEntry {
@@ -349,7 +349,10 @@ fn inventory_changes_name_the_slot_and_call_out_the_craft_result() {
         count: 0,
         ..entry.clone()
     };
-    assert_eq!(render_inventory_change(&emptied), "合成结果格（0）变空了。");
+    assert_eq!(
+        render_inventory_change(&emptied),
+        "合成结果格（0）当前是空的。"
+    );
 
     // 容器格空间：措辞中性（0 号在工作台是成品格、在熔炉是原料格，
     // 语义随开屏清单给过，这里不扣帽子）。
@@ -362,7 +365,7 @@ fn inventory_changes_name_the_slot_and_call_out_the_craft_result() {
     };
     assert_eq!(
         render_inventory_change(&crafted),
-        "容器格 0 出现了 oak_button ×1。"
+        "容器格 0 当前是 oak_button ×1。"
     );
     let in_container = world::InventoryChangeEntry {
         container_id: 3,
@@ -370,7 +373,7 @@ fn inventory_changes_name_the_slot_and_call_out_the_craft_result() {
     };
     assert_eq!(
         render_inventory_change(&in_container),
-        "容器格 12 出现了 oak_planks ×4。"
+        "容器格 12 当前是 oak_planks ×4。"
     );
 }
 
