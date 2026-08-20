@@ -23,6 +23,8 @@ mod connect;
 mod door;
 mod mining;
 mod movement;
+pub mod observed;
+mod pillar;
 mod state;
 
 pub use door::DoorCommand;
@@ -49,6 +51,10 @@ const MOVEMENT_STALL_TICKS: usize = 200;
 /// 一块挖不碎的时限。徒手挖石头约 15 秒（300 tick）是原版量级；取 400 tick
 /// 留足余量——超过它仍不碎，多半是够不着、被挡或工具不对，不是慢。
 const MINING_STALL_TICKS: u64 = 400;
+
+/// 垫柱一格等多久算卡住。跳跃全程约 12 tick，给到 60 tick（3 秒）足够容下
+/// 一次往返延迟；再久就是真的没成，如实说破。
+const PILLAR_STALL_TICKS: u64 = 60;
 
 /// 连接配置。v1 只有离线身份、重连固定 Never。
 #[derive(Clone, Debug)]
@@ -248,6 +254,85 @@ impl Module {
 
     /// 增量视口投影：对比方块记忆只报变化，并当场推进记忆（回执走内核
     /// settled 通道必达模型，产出即送达）。约束同 [`Module::scan`]。
+    /// 开启**合法寻路**：寻路只按 `memory` 里观察过的方块规划路线。
+    ///
+    /// 不调用就是原样——azalea 读服务端推来的全部已加载区块，包括同伴从没看过的
+    /// 地方。裁定与理由见 `docs/pathfinding-legality-decision.md`。
+    ///
+    /// 传进来的必须是**组合根那一份**记忆：轮末帧每 250ms 往里推进增量，寻路要
+    /// 看到的正是同一份，两份会各说各话。
+    pub fn use_observed_pathfinding(
+        &self,
+        memory: std::sync::Arc<std::sync::Mutex<crate::BlockMemory>>,
+    ) {
+        let world = self.inner.world_handle.lock().clone();
+        let Some(world) = world else {
+            // 世界还没就绪：装不上就如实什么都不做，调用方在 wait_ready 之后再叫一次。
+            return;
+        };
+        *self.inner.observed.lock() = Some(std::sync::Arc::new(
+            crate::machine::observed::ObservedBlocks::new(memory, world),
+        ));
+    }
+
+    /// 诊断：同一目标，全量世界 vs 只按观察过的地图，各算一次路。
+    ///
+    /// 不产生移动，也不装组件——纯粹为了回答「合法之后还找不找得到路、路长多少、
+    /// 算多久」。返回 `(全量, 合法)`。
+    pub fn compare_paths(
+        &self,
+        memory: std::sync::Arc<std::sync::Mutex<crate::BlockMemory>>,
+        goal: [i32; 3],
+    ) -> Result<
+        (
+            crate::machine::observed::PathAttempt,
+            crate::machine::observed::PathAttempt,
+        ),
+        String,
+    > {
+        let snapshot = self.latest();
+        if !matches!(snapshot.phase, ConnectionPhase::Ready) {
+            return Err("尚未连接到世界".to_owned());
+        }
+        let position = &snapshot.self_state.position;
+        let start = azalea::BlockPos::new(
+            position.x.floor() as i32,
+            position.y.floor() as i32,
+            position.z.floor() as i32,
+        );
+        crate::machine::observed::compare(
+            &self.inner,
+            memory,
+            start,
+            azalea::BlockPos::new(goal[0], goal[1], goal[2]),
+        )
+    }
+
+    /// 睁眼一次：把合法可见的方块整份写进记忆，返回吸收了多少格。
+    ///
+    /// 眼睛走这条路而不是 [`Self::scan_changes`]：**差异没有消费者了**。方块不进
+    /// 会话区之后（裁定五），记忆只需要「把看见的收进来」，不需要知道哪些是新的。
+    /// 实测差异那一层是 +3.7ms / 35%（8.8ms → 13.3ms），省下来是白赚的。
+    ///
+    /// 差异那套代码**保留不动**：将来做订阅（「盯着这个熔炉」）时，它就是原料；
+    /// 而且 `scan` 工具的 `changes` 模式现在仍然在用它。
+    pub fn absorb(
+        &self,
+        memory: &std::sync::Mutex<crate::BlockMemory>,
+        options: &crate::ViewportOptions,
+    ) -> Result<usize, String> {
+        let projection = self.scan(options)?;
+        let mut memory = memory.lock().map_err(|_| "方块记忆锁中毒".to_owned())?;
+        memory.absorb_visible(&projection.visible_blocks.blocks);
+        for block in [&projection.standing_on_block, &projection.looked_at_block]
+            .into_iter()
+            .flatten()
+        {
+            memory.absorb_visible(std::slice::from_ref(block));
+        }
+        Ok(projection.visible_blocks.blocks.len())
+    }
+
     pub fn scan_changes(
         &self,
         memory: &std::sync::Mutex<crate::BlockMemory>,

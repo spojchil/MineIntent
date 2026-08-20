@@ -18,7 +18,7 @@ use azalea::Client;
 
 use super::state::Inner;
 use super::{MOVEMENT_ARM_GRACE_TICKS, MOVEMENT_STALL_TICKS};
-use crate::JobOutcome;
+use crate::{JobKind, JobOutcome, JobProgress};
 
 /// 在途的移动任务（单意图槽）。终局判定按 azalea 寻路器的可观察状态：
 /// 成功到达时它把 goal 置 None（execute/mod.rs 目标达成分支）；走完未达时
@@ -31,6 +31,10 @@ pub(super) struct MovementJob {
     pub(super) armed: bool,
     /// 卡住通知只发一次。
     pub(super) stall_notified: bool,
+    /// 已经告诉过模型的这一程终点。**只读观察**——路一变就重说一句，
+    /// 续接本身归 azalea（`recalculate_near_end_of_path` 在部分路径快走完时
+    /// 用同一个 goal 自动重发）。我们插手只会打断它。
+    pub(super) announced_leg_end: Option<[i32; 3]>,
 }
 
 /// 移动 job 轮询的行动结论（纯函数，可单测）。
@@ -98,12 +102,18 @@ pub(super) fn poll_movement_job(inner: &Inner, bot: &Client) {
     let mut slot = inner.movement_job.lock();
     let Some(job) = slot.as_mut() else { return };
 
-    let Ok((pathfinder, stall_ticks, block_pos)) =
+    let Ok((pathfinder, stall_ticks, leg_end, block_pos)) =
         bot.try_query_self::<(Option<&Pathfinder>, Option<&ExecutingPath>, &Position), _>(
             |(pathfinder, executing, position)| {
                 (
                     pathfinder.map(|p| (p.goal.is_some(), p.is_calculating)),
                     executing.map(|e| e.ticks_since_last_node_reached),
+                    executing.and_then(|e| {
+                        e.path.back().map(|edge| {
+                            let target = edge.movement.target;
+                            [target.x, target.y, target.z]
+                        })
+                    }),
                     [
                         position.x.floor() as i32,
                         position.y.floor() as i32,
@@ -116,6 +126,19 @@ pub(super) fn poll_movement_job(inner: &Inner, bot: &Client) {
         return;
     };
     let (goal_some, calculating) = pathfinder.unwrap_or((false, false));
+
+    // 这一程的终点由寻路器算完才知道，所以在它出现（或被 patch 改动）时才说。
+    // 说的是意图不是承诺：走不走得到，下面的判定表照常判。
+    if let Some(leg_end) = leg_end {
+        if job.announced_leg_end != Some(leg_end) {
+            job.announced_leg_end = Some(leg_end);
+            let destination = job.destination;
+            inner.push_job_progress(
+                JobKind::MoveTo { destination },
+                JobProgress::Leg { to: leg_end },
+            );
+        }
+    }
     let step = movement_poll_step(MovementPoll {
         armed: job.armed,
         goal_some,

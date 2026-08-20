@@ -247,38 +247,42 @@ pub fn render_player_menu(snap: &TickSnapshot) -> String {
             .find(|entry| entry.slot == slot)
             .map(|entry| format!("{} ×{}", entry.item_name, entry.count))
     };
-    let section = |name: &str, range: std::ops::RangeInclusive<u32>| -> String {
+    // 清单用**格位地址**，不是协议号——模型要照这上面抄去写 move。
+    // 地址由映射生成（`world::slots`），协议号只活在机器层里。
+    let space = world::slots::SlotSpace::player();
+    let addressed = |name: &str, range: std::ops::RangeInclusive<u32>| {
         let filled: Vec<String> = range
             .clone()
-            .filter_map(|slot| item_at(slot).map(|text| format!("{slot}={text}")))
+            .filter_map(|slot| {
+                item_at(slot).map(|item| format!("{}={item}", space.describe(slot as u16)))
+            })
             .collect();
         if filled.is_empty() {
-            format!("{name}（{}-{}）：空", range.start(), range.end())
-        } else {
             format!(
-                "{name}（{}-{}）：{}",
-                range.start(),
-                range.end(),
-                filled.join("、")
+                "{name}（{}）：空",
+                space.legend_of(*range.start() as u16, *range.end() as u16)
             )
+        } else {
+            format!("{name}：{}", filled.join("、"))
         }
     };
     let held_menu_slot = 36 + u32::from(inventory.selected_hotbar_slot);
     let mut lines = vec![
         match item_at(0) {
-            Some(item) => format!("合成结果（0）：{item}"),
-            None => "合成结果（0）：空".to_owned(),
+            Some(item) => format!("result：{item}"),
+            None => "result：空".to_owned(),
         },
-        section("随身合成", 1..=4),
-        section("盔甲·头/胸/腿/脚", 5..=8),
-        section("主背包", 9..=35),
-        section("快捷栏", 36..=44),
+        addressed("随身合成", 1..=4),
+        addressed("盔甲", 5..=8),
+        addressed("主背包", 9..=35),
+        addressed("快捷栏", 36..=44),
         match item_at(45) {
-            Some(item) => format!("副手（45）：{item}"),
-            None => "副手（45）：空".to_owned(),
+            Some(item) => format!("offhand：{item}"),
+            None => "offhand：空".to_owned(),
         },
         format!(
-            "手持的是快捷栏格 {held_menu_slot}{}。",
+            "手持的是 {}{}。",
+            space.describe(held_menu_slot as u16),
             item_at(held_menu_slot)
                 .map(|item| format!("（{item}）"))
                 .unwrap_or_else(|| "（空手）".to_owned())
@@ -298,9 +302,18 @@ pub fn render_inventory_change(entry: &world::InventoryChangeEntry) -> String {
         (0, slot) => format!("物品栏格 {slot} "),
         (_, slot) => format!("容器格 {slot} "),
     };
+    // **说「当前是」，不说「出现了」。**
+    //
+    // 写口的 ack 早于服务端确认 2~3 tick（2026-08-17 实测），所以这条通知到达时
+    // 说的往往是**上一步之后**的状态。「出现了 X」是在断言一次转变——模型会拿它
+    // 去对自己的第几个动作，对不上就以为系统在闪烁；实测里它因此认定合成回执
+    // 「严重对不上」，只能靠反复关掉重开物品栏来盘点（2026-08-20 长跑，模型自述）。
+    //
+    // 「当前是 X」只是读数：晚一拍的读数只是旧读数，不是假事件；后一条自然覆盖前
+    // 一条，不需要谁去合并或抑制。又是同一条纪律——机器给事实，不给解释。
     match &entry.item_name {
-        Some(name) => format!("{place}出现了 {name} ×{}。", entry.count),
-        None => format!("{place}变空了。"),
+        Some(name) => format!("{place}当前是 {name} ×{}。", entry.count),
+        None => format!("{place}当前是空的。"),
     }
 }
 
@@ -524,6 +537,70 @@ pub fn render_viewport(projection: &world::ViewportProjection) -> String {
     lines.join("\n")
 }
 
+/// 记忆库查询结果的呈现。
+///
+/// **只给方块事实**：挑选、聚合、坐标、方位距离归机器；「这是悬崖」「那片林子」
+/// 那类解释归模型（维护者裁定 2026-08-20——机器产出解释，本质是替模型下结论）。
+///
+/// `matches` 要按距离从近到远给好；同标签聚合成一组，报数量与最近的那一处。
+pub fn render_memory_matches(origin: [i32; 3], matches: &[([i32; 3], String)]) -> String {
+    if matches.is_empty() {
+        return "记忆里没有符合的方块。".to_owned();
+    }
+    let mut groups: Vec<(String, usize, [i32; 3])> = Vec::new();
+    for (at, label) in matches {
+        match groups.iter_mut().find(|(seen, ..)| seen == label) {
+            Some((_, count, _)) => *count += 1,
+            None => groups.push((label.clone(), 1, *at)),
+        }
+    }
+    let described: Vec<String> = groups
+        .into_iter()
+        .map(|(label, count, at)| {
+            let [x, y, z] = at;
+            let where_ = format!(
+                "{x},{y},{z}，{} 格·{}",
+                block_distance(origin, at).round() as i64,
+                compass_from_delta(x - origin[0], z - origin[2])
+            );
+            if count > 1 {
+                format!("{label} ×{count}（最近 {where_}）")
+            } else {
+                format!("{label}（{where_}）")
+            }
+        })
+        .collect();
+    described.join("；")
+}
+
+fn block_distance(a: [i32; 3], b: [i32; 3]) -> f64 {
+    let (dx, dy, dz) = (
+        f64::from(b[0] - a[0]),
+        f64::from(b[1] - a[1]),
+        f64::from(b[2] - a[2]),
+    );
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+/// 八向方位。x 东正、z 南正（原版坐标系）。
+fn compass_from_delta(dx: i32, dz: i32) -> &'static str {
+    if dx == 0 && dz == 0 {
+        return "就在脚下";
+    }
+    let angle = f64::from(dx).atan2(-f64::from(dz)).to_degrees();
+    let normalized = (angle + 360.0) % 360.0;
+    match ((normalized + 22.5) / 45.0) as usize % 8 {
+        0 => "北",
+        1 => "东北",
+        2 => "东",
+        3 => "东南",
+        4 => "南",
+        5 => "西南",
+        6 => "西",
+        _ => "西北",
+    }
+}
+
 /// 增量查看结果的呈现：git 式 diff（维护者裁定）。
 ///
 /// 基线是记忆整体，不是「上一次报告」——比较不带时间性。每行是一个
@@ -622,12 +699,57 @@ pub fn render_directed(projection: &world::DirectedProjection) -> String {
     }
 }
 
+/// 进行中的进展措辞。
+///
+/// 一趟远路是多段的——按自己观察到的地图规划，只能先走到知识边界，到了看到更多
+/// 再往前。每段开始说一句这一程走到哪，模型才知道自己为什么走走停停；不说，它
+/// 看到的就是「走了一段莫名其妙停下」，然后去 scan 找补。
+///
+/// **不解释为什么到此为止**：路径是被知识边界截断还是被超时截断，`is_partial`
+/// 分不出，说了就是把未知讲成已知。
+pub fn render_job_progress(job: &world::JobKind, progress: &world::JobProgress) -> String {
+    match (job, progress) {
+        (
+            world::JobKind::MoveTo {
+                destination: [dx, dy, dz],
+            },
+            world::JobProgress::Leg { to: [x, y, z] },
+        ) => {
+            if [*x, *y, *z] == [*dx, *dy, *dz] {
+                format!("这一程直接走到 ({dx}, {dy}, {dz})。")
+            } else {
+                format!(
+                    "去 ({dx}, {dy}, {dz})：这一程先走到 ({x}, {y}, {z})，到了再看能不能接着走。"
+                )
+            }
+        }
+        (world::JobKind::Mine { .. }, world::JobProgress::Mined { done, total }) => {
+            format!(
+                "挖掉了第 {done} 块，还剩 {} 块。",
+                total.saturating_sub(*done)
+            )
+        }
+        (world::JobKind::PillarUp { .. }, world::JobProgress::Pillared { done, total }) => {
+            format!(
+                "垫上并站稳了第 {done} 格，还剩 {} 格。",
+                total.saturating_sub(*done)
+            )
+        }
+        // 类别对不上就如实说破，不编。
+        (job, progress) => format!("任务收到了不属于它的进展：{job:?} / {progress:?}。"),
+    }
+}
+
 /// 任务变化的通知措辞。哪些值得投递是己的判据，这里只管怎么说。
 pub fn render_job_entry(entry: &world::JobEntry) -> String {
+    let outcome = match &entry.event {
+        world::JobEvent::Finished(outcome) => *outcome,
+        world::JobEvent::Progress(progress) => return render_job_progress(&entry.job, progress),
+    };
     match &entry.job {
         world::JobKind::MoveTo {
             destination: [x, y, z],
-        } => match entry.outcome {
+        } => match outcome {
             world::JobOutcome::Arrived => format!("你到达了目的地 ({x}, {y}, {z})。"),
             world::JobOutcome::Replaced => "先前的移动被新的目标顶替了。".to_owned(),
             world::JobOutcome::Stopped => "你停下了移动。".to_owned(),
@@ -642,7 +764,7 @@ pub fn render_job_entry(entry: &world::JobEntry) -> String {
         },
         world::JobKind::Mine { targets, done } => {
             let total = targets.len();
-            match entry.outcome {
+            match outcome {
                 world::JobOutcome::Mined => format!("你挖完了这一串 {total} 块方块。"),
                 world::JobOutcome::MineBlocked => match targets.get(*done) {
                     Some([x, y, z]) => format!(
@@ -660,6 +782,18 @@ pub fn render_job_entry(entry: &world::JobEntry) -> String {
                 other => format!("挖掘任务收到了不属于它的结局：{other:?}。"),
             }
         }
+        world::JobKind::PillarUp { total, done } => match outcome {
+            world::JobOutcome::Pillared => format!("你往上垫了 {total} 格，站稳了。"),
+            world::JobOutcome::PillarBlocked => format!(
+                "垫到第 {} 格就卡住了（已垫上 {done} 格）——跳起来没能腾出脚下那格，或者方块没放上去。",
+                done + 1
+            ),
+            world::JobOutcome::Replaced => {
+                format!("先前的垫柱被新的顶替了（已垫上 {done}/{total} 格）。")
+            }
+            world::JobOutcome::Stopped => format!("你停下了垫柱（已垫上 {done}/{total} 格）。"),
+            other => format!("垫柱任务收到了不属于它的结局：{other:?}。"),
+        },
     }
 }
 

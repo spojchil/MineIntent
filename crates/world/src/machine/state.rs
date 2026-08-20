@@ -50,6 +50,7 @@ pub(crate) struct Inner {
     pub(super) movement_job: Mutex<Option<MovementJob>>,
     /// 在途挖掘任务（单意图槽，内含坐标队列）。
     pub(super) mining_job: Mutex<Option<MiningJob>>,
+    pub(super) pillar_job: Mutex<Option<super::pillar::PillarJob>>,
     pub(super) inventory_window: Mutex<VecDeque<InventoryChangeEntry>>,
     /// 各格上一个已知内容：(容器 id, 菜单号) → (物品名, 数量)。
     /// 服务端重发同值不算变化——判据在 [`Inner::push_inventory_change`]。
@@ -69,6 +70,9 @@ pub(crate) struct Inner {
     /// azalea 世界模型句柄（Spawn 登记）。方块读取走它的读锁，
     /// 可在任意线程进行——世界模型不是 ECS。
     pub(super) world_handle: Mutex<Option<Arc<RwLock<azalea::world::World>>>>,
+    /// 合法寻路的知识面。`None` = 没开，寻路照旧读全量世界。
+    /// 由 `Module::use_observed_pathfinding` 装上，连接层每 tick 推进它的脚下格。
+    pub(super) observed: Mutex<Option<Arc<super::observed::ObservedBlocks>>>,
     pub(super) stopping: AtomicBool,
     pub(super) shutdown: Notify,
     pub(super) tick: AtomicU64,
@@ -99,6 +103,7 @@ impl Inner {
             last_health: Mutex::new(None),
             movement_job: Mutex::new(None),
             mining_job: Mutex::new(None),
+            pillar_job: Mutex::new(None),
             inventory_window: Mutex::new(VecDeque::new()),
             last_slot_contents: Mutex::new(SlotLedger::new()),
             expected_slots: Mutex::new(Vec::new()),
@@ -108,6 +113,7 @@ impl Inner {
             pending: Mutex::new(Vec::new()),
             jump_reset: AtomicBool::new(false),
             world_handle: Mutex::new(None),
+            observed: Mutex::new(None),
             stopping: AtomicBool::new(false),
             shutdown: Notify::new(),
             tick: AtomicU64::new(0),
@@ -351,12 +357,21 @@ impl Inner {
     }
 
     pub(super) fn push_job_kind(&self, job: JobKind, outcome: JobOutcome) {
+        self.push_job_event(job, crate::JobEvent::Finished(outcome));
+    }
+
+    /// 进行中的进展：落一条事实，**不结束 job**。
+    pub(super) fn push_job_progress(&self, job: JobKind, progress: crate::JobProgress) {
+        self.push_job_event(job, crate::JobEvent::Progress(progress));
+    }
+
+    fn push_job_event(&self, job: JobKind, event: crate::JobEvent) {
         let entry = JobEntry {
             seq: self.fact_seq.fetch_add(1, Ordering::AcqRel),
             tick: self.tick.load(Ordering::Acquire),
             occurred_at: SystemTime::now(),
             job,
-            outcome,
+            event,
         };
         let mut window = self.jobs_window.lock();
         window.push_back(entry);
@@ -376,6 +391,7 @@ impl Inner {
             started_tick: self.tick.load(Ordering::Acquire),
             armed: false,
             stall_notified: false,
+            announced_leg_end: None,
         });
     }
 
@@ -408,6 +424,39 @@ impl Inner {
                 JobKind::Mine {
                     targets: job.targets,
                     done: job.cursor,
+                },
+                outcome,
+            );
+        }
+    }
+
+    /// 垫柱开槽：与挖掘/移动同款单意图槽。
+    pub(super) fn begin_pillar_job(&self, total: usize, target: [i32; 3]) {
+        let mut slot = self.pillar_job.lock();
+        if let Some(job) = slot.take() {
+            self.push_job_kind(
+                JobKind::PillarUp {
+                    total: job.total,
+                    done: job.total - job.remaining,
+                },
+                JobOutcome::Replaced,
+            );
+        }
+        *slot = Some(super::pillar::PillarJob {
+            remaining: total,
+            total,
+            target,
+            since_tick: self.tick.load(Ordering::Acquire),
+            placed: false,
+        });
+    }
+
+    pub(super) fn end_pillar_job(&self, outcome: JobOutcome) {
+        if let Some(job) = self.pillar_job.lock().take() {
+            self.push_job_kind(
+                JobKind::PillarUp {
+                    total: job.total,
+                    done: job.total - job.remaining,
                 },
                 outcome,
             );
@@ -547,7 +596,14 @@ mod tests {
         inner.end_movement_job_stopped(); // 没任务时不是事件
 
         let window = inner.jobs_window_now();
-        let outcomes: Vec<JobOutcome> = window.entries.iter().map(|entry| entry.outcome).collect();
+        let outcomes: Vec<JobOutcome> = window
+            .entries
+            .iter()
+            .filter_map(|entry| match entry.event {
+                crate::JobEvent::Finished(outcome) => Some(outcome),
+                crate::JobEvent::Progress(_) => None,
+            })
+            .collect();
         assert_eq!(outcomes, vec![JobOutcome::Replaced, JobOutcome::Stopped]);
         assert_eq!(
             window.entries[0].job,

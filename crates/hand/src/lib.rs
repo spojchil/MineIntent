@@ -27,6 +27,12 @@ pub trait HandDoor: Send + Sync {
     fn mining_status<'a>(&'a self) -> PortFuture<'a, Option<MiningStatus>>;
     /// 把手持方块放到目标空位（目标须紧挨已有方块；依附面由机器代选）。
     fn place<'a>(&'a self, block: [i32; 3]) -> PortFuture<'a, Result<(), String>>;
+    /// 垫柱：跳起来在脚下放方块，站上去，重复 `count` 次。
+    ///
+    /// **临时动作**——放置那条线整体要重做。它存在的理由是原版玩家最基本的一个
+    /// 动作，而模型自己做不到：跳与放之间要隔 100~300ms（实测），工具批里表达
+    /// 不了这个间隔，分两轮发又慢到窗口早过。时序归机器。
+    fn pillar_up<'a>(&'a self, count: usize) -> PortFuture<'a, Result<(), String>>;
     fn use_on_block<'a>(&'a self, block: [i32; 3]) -> PortFuture<'a, Result<(), String>>;
     fn use_on_entity<'a>(&'a self, entity_key: &'a str) -> PortFuture<'a, Result<(), String>>;
     fn use_item<'a>(&'a self) -> PortFuture<'a, Result<(), String>>;
@@ -87,6 +93,13 @@ impl HandTools {
                 Ok(blocks) => self.door.mine(blocks).await,
                 Err(reason) => return ToolResult::failure(call_id, reason),
             },
+            Some("pillar_up") => {
+                let count = arguments
+                    .get("count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(1) as usize;
+                self.door.pillar_up(count).await
+            }
             Some("place") => match read_block(arguments.get("block")) {
                 Ok(block) => self.door.place(block).await,
                 Err(reason) => return ToolResult::failure(call_id, reason),
@@ -140,7 +153,7 @@ impl HandTools {
             _ => {
                 return ToolResult::failure(
                     call_id,
-                    "action 必须是 attack/mine/mining_status/place/use_on/use_item/release/drop/swap_offhand/select_slot 之一；请改写调用",
+                    "action 必须是 attack/mine/mining_status/pillar_up/place/use_on/use_item/release/drop/swap_offhand/select_slot 之一；请改写调用",
                 )
             }
         };
@@ -195,11 +208,12 @@ impl ToolProvider for HandTools {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["attack", "mine", "mining_status", "place", "use_on", "use_item", "release", "drop", "swap_offhand", "select_slot"],
-                        "description": "attack=攻击实体；mine=按顺序挖掉一串方块（blocks 给坐标数组，机器逐块挖完；挖穿要时间，别急着发下一个——再发一次 mine 会放弃当前这串。可用 release 停手）；place=把手持方块放到目标空位（目标须紧挨已有方块）；use_on=对方块/实体使用（右键）；use_item=使用手持物品（吃/喝/举盾，持续到用完或 release）；mining_status=看一眼在途挖掘队列（**不要轮询**：挖完或卡住都会主动通知你，这个动作只在你确实拿不准时用一次）；release=松手；drop=丢手持物；swap_offhand=主副手对调；select_slot=选快捷栏格"
+                        "enum": ["attack", "mine", "mining_status", "pillar_up", "place", "use_on", "use_item", "release", "drop", "swap_offhand", "select_slot"],
+                        "description": "attack=攻击实体；mine=按顺序挖掉一串方块（blocks 给坐标数组，机器逐块挖完；挖穿要时间，别急着发下一个——再发一次 mine 会放弃当前这串。可用 release 停手）；pillar_up=垫柱：跳起来在脚下放方块、站上去，重复 count 次（想上到够不着的高处就用它；手里要先拿着方块）；place=把手持方块放到目标空位（目标须紧挨已有方块）；use_on=对方块/实体使用（右键）；use_item=使用手持物品（吃/喝/举盾，持续到用完或 release）；mining_status=看一眼在途挖掘队列（**不要轮询**：挖完或卡住都会主动通知你，这个动作只在你确实拿不准时用一次）；release=松手；drop=丢手持物；swap_offhand=主副手对调；select_slot=选快捷栏格"
                     },
                     "entity": { "type": "string", "description": "attack/use_on 用：目标实体的 entity_key" },
                     "block": { "type": "array", "items": {"type": "integer"}, "description": "place/use_on 用：方块坐标 [x, y, z]" },
+                    "count": { "type": "integer", "minimum": 1, "description": "pillar_up 用：往上垫几格（默认 1）" },
                     "blocks": { "type": "array", "items": {"type": "array", "items": {"type": "integer"}}, "description": "mine 用：要按顺序挖的坐标数组，如 [[37,63,-10],[37,64,-10]]；不必先确认那里有什么，空气会被如实拒绝" },
                     "stack": { "type": "boolean", "description": "drop 用：true 丢整组，默认丢一个" },
                     "slot": { "type": "integer", "minimum": 0, "maximum": 8, "description": "select_slot 用：快捷栏格号" }
@@ -267,6 +281,9 @@ mod tests {
         }
         fn place<'a>(&'a self, block: [i32; 3]) -> PortFuture<'a, Result<(), String>> {
             self.log(format!("place{block:?}"))
+        }
+        fn pillar_up<'a>(&'a self, count: usize) -> PortFuture<'a, Result<(), String>> {
+            self.log(format!("pillar_up({count})"))
         }
         fn use_on_block<'a>(&'a self, block: [i32; 3]) -> PortFuture<'a, Result<(), String>> {
             self.log(format!("use_on_block{block:?}"))

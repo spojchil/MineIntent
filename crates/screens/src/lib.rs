@@ -16,4 +16,4 @@ mod segment;
 
 pub use chat::{ChatBox, ChatDoor, ChatHistory, ChatReadMark};
 pub use container::{container_usage, ContainerScreen, CONTAINER_USAGE};
-pub use inventory::{InventoryDoor, InventoryScreen, ScreenKind, ScreenState, DISCARD_SLOT};
+pub use inventory::{InventoryDoor, InventoryScreen, ScreenKind, ScreenState, DISCARD};

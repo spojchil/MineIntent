@@ -16,17 +16,18 @@ use dispatch::{Domain, Occupancy, ToolClass};
 use serde_json::{json, Value};
 use world::SnapshotSource;
 
-use crate::inventory::{kind_word, InventoryDoor, ScreenKind, ScreenState, DISCARD_SLOT};
+use crate::inventory::{kind_word, InventoryDoor, ScreenKind, ScreenState, DISCARD};
 
 const TOOL_NAME: &str = "container";
 
 /// 所有容器共用的动词说明。开屏通知 = 种类名 + 格位清单 + 本文 +
 /// 种类补充（[`container_usage`] 汇总）。公开以便模型可见面导出评审。
 pub const CONTAINER_USAGE: &str =
-    "容器界面用法：格号即协议号，属于当前界面（物品栏屏的格号在这里不适用）。\
+    "容器界面用法：格位用地址，不是数字——具体认哪些写法，随开屏清单一起给。\
+**同一个位置在任何界面下都是同一个地址**——开着容器不改变 pack 与 hotbar 的写法。\
 {action:\"move\", from, to} 把 from 格的东西弄到 to 格，语义随 to 现状：to 为空=移过去\
 （可加 count 只挪几个，拆栈）；to 是同种物品=倒入合堆（可加 count 只倒几个，装不下的留在原格）；\
-to 是不同物品=整组对调（count 不适用）；to 用 99=把 from 整格丢出去。\
+to 是不同物品=整组对调（count 不适用）；to 写 drop=把 from 整格丢出去。\
 {action:\"close\"} 关闭容器回到世界。开着容器时无法移动或与世界交互。";
 
 /// 种类专属的用法补充（数据，不是代码）：只写通用动词说明覆盖不到的语义。
@@ -110,9 +111,12 @@ impl ContainerScreen {
                 );
             }
         }
-        let slot = |value: Option<&Value>| value.and_then(Value::as_u64).map(|slot| slot as u16);
+        let slot = |value: Option<&Value>| value.and_then(Value::as_str).map(str::to_owned);
         let (Some(from), Some(to)) = (slot(from), slot(to)) else {
-            return ToolResult::failure(call_id, "move 需要整数参数 from 与 to；请改写调用");
+            return ToolResult::failure(
+                call_id,
+                "move 需要 from 与 to 两个格位地址（如 \"pack 3\"、\"hotbar 0\"）；请改写调用",
+            );
         };
         let count = match count {
             None => None,
@@ -123,16 +127,16 @@ impl ContainerScreen {
                 }
             },
         };
-        if count.is_some() && to == DISCARD_SLOT {
+        if count.is_some() && to == DISCARD {
             return ToolResult::failure(
                 call_id,
-                "count 不能与 99 丢弃连用（丢弃是整格）；请改写调用",
+                "count 不能与 drop 连用（丢弃是整格）；请改写调用",
             );
         }
-        let outcome = if to == DISCARD_SLOT {
-            self.door.throw_slot(from).await
+        let outcome = if to == DISCARD {
+            self.door.throw_slot(from.clone()).await
         } else {
-            self.door.move_slots(from, to, count).await
+            self.door.move_slots(from.clone(), to.clone(), count).await
         };
         if let Err(reason) = outcome {
             return ToolResult::failure(call_id, reason);
@@ -154,7 +158,7 @@ impl ContainerScreen {
         //    真正要紧的那件事——摆料之后成品格冒出什么——本来就走信箱：
         //    自己点的两格是 Commanded 回声（不吵），成品格是 ServerObserved
         //    （预期之外，投递）。回执再报一遍格位既重复又落后。
-        let summary = if to == DISCARD_SLOT {
+        let summary = if to == DISCARD {
             format!("已丢弃格 {from}")
         } else {
             "已完成".to_owned()
@@ -201,8 +205,8 @@ impl dispatch::ToolProvider for ContainerScreen {
                         "enum": ["move", "describe", "close"],
                         "description": "move=把 from 格的东西弄到 to 格（移动/合堆/对调）；describe=取当前这种容器的完整用法（不随开屏自动给，要看自己取）；close=关闭容器"
                     },
-                    "from": { "type": "integer", "description": "move 用：来源格号（当前容器的格空间）" },
-                    "to": { "type": "integer", "description": "move 用：目标格号——空=移过去、同种物品=倒入合堆、不同物品=整组对调；99=把 from 整格丢出去" },
+                    "from": { "type": "string", "description": "move 用：来源格位地址，照清单上写的抄（容器自有区按容器名，如 chest 0-26；熔炉族是 smelt/fuel/result；工作台是 result 与 craft 0-8；另有 pack 0-26 与 hotbar 0-8）" },
+                    "to": { "type": "string", "description": "move 用：目标格位地址——空=移过去、同种物品=倒入合堆、不同物品=整组对调；写 drop=把 from 整格丢出去" },
                     "count": { "type": "integer", "description": "move 可选：只挪/只倒这么多个（to 为空或同种物品时）；不给则整组" }
                 },
                 "required": ["action"],
@@ -213,7 +217,9 @@ impl dispatch::ToolProvider for ContainerScreen {
             "当前开着的容器界面（工作台、箱子、熔炉等共用）。没有 open：对容器方块\
 使用（hand use_on）后界面由服务器打开，你会收到格位清单；不确定这种容器怎么用就 \
 describe。开着期间用 move 搬动/合堆/摆料/取物，close 关闭。开着时无法移动或与世界交互。\
-容器在服务端，动作的效果不会立刻反映出来；变化会主动通知你，等通知即可，别急着重做。"
+容器在服务端，动作的效果不会立刻反映出来；变化会主动通知你，等通知即可，别急着重做。\
+**一条消息里可以连发多个动作**——想好整套摆法就一次发全，比一次一格来回等快得多，\
+也不会看到摆到一半的中间产物。"
                 .to_owned(),
         );
         vec![(
@@ -268,8 +274,8 @@ mod tests {
     impl InventoryDoor for RecordingDoor {
         fn move_slots<'a>(
             &'a self,
-            from: u16,
-            to: u16,
+            from: String,
+            to: String,
             count: Option<u32>,
         ) -> PortFuture<'a, Result<(), String>> {
             Box::pin(async move {
@@ -281,7 +287,7 @@ mod tests {
                 Ok(())
             })
         }
-        fn throw_slot<'a>(&'a self, slot: u16) -> PortFuture<'a, Result<(), String>> {
+        fn throw_slot<'a>(&'a self, slot: String) -> PortFuture<'a, Result<(), String>> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push(format!("throw({slot})"));
                 Ok(())
@@ -383,19 +389,31 @@ mod tests {
     #[tokio::test]
     async fn move_requires_a_container_to_be_open() {
         let fixture = fixture(false);
-        let closed = invoke(&fixture, json!({"action": "move", "from": 0, "to": 40})).await;
+        let closed = invoke(
+            &fixture,
+            json!({"action": "move", "from": "result", "to": "hotbar 4"}),
+        )
+        .await;
         assert_eq!(closed.status, ToolResultStatus::Error);
         assert!(text_of(&closed).contains("hand use_on"));
         assert!(fixture.door.calls.lock().unwrap().is_empty());
 
         server_opens(&fixture);
-        let moved = invoke(&fixture, json!({"action": "move", "from": 0, "to": 40})).await;
+        let moved = invoke(
+            &fixture,
+            json!({"action": "move", "from": "result", "to": "hotbar 4"}),
+        )
+        .await;
         assert_eq!(moved.status, ToolResultStatus::Success);
-        let thrown = invoke(&fixture, json!({"action": "move", "from": 5, "to": 99})).await;
+        let thrown = invoke(
+            &fixture,
+            json!({"action": "move", "from": "armor head", "to": "drop"}),
+        )
+        .await;
         assert_eq!(thrown.status, ToolResultStatus::Success);
         assert_eq!(
             *fixture.door.calls.lock().unwrap(),
-            vec!["move(0,40)", "throw(5)"]
+            vec!["move(result,hotbar 4)", "throw(armor head)"]
         );
     }
 
@@ -405,26 +423,33 @@ mod tests {
         server_opens(&fixture);
         let moved = invoke(
             &fixture,
-            json!({"action": "move", "from": 37, "to": 2, "count": 1}),
+            json!({"action": "move", "from": "pack 37", "to": "pack 2", "count": 1}),
         )
         .await;
         assert_eq!(moved.status, ToolResultStatus::Success);
-        assert_eq!(*fixture.door.calls.lock().unwrap(), vec!["move(37,2,1)"]);
+        assert_eq!(
+            *fixture.door.calls.lock().unwrap(),
+            vec!["move(pack 37,pack 2,1)"]
+        );
 
         let bad = invoke(
             &fixture,
-            json!({"action": "move", "from": 37, "to": 99, "count": 2}),
+            json!({"action": "move", "from": "pack 37", "to": "drop", "count": 2}),
         )
         .await;
         assert_eq!(bad.status, ToolResultStatus::Error);
-        assert!(text_of(&bad).contains("不能与 99 丢弃连用"));
+        assert!(text_of(&bad).contains("不能与 drop 连用"));
     }
 
     #[tokio::test]
     async fn move_refuses_when_a_different_screen_is_open() {
         let fixture = fixture(false);
         fixture.state.server_open(ScreenKind::Inventory);
-        let result = invoke(&fixture, json!({"action": "move", "from": 1, "to": 2})).await;
+        let result = invoke(
+            &fixture,
+            json!({"action": "move", "from": "pack 1", "to": "pack 2"}),
+        )
+        .await;
         assert_eq!(result.status, ToolResultStatus::Error);
         assert!(text_of(&result).contains("物品栏"));
     }

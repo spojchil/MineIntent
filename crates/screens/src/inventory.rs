@@ -19,7 +19,11 @@ use serde_json::{json, Value};
 use world::SnapshotSource;
 
 /// 丢弃伪格：move(from, 99) = 把 from 整格丢出去（屏内 Ctrl+Q 语义）。只进不出。
-pub const DISCARD_SLOT: u16 = 99;
+/// 丢弃的目标地址。
+///
+/// 旧口径是协议号 99（我们自造的哨兵值）——但格位地址这一套里，「丢出去」本来就
+/// 不是一个格子，写成 `drop` 比一个魔数诚实。
+pub const DISCARD: &str = "drop";
 
 /// 当前开着的屏的种类。一次只能开一个屏（原版事实）；
 /// 谁开谁关，跨屏互斥在这里裁，占用账本只管域。
@@ -99,27 +103,38 @@ pub trait InventoryDoor: Send + Sync {
     /// 合堆、不同=对调），count 拆栈/限量；合法性由机器按两格现状仲裁。
     fn move_slots<'a>(
         &'a self,
-        from: u16,
-        to: u16,
+        from: String,
+        to: String,
         count: Option<u32>,
     ) -> PortFuture<'a, Result<(), String>>;
-    fn throw_slot<'a>(&'a self, slot: u16) -> PortFuture<'a, Result<(), String>>;
+    fn throw_slot<'a>(&'a self, slot: String) -> PortFuture<'a, Result<(), String>>;
     /// 关闭当前开着的服务端容器（发 ContainerClose）。物品栏屏用不到它。
     fn close_container<'a>(&'a self) -> PortFuture<'a, Result<(), String>>;
 }
 
 const TOOL_NAME: &str = "inventory";
 
-const USAGE: &str = "物品栏用法：格号即协议号——0 合成结果（只出不进），1-4 随身合成格（2×2 摆料，\
-成品出现在 0），5-8 盔甲（头/胸/腿/脚），9-35 主背包，36-44 快捷栏，45 副手。\
-{action:\"move\", from, to} 把 from 格的东西弄到 to 格，语义随 to 现状：to 为空=移过去\
+/// 物品栏用法全文。
+///
+/// 格位那一段**从映射自动生成**（`SlotSpace::legend`），不手写——描述与行为分成
+/// 两处写迟早对不上，`mining_status` 就是这么漏的（描述里讲过、schema 的 enum 里
+/// 没有，模型看得见调不动）。
+fn usage() -> String {
+    format!(
+        "物品栏用法：格位用地址，不是数字。{}。\
+**同一个位置在任何界面下都是同一个地址**：开着箱子时 hotbar 3 还是 hotbar 3，\
+select_slot 用的也是这个号。\
+{{action:\"move\", from, to}} 把 from 的东西弄到 to，语义随 to 现状：to 为空=移过去\
 （可加 count 只挪几个，拆栈）；to 是同种物品=倒入合堆（可加 count 只倒几个，装不下的留在原格）；\
-to 是不同物品=整组对调（count 不适用）；to 用 99=把 from 整格丢出去。\
-成品格（0）只能整组取走。非法放置（如盔甲格放非装备）会被世界拒绝。\
-开着物品栏时无法移动或与世界交互。";
+to 是不同物品=整组对调（count 不适用）；to 写 {DISCARD}=把 from 整格丢出去。\
+result 只能整组取走。非法放置（如盔甲格放非装备）会被世界拒绝。\
+开着物品栏时无法移动或与世界交互。",
+        world::slots::SlotSpace::player().legend()
+    )
+}
 
 /// 开屏时代替用法全文的一行指路。
-const USAGE_POINTER: &str = "（格号语义与 move 的用法：{\"action\":\"describe\"}）";
+const USAGE_POINTER: &str = "（格位地址与 move 的用法：{\"action\":\"describe\"}）";
 
 pub struct InventoryScreen {
     occupancy: Arc<Occupancy>,
@@ -163,7 +178,7 @@ impl InventoryScreen {
 
     /// 用法全文按需取。
     fn describe(&self, call_id: agent::ToolCallId) -> ToolResult {
-        ToolResult::success(call_id, vec![ContentPart::text(USAGE.to_owned())])
+        ToolResult::success(call_id, vec![ContentPart::text(usage())])
     }
 
     async fn move_items(
@@ -176,9 +191,12 @@ impl InventoryScreen {
         if self.state.current() != Some(ScreenKind::Inventory) {
             return ToolResult::failure(call_id, "物品栏没有打开；先 open");
         }
-        let slot = |value: Option<&Value>| value.and_then(Value::as_u64).map(|slot| slot as u16);
+        let slot = |value: Option<&Value>| value.and_then(Value::as_str).map(str::to_owned);
         let (Some(from), Some(to)) = (slot(from), slot(to)) else {
-            return ToolResult::failure(call_id, "move 需要整数参数 from 与 to；请改写调用");
+            return ToolResult::failure(
+                call_id,
+                "move 需要 from 与 to 两个格位地址（如 \"pack 3\"、\"hotbar 0\"）；请改写调用",
+            );
         };
         let count = match count {
             None => None,
@@ -189,23 +207,23 @@ impl InventoryScreen {
                 }
             },
         };
-        if count.is_some() && to == DISCARD_SLOT {
+        if count.is_some() && to == DISCARD {
             return ToolResult::failure(
                 call_id,
-                "count 不能与 99 丢弃连用（丢弃是整格）；请改写调用",
+                "count 不能与 drop 连用（丢弃是整格）；请改写调用",
             );
         }
-        let outcome = if to == DISCARD_SLOT {
-            self.door.throw_slot(from).await
+        let outcome = if to == DISCARD {
+            self.door.throw_slot(from.clone()).await
         } else {
-            self.door.move_slots(from, to, count).await
+            self.door.move_slots(from.clone(), to.clone(), count).await
         };
         if let Err(reason) = outcome {
             return ToolResult::failure(call_id, reason);
         }
         // 回执只说动作结论，不报格位现状（理由见 container.rs 同处注释：
         // 读的是上一 tick 的快照，且格位现状是事实、归快照与格位变化窗）。
-        let summary = if to == DISCARD_SLOT {
+        let summary = if to == DISCARD {
             format!("已丢弃格 {from}")
         } else {
             "已完成".to_owned()
@@ -232,8 +250,8 @@ impl dispatch::ToolProvider for InventoryScreen {
                         "enum": ["open", "describe", "move", "close"],
                         "description": "open=打开并列出全部格位；describe=取格号语义与 move 的完整用法（不随开屏自动给，要看自己取）；move=把 from 格的东西弄到 to 格（移动/合堆/对调）；close=关闭"
                     },
-                    "from": { "type": "integer", "description": "move 用：来源格号（0-45）" },
-                    "to": { "type": "integer", "description": "move 用：目标格号（0-45）——空=移过去、同种物品=倒入合堆、不同物品=整组对调；99=把 from 整格丢出去" },
+                    "from": { "type": "string", "description": format!("move 用：来源格位地址，照清单上写的抄。{}", world::slots::SlotSpace::player().legend()) },
+                    "to": { "type": "string", "description": format!("move 用：目标格位地址——空=移过去、同种物品=倒入合堆、不同物品=整组对调；写 {DISCARD}=把 from 整格丢出去") },
                     "count": { "type": "integer", "description": "move 可选：只挪/只倒这么多个（to 为空或同种物品时）；不给则整组" }
                 },
                 "required": ["action"],
@@ -242,7 +260,9 @@ impl dispatch::ToolProvider for InventoryScreen {
         );
         definition.description = Some(
             "物品栏。打开才能看到格位并整理（搬动/合堆/穿装备/摆随身合成/丢弃）；\
-打开期间无法移动或与世界交互，看完记得关。"
+打开期间无法移动或与世界交互，看完记得关。\
+**一条消息里可以连发多个动作**——想好整套摆法就一次发全，比一次一格来回等快得多，\
+也不会看到摆到一半的中间产物。"
                 .to_owned(),
         );
         vec![(
@@ -298,8 +318,8 @@ mod tests {
     impl InventoryDoor for RecordingDoor {
         fn move_slots<'a>(
             &'a self,
-            from: u16,
-            to: u16,
+            from: String,
+            to: String,
             count: Option<u32>,
         ) -> PortFuture<'a, Result<(), String>> {
             Box::pin(async move {
@@ -314,7 +334,7 @@ mod tests {
                 Ok(())
             })
         }
-        fn throw_slot<'a>(&'a self, slot: u16) -> PortFuture<'a, Result<(), String>> {
+        fn throw_slot<'a>(&'a self, slot: String) -> PortFuture<'a, Result<(), String>> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push(format!("throw({slot})"));
                 Ok(())
@@ -398,7 +418,7 @@ mod tests {
         let result = invoke(&fixture, json!({"action": "open"})).await;
         assert_eq!(result.status, ToolResultStatus::Success);
         let text = text_of(&result);
-        assert!(text.contains("10=diamond ×3"), "{text}");
+        assert!(text.contains("pack 1=diamond ×3"), "{text}");
         assert!(!text.contains("物品栏用法"), "开屏不该带用法全文：{text}");
         assert!(text.contains("describe"), "但要指得出路：{text}");
         assert!(fixture.occupancy.is_occupied(Domain::Screen));
@@ -414,7 +434,9 @@ mod tests {
         assert_eq!(described.status, ToolResultStatus::Success);
         let text = text_of(&described);
         assert!(text.contains("物品栏用法"), "{text}");
-        assert!(text.contains("成品格（0）只能整组取走"), "{text}");
+        assert!(text.contains("result 只能整组取走"), "{text}");
+        // 格位那一段是**生成**的，不是手写的——描述与行为不会各说各话。
+        assert!(text.contains("hotbar 0-8"), "{text}");
         // 指路那行提到的动作名与真实动作对得上。
         assert!(opened.contains("\"action\":\"describe\""), "{opened}");
     }
@@ -422,24 +444,40 @@ mod tests {
     #[tokio::test]
     async fn move_requires_open_then_reaches_the_door() {
         let fixture = fixture(None);
-        let closed = invoke(&fixture, json!({"action": "move", "from": 10, "to": 38})).await;
+        let closed = invoke(
+            &fixture,
+            json!({"action": "move", "from": "pack 1", "to": "hotbar 2"}),
+        )
+        .await;
         assert_eq!(closed.status, ToolResultStatus::Error);
         assert!(fixture.door.calls.lock().unwrap().is_empty());
 
         invoke(&fixture, json!({"action": "open"})).await;
-        let moved = invoke(&fixture, json!({"action": "move", "from": 10, "to": 38})).await;
+        let moved = invoke(
+            &fixture,
+            json!({"action": "move", "from": "pack 1", "to": "hotbar 2"}),
+        )
+        .await;
         assert_eq!(moved.status, ToolResultStatus::Success);
         let counted = invoke(
             &fixture,
-            json!({"action": "move", "from": 10, "to": 20, "count": 3}),
+            json!({"action": "move", "from": "pack 1", "to": "pack 11", "count": 3}),
         )
         .await;
         assert_eq!(counted.status, ToolResultStatus::Success);
-        let thrown = invoke(&fixture, json!({"action": "move", "from": 10, "to": 99})).await;
+        let thrown = invoke(
+            &fixture,
+            json!({"action": "move", "from": "pack 1", "to": "drop"}),
+        )
+        .await;
         assert_eq!(thrown.status, ToolResultStatus::Success);
         assert_eq!(
             *fixture.door.calls.lock().unwrap(),
-            vec!["move(10,38)", "move(10,20,3)", "throw(10)"]
+            vec![
+                "move(pack 1,hotbar 2)",
+                "move(pack 1,pack 11,3)",
+                "throw(pack 1)"
+            ]
         );
     }
 
@@ -447,7 +485,11 @@ mod tests {
     async fn door_refusal_comes_back_verbatim() {
         let fixture = fixture(Some("盔甲格只收对应装备"));
         invoke(&fixture, json!({"action": "open"})).await;
-        let result = invoke(&fixture, json!({"action": "move", "from": 10, "to": 5})).await;
+        let result = invoke(
+            &fixture,
+            json!({"action": "move", "from": "pack 1", "to": "armor head"}),
+        )
+        .await;
         assert_eq!(result.status, ToolResultStatus::Error);
         assert!(text_of(&result).contains("盔甲格只收对应装备"));
     }

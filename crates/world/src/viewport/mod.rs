@@ -128,6 +128,24 @@ pub struct ViewportOptions {
     pub predicate: VisibilityPredicate,
 }
 
+impl ViewportOptions {
+    /// 给**记忆**用的参数：判据不变，预算放开。
+    ///
+    /// `block_limit` 是**呈现**预算——模型读不了一万行，所以默认只留最近的 256 格。
+    /// 记忆没有这个问题：它是给机器读的（寻路）与按需查的（`blocks`），一次吸多少
+    /// 只影响内存与 CPU，不影响可读性。此前眼睛走的是默认参数，于是**远处看得见的
+    /// 方块从来没被记住过**——那是纯粹的损失。
+    ///
+    /// 视锥角度与遮挡判据**照旧不动**：那是合法性本身，放开它就等于让同伴看见它没
+    /// 看的地方。放开的只有「一次记多少」。
+    pub fn for_memory() -> Self {
+        Self {
+            block_limit: 65_536,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for ViewportOptions {
     fn default() -> Self {
         Self {
@@ -213,7 +231,10 @@ impl ViewportOptions {
         if self.vertical_half_angle >= PI / 2.0 || self.horizontal_half_angle >= PI / 2.0 {
             return Err("viewport 视锥半角必须小于 90 度".to_owned());
         }
-        if self.block_limit > 4_096 || self.entity_limit > 256 {
+        // 上限是防**模型**乱传的护栏（它的 scan 参数里根本没有这一项，所以实际
+        // 只挡内部误用）。记忆那条路要把整个可见集收进来，4 096 挡得住它——
+        // 抬到 64 Ki，够一次 160 格视野的量级，同时仍然拦得住离谱值。
+        if self.block_limit > 65_536 || self.entity_limit > 256 {
             return Err("viewport 结果上限过大".to_owned());
         }
         Ok(())

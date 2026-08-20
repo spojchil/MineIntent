@@ -29,7 +29,7 @@ publish = false
 # 次编译中的 feature 取并集：分开声明只会让「构建口径不同、azalea 编出来的
 # 东西也不同」，`-p world` 与 `--workspace` 得到两套指纹，来回切就整棵重编。
 # 现在只有一个消费者，统一声明既真实又省事。
-azalea = { git = "https://github.com/spojchil/azalea", rev = "d0cc847fa3c9e0d448e42b9636c7bd8684c5aa08", default-features = false, features = [
+azalea = { git = "https://github.com/spojchil/azalea", rev = "6ebf6b7efe196baad8fbbe6c8fbed165a72facc4", default-features = false, features = [
     "log",
     "packet-event",
 ] }
@@ -66,3 +66,4 @@ unsafe_code = "deny"
 [workspace.lints.clippy]
 # 与既有代码风格一致：字符串字面量统一 to_owned。
 str_to_string = "warn"
+

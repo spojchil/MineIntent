@@ -25,7 +25,10 @@ const PLACEHOLDER_PERSONA: &str = "\
 并不会真的告诉任何人。要开口，必须调用工具 chat_box，例如\
 {\"action\":\"say\",\"text\":\"你好\"}；不调用它就等于保持沉默。\
 想记住什么就用 remember 改写你的记忆。别人对你说的话会传到你这里；\
-真的想安静时，不调用任何工具即可。";
+真的想安静时，不调用任何工具即可。\
+另外：这套身体和工具还在开发中。哪里用起来别扭、和你的直觉相反、\
+回执说的和实际发生的对不上，或者你觉得换个做法会更顺手——都直接讲出来。\
+维护者读得到你的内心独白，这类反馈比我们自己猜有用得多。";
 
 // ---- 各门的哑实现：只为构造工具定义与调用样例，永不触碰世界 ----
 
@@ -47,13 +50,13 @@ impl ChatHistory for NoDoor {
 impl InventoryDoor for NoDoor {
     fn move_slots<'a>(
         &'a self,
-        _from: u16,
-        _to: u16,
+        _from: String,
+        _to: String,
         _count: Option<u32>,
     ) -> PortFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
-    fn throw_slot<'a>(&'a self, _slot: u16) -> PortFuture<'a, Result<(), String>> {
+    fn throw_slot<'a>(&'a self, _slot: String) -> PortFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
     fn close_container<'a>(&'a self) -> PortFuture<'a, Result<(), String>> {
@@ -97,6 +100,9 @@ impl hand::HandDoor for NoDoor {
         Box::pin(async { None })
     }
     fn place<'a>(&'a self, _b: [i32; 3]) -> PortFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn pillar_up<'a>(&'a self, _count: usize) -> PortFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
     fn use_on_block<'a>(&'a self, _b: [i32; 3]) -> PortFuture<'a, Result<(), String>> {
@@ -488,6 +494,7 @@ async fn main() {
             Box::new(perception::PerceptionTools::new(
                 door.clone(),
                 Arc::new(std::sync::Mutex::new(world::BlockMemory::new())),
+                snapshots.clone(),
             )),
         ),
     ];
@@ -736,7 +743,7 @@ async fn main() {
             job: world::JobKind::MoveTo {
                 destination: [35, 72, 3],
             },
-            outcome,
+            event: world::JobEvent::Finished(outcome),
         };
         let delivered = matches!(
             outcome,
@@ -845,17 +852,13 @@ async fn main() {
     }
     println!("- 被服务器关闭（非自己 close 的回声）：`容器界面被关闭了（crafting）。`");
 
-    // ---- 六、压缩（上下文满时的模型交互） ----
-    println!("\n## 六、上下文压缩（满时对模型的指令与结果包裹）\n");
-    println!(
-        "压缩指令全文（system，后接【长期记忆现文】与被压缩对话）：\n\n```text\n{}\n```\n",
-        context::COMPACTION_INSTRUCTIONS
-    );
-    println!("收尾催告（user）：`请按上面的规则输出压缩 JSON。`\n");
-    println!(
-        "压缩成功后新对话开头的摘要包裹（user）：\n\n```text\n{}\n（摘要正文）\n```",
-        context::SUMMARY_PREFIX
-    );
+    // ---- 六、压缩 ----
+    println!("\n## 六、上下文压缩\n");
+    println!("**当前是空实现：对话原样交回，模型看不到任何压缩相关的文本。**\n");
+    println!("此处此前导出的是一份压缩指令（要模型交回 `{{memory_full_text, summary}}`），");
+    println!("那一版形态被判定为错——压缩与长期记忆无关，且改写对话本身就让前缀缓存整体");
+    println!("失效。摘掉后重设计，材料在 `docs/compaction-decision.md`。\n");
+    println!("压缩线设在服务商上下文窗口的 95%，越线当前什么也不会发生（观察点）。");
 
     let _ = std::fs::remove_dir_all(&scratch);
 }

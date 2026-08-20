@@ -23,6 +23,18 @@ workspace = true
 # 工作区跑法只是被 companion 的特性统一掩着,这里把依赖说破。
 
 [[example]]
+name = "diff_mix_probe"
+required-features = ["azalea"]
+
+[[example]]
+name = "legal_path_probe"
+required-features = ["azalea"]
+
+[[example]]
+name = "pillar_probe"
+required-features = ["azalea"]
+
+[[example]]
 name = "scan_bench_probe"
 required-features = ["azalea"]
 

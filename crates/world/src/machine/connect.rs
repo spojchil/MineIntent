@@ -252,8 +252,10 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                 let outcome = run_command(inner, &bot, pending_command.command);
                 let _ = pending_command.ack.send(outcome);
             }
+            super::observed::tick(inner, &bot);
             poll_movement_job(inner, &bot);
             super::mining::poll_mining_job(inner, &bot);
+            super::pillar::poll_pillar_job(inner, &bot);
             // 与容器组件对账：开/关变迁产屏事实（use_on 触发的服务端开屏
             // 也从这里被看见）。
             let open_screen = bot
