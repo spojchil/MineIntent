@@ -13,6 +13,7 @@
 | 动后台 job / 事件通道 / 自身受伤前 | [后台 job 模型：讨论记录与前置调查](./background-job-design-notes.md) |
 | 裁决「空闲时什么该唤醒同伴」 | [唤醒判据：裁决材料](./wake-criterion-decision.md) |
 | 裁决上下文压缩 | [上下文压缩：裁决材料](./compaction-decision.md) |
+| 改动轮末帧装什么 | [轮末帧段清单：已裁内容与迁移丢件](./frame-segments-decision.md) |
 | 准备贡献 | [贡献流程](../CONTRIBUTING.md) |
 
 ## 文件权威等级
@@ -30,6 +31,7 @@
 | [`docs/background-job-design-notes.md`](./background-job-design-notes.md) | 后台 job 模型的讨论记录、azalea 能力调查与待决清单 | 无 |
 | [`docs/wake-criterion-decision.md`](./wake-criterion-decision.md) | 唤醒判据的现状、封闭候选集、约束与互斥选项，供维护者裁决 | 无 |
 | [`docs/compaction-decision.md`](./compaction-decision.md) | 上下文压缩的已下裁定、业界调查、上下文构成实测清册与未裁清单 | 无 |
+| [`docs/frame-segments-decision.md`](./frame-segments-decision.md) | 轮末帧段清单的已裁内容与出处、当前实现差距、「处境」命名的追查记录与未决清单 | 无 |
 | [`README.md`](../README.md) | 项目导航和最短启动 | 无 |
 | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | 人类贡献工作流 | 无 |
 | [`CLAUDE.md`](../CLAUDE.md) | 开发代理工作规则 | 无 |
