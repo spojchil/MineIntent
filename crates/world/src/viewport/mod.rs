@@ -128,6 +128,24 @@ pub struct ViewportOptions {
     pub predicate: VisibilityPredicate,
 }
 
+impl ViewportOptions {
+    /// 给**记忆**用的参数：判据不变，预算放开。
+    ///
+    /// `block_limit` 是**呈现**预算——模型读不了一万行，所以默认只留最近的 256 格。
+    /// 记忆没有这个问题：它是给机器读的（寻路）与按需查的（`blocks`），一次吸多少
+    /// 只影响内存与 CPU，不影响可读性。此前眼睛走的是默认参数，于是**远处看得见的
+    /// 方块从来没被记住过**——那是纯粹的损失。
+    ///
+    /// 视锥角度与遮挡判据**照旧不动**：那是合法性本身，放开它就等于让同伴看见它没
+    /// 看的地方。放开的只有「一次记多少」。
+    pub fn for_memory() -> Self {
+        Self {
+            block_limit: usize::MAX,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for ViewportOptions {
     fn default() -> Self {
         Self {

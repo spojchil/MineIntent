@@ -308,6 +308,31 @@ impl Module {
         )
     }
 
+    /// 睁眼一次：把合法可见的方块整份写进记忆，返回吸收了多少格。
+    ///
+    /// 眼睛走这条路而不是 [`Self::scan_changes`]：**差异没有消费者了**。方块不进
+    /// 会话区之后（裁定五），记忆只需要「把看见的收进来」，不需要知道哪些是新的。
+    /// 实测差异那一层是 +3.7ms / 35%（8.8ms → 13.3ms），省下来是白赚的。
+    ///
+    /// 差异那套代码**保留不动**：将来做订阅（「盯着这个熔炉」）时，它就是原料；
+    /// 而且 `scan` 工具的 `changes` 模式现在仍然在用它。
+    pub fn absorb(
+        &self,
+        memory: &std::sync::Mutex<crate::BlockMemory>,
+        options: &crate::ViewportOptions,
+    ) -> Result<usize, String> {
+        let projection = self.scan(options)?;
+        let mut memory = memory.lock().map_err(|_| "方块记忆锁中毒".to_owned())?;
+        memory.absorb_visible(&projection.visible_blocks.blocks);
+        for block in [&projection.standing_on_block, &projection.looked_at_block]
+            .into_iter()
+            .flatten()
+        {
+            memory.absorb_visible(std::slice::from_ref(block));
+        }
+        Ok(projection.visible_blocks.blocks.len())
+    }
+
     pub fn scan_changes(
         &self,
         memory: &std::sync::Mutex<crate::BlockMemory>,

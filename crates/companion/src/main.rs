@@ -32,13 +32,20 @@ use situation::SituationTracker;
 use wake::{ScreenDirective, SelfIdentity, WakeCursors};
 
 /// 人设占位（Q01 未裁；正式文本由维护者给出后替换）。
+///
+/// 末尾那句「开发中，欢迎反馈」是**开发阶段专用**，正式上线前删掉。它存在的理由：
+/// 实机测试的三种信息来源里，「问模型原因」是唯一能解释「为什么它那样做」的一种，
+/// 而它此前只能靠我们事后翻转录去猜。让它自己说「这里反直觉」，比我们猜准得多。
 const PLACEHOLDER_PERSONA: &str = "\
 你是这个 Minecraft 世界里的一位同伴，说中文。\
 重要：你直接写出的文字只是内心独白，世界里没有任何人能看到——写\"我告诉了他\"\
 并不会真的告诉任何人。要开口，必须调用工具 chat_box，例如\
 {\"action\":\"say\",\"text\":\"你好\"}；不调用它就等于保持沉默。\
 想记住什么就用 remember 改写你的记忆。别人对你说的话会传到你这里；\
-真的想安静时，不调用任何工具即可。";
+真的想安静时，不调用任何工具即可。\
+另外：这套身体和工具还在开发中。哪里用起来别扭、和你的直觉相反、\
+回执说的和实际发生的对不上，或者你觉得换个做法会更顺手——都直接讲出来。\
+维护者读得到你的内心独白，这类反馈比我们自己猜有用得多。";
 
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_owned())
@@ -442,7 +449,10 @@ impl agent::ContentObserver for TraceObserver {
     }
 }
 
-/// 增量帧的自适应节律。
+/// 眼睛的自适应节律。
+///
+/// 一次投影就是一整幅视口——纯 CPU 重活。它现在**只为记忆服务**（方块不进会话区），
+/// 但快慢仍然要按实测让路：拍一个常数在密林里会把 tick 处理拖垮，在旷野里又白等。
 ///
 /// 一次增量就是一整幅视口投影——纯 CPU 重活，耗时随视野里方块多少浮动，
 /// 拍一个常数（比如「每 5 tick」）在密林里会把 tick 处理拖垮，在旷野里又
@@ -541,7 +551,7 @@ impl FramePace {
     }
 }
 
-/// 轮末帧观察端：只在一轮模型响应落定（AttemptCommitted）时发信号；
+/// 眼睛的第二个触发源：一轮模型响应落定（AttemptCommitted）时发信号；
 /// 收集与投递在旁路任务做——观察端契约要求快速返回。
 struct RoundEndSignal(tokio::sync::mpsc::UnboundedSender<()>);
 
@@ -600,7 +610,7 @@ async fn main() -> Result<(), String> {
     // 增量呈现与寻路合法域随后也读写这一本。
     let block_memory = Arc::new(std::sync::Mutex::new(world::BlockMemory::new()));
     // 合法寻路：寻路只按这本记忆里观察过的方块规划，不再读服务端推来的全量世界。
-    // 必须是同一本——轮末帧每 250ms 往里推进增量，寻路要看到的正是那一份。
+    // 必须是同一本——眼睛每 250ms 把看见的写进去，寻路要读的正是那一份。
     module.use_observed_pathfinding(block_memory.clone());
     println!("[组合根] 合法寻路：只按观察过的方块规划路线");
     let read_mark = Arc::new(ChatReadMark::new());
@@ -670,9 +680,19 @@ async fn main() -> Result<(), String> {
     // 前缀只有人设与记忆——两者都不逐轮变，吃满前缀缓存。处境不在这里：
     // 它每轮都变，随帧追加在对话末尾（见 `situation` 模块的账）。
     let strategy = Arc::new(ContextStrategy::new(persona, memory_file));
-    // 轮末帧（维护者裁定：模式=增量）：每轮模型响应落定后收集一次
-    // 「与记忆的差异」，非空则以 Passive 投递——Passive 不叫醒空闲会话
-    // （帧从不引发轮，只搭现有轮的车），信箱耐久故收集时即推进记忆。
+    // 眼睛：持续把**合法可见**的方块写进记忆。
+    //
+    // 这个循环以前叫「轮末帧」，任务是把方块差异送给模型。方块不再进会话区之后
+    // （裁定五），它的身份变了——**它是眼睛，不是帧**：视口判据（视锥 + 遮挡 +
+    // ExposedFace）决定什么算看过，看过的自动进 BlockMemory，模型既不花轮次、也
+    // 看不见这个过程。就像人不「决定去看」，睁着眼东西就自己进了记忆。
+    //
+    // 视口因此仍然不可少，但角色是**合法性守门人**而非呈现：直接吸收服务端推来的
+    // 已加载区块会让记忆退化成「服务端给了什么」，今天刚从寻路里赶出去的开挂就会
+    // 从记忆的后门回来。
+    //
+    // 顺带还投递两样**非方块**的东西：处境变了的那几行、在途 job 的进展。它们便宜，
+    // 且只在真有内容时才发。
     let (round_end_tx, mut round_end_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let mut assembled = AgentSession::new(
         strategy.clone(),
@@ -729,26 +749,24 @@ async fn main() -> Result<(), String> {
                 let scan_module = module.clone();
                 let scan_memory = block_memory.clone();
                 // 两个时长，别混：
-                //   work  —— 投影本身（闭包内计时）。这才是「一次增量多少毫秒」。
-                //   round —— 派发 + 在阻塞池排队 + 执行 + join。节律该按它退让，
-                //            因为系统忙的时候排队就是真实代价。
-                // 此前只量 round 却标成「本次投影」——名不副实，先分开再说。
-                // 分开后实测：排队开销 ≈0ms（1000 次采样，work 与 round 均值同为
-                // 26ms）。所以实盘 26ms 全是计算，与空闲基准 13.3ms 的差距来自
-                // 场景而非调度：实盘投影在 7~122ms 之间随视野内容浮动。
-                // 两个数留着，是因为阻塞池一旦真忙起来它们会分开，而节律要跟着退。
+                //   work  —— 投影本身（闭包内计时）。
+                //   round —— 派发 + 在阻塞池排队 + 执行 + join。节律按它退让。
+                // 分开后实测排队开销 ≈0ms（1000 次采样，两者均值同为 26ms）；两个数
+                // 留着，是因为阻塞池一旦真忙起来它们会分开，而节律要跟着退。
                 let dispatched = std::time::Instant::now();
                 let outcome = tokio::task::spawn_blocking(move || {
                     let at = std::time::Instant::now();
-                    let changes =
-                        scan_module.scan_changes(&scan_memory, &world::ViewportOptions::default());
-                    (changes, at.elapsed())
+                    // 全量吸收，不算差异——差异没有消费者了（见 Module::absorb）。
+                    // 参数用 for_memory：判据不动，只把「一次记多少」的呈现预算放开。
+                    let absorbed =
+                        scan_module.absorb(&scan_memory, &world::ViewportOptions::for_memory());
+                    (absorbed, at.elapsed())
                 })
                 .await;
                 let round = dispatched.elapsed();
-                let (changes, work) = match outcome {
-                    Ok((changes, work)) => (Ok(changes), work),
-                    Err(error) => (Err(error), std::time::Duration::ZERO),
+                let (absorbed, work) = match outcome {
+                    Ok((absorbed, work)) => (absorbed, work),
+                    Err(_) => (Ok(0), std::time::Duration::ZERO),
                 };
                 pace.record(work, round);
                 if let Some(report) = pace.due_report() {
@@ -756,10 +774,7 @@ async fn main() -> Result<(), String> {
                 }
 
                 // 未连接/世界未就绪等如实拒绝：静默跳过，不是错误。
-                let Ok(Ok(changes)) = changes else { continue };
-                if changes.is_empty() {
-                    continue;
-                }
+                let Ok(absorbed) = absorbed else { continue };
                 // 处境搭这趟车。**触发仍然只看方块差异**：处境里的位置与附近实体
                 // 几乎每帧都变，让它自己触发就等于在原地站着也每 250ms 叫醒一次。
                 // 这里保守——「日常与事件的分界画在通道上」那条待裁（见
@@ -798,9 +813,8 @@ async fn main() -> Result<(), String> {
                 }
                 let text = sections.join("\n");
                 println!(
-                    "[组合根] 增量帧：{} 行（方块 {} 条只入记忆，不投递）（投影 {}ms，含排队 {}ms，均值 {}ms，下次间隔 {}ms）",
+                    "[组合根] 投递 {} 行（本次看进记忆 {absorbed} 格；投影 {}ms，含排队 {}ms，均值 {}ms，下次间隔 {}ms）",
                     sections.len(),
-                    changes.len(),
                     work.as_millis(),
                     round.as_millis(),
                     pace.average().as_millis(),
@@ -811,7 +825,7 @@ async fn main() -> Result<(), String> {
                 // 挖穿、别人动土、熔炉灭火都在这条通道上。忙时它排在轮末，
                 // 天然与进行中的轮合并，不插队。
                 if let Err(rejected) = session.enqueue(MailboxInput::when_idle(vec![item])).await {
-                    eprintln!("[组合根] 增量帧被拒：{:?}", rejected.reason);
+                    eprintln!("[组合根] 投递被拒：{:?}", rejected.reason);
                 }
             }
         });
