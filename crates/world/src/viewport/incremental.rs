@@ -66,6 +66,14 @@ impl BlockMemory {
         self.facts.get(&at)
     }
 
+    /// 遍历记住的每一格。
+    ///
+    /// 给**查询**用：模型问「附近有什么树」时，机器在这本记忆里找，而不是去翻
+    /// 实时世界——只答得出观察过的东西，与合法信息边界天然一致。
+    pub fn iter(&self) -> impl Iterator<Item = ([i32; 3], &BlockFact)> {
+        self.facts.iter().map(|(at, fact)| (*at, fact))
+    }
+
     pub fn len(&self) -> usize {
         self.facts.len()
     }

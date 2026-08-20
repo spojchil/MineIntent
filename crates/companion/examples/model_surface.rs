@@ -491,6 +491,7 @@ async fn main() {
             Box::new(perception::PerceptionTools::new(
                 door.clone(),
                 Arc::new(std::sync::Mutex::new(world::BlockMemory::new())),
+                snapshots.clone(),
             )),
         ),
     ];

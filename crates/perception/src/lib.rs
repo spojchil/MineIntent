@@ -25,10 +25,14 @@ pub trait ViewportDoor: Send + Sync {
     fn scan_changes<'a>(&'a self) -> PortFuture<'a, Result<Vec<world::BlockChange>, String>>;
 }
 
+mod blocks;
+
 const TOOL_NAME: &str = "scan";
 
 pub struct PerceptionTools {
     door: Arc<dyn ViewportDoor>,
+    /// 记忆库查询要知道「离我多远、什么方位」，所以要拿得到自身位置。
+    blocks: blocks::BlocksQuery,
     /// 方块记忆（组合根注入的共享认知状态）：scan 的回执送达模型即成为
     /// 「模型知道的事实」，在此吸收。内核的 settled 通道保证已定回执必达，
     /// 所以产出时上账即可，不需要请求级 commit 钩子。
@@ -36,8 +40,16 @@ pub struct PerceptionTools {
 }
 
 impl PerceptionTools {
-    pub fn new(door: Arc<dyn ViewportDoor>, memory: Arc<Mutex<BlockMemory>>) -> Self {
-        Self { door, memory }
+    pub fn new(
+        door: Arc<dyn ViewportDoor>,
+        memory: Arc<Mutex<BlockMemory>>,
+        snapshots: Arc<dyn world::SnapshotSource>,
+    ) -> Self {
+        Self {
+            door,
+            blocks: blocks::BlocksQuery::new(memory.clone(), snapshots),
+            memory,
+        }
     }
 
     fn absorb_projection(&self, projection: &ViewportProjection) {
@@ -180,11 +192,25 @@ impl ToolProvider for PerceptionTools {
 增量（changes，与已见过的对比只报差异）。不打断任何动作。"
                 .to_owned(),
         );
-        vec![(definition, ToolClass::Free)]
+        let mut library = ToolDefinition::new(blocks::TOOL_NAME, blocks::schema());
+        library.description = Some(blocks::DESCRIPTION.to_owned());
+        vec![(definition, ToolClass::Free), (library, ToolClass::Free)]
     }
 
     fn call<'a>(&'a self, call: ToolCall) -> PortFuture<'a, ToolResult> {
-        Box::pin(async move { self.dispatch(call).await })
+        Box::pin(async move {
+            if call.name.as_str() == blocks::TOOL_NAME {
+                let call_id = call.id.clone();
+                let Some(arguments) = call.arguments.as_object() else {
+                    return ToolResult::failure(call_id, "参数必须是 JSON 对象；请改写调用");
+                };
+                return match self.blocks.answer(arguments) {
+                    Ok(text) => ToolResult::success(call_id, vec![agent::ContentPart::text(text)]),
+                    Err(reason) => ToolResult::failure(call_id, reason),
+                };
+            }
+            self.dispatch(call).await
+        })
     }
 }
 
@@ -194,6 +220,18 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    struct HereSnapshots;
+
+    impl world::SnapshotSource for HereSnapshots {
+        fn latest(&self) -> Arc<world::TickSnapshot> {
+            Arc::new(world::TickSnapshot::empty(
+                world::Epoch(1),
+                0,
+                world::ConnectionPhase::Ready,
+            ))
+        }
+    }
 
     struct CannedDoor;
 
@@ -262,7 +300,11 @@ mod tests {
     fn tools_with_memory() -> (PerceptionTools, Arc<Mutex<BlockMemory>>) {
         let memory = Arc::new(Mutex::new(BlockMemory::new()));
         (
-            PerceptionTools::new(Arc::new(CannedDoor), memory.clone()),
+            PerceptionTools::new(
+                Arc::new(CannedDoor),
+                memory.clone(),
+                Arc::new(HereSnapshots),
+            ),
             memory,
         )
     }
@@ -318,12 +360,22 @@ mod tests {
         assert_eq!(facts.get([1, 64, -3]).unwrap().name, "stone");
     }
 
+    /// 看与查是两件事，都不占身体。
+    ///
+    /// `scan` 是睁眼——把视野吸进记忆；`blocks` 是查那本记忆。分成两个工具而不是
+    /// 一个工具的两个动作，是因为它们的失败方式完全不同：睁眼会被遮挡与距离限制，
+    /// 查记忆只会「没看过」。
     #[test]
-    fn registers_one_free_tool() {
+    fn registers_two_free_tools() {
         let (tools, _) = tools_with_memory();
         let registered = ToolProvider::tools(&tools);
-        assert_eq!(registered.len(), 1);
-        assert_eq!(registered[0].0.name.as_str(), "scan");
-        assert_eq!(registered[0].1, ToolClass::Free);
+        let names: Vec<&str> = registered
+            .iter()
+            .map(|(definition, _)| definition.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["scan", "blocks"]);
+        assert!(registered
+            .iter()
+            .all(|(_, class)| *class == ToolClass::Free));
     }
 }

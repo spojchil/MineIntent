@@ -637,6 +637,7 @@ async fn main() -> Result<(), String> {
                 block_memory: block_memory.clone(),
             }),
             block_memory.clone(),
+            snapshots.clone(),
         )),
         Arc::new(PresenceTools::new(Arc::new(ModulePresenceDoor(
             module.clone(),
@@ -782,11 +783,23 @@ async fn main() -> Result<(), String> {
                         sections.push(render::render_job_entry(entry));
                     }
                 }
-                let situation_lines = sections.len();
-                sections.push(render::render_block_changes(&changes));
+                // **方块信息不进会话区**（维护者裁定，2026-08-20）：diff 照常算、照常
+                // 推进记忆——那是给机器用的（寻路读它，`blocks` 工具查它）——但一格
+                // 都不推给模型。
+                //
+                // 账：3 分钟 164 帧、4,876 条差异，输入峰值 111,617；按 10.5 token/格
+                // 折算，半个 1M 窗口只装得下约 4.8 万格，而站着转两分钟就攒 7,040 格。
+                // 逐格进上下文在数学上就走不通，不是优化得好不好的问题。
+                //
+                // 模型要方块就自己 `scan`（睁眼，填记忆）再查记忆库——就像我改代码时
+                // 从不加载整个仓库，而是 grep 到行号再读那几行。
+                if sections.is_empty() {
+                    continue;
+                }
                 let text = sections.join("\n");
                 println!(
-                    "[组合根] 增量帧：{} 条差异 + {situation_lines} 行处境（投影 {}ms，含排队 {}ms，均值 {}ms，下次间隔 {}ms）",
+                    "[组合根] 增量帧：{} 行（方块 {} 条只入记忆，不投递）（投影 {}ms，含排队 {}ms，均值 {}ms，下次间隔 {}ms）",
+                    sections.len(),
                     changes.len(),
                     work.as_millis(),
                     round.as_millis(),
