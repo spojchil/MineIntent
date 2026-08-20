@@ -140,7 +140,7 @@ impl ViewportOptions {
     /// 看的地方。放开的只有「一次记多少」。
     pub fn for_memory() -> Self {
         Self {
-            block_limit: usize::MAX,
+            block_limit: 65_536,
             ..Self::default()
         }
     }
@@ -231,7 +231,10 @@ impl ViewportOptions {
         if self.vertical_half_angle >= PI / 2.0 || self.horizontal_half_angle >= PI / 2.0 {
             return Err("viewport 视锥半角必须小于 90 度".to_owned());
         }
-        if self.block_limit > 4_096 || self.entity_limit > 256 {
+        // 上限是防**模型**乱传的护栏（它的 scan 参数里根本没有这一项，所以实际
+        // 只挡内部误用）。记忆那条路要把整个可见集收进来，4 096 挡得住它——
+        // 抬到 64 Ki，够一次 160 格视野的量级，同时仍然拦得住离谱值。
+        if self.block_limit > 65_536 || self.entity_limit > 256 {
             return Err("viewport 结果上限过大".to_owned());
         }
         Ok(())
