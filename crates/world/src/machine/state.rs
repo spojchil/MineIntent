@@ -392,8 +392,6 @@ impl Inner {
             armed: false,
             stall_notified: false,
             announced_leg_end: None,
-            leg_started_at: [i32::MIN, i32::MIN, i32::MIN],
-            legs: 0,
         });
     }
 

@@ -52,6 +52,16 @@ async fn main() -> Result<(), String> {
         .parse()
         .map_err(|error| format!("端口无效：{error}"))?;
     let username = args.next().unwrap_or_else(|| "legalpath".to_owned());
+    // 距离表可从命令行给（逗号分隔），好在不重编的情况下试几千格。
+    let distances: Vec<i32> = args
+        .next()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|piece| piece.trim().parse().ok())
+                .collect()
+        })
+        .filter(|list: &Vec<i32>| !list.is_empty())
+        .unwrap_or_else(|| vec![4, 8, 16, 32, 64]);
 
     let module = Arc::new(
         Module::start(ConnectionConfig {
@@ -89,7 +99,7 @@ async fn main() -> Result<(), String> {
     let known = memory.lock().map(|m| m.len()).unwrap_or(0);
     println!("\n=== 环视一圈之后：记忆里有 {known} 格 ===");
 
-    for distance in [4, 8, 16, 32, 64] {
+    for distance in distances {
         println!("\n目标 ({}, {y}, {z})　距离 {distance} 格", x + distance);
         match module.compare_paths(memory.clone(), [x + distance, y, z]) {
             Ok((full, legal)) => {
