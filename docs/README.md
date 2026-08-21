@@ -34,7 +34,7 @@
 | [`docs/frame-segments-decision.md`](./frame-segments-decision.md) | 轮末帧段清单的已裁内容与出处、当前实现差距、「处境」命名的追查记录与未决清单 | 无 |
 | [`README.md`](../README.md) | 项目导航和最短启动 | 无 |
 | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | 人类贡献工作流 | 无 |
-| [`CLAUDE.md`](../CLAUDE.md) | 开发代理工作规则 | 无 |
+| [`AGENTS.md`](../AGENTS.md) | AI 编码助手工作规则的唯一真相源（`CLAUDE.md` 内容为 `@AGENTS.md`） | 无 |
 | 组件目录中的 README | 对应组件的局部使用说明 | 无 |
 | 代码、类型、测试和运行结果 | 当前实现的产生方与证据 | 不产生产品权威 |
 
