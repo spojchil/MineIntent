@@ -281,17 +281,38 @@ pub enum ChatPosition {
     GameInfo,
 }
 
+/// `ClientboundSound` 的定点坐标 → 世界坐标。
+///
+/// 包里的 x/y/z 是 `int`，不是格坐标也不是浮点：原版客户端读它是
+/// `getX() { return (float) this.x / 8.0f; }`（按 26.1.2 客户端字节码核实，
+/// 不是凭记忆）。先转 f32 再除，与原版逐位一致——先转 f64 再除会在
+/// 大坐标上和原版差最后几位。
+pub fn sound_fixed_point_to_world(value: i32) -> f64 {
+    f64::from(value as f32 / 8.0)
+}
+
 /// 声音注册名（如 `entity.zombie.ambient`）。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SoundId(pub String);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SoundEntry {
+    /// 与 ChatEntry.seq 同源的单调到达序号。恰好一次消费用它做游标——
+    /// 此前 `SoundEntry` 没有它，窗只能整份读，做不了「只取新的」。
+    pub seq: u64,
     pub tick: u64,
     pub occurred_at: Timestamp,
     /// 服务端明示（ClientboundSound）/ 客户端配音（LevelEvent 类）/ 纯本地推导。
     pub source: FactSource,
+    /// 原版混音分类（`hostile` / `players` / `blocks` / `ambient` …）的直译。
+    ///
+    /// 它是「这声音要不要说」的现成分档——`hostile` 就是「附近有怪」。但
+    /// **分档不是过滤**：这一层照收不误，说不说、怎么说归呈现层。
+    pub category: Option<String>,
     pub sound: SoundId,
+    /// 世界坐标。`ClientboundSound` 传的是定点数（客户端 `getX()` 是 `x / 8.0f`，
+    /// 已按 26.1.2 客户端字节码核实），这里还原成世界坐标。
+    /// 实体声（`ClientboundSoundEntity`）只给实体 id，坐标要另查，暂为 None。
     pub position: Option<[f64; 3]>,
 }
 
@@ -527,4 +548,20 @@ pub struct PlayerListEntry {
     pub yaw: Option<f64>,
     pub pitch: Option<f64>,
     pub held_item_name: Option<String>,
+}
+
+#[cfg(test)]
+mod sound_tests {
+    use super::sound_fixed_point_to_world;
+
+    /// 定点坐标按 8 还原。取的三个数来自 azalea 自己的 `ClientboundSound`
+    /// 往返测试用例（x=63、y=-480、z=82），对应世界坐标 7.875 / -60 / 10.25。
+    #[test]
+    fn sound_coordinates_are_eighths_not_blocks() {
+        assert_eq!(sound_fixed_point_to_world(63), 7.875);
+        assert_eq!(sound_fixed_point_to_world(-480), -60.0);
+        assert_eq!(sound_fixed_point_to_world(82), 10.25);
+        // 格中心是 .5，定点数上就是 8 的奇数倍——按格坐标直读会差半格。
+        assert_eq!(sound_fixed_point_to_world(4), 0.5);
+    }
 }

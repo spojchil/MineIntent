@@ -20,12 +20,13 @@ use super::mining::MiningJob;
 use super::movement::MovementJob;
 use super::{
     DAMAGE_WINDOW_ENTRIES, INVENTORY_WINDOW_ENTRIES, JOBS_WINDOW_ENTRIES, PICKUP_WINDOW_ENTRIES,
-    SCREEN_WINDOW_ENTRIES,
+    SCREEN_WINDOW_ENTRIES, SOUND_WINDOW_ENTRIES,
 };
 use crate::{
     ChatContent, ChatEntry, ChatPosition, ConnectionPhase, DamageEntry, Epoch, FactSource,
     InventoryChangeEntry, JobEntry, JobKind, JobOutcome, OpenScreenState, PickupEntry, PlayerRef,
-    ScreenEntry, ScreenEvent, TickSnapshot, Window, WorldMeta, CHAT_WINDOW_LINES,
+    ScreenEntry, ScreenEvent, SoundEntry, SoundId, TickSnapshot, Window, WorldMeta,
+    CHAT_WINDOW_LINES,
 };
 
 /// 预期回声的时限：swap/丢弃后这么多 tick 内，同格的 SetSlot 视为自己
@@ -66,6 +67,7 @@ pub(crate) struct Inner {
     pub(super) pickups_window: Mutex<VecDeque<PickupEntry>>,
     /// 盔甲值的 f64 位模式。属性包驱动，不每 tick 现读。
     pub(super) armor: AtomicU64,
+    pub(super) sounds_window: Mutex<VecDeque<SoundEntry>>,
     /// 预期关屏（我们刚下过 close）：失效 tick。时限内的 Closed 算回声。
     pub(super) expected_close: Mutex<Option<u64>>,
     pub(super) pending: Mutex<Vec<PendingCommand>>,
@@ -115,6 +117,7 @@ impl Inner {
             screens_window: Mutex::new(VecDeque::new()),
             pickups_window: Mutex::new(VecDeque::new()),
             armor: AtomicU64::new(0),
+            sounds_window: Mutex::new(VecDeque::new()),
             expected_close: Mutex::new(None),
             pending: Mutex::new(Vec::new()),
             jump_reset: AtomicBool::new(false),
@@ -152,6 +155,7 @@ impl Inner {
         snapshot.inventory_changes = self.inventory_window_now();
         snapshot.screens = self.screens_window_now();
         snapshot.pickups = self.pickups_window_now();
+        snapshot.sounds = self.sounds_window_now();
         self.publish(snapshot);
     }
 
@@ -194,6 +198,40 @@ impl Inner {
 
     pub(super) fn armor_now(&self) -> f64 {
         f64::from_bits(self.armor.load(Ordering::Acquire))
+    }
+
+    pub(super) fn sounds_window_now(&self) -> Window<SoundEntry> {
+        Window {
+            entries: self.sounds_window.lock().iter().cloned().collect(),
+        }
+    }
+
+    /// 记一声。
+    ///
+    /// **这一层不过滤**：脚步、环境音、音乐照收。要不要说、怎么说归呈现层
+    /// （`capture.rs` 模块头的「直译无损、政策外置」）。分类原样带上，
+    /// 呈现层要分档时不必再去猜。
+    pub(super) fn push_sound(
+        &self,
+        source: FactSource,
+        category: Option<String>,
+        sound: SoundId,
+        position: Option<[f64; 3]>,
+    ) {
+        let entry = SoundEntry {
+            seq: self.fact_seq.fetch_add(1, Ordering::AcqRel),
+            tick: self.tick.load(Ordering::Acquire),
+            occurred_at: SystemTime::now(),
+            source,
+            category,
+            sound,
+            position,
+        };
+        let mut window = self.sounds_window.lock();
+        window.push_back(entry);
+        while window.len() > SOUND_WINDOW_ENTRIES {
+            window.pop_front();
+        }
     }
 
     pub(super) fn pickups_window_now(&self) -> Window<PickupEntry> {

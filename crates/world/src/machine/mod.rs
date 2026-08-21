@@ -41,6 +41,9 @@ const JOBS_WINDOW_ENTRIES: usize = 32;
 const INVENTORY_WINDOW_ENTRIES: usize = 64;
 /// 拾取窗条目上限。挖一片树、砸一堆矿会连着来，比格位变化更密，取同一量级。
 const PICKUP_WINDOW_ENTRIES: usize = 64;
+/// 声音窗条目上限。声音是所有窗里最密的（脚步、方块、环境音一刻不停），
+/// 取得比别的窗大，靠游标每帧排空，不靠窗本身留存。
+const SOUND_WINDOW_ENTRIES: usize = 256;
 /// 屏开/关事实窗条目上限。开关稀疏，小窗足矣。
 const SCREEN_WINDOW_ENTRIES: usize = 16;
 /// 移动 job 起步宽限：下令后寻路器要过几个调度周期才可见（GotoEvent 是

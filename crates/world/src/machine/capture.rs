@@ -21,7 +21,7 @@ use azalea::Client;
 use super::state::{Inner, EPOCH};
 use crate::{
     ConnectionPhase, EntitySnapshot, ExperienceState, Inventory, InventorySlot, PlayerListEntry,
-    SelfState, TickSnapshot, Vec3Value, Window,
+    SelfState, TickSnapshot, Vec3Value,
 };
 
 /// 每 tick 的快照装配分段耗时。默认不开；`MINEINTENT_CAPTURE_TIMING=1` 才汇报。
@@ -156,8 +156,7 @@ pub(super) fn assemble_snapshot(inner: &Inner, bot: &Client) -> Option<TickSnaps
             value
         },
         chat: inner.chat_window_now(),
-        // 声音窗：生产者未落位，先空。
-        sounds: Window::default(),
+        sounds: inner.sounds_window_now(),
         damage: inner.damage_window_now(),
         jobs: inner.jobs_window_now(),
         inventory_changes: inner.inventory_window_now(),

@@ -22,6 +22,8 @@ use azalea::ecs::system::Res;
 use azalea::prelude::{bevy_ecs, Account, Component, Resource};
 use azalea::protocol::address::{ResolvedAddr, ServerAddr};
 use azalea::protocol::packets::game::ClientboundGamePacket;
+
+use crate::FactSource;
 use azalea::swarm::{DefaultSwarmPlugins, Swarm, SwarmBuilder, SwarmEvent};
 use azalea::world::WorldName;
 use azalea::{Client, DefaultPlugins, Event};
@@ -230,6 +232,34 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                     inner.push_inventory_change(0, menu_slot, item_name, count);
                 }
             }
+            // 声音：azalea 收到就扔（`sound` / `sound_entity` 是空体、参数
+            // 写作 `_p`），所以自己收。声音是唯一穿墙的通道——附近有怪、
+            // 有人在挖、有东西死了，眼睛都看不见。
+            //
+            // 坐标是**定点数**：客户端 `getX()` 是 `x / 8.0f`（按 26.1.2 客户端
+            // 字节码核实，不是凭记忆），这里还原成世界坐标。
+            ClientboundGamePacket::Sound(packet) => {
+                inner.push_sound(
+                    FactSource::ServerObserved,
+                    Some(sound_category_name(packet.source).to_owned()),
+                    sound_id_of(&packet.sound),
+                    Some([
+                        crate::sound_fixed_point_to_world(packet.x),
+                        crate::sound_fixed_point_to_world(packet.y),
+                        crate::sound_fixed_point_to_world(packet.z),
+                    ]),
+                );
+            }
+            // 实体声只给实体 id，不给坐标。坐标要另查实体，这里先不查——
+            // 呈现层还没裁怎么说，查了也没人用（查了就得每声一次 ECS 读）。
+            ClientboundGamePacket::SoundEntity(packet) => {
+                inner.push_sound(
+                    FactSource::ServerObserved,
+                    Some(sound_category_name(packet.source).to_owned()),
+                    sound_id_of(&packet.sound),
+                    None,
+                );
+            }
             // 盔甲值：走属性包自己收，azalea 不存属性
             // （`update_attributes` 是空体、参数 `_p`，`Attributes` 也只有
             // 移动/挖掘那几项，没有 armor）。
@@ -329,5 +359,37 @@ fn inventory_index_to_menu_slot(index: u32) -> Option<u16> {
         36..=39 => Some(8 - (index as u16 - 36)), // 盔甲：36脚→8 … 39头→5
         40 => Some(45),                           // 副手
         _ => None,
+    }
+}
+
+/// 混音分类的直译名。原版把每一声都分进这几档，`hostile` 就是「附近有怪」。
+fn sound_category_name(
+    source: azalea::protocol::packets::game::c_sound::SoundSource,
+) -> &'static str {
+    use azalea::protocol::packets::game::c_sound::SoundSource as S;
+    match source {
+        S::Master => "master",
+        S::Music => "music",
+        S::Records => "records",
+        S::Weather => "weather",
+        S::Blocks => "blocks",
+        S::Hostile => "hostile",
+        S::Neutral => "neutral",
+        S::Players => "players",
+        S::Ambient => "ambient",
+        S::Voice => "voice",
+    }
+}
+
+/// 声音注册名。资源包的自定义声音走 `Direct`，直接带着自己的 id。
+fn sound_id_of(
+    holder: &azalea::registry::Holder<
+        azalea::registry::builtin::SoundEvent,
+        azalea::core::sound::CustomSound,
+    >,
+) -> crate::SoundId {
+    match holder {
+        azalea::registry::Holder::Reference(event) => crate::SoundId(event.to_string()),
+        azalea::registry::Holder::Direct(custom) => crate::SoundId(custom.sound_id.to_string()),
     }
 }
