@@ -23,3 +23,7 @@ world = { path = "../world", features = ["azalea"] }
 
 [lints]
 workspace = true
+
+# 超时探针：不依赖 azalea，只打 HTTP 适配器这一层。
+[[example]]
+name = "model_timeout_probe"
