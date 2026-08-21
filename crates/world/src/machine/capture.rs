@@ -124,6 +124,7 @@ pub(super) fn assemble_snapshot(inner: &Inner, bot: &Client) -> Option<TickSnaps
         health,
         food: f64::from(hunger.food),
         food_saturation: f64::from(hunger.saturation),
+        armor: inner.armor_now(),
         oxygen: None,
         experience: Some(ExperienceState {
             level: experience.level,

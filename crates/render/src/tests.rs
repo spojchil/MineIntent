@@ -633,3 +633,14 @@ fn unknown_item_is_said_to_be_unknown_not_invented() {
         vec!["有人捡走了 bread ×1。"]
     );
 }
+
+/// 盔甲值 0 时整条省略——原版盔甲条在 0 点时本就隐藏，逐字对应。
+/// 这条省略只对「原版 UI 自己也隐藏」的项成立，不推广成通用默认。
+#[test]
+fn armor_is_omitted_at_zero_and_shown_otherwise() {
+    let mut snap = snapshot();
+    assert_eq!(render_vitals(&snap), "生命 18/20，饥饿 15/20。");
+
+    snap.self_state.armor = 8.0;
+    assert_eq!(render_vitals(&snap), "生命 18/20，饥饿 15/20，盔甲 8。");
+}

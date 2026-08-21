@@ -64,6 +64,8 @@ pub(crate) struct Inner {
     pub(super) open_screen: Mutex<Option<OpenScreenState>>,
     pub(super) screens_window: Mutex<VecDeque<ScreenEntry>>,
     pub(super) pickups_window: Mutex<VecDeque<PickupEntry>>,
+    /// 盔甲值的 f64 位模式。属性包驱动，不每 tick 现读。
+    pub(super) armor: AtomicU64,
     /// 预期关屏（我们刚下过 close）：失效 tick。时限内的 Closed 算回声。
     pub(super) expected_close: Mutex<Option<u64>>,
     pub(super) pending: Mutex<Vec<PendingCommand>>,
@@ -112,6 +114,7 @@ impl Inner {
             open_screen: Mutex::new(None),
             screens_window: Mutex::new(VecDeque::new()),
             pickups_window: Mutex::new(VecDeque::new()),
+            armor: AtomicU64::new(0),
             expected_close: Mutex::new(None),
             pending: Mutex::new(Vec::new()),
             jump_reset: AtomicBool::new(false),
@@ -180,6 +183,17 @@ impl Inner {
         Window {
             entries: self.screens_window.lock().iter().cloned().collect(),
         }
+    }
+
+    /// 记下盔甲值。属性包只在变化时来（穿脱、损坏、附魔），所以这里存着，
+    /// 不像血量那样每 tick 从 ECS 现读——azalea 压根不存属性
+    /// （`update_attributes` 是空体、参数 `_p`），现读没得读。
+    pub(super) fn track_armor(&self, value: f64) {
+        self.armor.store(value.to_bits(), Ordering::Release);
+    }
+
+    pub(super) fn armor_now(&self) -> f64 {
+        f64::from_bits(self.armor.load(Ordering::Acquire))
     }
 
     pub(super) fn pickups_window_now(&self) -> Window<PickupEntry> {

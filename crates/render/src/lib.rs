@@ -137,6 +137,12 @@ pub fn render_vitals(snap: &TickSnapshot) -> String {
     if let Some(oxygen) = this.oxygen {
         line.push_str(&format!("，氧气 {}", trim_number(oxygen)));
     }
+    // 盔甲值 0 时省略：**原版盔甲条在 0 点时本就整条隐藏**，与 UI 行为逐字
+    // 对应（旧线 `中期更新-08.md` §1）。这条省略只对「原版 UI 自己也隐藏」的
+    // 项成立，不是通用的默认省略。
+    if this.armor > 0.0 {
+        line.push_str(&format!("，盔甲 {}", trim_number(this.armor)));
+    }
     if !this.effects.is_empty() {
         let effects: Vec<String> = this
             .effects

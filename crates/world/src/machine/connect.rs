@@ -230,6 +230,30 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                     inner.push_inventory_change(0, menu_slot, item_name, count);
                 }
             }
+            // 盔甲值：走属性包自己收，azalea 不存属性
+            // （`update_attributes` 是空体、参数 `_p`，`Attributes` 也只有
+            // 移动/挖掘那几项，没有 armor）。
+            //
+            // **不从身上四件推算**：推算要一张物品→点数的硬表，附魔、纹饰、
+            // 自定义物品一律会错。服务端算好了直接给。修饰符的数学也不自己写，
+            // `AttributeInstance::calculate()` 就是原版那套。
+            ClientboundGamePacket::UpdateAttributes(update) => {
+                let own = bot
+                    .get_component::<azalea::core::entity_id::MinecraftEntityId>()
+                    .map(|id| *id);
+                if own == Some(update.entity_id) {
+                    for snapshot in &update.values {
+                        if snapshot.attribute == azalea::registry::builtin::Attribute::Armor {
+                            let mut instance =
+                                azalea::entity::attributes::AttributeInstance::new(snapshot.base);
+                            for modifier in &snapshot.modifiers {
+                                instance.insert(modifier.clone());
+                            }
+                            inner.track_armor(instance.calculate());
+                        }
+                    }
+                }
+            }
             // 拾取：源头是**实体消失**，不是格位数字变了。
             //
             // 和上面两条格位包分属两条通道，不是一条：格位变化是屏内读数

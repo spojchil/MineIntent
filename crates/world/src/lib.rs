@@ -437,6 +437,11 @@ pub struct SelfState {
     pub health: f64,
     pub food: f64,
     pub food_saturation: f64,
+    /// 盔甲值（原版盔甲条的点数，满 20）。
+    ///
+    /// 来源是服务端的 `armor` 属性，**不是**从身上四件推算的——推算要一张
+    /// 物品→点数的硬表，附魔、纹饰、自定义物品一律会错。属性由服务端算好给。
+    pub armor: f64,
     /// 只在水下等耗氧场景有意义时为 Some。
     pub oxygen: Option<f64>,
     pub experience: Option<ExperienceState>,
