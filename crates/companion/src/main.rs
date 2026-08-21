@@ -375,10 +375,19 @@ impl TraceObserver {
 }
 
 /// 每次模型请求一行：这一份上下文有多大、命中了多少、花了多久。
+/// 每一轮的起止各一行：它怎么开始的、怎么结束的。
 ///
 /// 轮级的 `ModelUsage` 是**累加**的（midturn `types.rs` 的 merge），回答不了
 /// 「单次请求的上下文多大」——那正是评估上下文时唯一要看的数。逐请求的
 /// `ModelRequestFinished` 才带真实数字。
+///
+/// **轮的结局此前一条都没记。** 2026-08-20 那次永久停机之所以只能靠「投影统计
+/// 还在滚」来判断进程没死，就是因为这里只接了两个请求级事件；内核明明发着
+/// `RunStarted` / `RunCompleted` / `RunStopped` / `RunFailed`（`RunFailed` 还是
+/// `EventLevel::Error`），我们一个都没听。
+///
+/// 补它不改任何行为——观察端是旁路。这一点很要紧：僵尸轮的成因未明，维护者裁
+/// 「不动」，而**多记一笔不是动**，少记一笔才是把证据丢了。
 impl agent::Observer for TraceObserver {
     fn observe(&self, event: &agent::AgentEvent) {
         match event {
@@ -411,6 +420,32 @@ impl agent::Observer for TraceObserver {
                     input.saturating_sub(cached)
                 ));
             }
+            agent::AgentEvent::RunStarted {
+                run_id,
+                prior_transcript_items,
+                ..
+            } => self.write(&format!(
+                "[轮开始] id={run_id:?} 起始转录条目={prior_transcript_items}"
+            )),
+            agent::AgentEvent::RunCompleted {
+                run_id,
+                model_requests,
+                tool_batches,
+                ..
+            } => self.write(&format!(
+                "[轮结束] id={run_id:?} 结局=完成 请求数={model_requests} 工具批={tool_batches}"
+            )),
+            agent::AgentEvent::RunStopped { run_id, .. } => {
+                self.write(&format!("[轮结束] id={run_id:?} 结局=被停止"))
+            }
+            agent::AgentEvent::RunFailed {
+                run_id,
+                stage,
+                error_kind,
+                ..
+            } => self.write(&format!(
+                "[轮结束] id={run_id:?} 结局=失败 阶段={stage:?} 错误类别={error_kind:?}"
+            )),
             _ => {}
         }
     }
