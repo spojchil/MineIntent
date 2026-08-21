@@ -20,6 +20,7 @@ pub enum SituationLine {
     Environment,
     Position,
     Vitals,
+    LookingAt,
     Hotbar,
     Held,
     Nearby,
@@ -49,6 +50,7 @@ pub fn render_situation_lines(
         (SituationLine::Identity, render_self_identity(snap)),
         (SituationLine::Environment, render_environment(snap)),
         (SituationLine::Position, render_position(snap)),
+        (SituationLine::LookingAt, render_looking_at(snap)),
         (SituationLine::Vitals, render_vitals(snap)),
         (SituationLine::Hotbar, render_hotbar(snap)),
         (SituationLine::Held, render_held(snap)),
@@ -89,14 +91,20 @@ pub fn render_self_identity(snap: &TickSnapshot) -> String {
     format!("你在这个世界里的名字是 {name}——别人叫这个名字就是在叫你。")
 }
 
-/// 环境一行：维度、时段，有雨雪雷才提天气。
+/// 环境一行：维度、群系，有雨雪雷才提天气。
+///
+/// **时段撤掉了**（2026-08-21）。旧线 2026-08-02 就裁过 `world.timeOfDay`
+/// 出局，理由是「洞内不可见，判据不过」；它后来无裁定地从这一行溜了回来。
+/// 复核上游也支持原裁定：26.1.2 客户端 45 项 `DebugScreenEntries` 里**没有**
+/// 一天内时刻这一项，唯一碰时钟的 `DAY_COUNT` 读的是天数。
+///
+/// 群系补上：原版 F3 的 `BIOME`，免费常驻，和坐标同档。
 pub fn render_environment(snap: &TickSnapshot) -> String {
     let meta = &snap.world_meta;
-    let mut line = format!(
-        "{}，{}",
-        dimension_word(&meta.dimension),
-        day_period_word(meta.day_time)
-    );
+    let mut line = dimension_word(&meta.dimension).to_owned();
+    if let Some(biome) = &snap.self_state.biome {
+        line.push_str(&format!("，{biome}"));
+    }
     if meta.thunder_level >= 0.5 {
         line.push_str("，雷雨");
     } else if meta.rain_level >= 0.5 {
@@ -104,6 +112,46 @@ pub fn render_environment(snap: &TickSnapshot) -> String {
     }
     line.push('。');
     line
+}
+
+/// 准星一行：此刻对着什么。
+///
+/// 原版 F3 的 `LOOKING_AT_*`（维护者 2026-08-21 裁定：F3 那批新项加）。
+/// 它值钱不在多一条信息，而在**免费**：模型此前要花轮次 `scan` / `look`
+/// 才知道自己对着什么，08-20 实盘感知占比 59%。
+///
+/// 数据直接取 azalea 每 tick 维护的 `HitResultComponent`——我们不自己发射线，
+/// 也就不会和它算出两套结果。够不着任何东西时这一行不出现（原版此时也不显示），
+/// 而处境的空行本来就不进差异。
+pub fn render_looking_at(snap: &TickSnapshot) -> String {
+    match &snap.self_state.looking_at {
+        None => String::new(),
+        Some(world::LookingAt::Block {
+            name,
+            position: [x, y, z],
+            face,
+        }) => format!(
+            "准星对着 {name}（{x}, {y}, {z}），命中{}面。",
+            face_word(face)
+        ),
+        Some(world::LookingAt::Entity { kind, name }) => match name {
+            Some(name) => format!("准星对着 {name}（{kind}）。"),
+            None => format!("准星对着 {kind}。"),
+        },
+    }
+}
+
+/// 命中面的中文。放置要贴在这一面上，所以说清楚。
+fn face_word(face: &str) -> &str {
+    match face {
+        "up" => "上",
+        "down" => "下",
+        "north" => "北",
+        "south" => "南",
+        "east" => "东",
+        "west" => "西",
+        other => other,
+    }
 }
 
 /// 位置一行：整数坐标 + 面朝（归一化后的八向）。
@@ -928,6 +976,10 @@ impl WindowTick for world::ChatEntry {
 pub use world::wrap_degrees;
 
 /// 原版昼夜时钟到时段词。锚点：0 日出、6000 正午、12000 日落、18000 午夜。
+///
+/// **不再进环境行**（见 `render_environment`）。留着是因为将来的信息工具
+/// ——模型主动抬头看天是合法的，被动推给它不是。
+#[allow(dead_code)]
 fn day_period_word(day_time: u64) -> &'static str {
     match day_time % 24_000 {
         0..=999 => "清晨",

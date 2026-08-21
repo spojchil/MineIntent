@@ -75,7 +75,7 @@ fn situation_covers_identity_environment_position_vitals_in_order() {
         lines[0],
         "你在这个世界里的名字是 xiaoming——别人叫这个名字就是在叫你。"
     );
-    assert_eq!(lines[1], "主世界，下午。");
+    assert_eq!(lines[1], "主世界。");
     assert_eq!(lines[2], "位置 (120, 64, -36)，面朝西。");
     assert_eq!(lines[3], "生命 18/20，饥饿 15/20。");
     // 快捷栏与手持排在生命之后、附近之前：都是「自己身上的事」。
@@ -112,29 +112,29 @@ fn weather_appears_only_when_it_rains() {
     assert!(!render_environment(&snap).contains("雨"));
 
     snap.world_meta.rain_level = 1.0;
-    assert_eq!(render_environment(&snap), "主世界，下午，下着雨。");
+    assert_eq!(render_environment(&snap), "主世界，下着雨。");
 
     snap.world_meta.thunder_level = 1.0;
-    assert_eq!(render_environment(&snap), "主世界，下午，雷雨。");
+    assert_eq!(render_environment(&snap), "主世界，雷雨。");
 }
 
 #[test]
-fn day_period_words_follow_vanilla_clock_anchors() {
+/// 时段**不进环境行**（2026-08-21 复核旧线 08-02 裁定：洞内不可见，判据不过；
+/// 26.1.2 客户端 45 项 F3 注册表里也没有一天内时刻这一项）。
+/// 时钟怎么变，这一行都不该跟着变。
+fn day_time_never_reaches_the_environment_line() {
     let mut snap = snapshot();
-    for (day_time, expected) in [
-        (0, "清晨"),
-        (6_000, "正午前后"),
-        (12_000, "黄昏"),
-        (18_000, "午夜前后"),
-        (23_500, "黎明前"),
-        (24_000 + 500, "清晨"),
-    ] {
+    let baseline = render_environment(&snap);
+    for day_time in [0, 6_000, 12_000, 18_000, 23_500, 24_500] {
         snap.world_meta.day_time = day_time;
-        assert!(
-            render_environment(&snap).contains(expected),
-            "day_time={day_time} 应是{expected}：{}",
-            render_environment(&snap)
+        assert_eq!(
+            render_environment(&snap),
+            baseline,
+            "day_time={day_time} 不该改变环境行"
         );
+    }
+    for word in ["清晨", "正午", "黄昏", "午夜", "黎明", "下午"] {
+        assert!(!baseline.contains(word), "环境行不该有时段词：{baseline}");
     }
 }
 
@@ -643,4 +643,58 @@ fn armor_is_omitted_at_zero_and_shown_otherwise() {
 
     snap.self_state.armor = 8.0;
     assert_eq!(render_vitals(&snap), "生命 18/20，饥饿 15/20，盔甲 8。");
+}
+
+/// 准星是 F3 的 `LOOKING_AT_*`：免费常驻，说清楚对着哪一格、命中哪一面
+/// （放置要贴在那一面上）。
+#[test]
+fn looking_at_names_the_block_and_the_face() {
+    let mut snap = snapshot();
+    snap.self_state.looking_at = Some(world::LookingAt::Block {
+        name: "oak_log".to_owned(),
+        position: [46, 70, 40],
+        face: "up".to_owned(),
+    });
+    assert_eq!(
+        render_looking_at(&snap),
+        "准星对着 oak_log（46, 70, 40），命中上面。"
+    );
+
+    snap.self_state.looking_at = Some(world::LookingAt::Entity {
+        kind: "minecraft:zombie".to_owned(),
+        name: None,
+    });
+    assert_eq!(render_looking_at(&snap), "准星对着 minecraft:zombie。");
+
+    snap.self_state.looking_at = Some(world::LookingAt::Entity {
+        kind: "minecraft:player".to_owned(),
+        name: Some("Alice".to_owned()),
+    });
+    assert_eq!(
+        render_looking_at(&snap),
+        "准星对着 Alice（minecraft:player）。"
+    );
+}
+
+/// 够不着任何东西时这一行不出现——原版此时也什么都不显示，
+/// 而处境的空行本来就不进差异。
+#[test]
+fn looking_at_nothing_produces_no_line() {
+    let snap = snapshot();
+    assert_eq!(render_looking_at(&snap), "");
+    assert!(
+        !render_situation_lines(&snap, (1, 100))
+            .iter()
+            .any(|(line, _)| *line == SituationLine::LookingAt),
+        "空的准星行不该进处境"
+    );
+}
+
+/// 群系接在维度后面——同属「我在哪」，都是 F3 免费常驻的那一档。
+#[test]
+fn biome_rides_the_environment_line_after_the_dimension() {
+    let mut snap = snapshot();
+    assert_eq!(render_environment(&snap), "主世界。");
+    snap.self_state.biome = Some("minecraft:taiga".to_owned());
+    assert_eq!(render_environment(&snap), "主世界，minecraft:taiga。");
 }

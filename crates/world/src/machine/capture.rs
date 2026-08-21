@@ -125,6 +125,8 @@ pub(super) fn assemble_snapshot(inner: &Inner, bot: &Client) -> Option<TickSnaps
         food: f64::from(hunger.food),
         food_saturation: f64::from(hunger.saturation),
         armor: inner.armor_now(),
+        looking_at: capture_looking_at(bot),
+        biome: capture_biome(bot),
         oxygen: None,
         experience: Some(ExperienceState {
             level: experience.level,
@@ -243,6 +245,75 @@ fn capture_inventory(inner: &Inner, bot: &Client) -> Inventory {
             space,
             ..Default::default()
         })
+}
+
+/// 准星指着什么。**azalea 每 tick 自己在维护 `HitResultComponent`**，
+/// 我们只是读——不自己发射线，也就不会和它算出两套结果。
+///
+/// `miss`（够不着任何东西）返回 None：原版此时也什么都不显示。
+fn capture_looking_at(bot: &Client) -> Option<crate::LookingAt> {
+    use azalea::core::hit_result::HitResult;
+    let hit = bot
+        .get_component::<azalea::interact::pick::HitResultComponent>()
+        .map(|hit| (*hit).clone())?;
+    match &*hit {
+        HitResult::Block(block) => {
+            if block.miss {
+                return None;
+            }
+            let world = bot.world();
+            let world = world.read();
+            let state = world.get_block_state(block.block_pos)?;
+            let named: Box<dyn azalea::block::BlockTrait> = Box::from(state);
+            Some(crate::LookingAt::Block {
+                name: canonical_registry_name(named.id()),
+                position: [block.block_pos.x, block.block_pos.y, block.block_pos.z],
+                face: format!("{:?}", block.direction).to_lowercase(),
+            })
+        }
+        HitResult::Entity(entity) => {
+            let mut ecs = bot.ecs.write();
+            let mut query = ecs.query::<(
+                azalea::ecs::entity::Entity,
+                Option<&EntityKindComponent>,
+                Option<&GameProfileComponent>,
+                Option<&azalea::entity::metadata::CustomName>,
+            )>();
+            let mut found = None;
+            for (id, kind, profile, custom) in query.iter(&ecs) {
+                if id == entity.entity {
+                    found = Some(crate::LookingAt::Entity {
+                        kind: kind
+                            .map(|kind| kind.to_string())
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        name: profile.map(|profile| profile.name.clone()).or_else(|| {
+                            custom
+                                .as_ref()
+                                .and_then(|c| c.0.as_ref().map(|t| t.to_string()))
+                        }),
+                    });
+                    break;
+                }
+            }
+            found
+        }
+    }
+}
+
+/// 所在格的群系。原版 F3 的 `BIOME`。
+///
+/// 群系是**数据驱动注册表**：包里只有协议 id，名字要过服务器进服时发来的
+/// 注册表。那份注册表存在 world 上（`registries`），`ResolvableDataRegistry`
+/// 负责查——所以这里不硬编 id→名，服务器加自定义群系也不会错。
+fn capture_biome(bot: &Client) -> Option<String> {
+    use azalea::core::data_registry::ResolvableDataRegistry;
+    let position = bot.get_component::<Position>()?;
+    let block_pos = azalea::BlockPos::from(&*position);
+    let world = bot.world();
+    let world = world.read();
+    let biome = world.get_biome(block_pos)?;
+    let (identifier, _) = biome.resolve(&world.registries)?;
+    Some(canonical_registry_name(&identifier.to_string()))
 }
 
 fn capture_players(bot: &Client) -> Vec<PlayerListEntry> {
