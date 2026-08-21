@@ -230,6 +230,19 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                     inner.push_inventory_change(0, menu_slot, item_name, count);
                 }
             }
+            // 拾取：源头是**实体消失**，不是格位数字变了。
+            //
+            // 和上面两条格位包分属两条通道，不是一条：格位变化是屏内读数
+            // （要开界面才看得见，措辞「当前是 X」），拾取是世界事件——物品
+            // 飞过来、有声音，不开背包也知道。所以它不受开屏与否管。
+            //
+            // 名字要在这一拍读完（见 `resolve_pickup`）：紧接着的
+            // RemoveEntities 会把那个掉落物实体删掉。
+            ClientboundGamePacket::TakeItemEntity(take) => {
+                let (by_self, by, item_name) =
+                    super::capture::resolve_pickup(&bot, take.item_id, take.player_id);
+                inner.push_pickup(by_self, by, item_name, take.amount);
+            }
             _ => {}
         },
         Event::Disconnect(reason) => {

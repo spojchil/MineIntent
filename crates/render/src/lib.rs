@@ -6,7 +6,7 @@
 //!
 //! 同类实体聚合呈现（数量 + 最近距离方位）——压缩方向是同质聚合，不是截断。
 
-use world::{ConnectionPhase, EntitySnapshot, TickSnapshot, Window};
+use world::{ConnectionPhase, EntitySnapshot, PickupEntry, TickSnapshot, Window};
 
 /// 处境的一行是哪一行。
 ///
@@ -977,3 +977,49 @@ fn trim_number(value: f64) -> String {
 
 #[cfg(test)]
 mod tests;
+
+/// 拾取成句：捡到了什么。
+///
+/// **主语是物品，不是格位**（维护者裁定 2026-08-21）：玩家捡东西时看见的是
+/// 物品飞过来、听见「啵」的一声，不是「第 4 格的数字变了」。落进主背包还是
+/// 快捷栏都一样报——对「我现在有这个东西」这件事，两者没有区别。
+///
+/// 所以这里一个格号都不出现。格号是屏内读数的事（`render_inventory_change`），
+/// 那条通道要开着界面才看得见。
+///
+/// 同一批里同名同来源的合并成一条：砍一棵树会一根一根地捡，五条
+/// 「捡到了 oak_log ×1」不如一条「捡到了 oak_log ×5」。合并只按
+/// (谁, 什么) 分组——**不跨人合并**，「我捡了 3 个」和「Alice 捡了 3 个」
+/// 是两件完全不同的事。
+pub fn render_pickups(entries: &[PickupEntry]) -> Vec<String> {
+    // 保序聚合：按首次出现的顺序输出，不排序——事实的先后本身是信息。
+    let mut order: Vec<(bool, Option<String>, Option<String>)> = Vec::new();
+    let mut totals: Vec<u32> = Vec::new();
+    for entry in entries {
+        let key = (entry.by_self, entry.by.clone(), entry.item_name.clone());
+        match order.iter().position(|seen| *seen == key) {
+            Some(index) => totals[index] = totals[index].saturating_add(entry.count),
+            None => {
+                order.push(key);
+                totals.push(entry.count);
+            }
+        }
+    }
+    order
+        .into_iter()
+        .zip(totals)
+        .map(|((by_self, by, item_name), count)| {
+            let what = match item_name {
+                Some(name) => format!("{name} ×{count}"),
+                // 掉落物实体的元数据还没到就认不出来。说不知道，不编一个名字。
+                None => format!("{count} 件没认出来的东西"),
+            };
+            match (by_self, by) {
+                (true, _) => format!("捡到了 {what}。"),
+                // 用户名与汉字之间留空格，「有人」不留——它本来就是汉字。
+                (false, Some(who)) => format!("{who} 捡走了 {what}。"),
+                (false, None) => format!("有人捡走了 {what}。"),
+            }
+        })
+        .collect()
+}

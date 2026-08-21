@@ -89,6 +89,7 @@ impl TickSnapshot {
             inventory_changes: Window::default(),
             open_screen: None,
             screens: Window::default(),
+            pickups: Window::default(),
         }
     }
 }
@@ -130,6 +131,31 @@ pub struct TickSnapshot {
     pub open_screen: Option<OpenScreenState>,
     /// 容器开/关的事实窗。关闭是否自己下令由 source 区分；投不投在消费方。
     pub screens: Window<ScreenEntry>,
+    /// 拾取事实窗。**和 `inventory_changes` 是两条通道，不是一条。**
+    /// 那条是屏内读数（要开界面才看得见，措辞「当前是 X」）；这条是世界事件
+    /// （物品飞过来、有声音、不开背包也知道），不受开屏与否管。
+    pub pickups: Window<PickupEntry>,
+}
+
+/// 拾取事实：一个掉落物被谁收走了、收走几个。
+///
+/// 源头是**实体消失**——服务端的 `ClientboundTakeItemEntity` 只说
+/// 「哪个掉落物实体、被哪个实体收走、几个」。物品名不在包里，要在收到这一拍
+/// 就去实体上读：紧接着的 `RemoveEntities` 会把这个实体删掉。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PickupEntry {
+    /// 与 ChatEntry.seq 同源的单调到达序号。
+    pub seq: u64,
+    pub tick: u64,
+    pub occurred_at: Timestamp,
+    /// 收走它的是不是我们自己。**别人在你面前把你挖的矿捡走也是事实**，
+    /// 而格位差异那条通道永远看不见这件事。
+    pub by_self: bool,
+    /// 收走它的玩家名；不是玩家或认不出就是 None。
+    pub by: Option<String>,
+    /// 物品注册名；掉落物实体的元数据还没到就是 None（不编）。
+    pub item_name: Option<String>,
+    pub count: u32,
 }
 
 /// 当前开着的服务端容器：种类直译 + 容器 id + 标题。

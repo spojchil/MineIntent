@@ -162,6 +162,7 @@ pub(super) fn assemble_snapshot(inner: &Inner, bot: &Client) -> Option<TickSnaps
         inventory_changes: inner.inventory_window_now(),
         open_screen: inner.open_screen.lock().clone(),
         screens: inner.screens_window_now(),
+        pickups: inner.pickups_window_now(),
     };
     if timing::on() {
         timing::record(
@@ -373,4 +374,40 @@ fn capture_entities(bot: &Client) -> Vec<EntitySnapshot> {
 /// azalea 注册名规范化：剥 `minecraft:` 前缀，与旧契约同法。
 pub(super) fn canonical_registry_name(name: &str) -> String {
     name.strip_prefix("minecraft:").unwrap_or(name).to_owned()
+}
+
+/// 一次拾取的两个未知数：被捡的是什么、捡它的是谁。
+///
+/// **必须在收到 `ClientboundTakeItemEntity` 的当下就问**——服务端紧接着会发
+/// `RemoveEntities` 把那个掉落物实体删掉，晚一拍就只剩一个查不到的 id。
+///
+/// 包里只有实体 id 和数量，物品名在掉落物实体自己的元数据上
+/// （azalea 的 `ItemItem` 组件）。元数据没到就返回 None，不编。
+pub(super) fn resolve_pickup(
+    bot: &Client,
+    item_entity: u32,
+    picker: azalea::core::entity_id::MinecraftEntityId,
+) -> (bool, Option<String>, Option<String>) {
+    let item_entity = azalea::core::entity_id::MinecraftEntityId::from(item_entity);
+    let by_self = bot
+        .get_component::<azalea::core::entity_id::MinecraftEntityId>()
+        .is_some_and(|own| *own == picker);
+
+    let mut ecs = bot.ecs.write();
+    let mut query = ecs.query::<(
+        &azalea::core::entity_id::MinecraftEntityId,
+        Option<&azalea::entity::metadata::ItemItem>,
+        Option<&GameProfileComponent>,
+    )>();
+    let mut item_name = None;
+    let mut by = None;
+    for (id, item, profile) in query.iter(&ecs) {
+        if *id == item_entity {
+            item_name = item.map(|item| canonical_registry_name(&item.0.kind().to_string()));
+        }
+        if *id == picker {
+            by = profile.map(|profile| profile.name.clone());
+        }
+    }
+    (by_self, by, item_name)
 }

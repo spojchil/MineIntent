@@ -19,12 +19,13 @@ use super::door::{DoorCommand, PendingCommand};
 use super::mining::MiningJob;
 use super::movement::MovementJob;
 use super::{
-    DAMAGE_WINDOW_ENTRIES, INVENTORY_WINDOW_ENTRIES, JOBS_WINDOW_ENTRIES, SCREEN_WINDOW_ENTRIES,
+    DAMAGE_WINDOW_ENTRIES, INVENTORY_WINDOW_ENTRIES, JOBS_WINDOW_ENTRIES, PICKUP_WINDOW_ENTRIES,
+    SCREEN_WINDOW_ENTRIES,
 };
 use crate::{
     ChatContent, ChatEntry, ChatPosition, ConnectionPhase, DamageEntry, Epoch, FactSource,
-    InventoryChangeEntry, JobEntry, JobKind, JobOutcome, OpenScreenState, PlayerRef, ScreenEntry,
-    ScreenEvent, TickSnapshot, Window, WorldMeta, CHAT_WINDOW_LINES,
+    InventoryChangeEntry, JobEntry, JobKind, JobOutcome, OpenScreenState, PickupEntry, PlayerRef,
+    ScreenEntry, ScreenEvent, TickSnapshot, Window, WorldMeta, CHAT_WINDOW_LINES,
 };
 
 /// 预期回声的时限：swap/丢弃后这么多 tick 内，同格的 SetSlot 视为自己
@@ -62,6 +63,7 @@ pub(crate) struct Inner {
     /// 当前开着的服务端容器（每 tick 与 ECS 组件对账，变迁产屏事实）。
     pub(super) open_screen: Mutex<Option<OpenScreenState>>,
     pub(super) screens_window: Mutex<VecDeque<ScreenEntry>>,
+    pub(super) pickups_window: Mutex<VecDeque<PickupEntry>>,
     /// 预期关屏（我们刚下过 close）：失效 tick。时限内的 Closed 算回声。
     pub(super) expected_close: Mutex<Option<u64>>,
     pub(super) pending: Mutex<Vec<PendingCommand>>,
@@ -109,6 +111,7 @@ impl Inner {
             expected_slots: Mutex::new(Vec::new()),
             open_screen: Mutex::new(None),
             screens_window: Mutex::new(VecDeque::new()),
+            pickups_window: Mutex::new(VecDeque::new()),
             expected_close: Mutex::new(None),
             pending: Mutex::new(Vec::new()),
             jump_reset: AtomicBool::new(false),
@@ -145,6 +148,7 @@ impl Inner {
         snapshot.jobs = self.jobs_window_now();
         snapshot.inventory_changes = self.inventory_window_now();
         snapshot.screens = self.screens_window_now();
+        snapshot.pickups = self.pickups_window_now();
         self.publish(snapshot);
     }
 
@@ -175,6 +179,40 @@ impl Inner {
     pub(super) fn screens_window_now(&self) -> Window<ScreenEntry> {
         Window {
             entries: self.screens_window.lock().iter().cloned().collect(),
+        }
+    }
+
+    pub(super) fn pickups_window_now(&self) -> Window<PickupEntry> {
+        Window {
+            entries: self.pickups_window.lock().iter().cloned().collect(),
+        }
+    }
+
+    /// 记一次拾取。
+    ///
+    /// 不做去重、不比对上一拍：`ClientboundTakeItemEntity` 本身就是一次性事件，
+    /// 服务端发一次就是发生了一次。这和 `push_inventory_change` 相反——那条是
+    /// 读数，同值重复要压掉；这条是事件，压掉就是漏报。
+    pub(super) fn push_pickup(
+        &self,
+        by_self: bool,
+        by: Option<String>,
+        item_name: Option<String>,
+        count: u32,
+    ) {
+        let entry = PickupEntry {
+            seq: self.fact_seq.fetch_add(1, Ordering::AcqRel),
+            tick: self.tick.load(Ordering::Acquire),
+            occurred_at: SystemTime::now(),
+            by_self,
+            by,
+            item_name,
+            count,
+        };
+        let mut window = self.pickups_window.lock();
+        window.push_back(entry);
+        while window.len() > PICKUP_WINDOW_ENTRIES {
+            window.pop_front();
         }
     }
 

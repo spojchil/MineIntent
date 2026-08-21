@@ -2,7 +2,7 @@ use std::time::SystemTime;
 
 use world::{
     ChatContent, ChatEntry, ConnectionPhase, EntitySnapshot, Epoch, FactSource, InventorySlot,
-    StatusEffect, TickSnapshot, Vec3Value,
+    PickupEntry, StatusEffect, TickSnapshot, Vec3Value,
 };
 
 use super::*;
@@ -568,4 +568,68 @@ fn switching_slots_changes_only_the_held_line() {
         .map(|((line, _), _)| *line)
         .collect();
     assert_eq!(changed, vec![SituationLine::Held]);
+}
+
+fn pickup(
+    seq: u64,
+    by_self: bool,
+    by: Option<&str>,
+    item: Option<&str>,
+    count: u32,
+) -> PickupEntry {
+    PickupEntry {
+        seq,
+        tick: 100,
+        occurred_at: SystemTime::now(),
+        by_self,
+        by: by.map(str::to_owned),
+        item_name: item.map(str::to_owned),
+        count,
+    }
+}
+
+/// 砍一棵树是一根一根地捡：五条「×1」不如一条「×5」。
+#[test]
+fn pickups_merge_by_item_within_one_delivery() {
+    let entries: Vec<PickupEntry> = (0..5)
+        .map(|seq| pickup(seq, true, None, Some("oak_log"), 1))
+        .collect();
+    assert_eq!(render_pickups(&entries), vec!["捡到了 oak_log ×5。"]);
+}
+
+/// 「我捡了 3 个」和「Alice 捡了 3 个」是两件完全不同的事，不许并成一条。
+#[test]
+fn pickups_never_merge_across_pickers() {
+    let entries = vec![
+        pickup(1, true, None, Some("iron_ore"), 2),
+        pickup(2, false, Some("Alice"), Some("iron_ore"), 3),
+        pickup(3, true, None, Some("iron_ore"), 1),
+    ];
+    assert_eq!(
+        render_pickups(&entries),
+        vec!["捡到了 iron_ore ×3。", "Alice 捡走了 iron_ore ×3。"]
+    );
+}
+
+/// 裁定 2026-08-21：拾取只说物品，**一个格号都不出现**。
+#[test]
+fn pickups_say_nothing_about_slots() {
+    let lines = render_pickups(&[pickup(1, true, None, Some("oak_log"), 3)]);
+    let text = lines.join("");
+    for word in ["hotbar", "pack", "slot", "格"] {
+        assert!(!text.contains(word), "拾取不该提格位：{text}");
+    }
+}
+
+/// 掉落物实体的元数据还没到就认不出来。说不知道，不编一个名字。
+#[test]
+fn unknown_item_is_said_to_be_unknown_not_invented() {
+    assert_eq!(
+        render_pickups(&[pickup(1, true, None, None, 2)]),
+        vec!["捡到了 2 件没认出来的东西。"]
+    );
+    assert_eq!(
+        render_pickups(&[pickup(2, false, None, Some("bread"), 1)]),
+        vec!["有人捡走了 bread ×1。"]
+    );
 }

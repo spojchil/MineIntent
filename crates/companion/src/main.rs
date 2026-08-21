@@ -729,6 +729,10 @@ async fn main() -> Result<(), String> {
             // job 进展的游标，与 wake 那条各走各的：进展是「还在走」，不该叫醒，
             // 由帧搭车呈现；终局才是事件，走 wake。
             let mut progress_seq: Option<u64> = None;
+            // 拾取游标与攒下的句子。**每帧都排空，投递时才吐**——不排空的话，
+            // 窗只有 64 条，挖得快就会在两次投递之间被挤掉。
+            let mut pickup_seq: Option<u64> = None;
+            let mut pickup_lines: Vec<String> = Vec::new();
             loop {
                 // 两个触发源，谁先到算谁：
                 //   一、模型响应落定（工具刚跑完，世界多半刚变）；
@@ -788,6 +792,34 @@ async fn main() -> Result<(), String> {
                 // 1,323 次是单行的位置变化；模型忙着时它们全堆在信箱里，一次并进
                 // 855 条、+98k token。
                 let snapshot = snapshots.latest();
+
+                // 拾取：世界事件，不受开屏与否管（裁定 2026-08-21）。
+                //
+                // **它搭车，不触发。** 挖矿时在途 job 的进展本来就在触发投递，
+                // 自己捡的东西顺势就出去了；空闲时被人塞了东西则要等下一次
+                // 投递——那属于「空闲唤醒源」，`wake-criterion-decision.md`
+                // §9.4 未裁，这里不替它裁。
+                {
+                    let fresh: Vec<world::PickupEntry> = snapshot
+                        .pickups
+                        .entries
+                        .iter()
+                        .filter(|entry| !pickup_seq.is_some_and(|seen| entry.seq <= seen))
+                        .cloned()
+                        .collect();
+                    if let Some(last) = fresh.last() {
+                        pickup_seq = Some(last.seq);
+                    }
+                    pickup_lines.extend(render::render_pickups(&fresh));
+                    // 攒太多就只留最近的：真到这一步说明久没投递，
+                    // 旧的拾取对「我现在有什么」已经由快捷栏那行代答了。
+                    const PICKUP_BACKLOG: usize = 32;
+                    if pickup_lines.len() > PICKUP_BACKLOG {
+                        let drop = pickup_lines.len() - PICKUP_BACKLOG;
+                        pickup_lines.drain(..drop);
+                    }
+                }
+
                 let mut progress = Vec::new();
                 for entry in &snapshot.jobs.entries {
                     if progress_seq.is_some_and(|seen| entry.seq <= seen) {
@@ -808,6 +840,7 @@ async fn main() -> Result<(), String> {
                     &snapshot,
                     read_mark.position(),
                 ));
+                sections.append(&mut pickup_lines);
                 sections.extend(progress);
                 // **方块信息不进会话区**（维护者裁定，2026-08-20）：diff 照常算、照常
                 // 推进记忆——那是给机器用的（寻路读它，`blocks` 工具查它）——但一格
