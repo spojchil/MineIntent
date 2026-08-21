@@ -78,7 +78,10 @@ fn situation_covers_identity_environment_position_vitals_in_order() {
     assert_eq!(lines[1], "主世界，下午。");
     assert_eq!(lines[2], "位置 (120, 64, -36)，面朝西。");
     assert_eq!(lines[3], "生命 18/20，饥饿 15/20。");
-    assert_eq!(lines.len(), 4, "没实体没未读时不该有第五行：{text}");
+    // 快捷栏与手持排在生命之后、附近之前：都是「自己身上的事」。
+    assert_eq!(lines[4], "快捷栏九格都是空的。副手：空。");
+    assert_eq!(lines[5], "手持 hotbar 0：空手。");
+    assert_eq!(lines.len(), 6, "没实体没未读时不该有第七行：{text}");
 }
 
 /// 用户名缺席（未就绪等）时不硬编一行空自称。
@@ -480,4 +483,89 @@ fn furnace_menu_listing_names_the_three_working_slots() {
             "{kind}: {text}"
         );
     }
+}
+
+fn slot(slot: u32, name: &str, count: u32) -> InventorySlot {
+    InventorySlot {
+        slot,
+        item_name: name.to_owned(),
+        count,
+        metadata: None,
+        durability_used: None,
+    }
+}
+
+#[test]
+fn hotbar_names_filled_slots_and_counts_the_empty_ones() {
+    let mut snap = snapshot();
+    // 玩家屏：快捷栏 36-44，副手 45。
+    snap.self_state.inventory.slots = vec![
+        slot(36, "iron_pickaxe", 1),
+        slot(39, "oak_log", 12),
+        slot(45, "shield", 1),
+        // 主背包的东西不该出现在快捷栏这一行里。
+        slot(9, "bread", 7),
+    ];
+    let line = render_hotbar(&snap);
+    assert_eq!(
+        line,
+        "快捷栏：hotbar 0=iron_pickaxe ×1、hotbar 3=oak_log ×12（其余 7 格空）。副手：shield ×1。"
+    );
+    assert!(!line.contains("bread"), "主背包不在快捷栏这一行");
+}
+
+#[test]
+fn empty_hotbar_says_so_once_instead_of_nine_times() {
+    let snap = snapshot();
+    assert_eq!(render_hotbar(&snap), "快捷栏九格都是空的。副手：空。");
+}
+
+#[test]
+fn held_line_reports_the_selected_slot_and_what_is_in_it() {
+    let mut snap = snapshot();
+    snap.self_state.inventory.slots = vec![slot(39, "oak_log", 12)];
+    snap.self_state.inventory.selected_hotbar_slot = 3;
+    assert_eq!(render_held(&snap), "手持 hotbar 3：oak_log ×12。");
+
+    snap.self_state.inventory.selected_hotbar_slot = 5;
+    assert_eq!(render_held(&snap), "手持 hotbar 5：空手。");
+}
+
+/// 开着容器时快捷栏整体后移一格（工作台屏 37-45）。写死玩家屏会把
+/// 每一格都标错名字——这正是快照自带 `space` 要挡住的事。
+#[test]
+fn hotbar_follows_the_active_slot_space_not_the_player_screen() {
+    let mut snap = snapshot();
+    snap.self_state.inventory.space =
+        world::slots::SlotSpace::new(37, 45, None, world::slots::OwnArea::Crafting);
+    // 工作台屏里协议号 37 才是快捷栏第一格；36 是主背包最后一格。
+    snap.self_state.inventory.slots = vec![slot(37, "iron_pickaxe", 1), slot(36, "bread", 7)];
+    let line = render_hotbar(&snap);
+    assert_eq!(
+        line,
+        "快捷栏：hotbar 0=iron_pickaxe ×1（其余 8 格空）。副手：空。"
+    );
+    assert!(
+        !line.contains("bread"),
+        "36 在工作台屏里是主背包，不是快捷栏"
+    );
+}
+
+/// 处境逐行差异靠的是行分得准：切换栏位只该动「手持」那一行，
+/// 快捷栏内容那一行不该跟着重发。
+#[test]
+fn switching_slots_changes_only_the_held_line() {
+    let mut snap = snapshot();
+    snap.self_state.inventory.slots = vec![slot(36, "iron_pickaxe", 1)];
+    let before = render_situation_lines(&snap, (1, 0));
+    snap.self_state.inventory.selected_hotbar_slot = 4;
+    let after = render_situation_lines(&snap, (1, 0));
+
+    let changed: Vec<SituationLine> = before
+        .iter()
+        .zip(after.iter())
+        .filter(|((_, a), (_, b))| a != b)
+        .map(|((line, _), _)| *line)
+        .collect();
+    assert_eq!(changed, vec![SituationLine::Held]);
 }

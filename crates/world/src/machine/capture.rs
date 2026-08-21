@@ -109,7 +109,7 @@ pub(super) fn assemble_snapshot(inner: &Inner, bot: &Client) -> Option<TickSnaps
     let entities_elapsed;
     let players_elapsed;
     let inventory_started = std::time::Instant::now();
-    let inventory_captured = capture_inventory(bot);
+    let inventory_captured = capture_inventory(inner, bot);
     let inventory_elapsed = inventory_started.elapsed();
 
     let self_state = SelfState {
@@ -207,7 +207,10 @@ pub(super) fn menu_kind_name(menu: &azalea::inventory::Menu) -> &'static str {
     }
 }
 
-fn capture_inventory(bot: &Client) -> Inventory {
+fn capture_inventory(inner: &Inner, bot: &Client) -> Inventory {
+    // 格号跟着当前活动菜单走,所以地址空间要和格号在同一次采集里取——
+    // 分两次取会在开屏/关屏那一拍错位。
+    let space = super::door::active_slot_space(inner, bot);
     bot.get_component::<InventoryComponent>()
         .map(|inventory| {
             let slots = inventory
@@ -232,9 +235,13 @@ fn capture_inventory(bot: &Client) -> Inventory {
             Inventory {
                 selected_hotbar_slot: inventory.selected_hotbar_slot,
                 slots,
+                space: space.clone(),
             }
         })
-        .unwrap_or_default()
+        .unwrap_or_else(|| Inventory {
+            space,
+            ..Default::default()
+        })
 }
 
 fn capture_players(bot: &Client) -> Vec<PlayerListEntry> {

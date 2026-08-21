@@ -20,6 +20,8 @@ pub enum SituationLine {
     Environment,
     Position,
     Vitals,
+    Hotbar,
+    Held,
     Nearby,
     Unread,
 }
@@ -48,6 +50,8 @@ pub fn render_situation_lines(
         (SituationLine::Environment, render_environment(snap)),
         (SituationLine::Position, render_position(snap)),
         (SituationLine::Vitals, render_vitals(snap)),
+        (SituationLine::Hotbar, render_hotbar(snap)),
+        (SituationLine::Held, render_held(snap)),
         (SituationLine::Nearby, render_nearby(snap)),
     ];
     let unread = unread_chat_count(snap, chat_read);
@@ -214,6 +218,71 @@ pub fn render_nearby(snap: &TickSnapshot) -> String {
     format!("附近：{}。", texts.join("；"))
 }
 
+/// 快捷栏一行：九格内容 + 副手。
+///
+/// 原裁定（旧线 `中期更新-08.md` §1）：hotbar 段 = 9 格全量 + 当前选中栏位 +
+/// 主手物品 + 副手物品。这一段在迁进 Rust 时整个丢了，直到 2026-08-20 实盘
+/// 模型自己说「不知道自己有什么」才补回来。
+///
+/// **不打开物品栏也看得见快捷栏**——它常显在 HUD 上，和血条同一档，
+/// 所以进处境；主背包要开界面才看得见，不进（见 `render_player_menu`）。
+///
+/// 「全量」按本仓既有口径呈现：点名有东西的格，空格只报数——与
+/// `render_player_menu` 同一套，不逐格写「空」。空格数本身也是信息
+/// （还能往回捡多少东西），但九个「空」字不是。
+pub fn render_hotbar(snap: &TickSnapshot) -> String {
+    let inventory = &snap.self_state.inventory;
+    let space = &inventory.space;
+    let item_at = |slot: u16| -> Option<String> {
+        inventory
+            .slots
+            .iter()
+            .find(|entry| entry.slot == u32::from(slot))
+            .map(|entry| format!("{} ×{}", entry.item_name, entry.count))
+    };
+    let mut filled = Vec::new();
+    let mut empty = 0usize;
+    for slot in space.hotbar_slots() {
+        match item_at(slot) {
+            Some(item) => filled.push(format!("{}={item}", space.describe(slot))),
+            None => empty += 1,
+        }
+    }
+    let offhand = space
+        .offhand_slot()
+        .and_then(item_at)
+        .unwrap_or_else(|| "空".to_owned());
+    if filled.is_empty() {
+        return format!("快捷栏九格都是空的。副手：{offhand}。");
+    }
+    let mut line = format!("快捷栏：{}", filled.join("、"));
+    if empty > 0 {
+        line.push_str(&format!("（其余 {empty} 格空）"));
+    }
+    line.push_str(&format!("。副手：{offhand}。"));
+    line
+}
+
+/// 手持一行：选中哪一格、手里是什么。
+///
+/// 与快捷栏分成两行，是因为两者变化频率差一个量级：切换栏位随时发生，
+/// 格子内容要捡到/用完才变。合成一行的话，每切一次栏位都要重发整条快捷栏
+/// ——处境走的是逐行差异，行分得越准，重复投递越少。
+pub fn render_held(snap: &TickSnapshot) -> String {
+    let inventory = &snap.self_state.inventory;
+    let space = &inventory.space;
+    let slot = space.hotbar_slot(inventory.selected_hotbar_slot);
+    let address = space.describe(slot);
+    match inventory
+        .slots
+        .iter()
+        .find(|entry| entry.slot == u32::from(slot))
+    {
+        Some(entry) => format!("手持 {address}：{} ×{}。", entry.item_name, entry.count),
+        None => format!("手持 {address}：空手。"),
+    }
+}
+
 /// 背包全文：手持 + 逐格清单。不进每轮处境，供工具面按需取用。
 pub fn render_inventory(snap: &TickSnapshot) -> String {
     let inventory = &snap.self_state.inventory;
@@ -249,7 +318,10 @@ pub fn render_player_menu(snap: &TickSnapshot) -> String {
     };
     // 清单用**格位地址**，不是协议号——模型要照这上面抄去写 move。
     // 地址由映射生成（`world::slots`），协议号只活在机器层里。
-    let space = world::slots::SlotSpace::player();
+    //
+    // 空间取自快照,不再写死玩家屏:开着工作台时快捷栏在 37-45,
+    // 写死 `player()` 会把每一格都标错名字。
+    let space = snap.self_state.inventory.space.clone();
     let addressed = |name: &str, range: std::ops::RangeInclusive<u32>| {
         let filled: Vec<String> = range
             .clone()

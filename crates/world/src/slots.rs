@@ -59,6 +59,14 @@ pub enum OwnArea {
 /// 盔甲四件，按协议号顺序（5-8）。
 const ARMOR: [&str; 4] = ["head", "chest", "legs", "feet"];
 
+/// 没开容器时就是玩家屏。快照的默认值取它,而不是取一个不存在的空空间——
+/// 「格号属于哪套空间」永远有答案,不该有「未知」这一档。
+impl Default for SlotSpace {
+    fn default() -> Self {
+        Self::player()
+    }
+}
+
 impl SlotSpace {
     pub fn new(hotbar_start: u16, max_slot: u16, offhand: Option<u16>, own: OwnArea) -> Self {
         Self {
@@ -81,6 +89,22 @@ impl SlotSpace {
 
     fn pack_start(&self) -> u16 {
         self.own_len()
+    }
+
+    /// 快捷栏第 `index` 格(0-8)的协议号。快捷栏的位置随屏变
+    /// (玩家屏 36 起、工作台屏 37 起),所以不能写死。
+    pub fn hotbar_slot(&self, index: u8) -> u16 {
+        self.hotbar_start + u16::from(index)
+    }
+
+    /// 快捷栏九格的协议号,从左到右。
+    pub fn hotbar_slots(&self) -> impl Iterator<Item = u16> + '_ {
+        (0..9).map(move |index| self.hotbar_slot(index))
+    }
+
+    /// 副手的协议号;容器屏一般没有。
+    pub fn offhand_slot(&self) -> Option<u16> {
+        self.offhand
     }
 
     /// 协议号 → 地址。给渲染用。

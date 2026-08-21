@@ -17,10 +17,13 @@ mod machine;
 mod viewport;
 
 pub use block::*;
-#[cfg(feature = "azalea")]
+// 纯数据（协议号 ↔ 地址的映射），不碰 azalea。`Inventory` 带着它，
+// 所以不能跟着接入层一起进特性门——否则关掉 azalea 时快照类型就散了。
 pub mod slots;
 
+#[cfg(feature = "azalea")]
 pub use machine::observed::PathAttempt;
+#[cfg(feature = "azalea")]
 pub use machine::{ConnectionConfig, DoorCommand, Module};
 pub use viewport::*;
 
@@ -433,6 +436,10 @@ pub struct StatusEffect {
 pub struct Inventory {
     pub selected_hotbar_slot: u8,
     pub slots: Vec<InventorySlot>,
+    /// 这些格号属于哪套地址空间。**没有它,格号是无意义的数字**:
+    /// 开着工作台时快捷栏在 37-45 而不是 36-44,同一个 40 指的是两格东西。
+    /// 快照自带它,呈现层就不必猜,也不会像先前那样写死玩家屏。
+    pub space: crate::slots::SlotSpace,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
