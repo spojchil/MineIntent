@@ -855,12 +855,6 @@ pub fn render_job_progress(job: &world::JobKind, progress: &world::JobProgress) 
                 total.saturating_sub(*done)
             )
         }
-        (world::JobKind::PillarUp { .. }, world::JobProgress::Pillared { done, total }) => {
-            format!(
-                "垫上并站稳了第 {done} 格，还剩 {} 格。",
-                total.saturating_sub(*done)
-            )
-        }
         // 类别对不上就如实说破，不编。
         (job, progress) => format!("任务收到了不属于它的进展：{job:?} / {progress:?}。"),
     }
@@ -908,18 +902,6 @@ pub fn render_job_entry(entry: &world::JobEntry) -> String {
                 other => format!("挖掘任务收到了不属于它的结局：{other:?}。"),
             }
         }
-        world::JobKind::PillarUp { total, done } => match outcome {
-            world::JobOutcome::Pillared => format!("你往上垫了 {total} 格，站稳了。"),
-            world::JobOutcome::PillarBlocked => format!(
-                "垫到第 {} 格就卡住了（已垫上 {done} 格）——跳起来没能腾出脚下那格，或者方块没放上去。",
-                done + 1
-            ),
-            world::JobOutcome::Replaced => {
-                format!("先前的垫柱被新的顶替了（已垫上 {done}/{total} 格）。")
-            }
-            world::JobOutcome::Stopped => format!("你停下了垫柱（已垫上 {done}/{total} 格）。"),
-            other => format!("垫柱任务收到了不属于它的结局：{other:?}。"),
-        },
     }
 }
 

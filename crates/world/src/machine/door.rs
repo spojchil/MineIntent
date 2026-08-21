@@ -52,10 +52,6 @@ pub enum DoorCommand {
     UseOnBlock([i32; 3]),
     /// 把手持方块放到目标空位（目标须紧挨已有方块，被点的是共享面）。
     PlaceBlock([i32; 3]),
-    /// 垫柱：跳起来在脚下放方块，站上去，重复 `count` 次。
-    PillarUp {
-        count: usize,
-    },
     UseOnEntity {
         entity_key: String,
     },
@@ -191,42 +187,6 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             Ok(())
         }
         DoorCommand::PlaceBlock(at) => place_block(inner, bot, at),
-        DoorCommand::PillarUp { count } => {
-            use azalea::entity::inventory::Inventory as InventoryComponent;
-            if count == 0 {
-                return Err("要垫几格？给个大于 0 的数".to_owned());
-            }
-            // 手里没东西就当场拒绝：在途失败没有措辞的位置，能提前说的就提前说。
-            let empty_handed = bot
-                .try_query_self::<&InventoryComponent, _>(|inventory| {
-                    inventory.held_item().is_empty()
-                })
-                .map_err(|_| "读不到物品栏".to_owned())?;
-            if empty_handed {
-                return Err("手里没拿东西，先用 select_slot 选中要垫的方块".to_owned());
-            }
-            let on_ground = bot
-                .try_query_self::<&azalea::entity::Physics, _>(|physics| physics.on_ground())
-                .map_err(|_| "读不到自身状态".to_owned())?;
-            if !on_ground {
-                return Err("人还在空中，落地再垫".to_owned());
-            }
-            let target = bot
-                .try_query_self::<&azalea::entity::Position, _>(|position| {
-                    [
-                        position.x.floor() as i32,
-                        position.y.floor() as i32,
-                        position.z.floor() as i32,
-                    ]
-                })
-                .map_err(|_| "读不到自身位置".to_owned())?;
-            inner.begin_pillar_job(count, target);
-            bot.set_jumping(true);
-            inner
-                .jump_reset
-                .store(true, std::sync::atomic::Ordering::Release);
-            Ok(())
-        }
         DoorCommand::UseOnEntity { entity_key } => {
             let entity = find_entity_by_key(bot, &entity_key)
                 .ok_or_else(|| format!("附近没有 {entity_key} 这个实体"))?;

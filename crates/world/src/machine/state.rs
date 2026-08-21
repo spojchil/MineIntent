@@ -52,7 +52,6 @@ pub(crate) struct Inner {
     pub(super) movement_job: Mutex<Option<MovementJob>>,
     /// 在途挖掘任务（单意图槽，内含坐标队列）。
     pub(super) mining_job: Mutex<Option<MiningJob>>,
-    pub(super) pillar_job: Mutex<Option<super::pillar::PillarJob>>,
     pub(super) inventory_window: Mutex<VecDeque<InventoryChangeEntry>>,
     /// 各格上一个已知内容：(容器 id, 菜单号) → (物品名, 数量)。
     /// 服务端重发同值不算变化——判据在 [`Inner::push_inventory_change`]。
@@ -109,7 +108,6 @@ impl Inner {
             last_health: Mutex::new(None),
             movement_job: Mutex::new(None),
             mining_job: Mutex::new(None),
-            pillar_job: Mutex::new(None),
             inventory_window: Mutex::new(VecDeque::new()),
             last_slot_contents: Mutex::new(SlotLedger::new()),
             expected_slots: Mutex::new(Vec::new()),
@@ -514,39 +512,6 @@ impl Inner {
                 JobKind::Mine {
                     targets: job.targets,
                     done: job.cursor,
-                },
-                outcome,
-            );
-        }
-    }
-
-    /// 垫柱开槽：与挖掘/移动同款单意图槽。
-    pub(super) fn begin_pillar_job(&self, total: usize, target: [i32; 3]) {
-        let mut slot = self.pillar_job.lock();
-        if let Some(job) = slot.take() {
-            self.push_job_kind(
-                JobKind::PillarUp {
-                    total: job.total,
-                    done: job.total - job.remaining,
-                },
-                JobOutcome::Replaced,
-            );
-        }
-        *slot = Some(super::pillar::PillarJob {
-            remaining: total,
-            total,
-            target,
-            since_tick: self.tick.load(Ordering::Acquire),
-            placed: false,
-        });
-    }
-
-    pub(super) fn end_pillar_job(&self, outcome: JobOutcome) {
-        if let Some(job) = self.pillar_job.lock().take() {
-            self.push_job_kind(
-                JobKind::PillarUp {
-                    total: job.total,
-                    done: job.total - job.remaining,
                 },
                 outcome,
             );

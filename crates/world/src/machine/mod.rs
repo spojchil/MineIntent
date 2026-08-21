@@ -24,7 +24,6 @@ mod door;
 mod mining;
 mod movement;
 pub mod observed;
-mod pillar;
 mod state;
 
 pub use door::DoorCommand;
@@ -56,10 +55,6 @@ const MOVEMENT_STALL_TICKS: usize = 200;
 /// 一块挖不碎的时限。徒手挖石头约 15 秒（300 tick）是原版量级；取 400 tick
 /// 留足余量——超过它仍不碎，多半是够不着、被挡或工具不对，不是慢。
 const MINING_STALL_TICKS: u64 = 400;
-
-/// 垫柱一格等多久算卡住。跳跃全程约 12 tick，给到 60 tick（3 秒）足够容下
-/// 一次往返延迟；再久就是真的没成，如实说破。
-const PILLAR_STALL_TICKS: u64 = 60;
 
 /// 连接配置。v1 只有离线身份、重连固定 Never。
 #[derive(Clone, Debug)]

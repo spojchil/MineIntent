@@ -102,9 +102,6 @@ impl hand::HandDoor for NoDoor {
     fn place<'a>(&'a self, _b: [i32; 3]) -> PortFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
-    fn pillar_up<'a>(&'a self, _count: usize) -> PortFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
     fn use_on_block<'a>(&'a self, _b: [i32; 3]) -> PortFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
