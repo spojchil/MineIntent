@@ -16,6 +16,7 @@ use parking_lot::{Mutex, RwLock};
 use tokio::sync::{oneshot, watch, Notify};
 
 use super::door::{DoorCommand, PendingCommand};
+use super::job::JobSlot;
 use super::mining::MiningJob;
 use super::movement::MovementJob;
 use super::{
@@ -24,9 +25,8 @@ use super::{
 };
 use crate::{
     ChatContent, ChatEntry, ChatPosition, ConnectionPhase, DamageEntry, Epoch, FactSource,
-    InventoryChangeEntry, JobEntry, JobKind, JobOutcome, OpenScreenState, PickupEntry, PlayerRef,
-    ScreenEntry, ScreenEvent, SoundEntry, SoundId, TickSnapshot, Window, WorldMeta,
-    CHAT_WINDOW_LINES,
+    InventoryChangeEntry, JobEntry, OpenScreenState, PickupEntry, PlayerRef, ScreenEntry,
+    ScreenEvent, SoundEntry, SoundId, TickSnapshot, Window, WorldMeta, CHAT_WINDOW_LINES,
 };
 
 /// 预期回声的时限：swap/丢弃后这么多 tick 内，同格的 SetSlot 视为自己
@@ -49,9 +49,9 @@ pub(crate) struct Inner {
     /// 上一 tick 的生命值；下降即产伤害条目。None = 尚无基线（首帧不产）。
     pub(super) last_health: Mutex<Option<f64>>,
     /// 在途移动任务（单意图槽）。
-    pub(super) movement_job: Mutex<Option<MovementJob>>,
+    pub(super) movement_job: JobSlot<MovementJob>,
     /// 在途挖掘任务（单意图槽，内含坐标队列）。
-    pub(super) mining_job: Mutex<Option<MiningJob>>,
+    pub(super) mining_job: JobSlot<MiningJob>,
     pub(super) inventory_window: Mutex<VecDeque<InventoryChangeEntry>>,
     /// 各格上一个已知内容：(容器 id, 菜单号) → (物品名, 数量)。
     /// 服务端重发同值不算变化——判据在 [`Inner::push_inventory_change`]。
@@ -84,6 +84,8 @@ pub(crate) struct Inner {
     /// 全部事实窗共用的单调到达序号（聊天/伤害/任务）：
     /// 跨窗可比先后，各窗游标互不干扰。
     pub(super) fact_seq: AtomicU64,
+    /// 任务 id 发放器：顶替时新旧任务要能区分。
+    pub(super) job_seq: AtomicU64,
     pub(super) day_time: AtomicU64,
     /// (rain_level, thunder_level)。
     pub(super) weather: Mutex<(f32, f32)>,
@@ -106,8 +108,8 @@ impl Inner {
             damage_window: Mutex::new(VecDeque::new()),
             jobs_window: Mutex::new(VecDeque::new()),
             last_health: Mutex::new(None),
-            movement_job: Mutex::new(None),
-            mining_job: Mutex::new(None),
+            movement_job: JobSlot::default(),
+            mining_job: JobSlot::default(),
             inventory_window: Mutex::new(VecDeque::new()),
             last_slot_contents: Mutex::new(SlotLedger::new()),
             expected_slots: Mutex::new(Vec::new()),
@@ -125,6 +127,7 @@ impl Inner {
             shutdown: Notify::new(),
             tick: AtomicU64::new(0),
             fact_seq: AtomicU64::new(0),
+            job_seq: AtomicU64::new(0),
             day_time: AtomicU64::new(0),
             weather: Mutex::new((0.0, 0.0)),
             dimension: Mutex::new("minecraft:overworld".to_owned()),
@@ -440,26 +443,25 @@ impl Inner {
         }
     }
 
-    pub(super) fn push_job(&self, destination: [i32; 3], outcome: JobOutcome) {
-        self.push_job_kind(JobKind::MoveTo { destination }, outcome);
+    /// 当前 tick。
+    pub(super) fn now_tick(&self) -> u64 {
+        self.tick.load(Ordering::Acquire)
     }
 
-    pub(super) fn push_job_kind(&self, job: JobKind, outcome: JobOutcome) {
-        self.push_job_event(job, crate::JobEvent::Finished(outcome));
+    /// 发一个新的任务 id。
+    pub(super) fn next_job_id(&self) -> crate::JobId {
+        crate::JobId(self.job_seq.fetch_add(1, Ordering::AcqRel))
     }
 
-    /// 进行中的进展：落一条事实，**不结束 job**。
-    pub(super) fn push_job_progress(&self, job: JobKind, progress: crate::JobProgress) {
-        self.push_job_event(job, crate::JobEvent::Progress(progress));
-    }
-
-    fn push_job_event(&self, job: JobKind, event: crate::JobEvent) {
+    /// 落一条任务事实。**只由 [`super::job::JobSlot`] 调用**——事实与槽位状态
+    /// 必须同源，绕过槽位直接写窗口会让「必有终局」这条不变量失去保证。
+    pub(super) fn push_job_fact(&self, id: crate::JobId, fact: crate::JobFact) {
         let entry = JobEntry {
             seq: self.fact_seq.fetch_add(1, Ordering::AcqRel),
             tick: self.tick.load(Ordering::Acquire),
             occurred_at: SystemTime::now(),
-            job,
-            event,
+            id,
+            fact,
         };
         let mut window = self.jobs_window.lock();
         window.push_back(entry);
@@ -468,66 +470,13 @@ impl Inner {
         }
     }
 
-    /// 移动任务开槽：旧任务被顶替即出窗。
-    pub(super) fn begin_movement_job(&self, destination: [i32; 3]) {
-        let mut slot = self.movement_job.lock();
-        if let Some(job) = slot.take() {
-            self.push_job(job.destination, JobOutcome::Replaced);
-        }
-        *slot = Some(MovementJob {
-            destination,
-            started_tick: self.tick.load(Ordering::Acquire),
-            armed: false,
-            stall_notified: false,
-            announced_leg_end: None,
-        });
-    }
-
-    /// 挖掘任务开槽：与移动同款的**单意图槽**——新队列顶替旧队列，旧的如实出窗。
-    ///
-    /// 顶替而非追加，是为了与 motion 的「新意图顶替旧意图」一致：模型改主意时
-    /// 重发一次完整数组即可，不必再有增删改查那一套。
-    pub(super) fn begin_mining_job(&self, targets: Vec<[i32; 3]>) {
-        let mut slot = self.mining_job.lock();
-        if let Some(job) = slot.take() {
-            self.push_job_kind(
-                JobKind::Mine {
-                    targets: job.targets,
-                    done: job.cursor,
-                },
-                JobOutcome::Replaced,
-            );
-        }
-        *slot = Some(MiningJob {
-            targets,
-            cursor: 0,
-            since_tick: self.tick.load(Ordering::Acquire),
-        });
-    }
-
-    /// 挖掘任务收槽并出窗（挖完、卡住都走这里）。
-    pub(super) fn end_mining_job(&self, outcome: JobOutcome) {
-        if let Some(job) = self.mining_job.lock().take() {
-            self.push_job_kind(
-                JobKind::Mine {
-                    targets: job.targets,
-                    done: job.cursor,
-                },
-                outcome,
-            );
-        }
-    }
-
-    /// release 停手：在途挖掘如实出窗。没任务时不是错误。
-    pub(super) fn end_mining_job_stopped(&self) {
-        self.end_mining_job(JobOutcome::Stopped);
-    }
-
-    /// 停止动词：在途任务如实出窗。没任务时不是错误。
-    pub(super) fn end_movement_job_stopped(&self) {
-        if let Some(job) = self.movement_job.lock().take() {
-            self.push_job(job.destination, JobOutcome::Stopped);
-        }
+    /// 全部在途任务。槽位是唯一真相源——不另建镜像表。
+    pub(super) fn jobs_in_flight(&self) -> Vec<crate::JobStatus> {
+        let now = self.now_tick();
+        [self.movement_job.status(now), self.mining_job.status(now)]
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     pub(super) fn push_chat(&self, sender: Option<(String, Option<String>)>, plain_text: String) {
@@ -645,27 +594,27 @@ mod tests {
     #[test]
     fn movement_job_replacement_and_stop_are_recorded() {
         let inner = Inner::new();
-        inner.begin_movement_job([10, 64, -3]);
-        inner.begin_movement_job([20, 64, 5]); // 顶替
-        inner.end_movement_job_stopped(); // 停止
-        inner.end_movement_job_stopped(); // 没任务时不是事件
+        let job = |d: [i32; 3]| crate::machine::movement::MovementJob::new(d, 0);
+        inner.movement_job.begin(&inner, job([10, 64, -3]));
+        inner.movement_job.begin(&inner, job([20, 64, 5])); // 顶替
+        inner.movement_job.cancel(&inner); // 停止
+        inner.movement_job.cancel(&inner); // 没任务时不是事件
 
         let window = inner.jobs_window_now();
-        let outcomes: Vec<JobOutcome> = window
+        let events: Vec<crate::MoveEvent> = window
             .entries
             .iter()
-            .filter_map(|entry| match entry.event {
-                crate::JobEvent::Finished(outcome) => Some(outcome),
-                crate::JobEvent::Progress(_) => None,
+            .map(|entry| match entry.fact {
+                crate::JobFact::Move { event, .. } => event,
+                ref other => panic!("期望移动事实，得到 {other:?}"),
             })
             .collect();
-        assert_eq!(outcomes, vec![JobOutcome::Replaced, JobOutcome::Stopped]);
         assert_eq!(
-            window.entries[0].job,
-            JobKind::MoveTo {
-                destination: [10, 64, -3]
-            }
+            events,
+            vec![crate::MoveEvent::Replaced, crate::MoveEvent::Cancelled]
         );
+        // 顶替与取消分属两个任务，id 必须不同——否则下游分不出谁的进展。
+        assert_ne!(window.entries[0].id, window.entries[1].id);
     }
 
     /// 判定表全景：armed 前后各态的行动结论。

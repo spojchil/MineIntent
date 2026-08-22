@@ -4,6 +4,7 @@ members = [
     "crates/context",
     "crates/dispatch",
     "crates/hand",
+    "crates/jobs",
     "crates/memory",
     "crates/motion",
     "crates/perception",

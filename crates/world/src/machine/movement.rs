@@ -10,15 +10,14 @@
 //! 卡住 = `ticks_since_last_node_reached` 超阈值——只通知不取消，
 //! 因为 azalea 自己会补路自救。
 
-use std::sync::atomic::Ordering;
-
 use azalea::entity::Position;
 use azalea::pathfinder::{ExecutingPath, Pathfinder, PathfinderClientExt};
 use azalea::Client;
 
+use super::job::{JobVerb, Step};
 use super::state::Inner;
 use super::{MOVEMENT_ARM_GRACE_TICKS, MOVEMENT_STALL_TICKS};
-use crate::{JobKind, JobOutcome, JobProgress};
+use crate::{JobFact, JobId, JobStatus, JobStatusKind, MoveEvent};
 
 /// 在途的移动任务（单意图槽）。终局判定按 azalea 寻路器的可观察状态：
 /// 成功到达时它把 goal 置 None（execute/mod.rs 目标达成分支）；走完未达时
@@ -37,6 +36,55 @@ pub(super) struct MovementJob {
     pub(super) announced_leg_end: Option<[i32; 3]>,
 }
 
+impl MovementJob {
+    pub(super) fn new(destination: [i32; 3], started_tick: u64) -> Self {
+        Self {
+            destination,
+            started_tick,
+            armed: false,
+            stall_notified: false,
+            announced_leg_end: None,
+        }
+    }
+}
+
+impl JobVerb for MovementJob {
+    type Event = MoveEvent;
+
+    fn fact(&self, event: MoveEvent) -> JobFact {
+        JobFact::Move {
+            destination: self.destination,
+            event,
+        }
+    }
+
+    fn replaced() -> MoveEvent {
+        MoveEvent::Replaced
+    }
+    fn cancelled() -> MoveEvent {
+        MoveEvent::Cancelled
+    }
+    fn timed_out() -> MoveEvent {
+        MoveEvent::TimedOut
+    }
+
+    /// 兜底期限：远宽于 `MOVEMENT_STALL_TICKS`（那个只发一次「卡住」提醒，
+    /// 任务照跑）。这里防的是「判定表根本没走到终局」，正常永不触发。
+    const WATCHDOG_TICKS: u64 = MOVEMENT_STALL_TICKS as u64 * 6;
+
+    fn status(&self, id: JobId, started_tick: u64, now_tick: u64) -> JobStatus {
+        JobStatus {
+            id,
+            kind: JobStatusKind::Move {
+                destination: self.destination,
+                leg: self.announced_leg_end,
+            },
+            started_tick,
+            elapsed_ticks: now_tick.saturating_sub(started_tick),
+        }
+    }
+}
+
 /// 移动 job 轮询的行动结论（纯函数，可单测）。
 #[derive(Debug, PartialEq, Eq)]
 enum MovementPollStep {
@@ -45,7 +93,7 @@ enum MovementPollStep {
     /// 寻路器已可见，进入武装状态。
     Arm,
     /// 任务终局：出窗并清槽。
-    End(JobOutcome),
+    End(MoveEvent),
     /// 卡住通知（任务继续）。
     Stall,
 }
@@ -73,21 +121,21 @@ fn movement_poll_step(poll: MovementPoll) -> MovementPollStep {
         }
         if poll.grace_exceeded {
             // 出发都没出发（消息丢失等罕见情形）——按走完未达收束，不装作还在走。
-            return MovementPollStep::End(JobOutcome::PathEnded);
+            return MovementPollStep::End(MoveEvent::PathEnded);
         }
         return MovementPollStep::Keep;
     }
     if !poll.calculating && !poll.executing {
         if !poll.goal_some {
             // 只有寻路器的目标达成分支会在无外停时清 goal。
-            return MovementPollStep::End(JobOutcome::Arrived);
+            return MovementPollStep::End(MoveEvent::Arrived);
         }
         // goal 还挂着但执行已停：走完未达（不可达/局部路径尽头）。
         // 站在目的地上的空路径情形按到达算——goal.success 的判据就是方块相等。
         return MovementPollStep::End(if poll.at_destination {
-            JobOutcome::Arrived
+            MoveEvent::Arrived
         } else {
-            JobOutcome::PathEnded
+            MoveEvent::PathEnded
         });
     }
     if poll.executing && poll.stalled_long && !poll.stall_notified {
@@ -99,9 +147,9 @@ fn movement_poll_step(poll: MovementPoll) -> MovementPollStep {
 /// 移动 job 每 tick 轮询：读寻路器三个状态位与自身方块位，
 /// 交给纯判定表（`movement_poll_step`），只在这里落副作用。
 pub(super) fn poll_movement_job(inner: &Inner, bot: &Client) {
-    let mut slot = inner.movement_job.lock();
-    let Some(job) = slot.as_mut() else { return };
-
+    if inner.movement_job.peek(|_| ()).is_none() {
+        return;
+    }
     let Ok((pathfinder, stall_ticks, leg_end, block_pos)) =
         bot.try_query_self::<(Option<&Pathfinder>, Option<&ExecutingPath>, &Position), _>(
             |(pathfinder, executing, position)| {
@@ -130,48 +178,49 @@ pub(super) fn poll_movement_job(inner: &Inner, bot: &Client) {
     // 这一程的终点由寻路器算完才知道，所以在它出现（或被 patch 改动）时才说。
     // 说的是意图不是承诺：走不走得到，下面的判定表照常判。
     if let Some(leg_end) = leg_end {
-        if job.announced_leg_end != Some(leg_end) {
-            job.announced_leg_end = Some(leg_end);
-            let destination = job.destination;
-            inner.push_job_progress(
-                JobKind::MoveTo { destination },
-                JobProgress::Leg { to: leg_end },
-            );
-        }
+        inner.movement_job.poll(inner, |job| {
+            if job.announced_leg_end == Some(leg_end) {
+                Step::Keep
+            } else {
+                job.announced_leg_end = Some(leg_end);
+                Step::Progress(MoveEvent::Leg { to: leg_end })
+            }
+        });
     }
-    let step = movement_poll_step(MovementPoll {
-        armed: job.armed,
-        goal_some,
-        calculating,
-        executing: stall_ticks.is_some(),
-        at_destination: block_pos == job.destination,
-        grace_exceeded: inner
-            .tick
-            .load(Ordering::Acquire)
-            .saturating_sub(job.started_tick)
-            > MOVEMENT_ARM_GRACE_TICKS,
-        stalled_long: stall_ticks.is_some_and(|ticks| ticks > MOVEMENT_STALL_TICKS),
-        stall_notified: job.stall_notified,
-    });
-    match step {
-        MovementPollStep::Keep => {}
-        MovementPollStep::Arm => job.armed = true,
+
+    let Some(step) = inner.movement_job.peek(|job| {
+        movement_poll_step(MovementPoll {
+            armed: job.armed,
+            goal_some,
+            calculating,
+            executing: stall_ticks.is_some(),
+            at_destination: block_pos == job.destination,
+            grace_exceeded: inner.now_tick().saturating_sub(job.started_tick)
+                > MOVEMENT_ARM_GRACE_TICKS,
+            stalled_long: stall_ticks.is_some_and(|ticks| ticks > MOVEMENT_STALL_TICKS),
+            stall_notified: job.stall_notified,
+        })
+    }) else {
+        return;
+    };
+
+    let landed = inner.movement_job.poll(inner, |job| match step {
+        MovementPollStep::Keep => Step::Keep,
+        MovementPollStep::Arm => {
+            job.armed = true;
+            Step::Keep
+        }
         MovementPollStep::Stall => {
             job.stall_notified = true;
-            let destination = job.destination;
-            drop(slot);
-            inner.push_job(destination, JobOutcome::Stalled);
+            Step::Progress(MoveEvent::Stalled)
         }
-        MovementPollStep::End(outcome) => {
-            let job = slot.take().expect("上面刚借到 Some");
-            drop(slot);
-            if outcome == JobOutcome::PathEnded {
-                // goal 还挂在寻路器上（走完未达不清 goal）；清掉僵尸目标，
-                // 避免下次判定被旧 goal 干扰。
-                bot.stop_pathfinding();
-            }
-            inner.push_job(job.destination, outcome);
-        }
+        MovementPollStep::End(event) => Step::End(event),
+    });
+
+    if landed == Some(MoveEvent::PathEnded) {
+        // goal 还挂在寻路器上（走完未达不清 goal）；清掉僵尸目标，
+        // 避免下次判定被旧 goal 干扰。
+        bot.stop_pathfinding();
     }
 }
 
@@ -205,7 +254,7 @@ mod tests {
                 grace_exceeded: true,
                 ..poll()
             }),
-            Step::End(JobOutcome::PathEnded)
+            Step::End(MoveEvent::PathEnded)
         );
         // 武装后：goal 清空且不在算不在走 = 寻路器宣告到达。
         assert_eq!(
@@ -213,7 +262,7 @@ mod tests {
                 armed: true,
                 ..poll()
             }),
-            Step::End(JobOutcome::Arrived)
+            Step::End(MoveEvent::Arrived)
         );
         // goal 还挂着但停了：不在目的地=走完未达；在目的地=空路径到达。
         assert_eq!(
@@ -222,7 +271,7 @@ mod tests {
                 goal_some: true,
                 ..poll()
             }),
-            Step::End(JobOutcome::PathEnded)
+            Step::End(MoveEvent::PathEnded)
         );
         assert_eq!(
             movement_poll_step(MovementPoll {
@@ -231,7 +280,7 @@ mod tests {
                 at_destination: true,
                 ..poll()
             }),
-            Step::End(JobOutcome::Arrived)
+            Step::End(MoveEvent::Arrived)
         );
         // 执行中：正常走→保持；久无推进→通知一次，此后沉默。
         let walking = MovementPoll {

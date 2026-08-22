@@ -14,7 +14,8 @@ use agent::adapters::http::{HttpModel, HttpModelConfig, Protocol};
 use agent::{AgentSession, InputMessage, MailboxInput, SessionConfig};
 use context::ContextStrategy;
 use dispatch::{Dispatcher, LifeGate, Occupancy, ToolProvider};
-use hand::{HandDoor, HandTools, MiningStatus};
+use hand::{HandDoor, HandTools};
+use jobs::{JobsDoor, JobsTools};
 use memory::{MemoryFile, MemoryTools};
 use motion::{MotionDoor, MotionTools};
 use perception::{PerceptionTools, ViewportDoor};
@@ -124,17 +125,6 @@ impl HandDoor for ModuleHandDoor {
     fn mine<'a>(&'a self, blocks: Vec<[i32; 3]>) -> agent::PortFuture<'a, Result<(), String>> {
         Box::pin(async move { self.0.execute(DoorCommand::Mine(blocks)).await })
     }
-    fn mining_status<'a>(&'a self) -> agent::PortFuture<'a, Option<MiningStatus>> {
-        Box::pin(async move {
-            self.0
-                .mining_status()
-                .map(|(done, total, current)| MiningStatus {
-                    done,
-                    total,
-                    current,
-                })
-        })
-    }
     fn place<'a>(&'a self, block: [i32; 3]) -> agent::PortFuture<'a, Result<(), String>> {
         Box::pin(async move { self.0.execute(DoorCommand::PlaceBlock(block)).await })
     }
@@ -168,6 +158,15 @@ impl HandDoor for ModuleHandDoor {
     }
     fn select_slot<'a>(&'a self, slot: u8) -> agent::PortFuture<'a, Result<(), String>> {
         Box::pin(async move { self.0.execute(DoorCommand::SelectSlot(slot)).await })
+    }
+}
+
+/// 任务表门：只读，问机器现在有什么在跑。
+struct ModuleJobsDoor(Arc<Module>);
+
+impl JobsDoor for ModuleJobsDoor {
+    fn in_flight<'a>(&'a self) -> agent::PortFuture<'a, Vec<world::JobStatus>> {
+        Box::pin(async move { self.0.jobs_in_flight() })
     }
 }
 
@@ -666,6 +665,7 @@ async fn main() -> Result<(), String> {
         Arc::new(MemoryTools::new(memory_file.clone())),
         Arc::new(MotionTools::new(Arc::new(ModuleMotionDoor(module.clone())))),
         Arc::new(HandTools::new(Arc::new(ModuleHandDoor(module.clone())))),
+        Arc::new(JobsTools::new(Arc::new(ModuleJobsDoor(module.clone())))),
         Arc::new(PerceptionTools::new(
             Arc::new(ModuleViewportDoor {
                 module: module.clone(),
@@ -849,7 +849,7 @@ async fn main() -> Result<(), String> {
                         continue;
                     }
                     progress_seq = Some(entry.seq);
-                    if matches!(entry.event, world::JobEvent::Progress(_)) {
+                    if !entry.fact.is_terminal() {
                         progress.push(render::render_job_entry(entry));
                     }
                 }
