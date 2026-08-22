@@ -1,0 +1,29 @@
+[package]
+name = "companion"
+description = "组合根：纵切装配——接入模块+编排+界面+记忆+上下文+最小唤醒脚手架"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+agent = { workspace = true, features = ["openai"] }
+context = { path = "../context" }
+dispatch = { path = "../dispatch" }
+hand = { path = "../hand" }
+motion = { path = "../motion" }
+perception = { path = "../perception" }
+presence = { path = "../presence" }
+memory = { path = "../memory" }
+render = { path = "../render" }
+serde_json = "1"
+screens = { path = "../screens" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+world = { path = "../world", features = ["azalea"] }
+
+[lints]
+workspace = true
+
+# 超时探针：不依赖 azalea，只打 HTTP 适配器这一层。
+[[example]]
+name = "model_timeout_probe"

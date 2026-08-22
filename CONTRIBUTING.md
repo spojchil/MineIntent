@@ -15,6 +15,7 @@
 ## 3. 实现与记录
 
 - 一个 Pull Request 解决一个清晰问题。
+- 提交信息只描述代码变更本身：不写跑测叙事、裁定过程或对话引用；测试经过进验证指南或 Issue。
 - 设计理由写入 commit message、紧贴实现的注释或关联 Issue；不要新建长期状态文档代替证据。
 - 若改动引入或改变产品语义，在 PR 的“产品假设”中引用准确的产品条目或提案 Issue，并列出仍未决定的部分。
 - 不提交 API 密钥、令牌、私人聊天、世界存档、未脱敏日志或本地运行数据。
@@ -26,6 +27,18 @@
 - 实际运行过的检查；
 - 人工观察或真实服务器证据；
 - 尚未验证的推断。
+
+改动 `crates/` 时另跑 Rust 工作区的三件套（与 CI 相同）：
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets
+cargo test --workspace --all-targets --locked
+```
+
+工具链由 `rust-toolchain.toml` 钉住（nightly，随 Azalea 的要求），
+`rustfmt`/`clippy` 已在其中声明，无需另行安装。
+运行方式与环境变量见 [Rust workspace 指南](./docs/guides/rust-workspace.md)。
 
 ## 5. Pull Request
 

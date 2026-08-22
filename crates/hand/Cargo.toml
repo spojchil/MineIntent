@@ -1,0 +1,18 @@
+[package]
+name = "hand"
+description = "手：攻击/挖掘/使用与物品操作的意图工具，三态互斥由世界侧状态机如实仲裁"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+agent = { workspace = true }
+dispatch = { path = "../dispatch" }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

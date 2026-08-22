@@ -1,0 +1,67 @@
+[package]
+name = "world"
+description = "模块一·原版连接与感知：tick 快照类型与快照源接口（连接机器随后落位）"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[features]
+# 连接机器(azalea 接入)。纯类型消费者不开此 feature,不拖 bevy 编译。
+azalea = ["dep:azalea", "dep:tokio", "dep:parking_lot"]
+
+[dependencies]
+azalea = { workspace = true, optional = true }
+parking_lot = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"], optional = true }
+
+[lints]
+workspace = true
+
+# 例子全部依赖连接机器。不声明 required-features 的话,
+# `cargo test -p world`(不带 feature)会试图编译它们而失败——
+# 工作区跑法只是被 companion 的特性统一掩着,这里把依赖说破。
+
+[[example]]
+name = "diff_mix_probe"
+required-features = ["azalea"]
+
+[[example]]
+name = "legal_path_probe"
+required-features = ["azalea"]
+
+[[example]]
+name = "pillar_probe"
+required-features = ["azalea"]
+
+[[example]]
+name = "scan_bench_probe"
+required-features = ["azalea"]
+
+[[example]]
+name = "craft_timing_probe"
+required-features = ["azalea"]
+
+[[example]]
+name = "crafting_probe"
+required-features = ["azalea"]
+
+[[example]]
+name = "fake_player"
+required-features = ["azalea"]
+
+[[example]]
+name = "open_probe"
+required-features = ["azalea"]
+
+[[example]]
+name = "swap_probe"
+required-features = ["azalea"]
+
+[[example]]
+name = "gaze_probe"
+required-features = ["azalea"]
+
+[[example]]
+name = "dig_place_probe"
+required-features = ["azalea"]

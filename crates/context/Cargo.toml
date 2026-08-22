@@ -1,0 +1,21 @@
+[package]
+name = "context"
+description = "上下文策略：实现内核提示端口，组装人设与记忆；处境渲染与对话压缩随后续模块落位"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+agent = { workspace = true }
+memory = { path = "../memory" }
+render = { path = "../render" }
+screens = { path = "../screens" }
+serde_json = "1"
+world = { path = "../world" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

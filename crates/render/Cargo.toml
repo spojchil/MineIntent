@@ -1,0 +1,13 @@
+[package]
+name = "render"
+description = "丙·渲染：tick 快照到模型可读文字的纯函数，呈现选择政策归此处"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+world = { path = "../world" }
+
+[lints]
+workspace = true
