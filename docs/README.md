@@ -8,13 +8,10 @@
 | 构建与运行 | [workspace 指南](./guides/rust-workspace.md) |
 | 检查、测试或验证 | [验证指南](./guides/validation.md) |
 | 理解当前实现 | [当前实现结构](./architecture.md)，再阅读其中链接的代码产生方 |
-| 追溯历史 | [历史来源与旧路径迁移表](./history/index.md)，再进入不可变 commit、Issue 或 PR |
-| 了解原版客户端能力范围（P04 参考） | [Minecraft Java 客户端能力全景](./minecraft-client-capability-panorama.md) |
-| 动后台 job / 事件通道 / 自身受伤前 | [后台 job 模型：讨论记录与前置调查](./background-job-design-notes.md) |
-| 裁决「空闲时什么该唤醒同伴」 | [唤醒判据：裁决材料](./wake-criterion-decision.md) |
-| 裁决上下文压缩 | [上下文压缩：裁决材料](./compaction-decision.md) |
-| 改动轮末帧装什么 | [轮末帧段清单：已裁内容与迁移丢件](./frame-segments-decision.md) |
 | 准备贡献 | [贡献流程](../CONTRIBUTING.md) |
+
+未决的设计问题在 GitHub Issue（`status:needs-decision` 标签）；历史材料靠 git 历史与
+`typescript-prototype` 快照 tag。
 
 ## 文件权威等级
 
@@ -25,20 +22,13 @@
 | [`docs/architecture.md`](./architecture.md) | 绑定到指定分支的当前实现说明 | 无 |
 | [`docs/guides/validation.md`](./guides/validation.md) | 检查、测试和验证边界 | 无 |
 | [`docs/guides/rust-workspace.md`](./guides/rust-workspace.md) | 构建、运行、配置与已知越界 | 无 |
-| [`docs/history/index.md`](./history/index.md) | 历史证据和旧路径导航 | 无 |
-| [`docs/minecraft-client-capability-panorama.md`](./minecraft-client-capability-panorama.md) | 原版客户端能力调研基线（26.1.2/775），P04 的参考材料 | 无 |
-| [`docs/history/`](./history/) | 已删实现的说明、审计与实盘证据；正文不复制回活文档 | 无 |
-| [`docs/background-job-design-notes.md`](./background-job-design-notes.md) | 后台 job 模型的讨论记录、azalea 能力调查与待决清单 | 无 |
-| [`docs/wake-criterion-decision.md`](./wake-criterion-decision.md) | 唤醒判据的现状、封闭候选集、约束与互斥选项，供维护者裁决 | 无 |
-| [`docs/compaction-decision.md`](./compaction-decision.md) | 上下文压缩的已下裁定、业界调查、上下文构成实测清册与未裁清单 | 无 |
-| [`docs/frame-segments-decision.md`](./frame-segments-decision.md) | 轮末帧段清单的已裁内容与出处、当前实现差距、「处境」命名的追查记录与未决清单 | 无 |
 | [`README.md`](../README.md) | 项目导航和最短启动 | 无 |
 | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | 人类贡献工作流 | 无 |
 | [`AGENTS.md`](../AGENTS.md) | AI 编码助手工作规则的唯一真相源（`CLAUDE.md` 内容为 `@AGENTS.md`） | 无 |
 | 组件目录中的 README | 对应组件的局部使用说明 | 无 |
 | 代码、类型、测试和运行结果 | 当前实现的产生方与证据 | 不产生产品权威 |
 
-“无产品权威”不等于内容可以随意失真；它表示这些文件只能描述入口、实现、操作、证据或工作流，不能替
+“无产品权威”不等于内容可以随意失真；它表示这些文件只能描述入口、实现、操作或工作流，不能替
 `产品.md` 增加产品判断。
 
 ## 维护边界
@@ -46,4 +36,3 @@
 - 产品文字只在 `产品.md` 中修改；其他文件引用条目，不复制整段产品定义。
 - 当前实现说明必须写明适用的分支和提交；过期时更新版本或明确标为历史。
 - 操作指南只保留可以执行的步骤，并把每项检查能够证明和不能证明的范围写清楚。
-- 历史正文不复制回活文档；使用不可变链接，并在路径变化时更新迁移表。

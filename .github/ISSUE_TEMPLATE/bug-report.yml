@@ -37,7 +37,7 @@ body:
     id: environment
     attributes:
       label: 环境
-      description: MineIntent commit、Node.js、Mineflayer、Minecraft 和服务端版本。
+      description: MineIntent commit、`cargo --version`/`rustc --version`、Minecraft 和服务端版本。
     validations:
       required: true
 

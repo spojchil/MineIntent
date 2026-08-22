@@ -1,12 +1,12 @@
 # 当前实现结构
 
-> 无产品权威。绑定分支 `refactor/single-stack`。
+> 无产品权威。绑定 `main`（单栈线合入提交，SHA 于合并后回填）。
 >
-> 本分支只有一条线。此前并存的两套实现都已移出：
-> TypeScript 原型（`src/`、`agent-service/`、`mcserver/`）说明见
-> [历史](./history/architecture-typescript.md)，代码仍在 `main`；
+> 本仓只有一条线。此前并存的两套实现都已移出：
+> TypeScript 原型（`src/`、`agent-service/`、`mcserver/`）已随本线落 `main` 删除，
+> 代码快照见 tag `typescript-prototype`（`e9b18c4`）；
 > 早期 Rust 移植（`crates/{app,backend,middle,contracts,toolloop}`）已删除，
-> 审计与实盘证据见 [`docs/history/`](./history/)。
+> 证据见 git 历史。
 
 ## 0. 一句话
 
@@ -101,7 +101,7 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
 
 升级流程：上游更新 → 本地验收（上游测试 + 对抗读）→ 改根 Cargo.toml 的
 rev → 修下游破口 → 推送。内核自己的测试在上游仓跑，不占本仓 CI。
-（此前的镜像拷贝期见 `docs/history/`；`crates/agent` 目录已于 2026-08-16 删除。）
+（`crates/agent` 目录已删除，见 git 历史。）
 
 ## 6. 线程模型
 

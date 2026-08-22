@@ -21,10 +21,9 @@
 
 <!-- 运行了哪些检查或游戏内测试，结果如何？ -->
 
-- [ ] `corepack pnpm check`
-- [ ] `corepack pnpm check:docs`
-- [ ] `corepack pnpm test`
-- [ ] `python3 -m unittest discover -s agent-service -p "test_*.py"`
+- [ ] `cargo fmt --all -- --check`
+- [ ] `cargo clippy --workspace --all-targets`
+- [ ] `cargo test --workspace --all-targets --locked`
 - [ ] 已补充适当的自动化或集成测试
 - [ ] 已验证失败、取消和清理路径
 
