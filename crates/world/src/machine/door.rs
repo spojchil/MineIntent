@@ -46,7 +46,7 @@ pub enum DoorCommand {
     },
     /// 挖掉一格方块（异步持续：挖穿与否由世界变化通知证实）。
     /// 按顺序挖一串方块。**队列**：`start_mining` 是单目标槽，一次只收一块
-    /// 会让模型以为在排队、实则每发一次就掐断上一块（2026-08-18 长跑实证）。
+    /// 会让模型以为在排队、实则每发一次就掐断上一块。
     /// 新队列顶替旧队列（与移动的单意图槽同款）。
     Mine(Vec<[i32; 3]>),
     UseOnBlock([i32; 3]),
@@ -115,7 +115,7 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
                 .map_err(|_| "读不到自身位置".to_owned())?;
             let yaw = yaw.to_radians();
             // 原版视向量水平分量：x=−sin(yaw)、z=+cos(yaw)（yaw 0=南+z）。
-            // 2026-08-17 修正：z 此前取反，「前进」会走成后退。
+            // z 若取反，「前进」会走成后退。
             let target = BlockPos::new(
                 (position.0 + (-yaw.sin()) * blocks).floor() as i32,
                 position.1.floor() as i32,
@@ -372,7 +372,7 @@ pub(super) fn active_slot_space(inner: &Inner, bot: &Client) -> crate::slots::Sl
         Some(open) => match open.kind.as_str() {
             "crafting" => crate::slots::OwnArea::Crafting,
             "furnace" | "blast_furnace" | "smoker" => crate::slots::OwnArea::Furnace,
-            // 其余按容器名整片编号（维护者裁定：映射按容器命名）。
+            // 其余按容器名整片编号：映射按容器命名，格号语义随屏走。
             other => crate::slots::OwnArea::Named(other.to_owned()),
         },
     };

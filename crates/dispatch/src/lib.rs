@@ -55,7 +55,7 @@ impl LifeGate for AlwaysAlive {
     }
 }
 
-/// 身体互斥域。2026-08-10 客户端考证裁定：手（攻击/挖掘/使用三态彼此互斥）
+/// 身体互斥域。手（攻击/挖掘/使用三态彼此互斥）
 /// 独立成域，与移动正交；朝向独立于移动（寻路与挖掘期间由各自任务牵引）。
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Domain {

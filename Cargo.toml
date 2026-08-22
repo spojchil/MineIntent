@@ -23,7 +23,7 @@ publish = false
 
 [workspace.dependencies]
 # 自有 fork：为每次 join 尝试铸不可变 AttemptToken 并支持 pre-Init 精确取消。
-# rev 钉死，升级须同时更新 crates/world/README.md 的说明。
+# rev 钉死，升级时在此处记录新 rev 与改动理由。
 #
 # packet-event 在此统一开启，而不是只由 world 单独要求。理由是 Cargo 对同一
 # 次编译中的 feature 取并集：分开声明只会让「构建口径不同、azalea 编出来的

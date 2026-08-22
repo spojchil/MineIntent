@@ -69,8 +69,8 @@ fn situation_covers_identity_environment_position_vitals_in_order() {
     let text = render_situation(&snapshot(), (1, 100));
     let lines: Vec<&str> = text.lines().collect();
 
-    // 自称在最前：不知道自己叫什么的话，点名的聊天会被当成关于第三方的话
-    // （2026-08-18 实盘：模型给自己取名「小雨」，旁观了派给自己的任务）。
+    // 自称在最前：不知道自己叫什么的话，点名的聊天会被当成关于第三方的话，
+    // 模型会旁观派给自己的任务。
     assert_eq!(
         lines[0],
         "你在这个世界里的名字是 xiaoming——别人叫这个名字就是在叫你。"
@@ -119,8 +119,8 @@ fn weather_appears_only_when_it_rains() {
 }
 
 #[test]
-/// 时段**不进环境行**（2026-08-21 复核旧线 08-02 裁定：洞内不可见，判据不过；
-/// 26.1.2 客户端 45 项 F3 注册表里也没有一天内时刻这一项）。
+/// 时段**不进环境行**：洞内不可见，判据不过；
+/// 26.1.2 客户端 45 项 F3 注册表里也没有一天内时刻这一项。
 /// 时钟怎么变，这一行都不该跟着变。
 fn day_time_never_reaches_the_environment_line() {
     let mut snap = snapshot();
@@ -239,7 +239,7 @@ fn wrap_degrees_matches_the_vanilla_half_open_range() {
     ] {
         assert_eq!(wrap_degrees(input), expected, "input {input}");
     }
-    // 2026-08-05 实盘出现过的累加值：与 126.76° 同朝向。
+    // 长时间游戏里 yaw 会累加到很大的数：它应与 126.76° 同朝向。
     assert!((wrap_degrees(-10_313.240_312_354_817) - 126.759_687_645_183).abs() < 1e-9);
     assert!(wrap_degrees(f64::NAN).is_nan());
     assert!(wrap_degrees(-0.0).is_sign_positive());
@@ -611,7 +611,7 @@ fn pickups_never_merge_across_pickers() {
     );
 }
 
-/// 裁定 2026-08-21：拾取只说物品，**一个格号都不出现**。
+/// 拾取只说物品，**一个格号都不出现**。
 #[test]
 fn pickups_say_nothing_about_slots() {
     let lines = render_pickups(&[pickup(1, true, None, Some("oak_log"), 3)]);

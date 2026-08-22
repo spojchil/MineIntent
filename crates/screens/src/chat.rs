@@ -26,7 +26,7 @@ pub trait ChatHistory: Send + Sync {
 }
 
 /// 聊天已读水位。未读数 = 聊天窗里 (epoch, tick) 晚于水位的条数（读数在渲染层）；
-/// 本类型只记"上次看到哪"。松语义（维护者裁定）：history 一看整体清零，
+/// 本类型只记"上次看到哪"。语义刻意从松：history 一看整体清零，
 /// 不追每条是否真的读过；重连换 epoch 后整窗算新。
 #[derive(Default)]
 pub struct ChatReadMark {
@@ -203,7 +203,7 @@ impl ChatBox {
 
     /// 用法全文按需取。
     ///
-    /// 2026-08-17 由 `open{describe}` 参数改成独立动作，与 inventory/container
+    /// 用法是独立动作而非 `open` 的参数，与 inventory/container
     /// 收口成同一套：查用法是界面的一个动作，不是开屏的一个选项。开着的时候
     /// 想再看一眼用法，不必为此重开一次屏。
     fn describe(&self, call_id: agent::ToolCallId) -> ToolResult {

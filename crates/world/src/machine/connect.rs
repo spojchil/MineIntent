@@ -100,8 +100,7 @@ pub(super) async fn run_swarm(inner: Arc<Inner>, config: ConnectionConfig) {
     };
     let plugins = (
         DefaultPlugins.build(),
-        // 2026-08-17 关掉自动重生（此前为「没有复活路径时死亡即永久」而保留）：
-        // 复活成了模型自己的决定（presence 工具），自动重生会把那个决定抢走。
+        // 自动重生关掉：复活是模型自己的决定（presence 工具），自动重生会把那个决定抢走。
         //
         // 附带效果值得记一笔：自动重生在时，死亡瞬间的 14→0→20 压在一个 tick
         // 里，每 tick 采样的 `SelfState.alive` 几乎必然错过 false（state.rs 的

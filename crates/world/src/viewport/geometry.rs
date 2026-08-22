@@ -77,7 +77,7 @@ pub(super) fn view_axes(yaw_degrees: f64, pitch_degrees: f64) -> ViewAxes {
     // 角度制输入（azalea LookDirection 同单位），内部转弧度。
     // 号向=原版视向量（Entity.calculateViewVector；azalea view_vector、
     // TS geometry.ts 同式）：yaw 0=南(+z)、90=西(−x)；pitch 正=向下。
-    // 2026-08-17 修正移植走形：此前 y、z 两分量取反——垂直反转+南北镜像。
+    // 注意 y、z 两分量的符号：取反即垂直反转+南北镜像。
     let yaw = yaw_degrees.to_radians();
     let pitch = pitch_degrees.to_radians();
     let forward = Point3 {

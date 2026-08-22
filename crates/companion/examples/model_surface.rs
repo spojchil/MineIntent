@@ -854,7 +854,7 @@ async fn main() {
     println!("**当前是空实现：对话原样交回，模型看不到任何压缩相关的文本。**\n");
     println!("此处此前导出的是一份压缩指令（要模型交回 `{{memory_full_text, summary}}`），");
     println!("那一版形态被判定为错——压缩与长期记忆无关，且改写对话本身就让前缀缓存整体");
-    println!("失效。摘掉后重设计，材料在 `docs/compaction-decision.md`。\n");
+    println!("失效。摘掉后重设计，待决项见 issue #136。\n");
     println!("压缩线设在服务商上下文窗口的 95%，越线当前什么也不会发生（观察点）。");
 
     let _ = std::fs::remove_dir_all(&scratch);

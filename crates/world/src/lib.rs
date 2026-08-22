@@ -199,10 +199,9 @@ pub struct WorldMeta {
     pub dimension: String,
     /// 世界时钟原始值。
     ///
-    /// **不进帧**：`% 24000` 的一天内时刻在洞里看不见（旧线 2026-08-02 裁
-    /// 「洞内不可见，判据不过」），而 F3 里根本没有这一项——整张 45 项的
-    /// `DebugScreenEntries` 只有 `DAY_COUNT`，读的是 `getPeriodCount`，即天数。
-    /// 2026-08-21 复核后按原裁定撤出环境行。字段留着：信息工具的 Day # 用它。
+    /// **不进帧**：`% 24000` 的一天内时刻在洞里看不见，而 F3 里根本没有这一项——
+    /// 整张 45 项的 `DebugScreenEntries` 只有 `DAY_COUNT`，读的是 `getPeriodCount`，
+    /// 即天数。字段留着：信息工具的 Day # 用它。
     pub day_time: u64,
     /// 雨强度 0..1（原版客户端的过渡值直译）。
     pub rain_level: f32,
@@ -381,7 +380,7 @@ pub enum JobKind {
     ///
     /// 之所以是队列，是因为 `start_mining` 是单目标槽——换目标即放弃上一个。
     /// 旧接口一次只收一块，模型以为自己在排队，实测连发四次把四块全掐断了，
-    /// 一块没挖掉（2026-08-18 长跑）。
+    /// 一块没挖掉。
     Mine {
         targets: Vec<[i32; 3]>,
         /// 已经挖碎的块数（终局措辞用：挖了几块、卡在第几块）。
@@ -465,10 +464,10 @@ pub struct SelfState {
     pub effects: Vec<StatusEffect>,
     pub inventory: Inventory,
     /// 准星指着什么。原版 F3 的 `LOOKING_AT_*`——**不打开任何界面就看得见**，
-    /// 与坐标朝向同档（维护者 2026-08-21 裁定：F3 那批新项加）。
+    /// 与坐标朝向同档。
     ///
     /// 它值钱不在「多一条信息」，而在**它是免费的**：模型此前要花轮次
-    /// `scan` / `look` 才知道自己对着什么，实盘感知占比 59%。
+    /// `scan` / `look` 才知道自己对着什么，实盘感知占比曾达 59%。
     pub looking_at: Option<LookingAt>,
     /// 所在格的群系注册名。原版 F3 的 `BIOME`。
     pub biome: Option<String>,

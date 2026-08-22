@@ -35,7 +35,7 @@ pub struct PerceptionTools {
     blocks: blocks::BlocksQuery,
     /// 方块记忆（组合根注入的共享认知状态）：scan 的回执送达模型即成为
     /// 「模型知道的事实」，在此吸收。内核的 settled 通道保证已定回执必达，
-    /// 所以产出时上账即可，不需要请求级 commit 钩子。
+    /// 所以产出时直接记账即可，不需要请求级 commit 钩子。
     memory: Arc<Mutex<BlockMemory>>,
 }
 
