@@ -364,17 +364,19 @@ impl Module {
     ) -> Result<usize, String> {
         // 空间先于记忆推进，两把锁不同时持有：眼睛是唯一写者，
         // 中间态最多是「空标了、方块还没上账」，读方看到的仍然是保守的一侧。
+        // 观察发生的刻取自同一份快照：投影读的就是它的姿态与实体。
+        let at_tick = self.latest().tick;
         let projection = {
             let mut space = space.lock().map_err(|_| "已观察空间锁中毒".to_owned())?;
             self.scan_observing(options, &mut space)?
         };
         let mut memory = memory.lock().map_err(|_| "方块记忆锁中毒".to_owned())?;
-        memory.absorb_visible(&projection.visible_blocks.blocks);
+        memory.absorb_visible(&projection.visible_blocks.blocks, at_tick);
         for block in [&projection.standing_on_block, &projection.looked_at_block]
             .into_iter()
             .flatten()
         {
-            memory.absorb_visible(std::slice::from_ref(block));
+            memory.absorb_visible(std::slice::from_ref(block), at_tick);
         }
         Ok(projection.visible_blocks.blocks.len())
     }
@@ -411,7 +413,7 @@ impl Module {
             options,
             bounds,
         )?;
-        memory.apply(&changes);
+        memory.apply(&changes, snapshot.tick);
         Ok(changes)
     }
 

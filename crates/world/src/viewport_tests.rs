@@ -277,7 +277,7 @@ fn changes_mode_reports_appearance_silence_vanish_and_ignores_whats_behind() {
     );
 
     // 推进后同景再看：无话可说。
-    memory.apply(&first);
+    memory.apply(&first, 0);
     let silent = project_changes(
         &pose(180.0),
         &memory,
@@ -299,13 +299,16 @@ fn changes_mode_reports_appearance_silence_vanish_and_ignores_whats_behind() {
 
     // 背后的记忆（视锥外）：即使世界全空也保持沉默——看不到就不下结论。
     let mut behind = BlockMemory::new();
-    behind.apply(&[BlockChange::Appeared {
-        at: [0, 2, 3],
-        fact: BlockFact {
-            name: "stone".to_owned(),
-            properties: BTreeMap::new(),
-        },
-    }]);
+    behind.apply(
+        &[BlockChange::Appeared {
+            at: [0, 2, 3],
+            fact: BlockFact {
+                name: "stone".to_owned(),
+                properties: BTreeMap::new(),
+            },
+        }],
+        0,
+    );
     let quiet = project_changes(&pose(180.0), &behind, all_air, &options(), world_bounds())
         .expect("fixture options should be valid");
     assert!(quiet.is_empty(), "{quiet:?}");
@@ -1049,7 +1052,7 @@ fn memory_and_space_together_answer_three_states() {
     let mut reader = WorldReader::new(|position| BlockProbe::from_read(&read(position)), &read);
     let mut space = ObservedSpace::new();
     let mut memory = BlockMemory::new();
-    memory.absorb_visible(&[seen([0, 1, 3])]);
+    memory.absorb_visible(&[seen([0, 1, 3])], 0);
 
     observe_free_space(
         &mut reader,

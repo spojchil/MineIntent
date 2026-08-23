@@ -66,10 +66,23 @@ fn visible_label(fact: &BlockFact) -> String {
     crate::block::visible_block_label(&fact.name, &fact.properties)
 }
 
-/// 方块记忆：位置 → 最后所见。只记非空气；空气=没有条目。
+/// 一格的记忆条目：身份，加上**最后一次看到它的刻**。
+///
+/// 时间不进 [`BlockFact`]：那个类型的相等语义是 [`diff`] 的身份判据
+/// （见 [`visible_label`]），掺进时间会让「同一块石头又看了一眼」变成一次变化。
+#[derive(Clone, Debug)]
+struct Entry {
+    fact: BlockFact,
+    last_seen: u64,
+}
+
+/// 方块记忆：位置 → 最后所见。只记非空气。
+///
+/// 「没有条目」**不等于**「那里是空的」——它同时是「从没看过」。这一位由
+/// [`crate::ObservedSpace`] 补，两本合起来才是三态。
 #[derive(Clone, Debug, Default)]
 pub struct BlockMemory {
-    facts: HashMap<[i32; 3], BlockFact>,
+    facts: HashMap<[i32; 3], Entry>,
 }
 
 impl BlockMemory {
@@ -78,7 +91,16 @@ impl BlockMemory {
     }
 
     pub fn get(&self, at: [i32; 3]) -> Option<&BlockFact> {
-        self.facts.get(&at)
+        self.facts.get(&at).map(|entry| &entry.fact)
+    }
+
+    /// 最后一次看到这一格是第几刻。
+    ///
+    /// 这具身体没有「同时」：它对世界的知识是不同时刻观测的编织物，
+    /// 任何「当前场景」都是查询重构的。陈旧度因此不是附加信息，
+    /// 是每条事实自带的一半——「三分钟前见过」和「刚刚看到」必须分得开。
+    pub fn last_seen(&self, at: [i32; 3]) -> Option<u64> {
+        self.facts.get(&at).map(|entry| entry.last_seen)
     }
 
     /// 遍历记住的每一格。
@@ -86,7 +108,14 @@ impl BlockMemory {
     /// 给**查询**用：模型问「附近有什么树」时，机器在这本记忆里找，而不是去翻
     /// 实时世界——只答得出观察过的东西，与合法信息边界天然一致。
     pub fn iter(&self) -> impl Iterator<Item = ([i32; 3], &BlockFact)> {
-        self.facts.iter().map(|(at, fact)| (*at, fact))
+        self.facts.iter().map(|(at, entry)| (*at, &entry.fact))
+    }
+
+    /// 同 [`Self::iter`]，另带最后所见的刻。给需要呈现陈旧度的查询用。
+    pub fn iter_seen(&self) -> impl Iterator<Item = ([i32; 3], &BlockFact, u64)> {
+        self.facts
+            .iter()
+            .map(|(at, entry)| (*at, &entry.fact, entry.last_seen))
     }
 
     pub fn len(&self) -> usize {
@@ -98,14 +127,28 @@ impl BlockMemory {
     }
 
     /// 推进记忆。只在变化确实送达模型之后调用（见模块头的推进纪律）。
-    pub fn apply(&mut self, changes: &[BlockChange]) {
+    ///
+    /// `at_tick` 是这次观察发生的刻，写进条目的 `last_seen`。
+    pub fn apply(&mut self, changes: &[BlockChange], at_tick: u64) {
         for change in changes {
             match change {
                 BlockChange::Appeared { at, fact } => {
-                    self.facts.insert(*at, fact.clone());
+                    self.facts.insert(
+                        *at,
+                        Entry {
+                            fact: fact.clone(),
+                            last_seen: at_tick,
+                        },
+                    );
                 }
                 BlockChange::Changed { at, now, .. } => {
-                    self.facts.insert(*at, now.clone());
+                    self.facts.insert(
+                        *at,
+                        Entry {
+                            fact: now.clone(),
+                            last_seen: at_tick,
+                        },
+                    );
                 }
                 BlockChange::Vanished { at, .. } => {
                     self.facts.remove(at);
@@ -124,27 +167,37 @@ impl BlockMemory {
 impl BlockMemory {
     /// 吸收全量/扫描可见集：逐格 upsert。空气防御同 [`diff`]。
     /// 只上账正面观察；本次没列出的格不动（缺席不当空气）。
-    pub fn absorb_visible(&mut self, visible: &[ViewportBlock]) {
+    pub fn absorb_visible(&mut self, visible: &[ViewportBlock], at_tick: u64) {
         for block in visible {
             if is_air_name(&block.name) {
                 continue;
             }
-            self.facts.insert(block.position, BlockFact::of(block));
+            // 身份没变也要刷新 `last_seen`：又看了一眼，这条事实就没那么旧了。
+            self.facts.insert(
+                block.position,
+                Entry {
+                    fact: BlockFact::of(block),
+                    last_seen: at_tick,
+                },
+            );
         }
     }
 
     /// 吸收定向结果：看见方块=upsert；亲眼见空=销账（消失确认）；
     /// 各种「看不见」不动记忆。
-    pub fn absorb_directed(&mut self, projection: &super::DirectedProjection) {
+    pub fn absorb_directed(&mut self, projection: &super::DirectedProjection, at_tick: u64) {
         for seen in &projection.seen {
             if is_air_name(&seen.name) {
                 self.facts.remove(&seen.at);
             } else {
                 self.facts.insert(
                     seen.at,
-                    BlockFact {
-                        name: seen.name.clone(),
-                        properties: seen.properties.clone(),
+                    Entry {
+                        fact: BlockFact {
+                            name: seen.name.clone(),
+                            properties: seen.properties.clone(),
+                        },
+                        last_seen: at_tick,
                     },
                 );
             }
@@ -251,16 +304,19 @@ mod tests {
     #[test]
     fn appeared_changed_and_silence_follow_the_table() {
         let mut memory = BlockMemory::new();
-        memory.apply(&[
-            BlockChange::Appeared {
-                at: [0, 64, 0],
-                fact: fact("stone"),
-            },
-            BlockChange::Appeared {
-                at: [1, 64, 0],
-                fact: fact("dirt"),
-            },
-        ]);
+        memory.apply(
+            &[
+                BlockChange::Appeared {
+                    at: [0, 64, 0],
+                    fact: fact("stone"),
+                },
+                BlockChange::Appeared {
+                    at: [1, 64, 0],
+                    fact: fact("dirt"),
+                },
+            ],
+            0,
+        );
         let visible = vec![
             block([0, 64, 0], "stone"),   // 相同 → 沉默
             block([1, 64, 0], "furnace"), // 变身 → Changed
@@ -292,7 +348,7 @@ mod tests {
             position: [0, 64, 0],
         };
         let mut memory = BlockMemory::new();
-        memory.absorb_visible(&[lit("false")]);
+        memory.absorb_visible(&[lit("false")], 0);
         // 燃起来了：白名单属性变 → Changed。
         let changes = diff(&memory, &[lit("true")], |_| true, |_| false);
         assert_eq!(changes.len(), 1);
@@ -308,7 +364,7 @@ mod tests {
             position: [1, 70, 0],
         };
         let mut leaves = BlockMemory::new();
-        leaves.absorb_visible(&[internal("1")]);
+        leaves.absorb_visible(&[internal("1")], 0);
         let silent = diff(&leaves, &[internal("3")], |_| true, |_| false);
         assert!(silent.is_empty(), "{silent:?}");
     }
@@ -317,16 +373,19 @@ mod tests {
     #[test]
     fn vanished_needs_eyewitness_proof_of_emptiness() {
         let mut memory = BlockMemory::new();
-        memory.apply(&[
-            BlockChange::Appeared {
-                at: [5, 64, 5],
-                fact: fact("chest"),
-            },
-            BlockChange::Appeared {
-                at: [6, 64, 5],
-                fact: fact("stone"),
-            },
-        ]);
+        memory.apply(
+            &[
+                BlockChange::Appeared {
+                    at: [5, 64, 5],
+                    fact: fact("chest"),
+                },
+                BlockChange::Appeared {
+                    at: [6, 64, 5],
+                    fact: fact("stone"),
+                },
+            ],
+            0,
+        );
         // 两格都缺席；只有 [5,64,5] 亲眼可证为空。
         let changes = diff(&memory, &[], |_| true, |at| at == [5, 64, 5]);
         assert_eq!(
@@ -344,10 +403,13 @@ mod tests {
     #[test]
     fn out_of_scope_memory_is_never_probed() {
         let mut memory = BlockMemory::new();
-        memory.apply(&[BlockChange::Appeared {
-            at: [100, 64, 100],
-            fact: fact("stone"),
-        }]);
+        memory.apply(
+            &[BlockChange::Appeared {
+                at: [100, 64, 100],
+                fact: fact("stone"),
+            }],
+            0,
+        );
         let probed = RefCell::new(Vec::new());
         let changes = diff(
             &memory,
@@ -374,12 +436,12 @@ mod tests {
         let replay = diff(&memory, &visible, |_| true, |_| false);
         assert_eq!(replay, first);
         // 请求成功：apply 后沉默。
-        memory.apply(&first);
+        memory.apply(&first, 0);
         let silent = diff(&memory, &visible, |_| true, |_| false);
         assert!(silent.is_empty());
         // 消失同理：apply Vanished 后条目移除。
         let vanished = diff(&memory, &[], |_| true, |_| true);
-        memory.apply(&vanished);
+        memory.apply(&vanished, 0);
         assert!(memory.is_empty());
     }
 
@@ -391,32 +453,35 @@ mod tests {
         };
 
         let mut memory = BlockMemory::new();
-        memory.absorb_visible(&[block([0, 64, 0], "stone"), block([9, 64, 9], "air")]);
+        memory.absorb_visible(&[block([0, 64, 0], "stone"), block([9, 64, 9], "air")], 0);
         assert_eq!(memory.get([0, 64, 0]), Some(&fact("stone")));
         assert_eq!(memory.get([9, 64, 9]), None, "空气不入账");
 
         // 定向：一格见到新方块、一格亲眼见空、一格被挡。
-        memory.absorb_directed(&DirectedProjection {
-            seen: vec![
-                DirectedSeenBlock {
-                    at: [1, 64, 0],
-                    name: "furnace".to_owned(),
-                    properties: BTreeMap::new(),
-                },
-                DirectedSeenBlock {
-                    at: [0, 64, 0],
-                    name: "air".to_owned(),
-                    properties: BTreeMap::new(),
-                },
-            ],
-            unseen: vec![DirectedUnseenBlock {
-                at: [2, 64, 0],
-                why: vec![DirectedWhy::Occluded],
-                distance: None,
-                max: None,
-                by: None,
-            }],
-        });
+        memory.absorb_directed(
+            &DirectedProjection {
+                seen: vec![
+                    DirectedSeenBlock {
+                        at: [1, 64, 0],
+                        name: "furnace".to_owned(),
+                        properties: BTreeMap::new(),
+                    },
+                    DirectedSeenBlock {
+                        at: [0, 64, 0],
+                        name: "air".to_owned(),
+                        properties: BTreeMap::new(),
+                    },
+                ],
+                unseen: vec![DirectedUnseenBlock {
+                    at: [2, 64, 0],
+                    why: vec![DirectedWhy::Occluded],
+                    distance: None,
+                    max: None,
+                    by: None,
+                }],
+            },
+            0,
+        );
         assert_eq!(memory.get([1, 64, 0]), Some(&fact("furnace")));
         assert_eq!(memory.get([0, 64, 0]), None, "亲眼见空销账");
         assert_eq!(memory.len(), 1);
@@ -426,16 +491,19 @@ mod tests {
     #[test]
     fn air_is_ignored_and_vanish_order_is_deterministic() {
         let mut memory = BlockMemory::new();
-        memory.apply(&[
-            BlockChange::Appeared {
-                at: [2, 64, 0],
-                fact: fact("stone"),
-            },
-            BlockChange::Appeared {
-                at: [1, 64, 0],
-                fact: fact("stone"),
-            },
-        ]);
+        memory.apply(
+            &[
+                BlockChange::Appeared {
+                    at: [2, 64, 0],
+                    fact: fact("stone"),
+                },
+                BlockChange::Appeared {
+                    at: [1, 64, 0],
+                    fact: fact("stone"),
+                },
+            ],
+            0,
+        );
         let with_air = vec![block([9, 64, 9], "air")];
         let changes = diff(&memory, &with_air, |_| true, |_| true);
         assert_eq!(
@@ -451,5 +519,71 @@ mod tests {
                 },
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod staleness_tests {
+    use super::*;
+
+    fn block(at: [i32; 3], name: &str) -> ViewportBlock {
+        ViewportBlock {
+            name: name.to_owned(),
+            properties: BTreeMap::new(),
+            position: at,
+        }
+    }
+
+    #[test]
+    fn absorbing_records_the_tick_it_was_seen_at() {
+        let mut memory = BlockMemory::new();
+        memory.absorb_visible(&[block([0, 64, 0], "stone")], 4032);
+        assert_eq!(memory.last_seen([0, 64, 0]), Some(4032));
+        assert_eq!(memory.last_seen([1, 64, 0]), None, "没记过的格没有时间");
+    }
+
+    /// 又看了一眼：时间刷新，但**身份没变就不是一次变化**。
+    /// 这正是时间不能进 `BlockFact` 的理由——进去了，每看一眼都会报变化。
+    #[test]
+    fn seeing_it_again_refreshes_time_without_becoming_a_change() {
+        let mut memory = BlockMemory::new();
+        memory.absorb_visible(&[block([0, 64, 0], "stone")], 100);
+
+        let again = [block([0, 64, 0], "stone")];
+        let changes = diff(&memory, &again, |_| true, |_| false);
+        assert!(
+            changes.is_empty(),
+            "同一块石头再看一眼不是变化：{changes:?}"
+        );
+
+        memory.absorb_visible(&again, 200);
+        assert_eq!(memory.last_seen([0, 64, 0]), Some(200), "时间要刷新");
+    }
+
+    /// 身份真的变了：既报变化，也刷新时间。
+    #[test]
+    fn a_real_change_updates_both_identity_and_time() {
+        let mut memory = BlockMemory::new();
+        memory.absorb_visible(&[block([0, 64, 0], "furnace")], 100);
+        let now = [block([0, 64, 0], "stone")];
+        let changes = diff(&memory, &now, |_| true, |_| false);
+        assert_eq!(changes.len(), 1, "身份变了应当报一条：{changes:?}");
+        memory.apply(&changes, 300);
+        assert_eq!(
+            memory.get([0, 64, 0]).map(|f| f.name.as_str()),
+            Some("stone")
+        );
+        assert_eq!(memory.last_seen([0, 64, 0]), Some(300));
+    }
+
+    /// 遍历带时间：查询侧要能把陈旧度一并呈现出来。
+    #[test]
+    fn iter_seen_carries_the_tick() {
+        let mut memory = BlockMemory::new();
+        memory.absorb_visible(&[block([0, 64, 0], "stone")], 7);
+        let seen: Vec<_> = memory.iter_seen().collect();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, [0, 64, 0]);
+        assert_eq!(seen[0].2, 7);
     }
 }
