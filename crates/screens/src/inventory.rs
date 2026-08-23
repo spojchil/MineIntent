@@ -128,6 +128,8 @@ select_slot 用的也是这个号。\
 （可加 count 只挪几个，拆栈）；to 是同种物品=倒入合堆（可加 count 只倒几个，装不下的留在原格）；\
 to 是不同物品=整组对调（count 不适用）；to 写 {DISCARD}=把 from 整格丢出去。\
 result 只能整组取走。非法放置（如盔甲格放非装备）会被世界拒绝。\
+{{action:\"list\"}} 看现在的物品栏（每一格，空格也画出来）——\
+回执只说这一步做完了、不报格位现状，要确认就 list 一次。\
 开着物品栏时无法移动或与世界交互。",
         world::slots::SlotSpace::player().legend()
     )
@@ -173,6 +175,19 @@ impl InventoryScreen {
         ToolResult::success(
             call_id,
             vec![ContentPart::text(format!("{listing}\n\n{USAGE_POINTER}"))],
+        )
+    }
+
+    /// 现在的物品栏长什么样。与 `container` 的 list 同义，两个屏一套说法。
+    fn list(&self, call_id: agent::ToolCallId) -> ToolResult {
+        if self.state.current() != Some(ScreenKind::Inventory) {
+            return ToolResult::failure(call_id, "物品栏没有打开；先 open");
+        }
+        ToolResult::success(
+            call_id,
+            vec![ContentPart::text(render::render_player_menu(
+                &self.snapshots.latest(),
+            ))],
         )
     }
 
@@ -247,8 +262,8 @@ impl dispatch::ToolProvider for InventoryScreen {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["open", "describe", "move", "close"],
-                        "description": "open=打开并列出全部格位；describe=取格号语义与 move 的完整用法（不随开屏自动给，要看自己取）；move=把 from 格的东西弄到 to 格（移动/合堆/对调）；close=关闭"
+                        "enum": ["open", "list", "describe", "move", "close"],
+                        "description": "open=打开并列出全部格位；list=看现在的物品栏（每一格，空格也画出来）；describe=取格号语义与 move 的完整用法（不随开屏自动给，要看自己取）；move=把 from 格的东西弄到 to 格（移动/合堆/对调）；close=关闭"
                     },
                     "from": { "type": "string", "description": format!("move 用：来源格位地址，照清单上写的抄。{}", world::slots::SlotSpace::player().legend()) },
                     "to": { "type": "string", "description": format!("move 用：目标格位地址——空=移过去、同种物品=倒入合堆、不同物品=整组对调；写 {DISCARD}=把 from 整格丢出去") },
@@ -281,6 +296,7 @@ impl dispatch::ToolProvider for InventoryScreen {
             };
             match arguments.get("action").and_then(Value::as_str) {
                 Some("open") => self.open(call_id),
+                Some("list") => self.list(call_id),
                 Some("describe") => self.describe(call_id),
                 Some("move") => {
                     self.move_items(
@@ -294,7 +310,7 @@ impl dispatch::ToolProvider for InventoryScreen {
                 Some("close") => self.close(call_id),
                 _ => ToolResult::failure(
                     call_id,
-                    "action 必须是 open/describe/move/close 之一；请改写调用",
+                    "action 必须是 open/list/describe/move/close 之一；请改写调用",
                 ),
             }
         })

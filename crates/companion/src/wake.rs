@@ -66,13 +66,17 @@ impl WakeCursors {
     /// 自身身份，用于防自激。
     ///
     /// `entity_key` 是自身 UUID；服务端不给发言者 UUID 时退回用户名比较。
-    /// `item_screen_open`：格位类屏（物品栏/工作台）开着才投递格位变化
-    /// （开着屏时有预期之外的格子变化也要通知；关着时不吵）。
+    /// `inventory_screen_open`：**物品栏屏**开着才投递格位变化。
+    ///
+    /// 容器（工作台、箱子、熔炉）的格位变化不再推送——改由模型自己
+    /// `container list`。推送在容器屏上是坏的：写口回执早于服务端确认，
+    /// 而模型的下一次请求在回执那一刻就发出，于是读数恒定落在它的下一个
+    /// 动作之后，且它无从知道这一点。实盘三段独立序列零例外。
     pub fn collect(
         &mut self,
         snapshot: &TickSnapshot,
         own: SelfIdentity<'_>,
-        item_screen_open: bool,
+        inventory_screen_open: bool,
     ) -> Wake {
         let mut lines = Vec::new();
         let mut screens = Vec::new();
@@ -115,7 +119,7 @@ impl WakeCursors {
         for entry in &snapshot.inventory_changes.entries {
             // 游标先推进（含屏关着时错过的条目——过了就是过了，不回放）。
             if advance(&mut self.inventory, entry.seq)
-                && item_screen_open
+                && inventory_screen_open
                 && wakes_on_inventory(entry)
             {
                 lines.push(render_inventory_change(entry));
@@ -181,7 +185,8 @@ fn wakes_on(fact: &JobFact) -> bool {
 /// 哪些库存变化值得通知：预期之外的（ServerObserved）。
 /// 自己 swap/丢弃的回声（Commanded）不吵——模型刚收到过工具回执。
 fn wakes_on_inventory(entry: &InventoryChangeEntry) -> bool {
-    entry.source == FactSource::ServerObserved
+    // 只认玩家物品栏屏（容器 0）。容器格位走拉取，见 `collect` 的说明。
+    entry.container_id == 0 && entry.source == FactSource::ServerObserved
 }
 
 fn render_inventory_change(entry: &InventoryChangeEntry) -> String {
