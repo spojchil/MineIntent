@@ -906,12 +906,10 @@ async fn main() -> Result<(), String> {
                 let wake = cursors.collect(
                     &snapshot,
                     SelfIdentity { entity_key: &own_key, username: &username },
-                    // 格位变化只在格位类屏（物品栏/工作台）开着时投递：
-                    // 关着屏时格号对模型无意义（它看不见界面）。
-                    matches!(
-                        screen_state.current(),
-                        Some(ScreenKind::Inventory | ScreenKind::Container)
-                    ),
+                    // 格位变化只在**物品栏屏**开着时投递：关着屏时格号对模型
+                    // 无意义（它看不见界面）。容器屏不再走推送——那条通道恒定
+                    // 晚一个动作且无法自我定位，改由 `container list` 拉取。
+                    screen_state.current() == Some(ScreenKind::Inventory),
                 );
                 if wake.is_empty() {
                     continue;

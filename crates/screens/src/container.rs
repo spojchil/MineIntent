@@ -8,6 +8,10 @@
 //! 差异降为数据（清单段表在 render，用法补充在 [`container_usage`]）。
 //!
 //! 配方知识在模型自己身上：机器不查配方表，摆什么出什么由服务器仲裁。
+//!
+//! 屏内现状是**拉取**（`list`），不是推送。原版玩家开着 GUI 时界面一直在
+//! 眼前，而我们只在开屏那一瞬给过一次清单——低于 P04 的下界。补法只能是
+//! 拉取：推送做不到「模型知道自己是什么时候读的」，理由见 [`ContainerScreen::list`]。
 
 use std::sync::Arc;
 
@@ -28,32 +32,36 @@ pub const CONTAINER_USAGE: &str =
 {action:\"move\", from, to} 把 from 格的东西弄到 to 格，语义随 to 现状：to 为空=移过去\
 （可加 count 只挪几个，拆栈）；to 是同种物品=倒入合堆（可加 count 只倒几个，装不下的留在原格）；\
 to 是不同物品=整组对调（count 不适用）；to 写 drop=把 from 整格丢出去。\
+{action:\"list\"} 看现在的界面长什么样（每一格都列出来，空格也画出来）——\
+**动作的效果不会立刻反映出来，想确认就 list 一次，不要靠回执猜**。\
 {action:\"close\"} 关闭容器回到世界。开着容器时无法移动或与世界交互。";
 
 /// 种类专属的用法补充（数据，不是代码）：只写通用动词说明覆盖不到的语义。
 fn kind_supplement(kind: &str) -> Option<&'static str> {
     match kind {
         "crafting" => Some(
-            "这是工作台（3×3 合成）：0 成品（只出不进、只能整组取走），1-9 摆料\
-（行优先：1-3 上行、4-6 中行、7-9 下行），10-36 主背包，37-45 快捷栏，无副手格。\
-摆满配方后成品出现在 0，取成品用 move(0, 快捷栏或背包格)，会按配方消耗摆料；\
-配方要同种材料占多格时用 count 拆栈，如 {action:\"move\", from:37, to:2, count:1}。",
+            "这是工作台（3×3 合成）：result 成品（只出不进、只能整组取走），craft 0-8 摆料\
+（行优先：0-2 上行、3-5 中行、6-8 下行），另有 pack 0-26 主背包、hotbar 0-8 快捷栏，无副手格。\
+摆满配方后成品出现在 result，取成品用 move(result, 某个 pack/hotbar 格)，会按配方消耗摆料；\
+配方要同种材料占多格时用 count 拆栈，如 {action:\"move\", from:\"hotbar 0\", to:\"craft 1\", count:1}。\
+**关掉界面，摆料格里的东西会退回背包（背包放不下就掉在地上）**——工作台不替你存料，\
+这一点和熔炉相反。你自己 close、走远了、或者去开别的容器，都算关掉。",
         ),
         "furnace" => Some(
-            "这是熔炉：0 原料，1 燃料（只收燃料，如煤炭、木制品；放别的会被服务器退回），\
-2 成品（只出不进、只能整组取走），3-29 主背包，30-38 快捷栏，无副手格。\
+            "这是熔炉：smelt 原料，fuel 燃料（只收燃料，如煤炭、木制品；放别的会被服务器退回），\
+result 成品（只出不进、只能整组取走），另有 pack 0-26 主背包、hotbar 0-8 快捷栏，无副手格。\
 原料与燃料就位后自动开始烧，每件约 10 秒；不必守着界面——close 之后熔炉照样烧，\
 估摸烧完再回来开取成品。",
         ),
         "blast_furnace" => Some(
             "这是高炉（只炼矿石与金属类，速度是熔炉两倍、每件约 5 秒）：\
-0 原料，1 燃料（只收燃料），2 成品（只出不进、只能整组取走），\
-3-29 主背包，30-38 快捷栏。close 之后照样烧，烧完再来取。",
+smelt 原料，fuel 燃料（只收燃料），result 成品（只出不进、只能整组取走），\
+另有 pack 0-26 主背包、hotbar 0-8 快捷栏。close 之后照样烧，烧完再来取。",
         ),
         "smoker" => Some(
             "这是烟熏炉（只烤食物，速度是熔炉两倍、每件约 5 秒）：\
-0 原料，1 燃料（只收燃料），2 成品（只出不进、只能整组取走），\
-3-29 主背包，30-38 快捷栏。close 之后照样烧，烧完再来取。",
+smelt 原料，fuel 燃料（只收燃料），result 成品（只出不进、只能整组取走），\
+另有 pack 0-26 主背包、hotbar 0-8 快捷栏。close 之后照样烧，烧完再来取。",
         ),
         _ => None,
     }
@@ -150,17 +158,47 @@ impl ContainerScreen {
         //    于是每一步都做了两遍（一次 GUI 实验里 13 次 move 近一半是这么来的）。
         //    预判会说谎、空等没有上限，所以改为**把延迟告诉模型**
         //    （见本工具 description）。
-        // 2. 就算读对了也没意义——格位现状是**事实**，归快照与格位变化窗；
+        // 2. 就算读对了也没意义——格位现状是**事实**，归快照；
         //    工具只表达意图、回执只说结论（与 motion/hand 的 `accepted` 同款）。
-        //    真正要紧的那件事——摆料之后成品格冒出什么——本来就走信箱：
-        //    自己点的两格是 Commanded 回声（不吵），成品格是 ServerObserved
-        //    （预期之外，投递）。回执再报一遍格位既重复又落后。
+        //
+        // 真正要紧的那件事——摆料之后成品格冒出什么——归 `list`（拉取），
+        // 不再走信箱。推送那一版是坏的：回执早于服务端确认，而模型的下一次
+        // 请求在回执那一刻就发出，于是读数恒定落在它的**下一个动作之后**，
+        // 且它无从知道自己晚了一拍。实盘三段独立序列零例外：放第二块木板时
+        // 告诉它「一块木板的结果」，放第三块时告诉它「两块的结果」。它据此
+        // 推出过一条几何结论，然后拿整局去验证一个错的前提。
         let summary = if to == DISCARD {
             format!("已丢弃格 {from}")
         } else {
             "已完成".to_owned()
         };
         ToolResult::success_json(call_id, json!({ "done": summary }))
+    }
+
+    /// 现在的界面长什么样。
+    ///
+    /// 拉取，不是推送。屏内状态本来是**持续可见**的（原版玩家一直看着 GUI），
+    /// 我们只在开屏那一瞬给过一次清单，之后每操作一步这份认知就作废一分——
+    /// 实盘里模型只好靠「移出来看看、再放回去」试探，或者关屏重开，而关屏
+    /// 会把摆料退回背包，于是它唯一的刷新手段摧毁了被刷新的东西。
+    ///
+    /// 读的是上一 tick 的快照，但这不构成上面那种错位：拉取发生在模型的
+    /// 下一轮，距上次写口已隔一整个来回（实测 2.5 秒以上 ≈ 50 游戏刻），
+    /// 服务端状态早已落定；而且读的就是「现在」，模型知道自己是什么时候读的。
+    fn list(&self, call_id: agent::ToolCallId) -> ToolResult {
+        let snapshot = self.snapshots.latest();
+        let Some(open) = snapshot.open_screen.as_ref() else {
+            return ToolResult::failure(
+                call_id,
+                "现在没有开着的容器界面；先对容器方块使用（hand use_on），等界面打开的通知",
+            );
+        };
+        ToolResult::success(
+            call_id,
+            vec![ContentPart::text(render::render_container_menu(
+                &snapshot, &open.kind,
+            ))],
+        )
     }
 
     /// 用法全文按需取——种类随**当前开着的那个屏**，不用模型自己报。
@@ -199,8 +237,8 @@ impl dispatch::ToolProvider for ContainerScreen {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["move", "describe", "close"],
-                        "description": "move=把 from 格的东西弄到 to 格（移动/合堆/对调）；describe=取当前这种容器的完整用法（不随开屏自动给，要看自己取）；close=关闭容器"
+                        "enum": ["move", "list", "describe", "close"],
+                        "description": "move=把 from 格的东西弄到 to 格（移动/合堆/对调）；list=看现在的界面（每一格，空格也画出来）；describe=取当前这种容器的完整用法（不随开屏自动给，要看自己取）；close=关闭容器"
                     },
                     "from": { "type": "string", "description": "move 用：来源格位地址，照清单上写的抄（容器自有区按容器名，如 chest 0-26；熔炉族是 smelt/fuel/result；工作台是 result 与 craft 0-8；另有 pack 0-26 与 hotbar 0-8）" },
                     "to": { "type": "string", "description": "move 用：目标格位地址——空=移过去、同种物品=倒入合堆、不同物品=整组对调；写 drop=把 from 整格丢出去" },
@@ -213,8 +251,10 @@ impl dispatch::ToolProvider for ContainerScreen {
         definition.description = Some(
             "当前开着的容器界面（工作台、箱子、熔炉等共用）。没有 open：对容器方块\
 使用（hand use_on）后界面由服务器打开，你会收到格位清单；不确定这种容器怎么用就 \
-describe。开着期间用 move 搬动/合堆/摆料/取物，close 关闭。开着时无法移动或与世界交互。\
-容器在服务端，动作的效果不会立刻反映出来；变化会主动通知你，等通知即可，别急着重做。\
+describe。开着期间用 move 搬动/合堆/摆料/取物，list 看现在的界面，close 关闭。\
+开着时无法移动或与世界交互。\
+容器在服务端，动作的效果不会立刻反映出来，回执只说这一步做完了、不报格位现状；\
+**要确认摆成什么样了就 list 一次**。\
 **一条消息里可以连发多个动作**——想好整套摆法就一次发全，比一次一格来回等快得多，\
 也不会看到摆到一半的中间产物。"
                 .to_owned(),
@@ -243,11 +283,12 @@ describe。开着期间用 move 搬动/合堆/摆料/取物，close 关闭。开
                     )
                     .await
                 }
+                Some("list") => self.list(call_id),
                 Some("describe") => self.describe(call_id),
                 Some("close") => self.close(call_id).await,
                 _ => ToolResult::failure(
                     call_id,
-                    "action 必须是 move/describe/close 之一；请改写调用",
+                    "action 必须是 move/list/describe/close 之一；请改写调用",
                 ),
             }
         })
@@ -325,6 +366,32 @@ mod tests {
                 container_id: 1,
                 title: None,
             });
+            Arc::new(snapshot)
+        }
+    }
+
+    /// 开着工作台、摆料格里有一块木板的快照。地址空间与活动菜单一致
+    /// （机器层的 `active_slot_space` 同源）——写死玩家屏会把每一格都标错。
+    struct CraftingSnapshots;
+
+    impl SnapshotSource for CraftingSnapshots {
+        fn latest(&self) -> Arc<world::TickSnapshot> {
+            let mut snapshot =
+                world::TickSnapshot::empty(world::Epoch(1), 1, world::ConnectionPhase::Ready);
+            snapshot.open_screen = Some(world::OpenScreenState {
+                kind: "crafting".to_owned(),
+                container_id: 1,
+                title: None,
+            });
+            snapshot.self_state.inventory.space =
+                world::slots::SlotSpace::new(37, 45, None, world::slots::OwnArea::Crafting);
+            snapshot.self_state.inventory.slots = vec![world::InventorySlot {
+                slot: 5,
+                item_name: "oak_planks".to_owned(),
+                count: 1,
+                metadata: None,
+                durability_used: None,
+            }];
             Arc::new(snapshot)
         }
     }
@@ -545,5 +612,83 @@ mod tests {
         // 专属差异各自点名。
         assert!(container_usage("blast_furnace").contains("矿石"));
         assert!(container_usage("smoker").contains("食物"));
+    }
+
+    /// list 是**拉取**：没开容器时如实拒绝；开着时给出此刻的界面。
+    ///
+    /// 它存在的理由正是推送做不到的那件事——读的就是「现在」，而且模型
+    /// 知道自己是什么时候读的。旧的格位变化推送恒定落在模型的下一个动作
+    /// 之后，它无从校正（实盘三段独立序列零例外）。
+    #[tokio::test]
+    async fn list_needs_an_open_container_and_then_draws_every_slot() {
+        let fixture = fixture(false);
+        let refused = invoke(&fixture, json!({"action": "list"})).await;
+        assert_eq!(refused.status, ToolResultStatus::Error);
+        assert!(text_of(&refused).contains("hand use_on"), "{refused:?}");
+
+        let screen = ContainerScreen::new(
+            Arc::new(Occupancy::new()),
+            Arc::new(ScreenState::new()),
+            Arc::new(RecordingDoor::default()),
+            Arc::new(CraftingSnapshots),
+        );
+        let listed = dispatch::ToolProvider::call(
+            &screen,
+            ToolCall::new("call-1", TOOL_NAME, json!({"action": "list"})),
+        )
+        .await;
+        assert_eq!(listed.status, ToolResultStatus::Success);
+        let text = text_of(&listed);
+        // 空格也画出来——「没列出来」和「是空的」在摆配方时是两回事。
+        assert!(text.contains("craft 0-2  [空][空][空]"), "{text}");
+        assert!(
+            text.contains("craft 3-5  [空][oak_planks ×1][空]"),
+            "{text}"
+        );
+        // 协议号不许漏进可见面：模型照清单抄的写法必须 move 认得。
+        assert!(!text.contains("（1-9）"), "{text}");
+        assert!(!text.contains("5=oak_planks"), "{text}");
+    }
+
+    /// 关工作台会把摆料退回背包，这是原版服务端行为
+    /// （`CraftingMenu.removed` → `clearContainer`，26.1.2 反编译核对）。
+    /// 用法必须说出来：实盘里模型不知道这件事，把退回的材料
+    /// 误判成「我自己移来移去弄丢了」，并据此改错了后面的整套操作。
+    /// 熔炉族相反（close 之后照样烧），两边都得说准。
+    #[test]
+    fn crafting_says_closing_returns_the_grid_and_furnaces_say_the_opposite() {
+        let crafting = container_usage("crafting");
+        assert!(crafting.contains("退回背包"), "{crafting}");
+        assert!(!crafting.contains("照样烧"), "{crafting}");
+        for kind in ["furnace", "blast_furnace", "smoker"] {
+            let usage = container_usage(kind);
+            assert!(usage.contains("照样烧"), "{kind}: {usage}");
+            assert!(!usage.contains("退回背包"), "{kind}: {usage}");
+        }
+    }
+
+    /// 动作齐不齐以 **schema 的 enum** 为准：严格模式的服务商照它挡调用，
+    /// 描述里写了而 enum 里没有的动作，模型看得见却调不出来
+    /// （`mining_status` 就是这么漏的）。拒绝话术也得把动作列全，
+    /// 否则模型只能靠猜找回自己刚被拒的那个名字。
+    #[tokio::test]
+    async fn the_schema_enum_lists_every_dispatchable_action() {
+        let fixture = fixture(false);
+        let registered = dispatch::ToolProvider::tools(&fixture.screen);
+        let allowed: Vec<String> = registered[0].0.input_schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action 应有 enum")
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect();
+        assert!(allowed.contains(&"list".to_owned()), "{allowed:?}");
+        let refusal = invoke(&fixture, json!({"action": "根本不存在的动作"})).await;
+        let text = text_of(&refusal);
+        for action in &allowed {
+            assert!(
+                text.contains(action.as_str()),
+                "拒绝话术漏了 {action}：{text}"
+            );
+        }
     }
 }

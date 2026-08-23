@@ -296,6 +296,7 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
                 MoveEnds {
                     from,
                     to,
+                    slot_space: space.clone(),
                     from_stack,
                     to_count,
                     same_item,
@@ -456,6 +457,9 @@ pub(super) fn plan_swap(a: u16, b: u16, geometry: &MenuGeometry) -> Result<Vec<S
 pub(super) struct MoveEnds {
     pub(super) from: u16,
     pub(super) to: u16,
+    /// 这一屏的地址空间。**只给拒绝话术用**：协议号不出本层，
+    /// 说不动的时候得用模型写得出来的那个名字回它。
+    pub(super) slot_space: crate::slots::SlotSpace,
     /// from 格：Some((数量, 堆叠上限))；None=空。
     pub(super) from_stack: Option<(u32, u32)>,
     /// to 格现有数量；None=空。
@@ -487,21 +491,26 @@ pub(super) fn plan_move(
     let MoveEnds {
         from,
         to,
+        slot_space,
         from_stack,
         to_count,
         same_item,
         from_take_only,
         to_take_only,
     } = ends;
+    let from_addr = slot_space.describe(from);
+    let to_addr = slot_space.describe(to);
     let Some((available, cap)) = from_stack else {
-        return Err(format!("格 {from} 是空的，没有可挪的"));
+        return Err(format!("{from_addr} 是空的，没有可挪的"));
     };
     if let Some(count) = count {
         if count == 0 {
             return Err("count 必须大于 0".to_owned());
         }
         if count > available {
-            return Err(format!("格 {from} 只有 {available} 个，挪不了 {count} 个"));
+            return Err(format!(
+                "{from_addr} 只有 {available} 个，挪不了 {count} 个"
+            ));
         }
     }
     let left = |slot: u16| ClickOperation::Pickup(PickupClick::Left { slot: Some(slot) });
@@ -529,19 +538,19 @@ pub(super) fn plan_move(
         // 同种物品：倒入合堆。
         Some(existing) if same_item => {
             if to_take_only {
-                return Err(format!("格 {to} 是成品格，只出不进"));
+                return Err(format!("{to_addr} 是成品格，只出不进"));
             }
             let space = cap.saturating_sub(existing);
             if space == 0 {
-                return Err(format!("格 {to} 已经满了，倒不进去"));
+                return Err(format!("{to_addr} 已经满了，倒不进去"));
             }
             let pour = count.unwrap_or_else(|| available.min(space));
             if pour > space {
-                return Err(format!("格 {to} 只装得下 {space} 个"));
+                return Err(format!("{to_addr} 只装得下 {space} 个"));
             }
             let remainder = available - pour;
             if from_take_only && remainder > 0 {
-                return Err(format!("格 {to} 装不下全部，而成品格不能留余量"));
+                return Err(format!("{to_addr} 装不下全部，而成品格不能留余量"));
             }
             if pour == available {
                 // 整组拿起倒入，装得下就没有余量要放回。
@@ -836,6 +845,11 @@ mod tests {
         }
     }
 
+    /// 工作台屏的地址空间，与 `crafting_menu_geometry` 配套。
+    fn crafting_slot_space() -> crate::slots::SlotSpace {
+        crate::slots::SlotSpace::new(37, 45, None, crate::slots::OwnArea::Crafting)
+    }
+
     #[test]
     fn support_face_uses_the_only_solid_neighbor() {
         // 只有脚下有地面：依附块是下邻格，被点的是它的顶面，命中点在共享面中心。
@@ -902,6 +916,7 @@ mod tests {
         MoveEnds {
             from,
             to,
+            slot_space: crate::slots::SlotSpace::player(),
             from_stack,
             to_count,
             same_item,
@@ -988,6 +1003,7 @@ mod tests {
         let take_only_source = |to_count: Option<u32>, same: bool| MoveEnds {
             from: 0,
             to: 40,
+            slot_space: crafting_slot_space(),
             from_stack: Some((4, 64)),
             to_count,
             same_item: same,
@@ -1005,6 +1021,7 @@ mod tests {
         let into_result = MoveEnds {
             from: 40,
             to: 0,
+            slot_space: crafting_slot_space(),
             from_stack: Some((4, 64)),
             to_count: Some(4),
             same_item: true,

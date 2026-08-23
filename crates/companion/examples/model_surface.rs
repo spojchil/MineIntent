@@ -367,6 +367,30 @@ async fn call(provider: &dyn ToolProvider, name: &str, args: serde_json::Value) 
     format!("{status} {}", result_text(&result))
 }
 
+/// 导出用的工作台快照：地址空间与活动菜单一致。
+fn crafting_menu_snapshot() -> world::TickSnapshot {
+    let mut snap = world::TickSnapshot::empty(world::Epoch(1), 122, world::ConnectionPhase::Ready);
+    snap.self_state.inventory.space =
+        world::slots::SlotSpace::new(37, 45, None, world::slots::OwnArea::Crafting);
+    snap.self_state.inventory.slots = vec![
+        world::InventorySlot {
+            slot: 5,
+            item_name: "oak_planks".to_owned(),
+            count: 1,
+            metadata: None,
+            durability_used: None,
+        },
+        world::InventorySlot {
+            slot: 40,
+            item_name: "stick".to_owned(),
+            count: 4,
+            metadata: None,
+            durability_used: None,
+        },
+    ];
+    snap
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let scratch = std::env::temp_dir().join(format!("model-surface-{}", std::process::id()));
@@ -772,13 +796,15 @@ async fn main() {
         };
         println!("- `{}`", render::render_damage_entry(&entry));
     }
-    println!("\n库存变化通知（格位类屏开着才投递；自己动作的回声不投递；容器 0=物品栏屏，非 0=当时开着的容器格空间）：\n");
+    println!(
+        "\n库存变化通知（**只有物品栏屏**开着才投递；自己动作的回声不投递）。\
+容器的格位变化不再推送——那条通道恒定晚一个动作且模型无从知道，改由 \
+`container list` 自己看：\n"
+    );
     for (container_id, slot, item, count) in [
         (0_i32, 38_u16, Some("emerald"), 5_u32),
         (0, 0, Some("oak_button"), 1),
         (0, 10, None, 0),
-        (3, 0, Some("oak_button"), 1),
-        (3, 5, None, 0),
     ] {
         let entry = world::InventoryChangeEntry {
             seq: 1,
@@ -796,6 +822,10 @@ async fn main() {
     {
         let mut crafting_snap =
             world::TickSnapshot::empty(world::Epoch(1), 120, world::ConnectionPhase::Ready);
+        // 地址空间随活动菜单走（机器层的 `active_slot_space` 同源）：
+        // 写死玩家屏会把每一格都标错名字，导出当场失真。
+        crafting_snap.self_state.inventory.space =
+            world::slots::SlotSpace::new(37, 45, None, world::slots::OwnArea::Crafting);
         crafting_snap.self_state.inventory.slots = vec![
             world::InventorySlot {
                 slot: 5,
@@ -823,13 +853,22 @@ async fn main() {
             "开屏（hand use_on 工作台后，服务器打开界面）：\n\n```text\n{}\n```\n",
             render::render_container_opened(&crafting_snap, "crafting", false)
         );
+        let mut chest_snap = crafting_snap.clone();
+        chest_snap.self_state.inventory.space = world::slots::SlotSpace::new(
+            54,
+            62,
+            None,
+            world::slots::OwnArea::Named("chest".to_owned()),
+        );
         println!(
             "开屏（箱子）：\n\n```text\n{}\n```\n",
-            render::render_container_opened(&crafting_snap, "generic_9x3", false)
+            render::render_container_opened(&chest_snap, "generic_9x3", false)
         );
 
         let mut furnace_snap =
             world::TickSnapshot::empty(world::Epoch(1), 121, world::ConnectionPhase::Ready);
+        furnace_snap.self_state.inventory.space =
+            world::slots::SlotSpace::new(30, 38, None, world::slots::OwnArea::Furnace);
         furnace_snap.self_state.inventory.slots = vec![
             world::InventorySlot {
                 slot: 4,
@@ -852,6 +891,10 @@ async fn main() {
         );
     }
     println!("- 被服务器关闭（非自己 close 的回声）：`容器界面被关闭了（crafting）。`");
+    println!(
+        "\n界面现状按需拉取（`{{\"action\":\"list\"}}`，与开屏清单共用同一份渲染）：\n\n```text\n{}\n```\n",
+        render::render_container_menu(&crafting_menu_snapshot(), "crafting")
+    );
 
     // ---- 六、压缩 ----
     println!("\n## 六、上下文压缩\n");

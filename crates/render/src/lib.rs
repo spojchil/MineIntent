@@ -353,53 +353,113 @@ pub fn render_inventory(snap: &TickSnapshot) -> String {
     format!("手持：{held}。背包：{}。", items.join("、"))
 }
 
-/// 物品栏屏全景：46 格按分区列出（协议号即格号），空格不逐一点名。
-/// 用法说明归 screens（操作信息），这里只呈现内容。
-pub fn render_player_menu(snap: &TickSnapshot) -> String {
-    let inventory = &snap.self_state.inventory;
-    let item_at = |slot: u32| -> Option<String> {
-        inventory
+/// 一格画成一个方格。**空格也要画出来。**
+///
+/// 「没列出来」和「是空的」在摆配方时是天差地别的两件事，而旧清单把空格
+/// 一律省略——模型只好用「移出来看看有没有东西、再放回去」试探格子现状
+/// （实盘一次里连做过四轮）。省掉的那点字节，它得用四次调用买回来。
+fn cell(item: Option<String>) -> String {
+    match item {
+        Some(text) => format!("[{text}]"),
+        None => "[空]".to_owned(),
+    }
+}
+
+/// 把一片连续格位画成网格（行优先），每行前面标出这一行的地址区间。
+///
+/// 行标不是装饰。模型按「上行/中行」想配方，而地址是一维的（craft 0-8）；
+/// 不把二维还给它，它就得自己数——实盘里它数对了，却因为读数错位而推翻
+/// 了自己，反过来怀疑编号，整局再没走出来。
+fn grid(
+    space: &world::slots::SlotSpace,
+    first: u16,
+    cols: u16,
+    rows: u16,
+    item_at: &dyn Fn(u32) -> Option<String>,
+) -> String {
+    (0..rows)
+        .map(|row| {
+            let start = first + row * cols;
+            let cells: String = (0..cols)
+                .map(|col| cell(item_at(u32::from(start + col))))
+                .collect();
+            format!("  {}  {cells}", space.legend_of(start, start + cols - 1))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 一段格位的非空清单，地址照 [`world::slots`] 那套写。
+/// 段内全空时报「空」，并给出这一段的地址区间——模型得知道这段叫什么。
+fn addressed_section(
+    space: &world::slots::SlotSpace,
+    name: &str,
+    range: std::ops::RangeInclusive<u32>,
+    item_at: &dyn Fn(u32) -> Option<String>,
+) -> String {
+    let filled: Vec<String> = range
+        .clone()
+        .filter_map(|slot| {
+            item_at(slot).map(|item| format!("{}={item}", space.describe(slot as u16)))
+        })
+        .collect();
+    if filled.is_empty() {
+        format!(
+            "{name}（{}）：空",
+            space.legend_of(*range.start() as u16, *range.end() as u16)
+        )
+    } else {
+        format!("{name}：{}", filled.join("、"))
+    }
+}
+
+/// 单格一行：`成品 result：空`。名字给人看，地址给模型抄。
+fn addressed_single(
+    space: &world::slots::SlotSpace,
+    name: &str,
+    slot: u32,
+    item_at: &dyn Fn(u32) -> Option<String>,
+) -> String {
+    let address = space.describe(slot as u16);
+    match item_at(slot) {
+        Some(item) => format!("{name} {address}：{item}"),
+        None => format!("{name} {address}：空"),
+    }
+}
+
+/// 从快照取「某格现在是什么」。名字带数量，空格为 None。
+fn slot_reader(snap: &TickSnapshot) -> impl Fn(u32) -> Option<String> + '_ {
+    move |slot: u32| {
+        snap.self_state
+            .inventory
             .slots
             .iter()
             .find(|entry| entry.slot == slot)
             .map(|entry| format!("{} ×{}", entry.item_name, entry.count))
-    };
-    // 清单用**格位地址**，不是协议号——模型要照这上面抄去写 move。
-    // 地址由映射生成（`world::slots`），协议号只活在机器层里。
-    //
-    // 空间取自快照,不再写死玩家屏:开着工作台时快捷栏在 37-45,
-    // 写死 `player()` 会把每一格都标错名字。
-    let space = snap.self_state.inventory.space.clone();
-    let addressed = |name: &str, range: std::ops::RangeInclusive<u32>| {
-        let filled: Vec<String> = range
-            .clone()
-            .filter_map(|slot| {
-                item_at(slot).map(|item| format!("{}={item}", space.describe(slot as u16)))
-            })
-            .collect();
-        if filled.is_empty() {
-            format!(
-                "{name}（{}）：空",
-                space.legend_of(*range.start() as u16, *range.end() as u16)
-            )
-        } else {
-            format!("{name}：{}", filled.join("、"))
-        }
-    };
+    }
+}
+
+/// 物品栏屏全景：46 格按分区列出。
+///
+/// 清单用**格位地址**，不是协议号——模型要照这上面抄去写 move。
+/// 地址由映射生成（`world::slots`），协议号只活在机器层里。
+/// 空间取自快照，不写死玩家屏：开着工作台时快捷栏在 37-45，
+/// 写死 `player()` 会把每一格都标错名字。
+pub fn render_player_menu(snap: &TickSnapshot) -> String {
+    let inventory = &snap.self_state.inventory;
+    let space = &inventory.space;
+    let item_at = slot_reader(snap);
     let held_menu_slot = 36 + u32::from(inventory.selected_hotbar_slot);
-    let mut lines = vec![
-        match item_at(0) {
-            Some(item) => format!("result：{item}"),
-            None => "result：空".to_owned(),
-        },
-        addressed("随身合成", 1..=4),
-        addressed("盔甲", 5..=8),
-        addressed("主背包", 9..=35),
-        addressed("快捷栏", 36..=44),
-        match item_at(45) {
-            Some(item) => format!("offhand：{item}"),
-            None => "offhand：空".to_owned(),
-        },
+    let lines = [
+        addressed_single(space, "成品", 0, &item_at),
+        // 随身合成也画成网格：2×2 是开局唯一的合成台，摆错一格的代价
+        // 和工作台一样大，而它一样看不见空格。
+        format!("随身合成 2×2（{}，行优先）：", space.legend_of(1, 4)),
+        grid(space, 1, 2, 2, &item_at),
+        addressed_section(space, "盔甲", 5..=8, &item_at),
+        addressed_section(space, "主背包", 9..=35, &item_at),
+        addressed_section(space, "快捷栏", 36..=44, &item_at),
+        addressed_single(space, "副手", 45, &item_at),
         format!(
             "手持的是 {}{}。",
             space.describe(held_menu_slot as u16),
@@ -408,29 +468,28 @@ pub fn render_player_menu(snap: &TickSnapshot) -> String {
                 .unwrap_or_else(|| "（空手）".to_owned())
         ),
     ];
-    lines.retain(|line| !line.is_empty());
     lines.join("\n")
 }
 
-/// 物品栏格位变化的通知措辞。合成结果格单独点名（它的出现
-/// 也算预期之外的变化）。容器 0 是物品栏屏；其他容器措辞保持中性
-/// （0 号在工作台是成品格、在熔炉是原料格——语义已随开屏清单给过，
-/// 这里不替格号扣帽子）。
+/// 物品栏格位变化的通知措辞。
+///
+/// 只服务玩家物品栏屏（容器 0）——容器的格位变化不再推送，改由模型自己
+/// 查看（`container` 的 list）。理由是这条推送**无法自我定位**：写口回执
+/// 早于服务端确认，而模型的下一次请求在回执那一刻就发出去了，于是这条
+/// 读数恒定落在它的**下一个动作之后**。实盘三段独立序列零例外：放第二块
+/// 木板时告诉它「一块木板的结果」，放第三块时告诉它「两块的结果」。
+///
+/// 措辞「当前是」本是为这个延迟准备的缓解——但它只在读者知道自己晚了一拍
+/// 时才无害。模型手上唯一的时间锚点就是它刚做完的那个动作，把读数锚到那里
+/// 是唯一可能的读法，也是错的。拉取没有这个毛病：读的就是「现在」。
 pub fn render_inventory_change(entry: &world::InventoryChangeEntry) -> String {
-    let place = match (entry.container_id, entry.slot) {
-        (0, 0) => "合成结果格（0）".to_owned(),
-        (0, slot) => format!("物品栏格 {slot} "),
-        (_, slot) => format!("容器格 {slot} "),
+    let space = world::slots::SlotSpace::player();
+    // 尾随空格在地址那一支里（`物品栏 pack 3 当前是…`）；
+    // 成品格那一支自带括号收尾，再补空格就散了。
+    let place = match entry.slot {
+        0 => "合成结果格（result）".to_owned(),
+        slot => format!("物品栏 {} ", space.describe(slot)),
     };
-    // **说「当前是」，不说「出现了」。**
-    //
-    // 写口的 ack 早于服务端确认 2~3 tick，所以这条通知到达时
-    // 说的往往是**上一步之后**的状态。「出现了 X」是在断言一次转变——模型会拿它
-    // 去对自己的第几个动作，对不上就以为系统在闪烁；实测里它因此认定合成回执
-    // 「严重对不上」，只能靠反复关掉重开物品栏来盘点。
-    //
-    // 「当前是 X」只是读数：晚一拍的读数只是旧读数，不是假事件；后一条自然覆盖前
-    // 一条，不需要谁去合并或抑制。又是同一条纪律——机器给事实，不给解释。
     match &entry.item_name {
         Some(name) => format!("{place}当前是 {name} ×{}。", entry.count),
         None => format!("{place}当前是空的。"),
@@ -448,10 +507,6 @@ fn container_area_len(kind: &str) -> Option<u32> {
         "generic_9x4" => 36,
         "generic_9x5" => 45,
         "generic_9x6" => 54,
-        "generic_3x3" | "crafter_3x3" => 9,
-        "anvil" | "blast_furnace" | "furnace" | "smoker" | "grindstone" | "merchant"
-        | "cartography_table" => 3,
-        "beacon" | "lectern" => 1,
         "brewing_stand" | "hopper" => 5,
         "crafting" => 10,
         "enchantment" | "stonecutter" => 2,
@@ -461,8 +516,7 @@ fn container_area_len(kind: &str) -> Option<u32> {
     })
 }
 
-/// 容器开屏通知的整段文本：格位清单（格号即协议号，属于该容器的格空间）
-/// + 用法指引。
+/// 容器开屏通知的整段文本：格位清单 + 用法指引。
 ///
 /// 语义段表是数据：工作台（成品/摆料）与熔炉族（原料/燃料/成品）有
 /// 专属标注，其余已知容器按「容器格 + 主背包 + 快捷栏」通用三段
@@ -488,73 +542,58 @@ pub fn render_container_opened(snap: &TickSnapshot, kind: &str, chat_displaced: 
     }
     text.push('\n');
     text.push_str(&render_container_menu(snap, kind));
-    text.push_str("\n\n（这种容器怎么用：{\"action\":\"describe\"}）");
+    text.push_str(
+        "\n\n（再看一眼现在的界面：{\"action\":\"list\"}；这种容器怎么用：{\"action\":\"describe\"}）",
+    );
     text
 }
 
+/// 容器界面的格位清单。地址照 [`world::slots`] 那套写，协议号不出现。
 pub fn render_container_menu(snap: &TickSnapshot, kind: &str) -> String {
-    let inventory = &snap.self_state.inventory;
-    let item_at = |slot: u32| -> Option<String> {
-        inventory
-            .slots
-            .iter()
-            .find(|entry| entry.slot == slot)
-            .map(|entry| format!("{} ×{}", entry.item_name, entry.count))
-    };
-    let section = |name: &str, range: std::ops::RangeInclusive<u32>| -> String {
-        let filled: Vec<String> = range
-            .clone()
-            .filter_map(|slot| item_at(slot).map(|text| format!("{slot}={text}")))
-            .collect();
-        if filled.is_empty() {
-            format!("{name}（{}-{}）：空", range.start(), range.end())
-        } else {
-            format!(
-                "{name}（{}-{}）：{}",
-                range.start(),
-                range.end(),
-                filled.join("、")
-            )
-        }
-    };
-    let single = |name: &str, slot: u32| -> String {
-        match item_at(slot) {
-            Some(item) => format!("{name}（{slot}）：{item}"),
-            None => format!("{name}（{slot}）：空"),
-        }
-    };
+    let space = &snap.self_state.inventory.space;
+    let item_at = slot_reader(snap);
     if kind == "crafting" {
-        let lines = [
-            single("成品", 0),
-            section("摆料 3×3", 1..=9),
-            section("主背包", 10..=36),
-            section("快捷栏", 37..=45),
-        ];
-        return lines.join("\n");
+        return [
+            addressed_single(space, "成品", 0, &item_at),
+            format!("摆料 3×3（{}，行优先）：", space.legend_of(1, 9)),
+            grid(space, 1, 3, 3, &item_at),
+            addressed_section(space, "主背包", 10..=36, &item_at),
+            addressed_section(space, "快捷栏", 37..=45, &item_at),
+        ]
+        .join("\n");
     }
     if matches!(kind, "furnace" | "blast_furnace" | "smoker") {
-        let lines = [
-            single("原料", 0),
-            single("燃料", 1),
-            single("成品", 2),
-            section("主背包", 3..=29),
-            section("快捷栏", 30..=38),
-        ];
-        return lines.join("\n");
+        return [
+            addressed_single(space, "原料", 0, &item_at),
+            addressed_single(space, "燃料", 1, &item_at),
+            addressed_single(space, "成品", 2, &item_at),
+            addressed_section(space, "主背包", 3..=29, &item_at),
+            addressed_section(space, "快捷栏", 30..=38, &item_at),
+        ]
+        .join("\n");
     }
     if let Some(own) = container_area_len(kind) {
-        let lines = [
-            section("容器格", 0..=own - 1),
-            section("主背包", own..=own + 26),
-            section("快捷栏", own + 27..=own + 35),
-        ];
-        return lines.join("\n");
+        return [
+            addressed_section(space, "容器格", 0..=own - 1, &item_at),
+            addressed_section(space, "主背包", own..=own + 26, &item_at),
+            addressed_section(space, "快捷栏", own + 27..=own + 35, &item_at),
+        ]
+        .join("\n");
     }
-    // 未知种类：逐格罗列非空格位，不猜段界。
-    let mut slots: Vec<String> = inventory
+    // 未知种类：逐格罗列非空格位，不猜段界。地址照样由映射生成。
+    let mut slots: Vec<String> = snap
+        .self_state
+        .inventory
         .slots
         .iter()
-        .map(|entry| format!("{}={} ×{}", entry.slot, entry.item_name, entry.count))
+        .map(|entry| {
+            format!(
+                "{}={} ×{}",
+                space.describe(entry.slot as u16),
+                entry.item_name,
+                entry.count
+            )
+        })
         .collect();
     slots.sort();
     if slots.is_empty() {

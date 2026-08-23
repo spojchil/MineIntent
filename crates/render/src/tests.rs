@@ -308,27 +308,10 @@ fn player_menu_lists_sections_by_slot_address() {
     let mut snap = snapshot();
     snap.self_state.inventory.selected_hotbar_slot = 2;
     snap.self_state.inventory.slots = vec![
-        InventorySlot {
-            slot: 6,
-            item_name: "iron_chestplate".to_owned(),
-            count: 1,
-            metadata: None,
-            durability_used: None,
-        },
-        InventorySlot {
-            slot: 10,
-            item_name: "diamond".to_owned(),
-            count: 3,
-            metadata: None,
-            durability_used: None,
-        },
-        InventorySlot {
-            slot: 38,
-            item_name: "bread".to_owned(),
-            count: 7,
-            metadata: None,
-            durability_used: None,
-        },
+        slot(2, "oak_planks", 1),
+        slot(6, "iron_chestplate", 1),
+        slot(10, "diamond", 3),
+        slot(38, "bread", 7),
     ];
     let text = render_player_menu(&snap);
     // 清单用**格位地址**：模型照这上面抄就能写 move，协议号不出现在可见面。
@@ -338,8 +321,14 @@ fn player_menu_lists_sections_by_slot_address() {
     );
     assert!(text.contains("主背包：pack 1=diamond ×3"), "{text}");
     assert!(text.contains("快捷栏：hotbar 2=bread ×7"), "{text}");
-    assert!(text.contains("随身合成（craft 0-3）：空"), "{text}");
     assert!(text.contains("手持的是 hotbar 2（bread ×7）"), "{text}");
+    // 随身合成画成网格，**空格也画出来**：模型摆配方时要能一眼看出哪格是空的。
+    assert!(
+        text.contains("随身合成 2×2（craft 0-3，行优先）："),
+        "{text}"
+    );
+    assert!(text.contains("craft 0-1  [空][oak_planks ×1]"), "{text}");
+    assert!(text.contains("craft 2-3  [空][空]"), "{text}");
     assert!(
         !text.contains("（36-44）"),
         "协议号不该出现在清单里：{text}"
@@ -347,7 +336,7 @@ fn player_menu_lists_sections_by_slot_address() {
 }
 
 #[test]
-fn inventory_changes_name_the_slot_and_call_out_the_craft_result() {
+fn inventory_changes_name_the_slot_by_address() {
     let entry = world::InventoryChangeEntry {
         seq: 1,
         tick: 10,
@@ -358,142 +347,106 @@ fn inventory_changes_name_the_slot_and_call_out_the_craft_result() {
         item_name: Some("oak_planks".to_owned()),
         count: 4,
     };
+    // 地址，不是协议号——这条通知和 move 的写法必须是同一套。
     assert_eq!(
         render_inventory_change(&entry),
-        "物品栏格 12 当前是 oak_planks ×4。"
+        "物品栏 pack 3 当前是 oak_planks ×4。"
     );
 
     let emptied = world::InventoryChangeEntry {
         slot: 0,
         item_name: None,
         count: 0,
-        ..entry.clone()
-    };
-    assert_eq!(
-        render_inventory_change(&emptied),
-        "合成结果格（0）当前是空的。"
-    );
-
-    // 容器格空间：措辞中性（0 号在工作台是成品格、在熔炉是原料格，
-    // 语义随开屏清单给过，这里不扣帽子）。
-    let crafted = world::InventoryChangeEntry {
-        container_id: 3,
-        slot: 0,
-        item_name: Some("oak_button".to_owned()),
-        count: 1,
-        ..entry.clone()
-    };
-    assert_eq!(
-        render_inventory_change(&crafted),
-        "容器格 0 当前是 oak_button ×1。"
-    );
-    let in_container = world::InventoryChangeEntry {
-        container_id: 3,
         ..entry
     };
     assert_eq!(
-        render_inventory_change(&in_container),
-        "容器格 12 当前是 oak_planks ×4。"
+        render_inventory_change(&emptied),
+        "合成结果格（result）当前是空的。"
     );
 }
 
+/// 工作台屏的地址空间：0 成品、1-9 摆料、10-36 主背包、37-45 快捷栏。
+fn crafting_space() -> world::slots::SlotSpace {
+    world::slots::SlotSpace::new(37, 45, None, world::slots::OwnArea::Crafting)
+}
+
 #[test]
-fn crafting_menu_listing_uses_the_crafting_slot_space() {
+fn crafting_menu_listing_draws_the_grid_including_empty_slots() {
     let mut snap = world::TickSnapshot::empty(world::Epoch(1), 1, world::ConnectionPhase::Ready);
+    snap.self_state.inventory.space = crafting_space();
     snap.self_state.inventory.slots = vec![
-        world::InventorySlot {
-            slot: 0,
-            item_name: "oak_button".to_owned(),
-            count: 1,
-            metadata: None,
-            durability_used: None,
-        },
-        world::InventorySlot {
-            slot: 5,
-            item_name: "oak_planks".to_owned(),
-            count: 1,
-            metadata: None,
-            durability_used: None,
-        },
-        world::InventorySlot {
-            slot: 20,
-            item_name: "diamond".to_owned(),
-            count: 3,
-            metadata: None,
-            durability_used: None,
-        },
-        world::InventorySlot {
-            slot: 45,
-            item_name: "bread".to_owned(),
-            count: 7,
-            metadata: None,
-            durability_used: None,
-        },
+        slot(0, "oak_button", 1),
+        slot(5, "oak_planks", 1),
+        slot(20, "diamond", 3),
+        slot(45, "bread", 7),
     ];
     let text = render_container_menu(&snap, "crafting");
-    assert!(text.contains("成品（0）：oak_button ×1"), "{text}");
-    assert!(text.contains("摆料 3×3（1-9）：5=oak_planks ×1"), "{text}");
-    assert!(text.contains("主背包（10-36）：20=diamond ×3"), "{text}");
+    assert!(text.contains("成品 result：oak_button ×1"), "{text}");
+    // 3×3 逐行画出，行标给出这一行的地址区间——模型不必自己把一维数成二维。
+    assert!(text.contains("摆料 3×3（craft 0-8，行优先）："), "{text}");
+    assert!(text.contains("craft 0-2  [空][空][空]"), "{text}");
+    assert!(
+        text.contains("craft 3-5  [空][oak_planks ×1][空]"),
+        "{text}"
+    );
+    assert!(text.contains("craft 6-8  [空][空][空]"), "{text}");
+    assert!(text.contains("主背包：pack 10=diamond ×3"), "{text}");
     // 玩家屏里 45 是副手；工作台屏里 45 是快捷栏末格。
-    assert!(text.contains("快捷栏（37-45）：45=bread ×7"), "{text}");
+    assert!(text.contains("快捷栏：hotbar 8=bread ×7"), "{text}");
+    // 协议号一个都不许漏出来——旧清单正是在这里把模型带偏了整整一局。
+    for leaked in [
+        "（1-9）",
+        "（10-36）",
+        "（37-45）",
+        "5=oak_planks",
+        "20=diamond",
+    ] {
+        assert!(!text.contains(leaked), "协议号漏进清单：{leaked}\n{text}");
+    }
+}
 
-    // 已知容器按通用三段（箱子：27 容器格 + 主背包 + 快捷栏）。
+#[test]
+fn known_containers_use_three_sections_and_unknown_ones_are_listed_flat() {
+    let mut snap = world::TickSnapshot::empty(world::Epoch(1), 1, world::ConnectionPhase::Ready);
+    snap.self_state.inventory.space = world::slots::SlotSpace::new(
+        54,
+        62,
+        None,
+        world::slots::OwnArea::Named("chest".to_owned()),
+    );
+    snap.self_state.inventory.slots = vec![slot(20, "diamond", 3)];
     let chest = render_container_menu(&snap, "generic_9x3");
-    assert!(chest.contains("容器格（0-26）"), "{chest}");
-    assert!(chest.contains("主背包（27-53）"), "{chest}");
-    assert!(chest.contains("快捷栏（54-62）"), "{chest}");
-    // 未知种类逐格罗列，不猜段界。
+    assert!(chest.contains("容器格：chest 20=diamond ×3"), "{chest}");
+    assert!(chest.contains("主背包（pack 0-26）：空"), "{chest}");
+    assert!(chest.contains("快捷栏（hotbar 0-8）：空"), "{chest}");
+    // 未知种类逐格罗列，不猜段界；地址照样由映射生成。
     let unknown = render_container_menu(&snap, "modded_thing");
-    assert!(unknown.contains("非空格位："), "{unknown}");
+    assert!(
+        unknown.contains("非空格位：chest 20=diamond ×3"),
+        "{unknown}"
+    );
 }
 
 #[test]
 fn furnace_menu_listing_names_the_three_working_slots() {
     let mut snap = world::TickSnapshot::empty(world::Epoch(1), 1, world::ConnectionPhase::Ready);
+    snap.self_state.inventory.space =
+        world::slots::SlotSpace::new(30, 38, None, world::slots::OwnArea::Furnace);
     snap.self_state.inventory.slots = vec![
-        world::InventorySlot {
-            slot: 0,
-            item_name: "raw_iron".to_owned(),
-            count: 3,
-            metadata: None,
-            durability_used: None,
-        },
-        world::InventorySlot {
-            slot: 1,
-            item_name: "coal".to_owned(),
-            count: 2,
-            metadata: None,
-            durability_used: None,
-        },
-        world::InventorySlot {
-            slot: 10,
-            item_name: "bread".to_owned(),
-            count: 5,
-            metadata: None,
-            durability_used: None,
-        },
-        world::InventorySlot {
-            slot: 31,
-            item_name: "stick".to_owned(),
-            count: 4,
-            metadata: None,
-            durability_used: None,
-        },
+        slot(0, "raw_iron", 3),
+        slot(1, "coal", 2),
+        slot(10, "bread", 5),
+        slot(31, "stick", 4),
     ];
-    // 熔炉族三种同形：原料/燃料/成品 + 玩家区（3-29 主背包、30-38 快捷栏）。
+    // 熔炉族三种同形：原料/燃料/成品 + 玩家区。
     for kind in ["furnace", "blast_furnace", "smoker"] {
         let text = render_container_menu(&snap, kind);
-        assert!(text.contains("原料（0）：raw_iron ×3"), "{kind}: {text}");
-        assert!(text.contains("燃料（1）：coal ×2"), "{kind}: {text}");
-        assert!(text.contains("成品（2）：空"), "{kind}: {text}");
-        assert!(
-            text.contains("主背包（3-29）：10=bread ×5"),
-            "{kind}: {text}"
-        );
-        assert!(
-            text.contains("快捷栏（30-38）：31=stick ×4"),
-            "{kind}: {text}"
-        );
+        assert!(text.contains("原料 smelt：raw_iron ×3"), "{kind}: {text}");
+        assert!(text.contains("燃料 fuel：coal ×2"), "{kind}: {text}");
+        assert!(text.contains("成品 result：空"), "{kind}: {text}");
+        assert!(text.contains("主背包：pack 7=bread ×5"), "{kind}: {text}");
+        assert!(text.contains("快捷栏：hotbar 1=stick ×4"), "{kind}: {text}");
+        assert!(!text.contains("（3-29）"), "协议号漏进清单：{kind}: {text}");
     }
 }
 
