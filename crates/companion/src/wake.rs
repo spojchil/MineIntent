@@ -10,8 +10,8 @@
 //! 不会漏——tick 会重复，seq 不会。
 
 use world::{
-    DamageEntry, FactSource, InventoryChangeEntry, JobEntry, JobEvent, JobOutcome, ScreenEvent,
-    TickSnapshot,
+    DamageEntry, FactSource, InventoryChangeEntry, JobEntry, JobFact, MineEvent, MoveEvent,
+    ScreenEvent, TickSnapshot,
 };
 
 /// 屏事实要组合根做的事：状态翻转与占域是副作用，出纯函数交给外面。
@@ -107,10 +107,8 @@ impl WakeCursors {
             }
             // 进展不走这条通道：它是「还在走」，不是「出事了」，由轮末帧搭车呈现
             // （组合根另有一个游标）。这里只管终局。
-            if let JobEvent::Finished(outcome) = entry.event {
-                if wakes_on(outcome) {
-                    lines.push(render_job(entry));
-                }
+            if entry.fact.is_terminal() && wakes_on(&entry.fact) {
+                lines.push(render_job(entry));
             }
         }
 
@@ -164,15 +162,20 @@ fn advance(cursor: &mut Option<u64>, seq: u64) -> bool {
 /// 哪些任务终局值得把同伴叫起来。
 ///
 /// 顶替与停止是**模型自己下的令**的回声——为它醒等于自己吵自己。
-fn wakes_on(outcome: JobOutcome) -> bool {
-    matches!(
-        outcome,
-        JobOutcome::Arrived
-            | JobOutcome::PathEnded
-            | JobOutcome::Stalled
-            | JobOutcome::Mined
-            | JobOutcome::MineBlocked
-    )
+/// 哪些终局值得叫醒。**自己干的不必回报**：顶替与取消都是模型刚下的命令，
+/// 告诉它「你停下了」只是复述它自己的动作。看门狗超时要报——那正是它不知道
+/// 的那种失败。
+fn wakes_on(fact: &JobFact) -> bool {
+    match fact {
+        JobFact::Move { event, .. } => !matches!(
+            event,
+            MoveEvent::Replaced | MoveEvent::Cancelled | MoveEvent::Leg { .. } | MoveEvent::Stalled
+        ),
+        JobFact::Mine { event, .. } => !matches!(
+            event,
+            MineEvent::Replaced | MineEvent::Cancelled | MineEvent::Broke { .. }
+        ),
+    }
 }
 
 /// 哪些库存变化值得通知：预期之外的（ServerObserved）。
@@ -197,8 +200,7 @@ fn render_job(entry: &JobEntry) -> String {
 mod tests {
     use super::*;
     use world::{
-        ChatContent, ChatEntry, ChatPosition, ConnectionPhase, Epoch, FactSource, JobKind,
-        PlayerRef, Window,
+        ChatContent, ChatEntry, ChatPosition, ConnectionPhase, Epoch, FactSource, PlayerRef, Window,
     };
 
     const OWN_UUID: &str = "11111111-2222-3333-4444-555555555555";
@@ -239,15 +241,16 @@ mod tests {
         }
     }
 
-    fn job(seq: u64, outcome: JobOutcome) -> JobEntry {
+    fn job(seq: u64, event: MoveEvent) -> JobEntry {
         JobEntry {
             seq,
             tick: seq,
             occurred_at: std::time::SystemTime::UNIX_EPOCH,
-            job: JobKind::MoveTo {
+            id: world::JobId(seq),
+            fact: JobFact::Move {
                 destination: [1, 2, 3],
+                event,
             },
-            event: JobEvent::Finished(outcome),
         }
     }
 
@@ -356,21 +359,23 @@ mod tests {
     }
 
     #[test]
-    fn only_outcomes_we_did_not_command_wake_us() {
+    fn only_terminals_we_did_not_command_wake_us() {
         let mut snap = snapshot();
         let mut cursors = WakeCursors::default();
         snap.jobs = Window {
             entries: vec![
-                job(1, JobOutcome::Arrived),
-                job(2, JobOutcome::Replaced),
-                job(3, JobOutcome::Stopped),
-                job(4, JobOutcome::PathEnded),
-                job(5, JobOutcome::Stalled),
+                job(1, MoveEvent::Arrived),
+                job(2, MoveEvent::Replaced),
+                job(3, MoveEvent::Cancelled),
+                job(4, MoveEvent::PathEnded),
+                job(5, MoveEvent::Stalled),
             ],
         };
 
-        // 顶替与停止是模型自己下的令的回声，不该把它自己吵醒。
-        assert_eq!(cursors.collect(&snap, identity(), false).lines.len(), 3);
+        // 三类被挡下，只剩到达与走不到：
+        //   顶替、取消——模型自己下的令的回声，不该把它自己吵醒；
+        //   卡住——它是**进展**不是终局（任务还在跑），由帧搭车呈现。
+        assert_eq!(cursors.collect(&snap, identity(), false).lines.len(), 2);
     }
 
     #[test]
@@ -385,7 +390,7 @@ mod tests {
             entries: vec![damage(2, 20.0, 14.0)],
         };
         snap.jobs = Window {
-            entries: vec![job(3, JobOutcome::Arrived)],
+            entries: vec![job(3, MoveEvent::Arrived)],
         };
 
         let lines = cursors.collect(&snap, identity(), false).lines;

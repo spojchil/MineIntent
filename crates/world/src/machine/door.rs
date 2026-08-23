@@ -97,7 +97,10 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
         }
         DoorCommand::GoTo([x, y, z]) => {
             let destination = [x.floor() as i32, y.floor() as i32, z.floor() as i32];
-            inner.begin_movement_job(destination);
+            inner.movement_job.begin(
+                inner,
+                super::movement::MovementJob::new(destination, inner.now_tick()),
+            );
             // 禁止寻路器隐式挖方块：挖掘是模型的显式动作（hand mine），
             // 不是移动的副作用——实测它会把作为目的地的工作台整个挖掉。
             begin_goto(bot, destination);
@@ -121,7 +124,10 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
                 position.1.floor() as i32,
                 (position.2 + yaw.cos() * blocks).floor() as i32,
             );
-            inner.begin_movement_job([target.x, target.y, target.z]);
+            inner.movement_job.begin(
+                inner,
+                super::movement::MovementJob::new([target.x, target.y, target.z], inner.now_tick()),
+            );
             bot.start_goto_with_opts(
                 BlockPosGoal(target),
                 PathfinderOpts::new().allow_mining(false),
@@ -129,7 +135,7 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             Ok(())
         }
         DoorCommand::StopMoving => {
-            inner.end_movement_job_stopped();
+            inner.movement_job.cancel(inner);
             bot.stop_pathfinding();
             bot.walk(WalkDirection::None);
             Ok(())
@@ -178,7 +184,10 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
                 return Err(format!("({x},{y},{z}) 没有方块，是空气"));
             }
             check_reach(bot, BlockPos::new(x, y, z).center())?;
-            inner.begin_mining_job(targets.clone());
+            inner.mining_job.begin(
+                inner,
+                super::mining::MiningJob::new(targets.clone(), inner.now_tick()),
+            );
             begin_mining(bot, targets[0]);
             Ok(())
         }
@@ -208,7 +217,7 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
                     .write_message(azalea::mining::StopMiningBlockEvent { entity: bot.entity });
             }
             // 队列也要收：不收的话轮询会不停重发 start_mining，release 等于没停。
-            inner.end_mining_job_stopped();
+            inner.mining_job.cancel(inner);
             bot.write_packet(s_player_action::ServerboundPlayerAction {
                 action: s_player_action::Action::ReleaseUseItem,
                 pos: BlockPos::new(0, 0, 0),

@@ -827,73 +827,59 @@ pub fn render_directed(projection: &world::DirectedProjection) -> String {
 ///
 /// **不解释为什么到此为止**：路径是被知识边界截断还是被超时截断，`is_partial`
 /// 分不出，说了就是把未知讲成已知。
-pub fn render_job_progress(job: &world::JobKind, progress: &world::JobProgress) -> String {
-    match (job, progress) {
-        (
-            world::JobKind::MoveTo {
-                destination: [dx, dy, dz],
-            },
-            world::JobProgress::Leg { to: [x, y, z] },
-        ) => {
-            if [*x, *y, *z] == [*dx, *dy, *dz] {
-                format!("这一程直接走到 ({dx}, {dy}, {dz})。")
-            } else {
-                format!(
-                    "去 ({dx}, {dy}, {dz})：这一程先走到 ({x}, {y}, {z})，到了再看能不能接着走。"
-                )
-            }
-        }
-        (world::JobKind::Mine { .. }, world::JobProgress::Mined { done, total }) => {
-            format!(
-                "挖掉了第 {done} 块，还剩 {} 块。",
-                total.saturating_sub(*done)
-            )
-        }
-        // 类别对不上就如实说破，不编。
-        (job, progress) => format!("任务收到了不属于它的进展：{job:?} / {progress:?}。"),
-    }
-}
-
-/// 任务变化的通知措辞。哪些值得投递是己的判据，这里只管怎么说。
 pub fn render_job_entry(entry: &world::JobEntry) -> String {
-    let outcome = match &entry.event {
-        world::JobEvent::Finished(outcome) => *outcome,
-        world::JobEvent::Progress(progress) => return render_job_progress(&entry.job, progress),
-    };
-    match &entry.job {
-        world::JobKind::MoveTo {
+    match &entry.fact {
+        world::JobFact::Move {
             destination: [x, y, z],
-        } => match outcome {
-            world::JobOutcome::Arrived => format!("你到达了目的地 ({x}, {y}, {z})。"),
-            world::JobOutcome::Replaced => "先前的移动被新的目标顶替了。".to_owned(),
-            world::JobOutcome::Stopped => "你停下了移动。".to_owned(),
-            world::JobOutcome::PathEnded => {
-                format!("你没能到达 ({x}, {y}, {z})——路走到了尽头，目的地过不去。")
+            event,
+        } => match event {
+            world::MoveEvent::Leg { to: [lx, ly, lz] } => {
+                if [*lx, *ly, *lz] == [*x, *y, *z] {
+                    format!("这一程直接走到 ({x}, {y}, {z})。")
+                } else {
+                    format!(
+                        "去 ({x}, {y}, {z})：这一程先走到 ({lx}, {ly}, {lz})，到了再看能不能接着走。"
+                    )
+                }
             }
-            world::JobOutcome::Stalled => {
+            world::MoveEvent::Stalled => {
                 format!("你在前往 ({x}, {y}, {z}) 的路上卡住了一阵子，一直没有进展。")
             }
-            // 挖掘结局落在移动任务上是不可能的；真出现了如实说破，不编。
-            other => format!("移动任务收到了不属于它的结局：{other:?}。"),
+            world::MoveEvent::Arrived => format!("你到达了目的地 ({x}, {y}, {z})。"),
+            world::MoveEvent::PathEnded => {
+                format!("你没能到达 ({x}, {y}, {z})——路走到了尽头，目的地过不去。")
+            }
+            world::MoveEvent::Replaced => "先前的移动被新的目标顶替了。".to_owned(),
+            world::MoveEvent::Cancelled => "你停下了移动。".to_owned(),
+            world::MoveEvent::TimedOut => format!(
+                "去 ({x}, {y}, {z}) 这件事没了下文，机器把它收了——既没到达也没报错，多半是哪里卡住了。"
+            ),
         },
-        world::JobKind::Mine { targets, done } => {
+        world::JobFact::Mine {
+            targets,
+            done,
+            event,
+        } => {
             let total = targets.len();
-            match outcome {
-                world::JobOutcome::Mined => format!("你挖完了这一串 {total} 块方块。"),
-                world::JobOutcome::MineBlocked => match targets.get(*done) {
-                    Some([x, y, z]) => format!(
-                        "挖到第 {} 块就卡住了：({x}, {y}, {z}) 迟迟不碎——多半是够不着、被挡住，或者手上的工具挖不动它。前面 {done} 块已经挖掉了。",
-                        done + 1
-                    ),
-                    None => format!("挖掘卡住了（已挖掉 {done}/{total} 块）。"),
-                },
-                world::JobOutcome::Replaced => {
+            match event {
+                world::MineEvent::Broke { done, total } => format!(
+                    "挖掉了第 {done} 块，还剩 {} 块。",
+                    total.saturating_sub(*done)
+                ),
+                world::MineEvent::Cleared => format!("你挖完了这一串 {total} 块方块。"),
+                world::MineEvent::Blocked { at: [x, y, z] } => format!(
+                    "挖到第 {} 块就卡住了：({x}, {y}, {z}) 迟迟不碎——多半是够不着、被挡住，或者手上的工具挖不动它。前面 {done} 块已经挖掉了。",
+                    done + 1
+                ),
+                world::MineEvent::Replaced => {
                     format!("先前的挖掘被新的队列顶替了（已挖掉 {done}/{total} 块）。")
                 }
-                world::JobOutcome::Stopped => {
+                world::MineEvent::Cancelled => {
                     format!("你停下了挖掘（已挖掉 {done}/{total} 块）。")
                 }
-                other => format!("挖掘任务收到了不属于它的结局：{other:?}。"),
+                world::MineEvent::TimedOut => format!(
+                    "这串挖掘没了下文，机器把它收了（已挖掉 {done}/{total} 块）——既没挖完也没报卡住。"
+                ),
             }
         }
     }

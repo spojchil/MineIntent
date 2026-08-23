@@ -247,26 +247,38 @@ fn wrap_degrees_matches_the_vanilla_half_open_range() {
 
 #[test]
 fn job_entries_render_each_outcome_in_world_language() {
-    let entry = |outcome| world::JobEntry {
+    let entry = |event| world::JobEntry {
         seq: 1,
         tick: 100,
         occurred_at: SystemTime::now(),
-        job: world::JobKind::MoveTo {
+        id: world::JobId(7),
+        fact: world::JobFact::Move {
             destination: [10, 64, -3],
+            event,
         },
-        event: world::JobEvent::Finished(outcome),
     };
     assert_eq!(
-        render_job_entry(&entry(world::JobOutcome::Arrived)),
+        render_job_entry(&entry(world::MoveEvent::Arrived)),
         "你到达了目的地 (10, 64, -3)。"
     );
-    assert!(render_job_entry(&entry(world::JobOutcome::PathEnded)).contains("没能到达"));
-    assert!(render_job_entry(&entry(world::JobOutcome::Stalled)).contains("卡住"));
+    assert!(render_job_entry(&entry(world::MoveEvent::PathEnded)).contains("没能到达"));
+    assert!(render_job_entry(&entry(world::MoveEvent::Stalled)).contains("卡住"));
     assert_eq!(
-        render_job_entry(&entry(world::JobOutcome::Stopped)),
+        render_job_entry(&entry(world::MoveEvent::Cancelled)),
         "你停下了移动。"
     );
-    assert!(render_job_entry(&entry(world::JobOutcome::Replaced)).contains("顶替"));
+    assert!(render_job_entry(&entry(world::MoveEvent::Replaced)).contains("顶替"));
+    // 看门狗收槽也要有话说——沉默才是这套设计最怕的东西。
+    assert!(render_job_entry(&entry(world::MoveEvent::TimedOut)).contains("没了下文"));
+}
+
+/// 「卡住」是进展不是终局：类型上就该分得开，呈现也不该说成结束了。
+#[test]
+fn stalling_is_progress_while_giving_up_is_terminal() {
+    assert!(!world::MoveEvent::Stalled.is_terminal());
+    assert!(world::MoveEvent::PathEnded.is_terminal());
+    assert!(!world::MineEvent::Broke { done: 1, total: 3 }.is_terminal());
+    assert!(world::MineEvent::Blocked { at: [1, 2, 3] }.is_terminal());
 }
 
 #[test]

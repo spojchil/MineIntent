@@ -12,13 +12,12 @@
 //! 徒手挖原木要好几秒，按时间猜必然错；按世界状态判则与工具、附魔、方块
 //! 硬度全都无关。
 
-use std::sync::atomic::Ordering;
-
 use azalea::Client;
 
+use super::job::{JobVerb, Step};
 use super::state::Inner;
 use super::MINING_STALL_TICKS;
-use crate::JobOutcome;
+use crate::{JobFact, JobId, JobStatus, JobStatusKind, MineEvent};
 
 /// 在途的挖掘任务（单意图槽，与移动同款）。
 pub(super) struct MiningJob {
@@ -27,6 +26,55 @@ pub(super) struct MiningJob {
     pub(super) cursor: usize,
     /// 当前这块从哪个 tick 开始挖的（判「迟迟不碎」用）。
     pub(super) since_tick: u64,
+}
+
+impl MiningJob {
+    pub(super) fn new(targets: Vec<[i32; 3]>, since_tick: u64) -> Self {
+        Self {
+            targets,
+            cursor: 0,
+            since_tick,
+        }
+    }
+}
+
+impl JobVerb for MiningJob {
+    type Event = MineEvent;
+
+    fn fact(&self, event: MineEvent) -> JobFact {
+        JobFact::Mine {
+            targets: self.targets.clone(),
+            done: self.cursor,
+            event,
+        }
+    }
+
+    fn replaced() -> MineEvent {
+        MineEvent::Replaced
+    }
+    fn cancelled() -> MineEvent {
+        MineEvent::Cancelled
+    }
+    fn timed_out() -> MineEvent {
+        MineEvent::TimedOut
+    }
+
+    /// 兜底期限：远宽于 `MINING_STALL_TICKS`（动词自己判「挖不动」用那个）。
+    /// 这里只防「动词判定根本没走到」，正常情况永远不该触发。
+    const WATCHDOG_TICKS: u64 = MINING_STALL_TICKS * 3;
+
+    fn status(&self, id: JobId, started_tick: u64, now_tick: u64) -> JobStatus {
+        JobStatus {
+            id,
+            kind: JobStatusKind::Mine {
+                targets: self.targets.clone(),
+                done: self.cursor,
+                current: self.targets.get(self.cursor).copied(),
+            },
+            started_tick,
+            elapsed_ticks: now_tick.saturating_sub(started_tick),
+        }
+    }
 }
 
 /// 轮询的行动结论（纯函数，可单测）。
@@ -71,63 +119,56 @@ pub(super) fn mining_poll_step(
 }
 
 /// 每 tick 轮询在途挖掘任务，落副作用。
+///
+/// 收槽只经 [`Step::End`]——槽位不外露 `take()`，所以「必有终局」忘不掉。
 pub(super) fn poll_mining_job(inner: &Inner, bot: &Client) {
-    let tick = inner.tick.load(Ordering::Acquire);
-    let (target, elapsed, remaining_after_this) = {
-        let job = inner.mining_job.lock();
-        let Some(job) = job.as_ref() else { return };
-        let Some(target) = job.targets.get(job.cursor).copied() else {
-            return;
-        };
-        (
-            target,
-            tick.saturating_sub(job.since_tick),
-            job.targets.len() - job.cursor - 1,
-        )
+    let tick = inner.now_tick();
+    // 先把判定要的世界读数取出来：闭包里只做状态转换，不再碰锁。
+    let Some((target, elapsed, remaining_after_this)) = inner
+        .mining_job
+        .peek(|job| {
+            job.targets.get(job.cursor).copied().map(|target| {
+                (
+                    target,
+                    tick.saturating_sub(job.since_tick),
+                    job.targets.len() - job.cursor - 1,
+                )
+            })
+        })
+        .flatten()
+    else {
+        return;
     };
 
     // 读不到（未加载等）：当作没碎（false），交给时限去判卡住。
     let target_is_air = super::door::block_is_air(inner, target).unwrap_or_default();
     let is_mining = bot.get_component::<azalea::mining::Mining>().is_some();
+    let step = mining_poll_step(target_is_air, is_mining, elapsed, remaining_after_this);
 
-    match mining_poll_step(target_is_air, is_mining, elapsed, remaining_after_this) {
+    let mut reissue_at = None;
+    inner.mining_job.poll(inner, |job| match step {
         MiningPollStep::Keep { reissue } => {
             if reissue {
-                super::door::begin_mining(bot, target);
+                reissue_at = Some(target);
             }
+            Step::Keep
         }
         MiningPollStep::Advance => {
-            let (next, progress) = {
-                let mut job = inner.mining_job.lock();
-                let Some(job) = job.as_mut() else { return };
-                job.cursor += 1;
-                job.since_tick = tick;
-                (
-                    job.targets.get(job.cursor).copied(),
-                    (
-                        crate::JobKind::Mine {
-                            targets: job.targets.clone(),
-                            done: job.cursor,
-                        },
-                        crate::JobProgress::Mined {
-                            done: job.cursor,
-                            total: job.targets.len(),
-                        },
-                    ),
-                )
-            };
+            job.cursor += 1;
+            job.since_tick = tick;
+            reissue_at = job.targets.get(job.cursor).copied();
             // 一块碎了就说一句：整队挖完才是终局，中途不该沉默到底。
-            inner.push_job_progress(progress.0, progress.1);
-            if let Some(next) = next {
-                super::door::begin_mining(bot, next);
-            }
+            Step::Progress(MineEvent::Broke {
+                done: job.cursor,
+                total: job.targets.len(),
+            })
         }
-        MiningPollStep::Finished => {
-            inner.end_mining_job(JobOutcome::Mined);
-        }
-        MiningPollStep::Blocked => {
-            inner.end_mining_job(JobOutcome::MineBlocked);
-        }
+        MiningPollStep::Finished => Step::End(MineEvent::Cleared),
+        MiningPollStep::Blocked => Step::End(MineEvent::Blocked { at: target }),
+    });
+
+    if let Some(next) = reissue_at {
+        super::door::begin_mining(bot, next);
     }
 }
 

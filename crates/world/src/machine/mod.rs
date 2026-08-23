@@ -21,6 +21,7 @@ mod blocks;
 mod capture;
 mod connect;
 mod door;
+mod job;
 mod mining;
 mod movement;
 pub mod observed;
@@ -368,12 +369,11 @@ impl Module {
         Ok(changes)
     }
 
-    /// 在途挖掘队列现状：(已挖块数, 总块数, 正在挖的那块)。None = 没在挖。
-    pub fn mining_status(&self) -> Option<(usize, usize, [i32; 3])> {
-        let job = self.inner.mining_job.lock();
-        let job = job.as_ref()?;
-        let current = job.targets.get(job.cursor).copied()?;
-        Some((job.cursor, job.targets.len(), current))
+    /// 全部在途任务。空 = 什么都没在跑。
+    ///
+    /// 槽位是唯一真相源，不另建镜像表——两份真相迟早会不一致。
+    pub fn jobs_in_flight(&self) -> Vec<crate::JobStatus> {
+        self.inner.jobs_in_flight()
     }
 
     /// 聊天窗读取：最近 count 条，旧在前新在后。

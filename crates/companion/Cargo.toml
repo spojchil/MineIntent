@@ -11,6 +11,7 @@ agent = { workspace = true, features = ["openai"] }
 context = { path = "../context" }
 dispatch = { path = "../dispatch" }
 hand = { path = "../hand" }
+jobs = { path = "../jobs" }
 motion = { path = "../motion" }
 perception = { path = "../perception" }
 presence = { path = "../presence" }

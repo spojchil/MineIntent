@@ -23,15 +23,8 @@ pub trait HandDoor: Send + Sync {
     /// 按顺序挖一串方块。**队列**：机器逐块挖完，新队列顶替旧队列。
     /// 单块也走这里（长度 1 的数组）。
     fn mine<'a>(&'a self, blocks: Vec<[i32; 3]>) -> PortFuture<'a, Result<(), String>>;
-    /// 在途挖掘队列的现状。`None` = 现在没有在挖。
-    fn mining_status<'a>(&'a self) -> PortFuture<'a, Option<MiningStatus>>;
     /// 把手持方块放到目标空位（目标须紧挨已有方块；依附面由机器代选）。
     fn place<'a>(&'a self, block: [i32; 3]) -> PortFuture<'a, Result<(), String>>;
-    /// 垫柱：跳起来在脚下放方块，站上去，重复 `count` 次。
-    ///
-    /// **临时动作**——放置那条线整体要重做。它存在的理由是原版玩家最基本的一个
-    /// 动作，而模型自己做不到：跳与放之间要隔 100~300ms（实测），工具批里表达
-    /// 不了这个间隔，分两轮发又慢到窗口早过。时序归机器。
     fn use_on_block<'a>(&'a self, block: [i32; 3]) -> PortFuture<'a, Result<(), String>>;
     fn use_on_entity<'a>(&'a self, entity_key: &'a str) -> PortFuture<'a, Result<(), String>>;
     fn use_item<'a>(&'a self) -> PortFuture<'a, Result<(), String>>;
@@ -40,15 +33,6 @@ pub trait HandDoor: Send + Sync {
     fn drop_item<'a>(&'a self, whole_stack: bool) -> PortFuture<'a, Result<(), String>>;
     fn swap_offhand<'a>(&'a self) -> PortFuture<'a, Result<(), String>>;
     fn select_slot<'a>(&'a self, slot: u8) -> PortFuture<'a, Result<(), String>>;
-}
-
-/// 在途挖掘队列的现状（只读）。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MiningStatus {
-    pub done: usize,
-    pub total: usize,
-    /// 正在挖的那一块。
-    pub current: [i32; 3],
 }
 
 const TOOL_NAME: &str = "hand";
@@ -75,19 +59,6 @@ impl HandTools {
                     return ToolResult::failure(call_id, "attack 需要字符串参数 entity；请改写调用")
                 }
             },
-            Some("mining_status") => {
-                return match self.door.mining_status().await {
-                    Some(status) => ToolResult::success_json(
-                        call_id,
-                        json!({
-                            "done": status.done,
-                            "total": status.total,
-                            "current": status.current,
-                        }),
-                    ),
-                    None => ToolResult::success_json(call_id, json!({"state": "idle"})),
-                };
-            }
             Some("mine") => match read_blocks(arguments.get("blocks").or(arguments.get("block"))) {
                 Ok(blocks) => self.door.mine(blocks).await,
                 Err(reason) => return ToolResult::failure(call_id, reason),
@@ -145,7 +116,7 @@ impl HandTools {
             _ => {
                 return ToolResult::failure(
                     call_id,
-                    "action 必须是 attack/mine/mining_status/place/use_on/use_item/release/drop/swap_offhand/select_slot 之一；请改写调用",
+                    "action 必须是 attack/mine/place/use_on/use_item/release/drop/swap_offhand/select_slot 之一；请改写调用",
                 )
             }
         };
@@ -200,8 +171,8 @@ impl ToolProvider for HandTools {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["attack", "mine", "mining_status", "place", "use_on", "use_item", "release", "drop", "swap_offhand", "select_slot"],
-                        "description": "attack=攻击实体；mine=按顺序挖掉一串方块（blocks 给坐标数组，机器逐块挖完；挖穿要时间，别急着发下一个——再发一次 mine 会放弃当前这串。可用 release 停手）；place=把手持方块放到目标空位（目标须紧挨已有方块）；use_on=对方块/实体使用（右键）；use_item=使用手持物品（吃/喝/举盾，持续到用完或 release）；mining_status=看一眼在途挖掘队列（**不要轮询**：挖完或卡住都会主动通知你，这个动作只在你确实拿不准时用一次）；release=松手；drop=丢手持物；swap_offhand=主副手对调；select_slot=选快捷栏格"
+                        "enum": ["attack", "mine", "place", "use_on", "use_item", "release", "drop", "swap_offhand", "select_slot"],
+                        "description": "attack=攻击实体；mine=按顺序挖掉一串方块（blocks 给坐标数组，机器逐块挖完；挖穿要时间，别急着发下一个——再发一次 mine 会放弃当前这串。想看进度用 jobs 工具；可用 release 停手）；place=把手持方块放到目标空位（目标须紧挨已有方块）；use_on=对方块/实体使用（右键）；use_item=使用手持物品（吃/喝/举盾，持续到用完或 release）；release=松手；drop=丢手持物；swap_offhand=主副手对调；select_slot=选快捷栏格"
                     },
                     "entity": { "type": "string", "description": "attack/use_on 用：目标实体的 entity_key" },
                     "block": { "type": "array", "items": {"type": "integer"}, "description": "place/use_on 用：方块坐标 [x, y, z]" },
@@ -266,9 +237,6 @@ mod tests {
         }
         fn mine<'a>(&'a self, blocks: Vec<[i32; 3]>) -> PortFuture<'a, Result<(), String>> {
             self.log(format!("mine{blocks:?}"))
-        }
-        fn mining_status<'a>(&'a self) -> PortFuture<'a, Option<MiningStatus>> {
-            Box::pin(async { None })
         }
         fn place<'a>(&'a self, block: [i32; 3]) -> PortFuture<'a, Result<(), String>> {
             self.log(format!("place{block:?}"))
