@@ -17,6 +17,12 @@
 //! 一律**方块事实**——坐标、标签、方位距离。
 //!
 //! 「这是悬崖」「那片林子」由模型自己看出来：机器产出解释，本质是替模型下结论。
+//!
+//! # 三个入口，一条边界
+//!
+//! `find`/`around` 是收好词的快捷问法，`sql` 是把提问的自由整个交出去
+//! （见 [`crate::sql`]）。三者读的是同一份记忆，因而共享同一条信息边界：
+//! **只答得出观察过的东西**。
 
 use std::sync::{Arc, Mutex};
 
@@ -176,14 +182,33 @@ impl BlocksQuery {
                     limit,
                 );
                 if found.is_empty() {
+                    // **「记忆里没有」不等于「附近没有」。** 记忆只装看见过、
+                    // 且当时露出面的方块（视口判据 ExposedFace），埋在石头里的
+                    // 矿脉从来不进来。不说穿这一点，模型会把一次失败的回忆
+                    // 当成一次完整的勘探，然后合理地走开——而脚下三格可能就是矿。
                     return Ok(format!(
-                        "记忆里没有「{what}」。记住的一共 {} 格。",
+                        "记忆里没有「{what}」。记住的一共 {} 格——这些只是你看见过、\
+而且当时露出面的方块；埋在石头里的东西不会在里面，那种得挖开才知道。",
                         memory.len()
                     ));
                 }
                 render::render_memory_matches(origin, &found)
             }
-            _ => return Err("action 必须是 find 或 around；请改写调用".to_owned()),
+            Some("sql") => {
+                let Some(query) = arguments.get("query").and_then(Value::as_str) else {
+                    return Err("sql 要给 query：一条 SELECT 语句（表结构见 describe）".to_owned());
+                };
+                let snapshot = self.snapshots.latest();
+                let position = &snapshot.self_state.position;
+                return crate::sql::run(
+                    &memory,
+                    [position.x, position.y, position.z],
+                    ALIASES,
+                    query,
+                );
+            }
+            Some("describe") => return Ok(crate::sql::SCHEMA_DOC.to_owned()),
+            _ => return Err("action 必须是 find/around/sql/describe 之一；请改写调用".to_owned()),
         };
         Ok(format!(
             "{body}\n（这些是你看过的；记忆里一共 {} 格）",
@@ -198,9 +223,10 @@ pub(crate) fn schema() -> Value {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["find", "around"],
-                "description": "find=找某类方块在哪（要 what）；around=看看身边记住了些什么"
+                "enum": ["find", "around", "sql", "describe"],
+                "description": "find=找某类方块在哪（要 what）；around=看看身边记住了些什么；sql=用一条 SELECT 自己查（要 query，表结构见 describe）；describe=取表结构与例子"
             },
+            "query": { "type": "string", "description": "sql 用：一条只读 SELECT。表是 seen_blocks（x,y,z,name,label,distance,props）与 block_aliases（alias,pattern）" },
             "what": {
                 "type": "string",
                 "description": "find 用：找什么。可用「木头/树叶/石头/矿石/铁/煤/水/岩浆/沙子/土/容器/炉子/工作台/床/门」，也可以直接写方块名（如 spruce_log）"
