@@ -633,6 +633,10 @@ async fn main() -> Result<(), String> {
     // 方块记忆：同伴「已知道什么」的共享认知状态。当前由 scan 回执喂入；
     // 增量呈现与寻路合法域随后也读写这一本。
     let block_memory = Arc::new(std::sync::Mutex::new(world::BlockMemory::new()));
+    // 已观察空间：与上一本合起来才是三态世界。方块记忆只装非空气，于是它的
+    // 「没有条目」同时是「没看过」和「看过、是空的」——这一位把两者分开。
+    // 眼睛是唯一写者，与方块记忆同一趟投影推进。
+    let observed_space = Arc::new(std::sync::Mutex::new(world::ObservedSpace::new()));
     // 合法寻路：寻路只按这本记忆里观察过的方块规划，不再读服务端推来的全量世界。
     // 必须是同一本——眼睛每 250ms 把看见的写进去，寻路要读的正是那一份。
     module.use_observed_pathfinding(block_memory.clone());
@@ -745,6 +749,7 @@ async fn main() -> Result<(), String> {
         let session = session.clone();
         let module = module.clone();
         let block_memory = block_memory.clone();
+        let observed_space = observed_space.clone();
         let snapshots = snapshots.clone();
         let read_mark = read_mark.clone();
         let compacted = compacted.clone();
@@ -777,6 +782,7 @@ async fn main() -> Result<(), String> {
 
                 let scan_module = module.clone();
                 let scan_memory = block_memory.clone();
+                let scan_space = observed_space.clone();
                 // 两个时长，别混：
                 //   work  —— 投影本身（闭包内计时）。
                 //   round —— 派发 + 在阻塞池排队 + 执行 + join。节律按它退让。
@@ -787,8 +793,11 @@ async fn main() -> Result<(), String> {
                     let at = std::time::Instant::now();
                     // 全量吸收，不算差异——差异没有消费者了（见 Module::absorb）。
                     // 参数用 for_memory：判据不动，只把「一次记多少」的呈现预算放开。
-                    let absorbed =
-                        scan_module.absorb(&scan_memory, &world::ViewportOptions::for_memory());
+                    let absorbed = scan_module.absorb(
+                        &scan_memory,
+                        &scan_space,
+                        &world::ViewportOptions::for_memory(),
+                    );
                     (absorbed, at.elapsed())
                 })
                 .await;

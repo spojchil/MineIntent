@@ -216,6 +216,46 @@ impl Module {
         .map_err(|error| error.to_string())
     }
 
+    /// 同 [`Module::scan`]，另把射线走过的空格记进 [`crate::ObservedSpace`]。
+    ///
+    /// 单独一个入口而不是给 `scan` 加参数：`scan` 服务的是**工具回执**（模型问
+    /// 「我看见什么」），一次性；本入口服务的是**眼睛**，每帧都跑，是三态记忆
+    /// 里「确认为空」那一位的唯一产生方。
+    fn scan_observing(
+        &self,
+        options: &crate::ViewportOptions,
+        space: &mut crate::ObservedSpace,
+    ) -> Result<crate::ViewportProjection, String> {
+        let snapshot = self.latest();
+        if !matches!(snapshot.phase, ConnectionPhase::Ready) {
+            return Err("尚未连接到世界，无法观察".to_owned());
+        }
+        let world = self
+            .inner
+            .world_handle
+            .lock()
+            .clone()
+            .ok_or_else(|| "世界模型尚未就绪".to_owned())?;
+        let world = world.read();
+        let pose = crate::viewport::Pose {
+            position: snapshot.self_state.position,
+            yaw: snapshot.self_state.yaw,
+            pitch: snapshot.self_state.pitch,
+        };
+        crate::viewport::project_observing(
+            &pose,
+            &snapshot.entities,
+            crate::viewport::WorldReader::new(
+                |position| probe_block_from_world(&world, position),
+                |position| read_block_from_world(&world, position),
+            ),
+            options,
+            || Ok(()),
+            space,
+        )
+        .map_err(|error| error.to_string())
+    }
+
     /// 定向视口投影：约束同 [`Module::scan`]。
     pub fn scan_directed(
         &self,
@@ -319,9 +359,15 @@ impl Module {
     pub fn absorb(
         &self,
         memory: &std::sync::Mutex<crate::BlockMemory>,
+        space: &std::sync::Mutex<crate::ObservedSpace>,
         options: &crate::ViewportOptions,
     ) -> Result<usize, String> {
-        let projection = self.scan(options)?;
+        // 空间先于记忆推进，两把锁不同时持有：眼睛是唯一写者，
+        // 中间态最多是「空标了、方块还没上账」，读方看到的仍然是保守的一侧。
+        let projection = {
+            let mut space = space.lock().map_err(|_| "已观察空间锁中毒".to_owned())?;
+            self.scan_observing(options, &mut space)?
+        };
         let mut memory = memory.lock().map_err(|_| "方块记忆锁中毒".to_owned())?;
         memory.absorb_visible(&projection.visible_blocks.blocks);
         for block in [&projection.standing_on_block, &projection.looked_at_block]

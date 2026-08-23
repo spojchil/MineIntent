@@ -12,8 +12,10 @@ use crate::{wrap_degrees, EntitySnapshot, Vec3Value};
 
 mod geometry;
 mod incremental;
+mod observed_space;
 
 pub use incremental::{diff, BlockChange, BlockFact, BlockMemory};
+pub use observed_space::ObservedSpace;
 
 use geometry::{
     add, box_intersects_frustum, box_visibility_samples, compare_candidate, distance_to_box, dot,
@@ -486,7 +488,43 @@ pub fn project_with_reader<P, F, C>(
     entities: &[EntitySnapshot],
     reader: WorldReader<P, F>,
     options: &ViewportOptions,
+    checkpoint: C,
+) -> Result<ViewportProjection, ViewportError>
+where
+    P: FnMut(BlockPosition) -> BlockProbe,
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), ViewportError>,
+{
+    project_inner(pose, entities, reader, options, checkpoint, None)
+}
+
+/// 投影，并把射线走过的空格记进 [`ObservedSpace`]。
+///
+/// 与 [`project_with_reader`] 同一次投影、同一份探针缓存：候选扫描已经把视锥里
+/// 每一格都探过了，标记这一趟几乎全是缓存命中。判据见 [`observe_free_space`]。
+pub fn project_observing<P, F, C>(
+    pose: &Pose,
+    entities: &[EntitySnapshot],
+    reader: WorldReader<P, F>,
+    options: &ViewportOptions,
+    checkpoint: C,
+    space: &mut ObservedSpace,
+) -> Result<ViewportProjection, ViewportError>
+where
+    P: FnMut(BlockPosition) -> BlockProbe,
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), ViewportError>,
+{
+    project_inner(pose, entities, reader, options, checkpoint, Some(space))
+}
+
+fn project_inner<P, F, C>(
+    pose: &Pose,
+    entities: &[EntitySnapshot],
+    reader: WorldReader<P, F>,
+    options: &ViewportOptions,
     mut checkpoint: C,
+    space: Option<&mut ObservedSpace>,
 ) -> Result<ViewportProjection, ViewportError>
 where
     P: FnMut(BlockPosition) -> BlockProbe,
@@ -526,6 +564,15 @@ where
     let visible_entities =
         visible_entities(&mut reader, entities, eye, axes, options, &mut checkpoint)?;
     let visible_blocks = visible_blocks(&mut reader, pose, eye, axes, options, &mut checkpoint)?;
+    if let Some(space) = space {
+        observe_free_space(
+            &mut reader,
+            eye,
+            &visible_blocks.blocks,
+            space,
+            &mut checkpoint,
+        )?;
+    }
 
     Ok(ViewportProjection {
         pose: ViewportPose {
@@ -1405,6 +1452,71 @@ where
         )?,
         RayOutcome::Clear
     ))
+}
+
+/// 把「通向已见方块的射线上走过的空格」记进 [`ObservedSpace`]。
+///
+/// 独立一趟，不挂在热路径上：`visible_blocks` 一次投影要问十几万次探针，
+/// 而本函数是**每个已见方块一条射线**（几百条量级），加起来只有百分之几。
+/// 换来的是热路径那五层泛型一行不用改。
+///
+/// 判据：从眼睛朝方块中心步进，**撞到第一个非空气格就停**，只标记它之前的空格。
+/// 于是标记的每一格都满足「眼睛到它之间全空」——这正是看得见的判据本身，
+/// 因此永远不会多标。可见性本身是由暴露面射线定的（射向面，不是射向中心），
+/// 中心线可能被挡；被挡就在挡住的地方停下，这一支自然什么都不标。
+///
+/// 少标的地方有两处，都是有意的保守：射线尽头没有可见面的方向（看天）不在
+/// 本趟之内；玻璃、水、树叶这类**透光但非空气**的格会让步进停下，它们身后
+/// 的空不被标记。少标的后果是「还没看过」，多标的后果是让同伴知道它没看过的
+/// 事——两者不对等。
+fn observe_free_space<P, F, C>(
+    reader: &mut WorldReader<P, F>,
+    eye: Point3,
+    blocks: &[ViewportBlock],
+    space: &mut ObservedSpace,
+    checkpoint: &mut C,
+) -> Result<(), ViewportError>
+where
+    P: FnMut(BlockPosition) -> BlockProbe,
+    F: FnMut(BlockPosition) -> BlockReadResult,
+    C: FnMut() -> Result<(), ViewportError>,
+{
+    for block in blocks {
+        checkpoint()?;
+        let center = Point3 {
+            x: f64::from(block.position[0]) + 0.5,
+            y: f64::from(block.position[1]) + 0.5,
+            z: f64::from(block.position[2]) + 0.5,
+        };
+        let delta = subtract(center, eye);
+        let distance = length(delta);
+        if distance == 0.0 {
+            continue;
+        }
+        let direction = normalize(delta, distance);
+        let steps = (distance / RAY_STEP).floor() as i32;
+        for step in 1..=steps {
+            checkpoint()?;
+            let along = f64::from(step) * RAY_STEP;
+            let voxel = BlockPosition {
+                x: (eye.x + direction.x * along).floor() as i32,
+                y: (eye.y + direction.y * along).floor() as i32,
+                z: (eye.z + direction.z * along).floor() as i32,
+            };
+            match reader.probe(voxel.clone()) {
+                // 空气：这一格看过了，而且是空的。
+                BlockProbe::Loaded { visible: false, .. } => {
+                    space.mark([voxel.x, voxel.y, voxel.z]);
+                }
+                // 有东西：射线到此为止，身后的空一律不标。
+                BlockProbe::Loaded { visible: true, .. } => break,
+                // 读不到就停：没加载的地方不能声称看过。
+                BlockProbe::Unloaded => break,
+                BlockProbe::OutOfWorld => continue,
+            }
+        }
+    }
+    Ok(())
 }
 
 fn first_hit<P, F, C>(
