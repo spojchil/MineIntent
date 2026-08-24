@@ -27,6 +27,7 @@ pub trait ViewportDoor: Send + Sync {
 
 mod blocks;
 mod sql;
+mod vtab;
 
 const TOOL_NAME: &str = "scan";
 
@@ -199,7 +200,7 @@ impl ToolProvider for PerceptionTools {
                 .to_owned(),
         );
         let mut library = ToolDefinition::new(blocks::TOOL_NAME, blocks::schema());
-        library.description = Some(blocks::DESCRIPTION.to_owned());
+        library.description = Some(blocks::description());
         vec![(definition, ToolClass::Free), (library, ToolClass::Free)]
     }
 

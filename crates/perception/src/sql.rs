@@ -2,8 +2,8 @@
 //!
 //! # 为什么给 SQL
 //!
-//! 记忆本身没有上限（`BlockMemory` 是一张裸表，不淘汰不过期），查询侧却只有
-//! `find`/`around` 两个写死的动作加一张手维护的别名表。「y 小于 40 的铁矿按
+//! 记忆本身没有上限（不淘汰、不过期），查询侧却只有 `find`/`around` 两个写死
+//! 的动作加一张手维护的别名表。「y 小于 40 的铁矿按
 //! 距离排序」「我看过的方块各有多少」这类问题，工具面根本没有语法去表达它们。
 //!
 //! 给 SQL 不是"更强的检索"，是把**提问的自由**还给模型：它写得出的问题，
@@ -25,8 +25,11 @@
 //! # 为什么不把热存储搬进 SQLite
 //!
 //! `BlockMemory` 是**寻路器每 tick 读、组合根每 250ms 写**的热路径。把它换成
-//! SQLite 是拿移动和感知去冒险。这里改为**查询时现物化**：几千行毫秒级，
-//! 五十万行也不过零点几秒，而 SQLite 只活在「模型发问」这一条路径上。
+//! SQLite 是拿移动和感知去冒险。世界那两张表因此是**虚表**（见 [`crate::vtab`]），
+//! 底下还是那本记忆，SQLite 只活在「模型发问」这一条路径上，一行都不产生。
+//!
+//! 而且读的是一份**快照**：查询期一律不持记忆的锁，否则 300ms 的预算会把眼睛
+//! 和寻路器一起按住，同一条 SQL 里还会看到前后不一致的世界。
 //!
 //! # 三道闸，缺一不可
 //!
@@ -42,6 +45,8 @@ use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::{Connection, Row};
 use world::BlockMemory;
 
+use crate::vtab;
+
 /// 结果条数上限。再多就回到了「逐格推送」那条死路。
 const MAX_ROWS: usize = 200;
 /// 输出字节上限。行数少但每行极长（比如 `SELECT group_concat(...)`）同样要挡。
@@ -51,21 +56,32 @@ const TIME_BUDGET: Duration = Duration::from_millis(300);
 /// 进度回调的检查粒度（虚拟机指令数）。小到能及时中断，大到不拖慢正常查询。
 const PROGRESS_OPS: i32 = 10_000;
 
-/// 模型看得见的表。
+/// 模型看得见的表。世界那两张是虚表（见 [`crate::vtab`]），另两张现建。
 const SEEN_BLOCKS: &str = "seen_blocks";
+const SEEN_EMPTY: &str = "seen_empty";
 const BLOCK_ALIASES: &str = "block_aliases";
 /// 此时此地：一行，把「当下」从那张陈旧的表里剥出来单独放。
 const ME: &str = "me";
 
-/// 表结构说明。随 `describe` 给出，不进常驻工具描述——静态文本每次都发一遍
-/// 是纯浪费，而它一个字都不会变。
-pub(crate) const SCHEMA_DOC: &str = r#"你的方块记忆是一张可以用 SQL 查的表。只读，一次一条 SELECT。
+/// 表结构说明。**并进常驻工具描述**，不做成按需拉取的动作。
+///
+/// 工具定义走的是请求的 `tools` 字段：每次请求发一份、不累积，落在提示前缀里，
+/// 缓存吃得住。做成 `describe` 动作看似省了，实际是——模型第一次用 SQL 之前
+/// 要多花一次往返，拿到之后这段文字**从此每次请求都跟着转录发**，一次都没省;
+/// 而且它落在可压缩区，会在会话中途被压掉，模型手里的语法参考凭空消失，
+/// 它还不会知道自己丢了。表结构一个字都不会变，没有「按需」的前提。
+pub(crate) const SCHEMA_DOC: &str = r#"你的方块记忆可以用 SQL 查。只读，一次一条 SELECT。
 
-seen_blocks —— 你**亲眼看见过**的方块，每格一行
+三张世界表加一份词表：
+
+seen_blocks —— 看过、**有东西**的格，每格一行
   x, y, z     整数坐标
   name        方块名（如 iron_ore、jungle_log）
-  label       带可见属性的完整标签（如 jungle_log[axis=y]），和清单里显示的一致
+  label       带可见属性的完整标签（如 jungle_log[axis=y]）
   props       属性的 JSON，可用 json_extract(props,'$.axis')
+
+seen_empty —— 看过、**是空的**格，每格一行
+  x, y, z     整数坐标
 
 me —— 你此刻在哪，只有一行
   x, y, z     当前位置（小数）
@@ -74,7 +90,18 @@ block_aliases —— 说法到方块名的对照，可以 JOIN，也可以不用
   alias       说法，如「木头」「矿石」
   pattern     该说法涵盖的名字片段，如 _log、_ore
 
-另有两个函数：dist(x,y,z) 给出那一格离你多少格；sqrt(v) 开方。
+函数：dist(x,y,z) 那一格离你多少格；sqrt(v) 开方。
+
+**没看过 = 两张表都没有。** 它没有自己的表，因为世界无界、补集数不完；
+要问就写反连接，而且自己圈好坐标范围：
+  SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM seen_blocks WHERE x=10 AND y=64 AND z=3)
+              AND NOT EXISTS (SELECT 1 FROM seen_empty  WHERE x=10 AND y=64 AND z=3)
+
+**两张表「查不到」的原因不一样，别拿一张去推另一张：**
+seen_blocks 只装当时**露出面**的方块——埋在石头里的矿脉从来不进来，
+查不到不等于附近没有，那种只能挖开才知道。
+seen_empty 只装**射线穿过**的空格——看天的方向、玻璃水树叶身后不进来，
+查不到不等于那里有东西，多半只是还没看过。
 
 例子：
   SELECT name, x, y, z, dist(x,y,z) d FROM seen_blocks
@@ -83,14 +110,19 @@ block_aliases —— 说法到方块名的对照，可以 JOIN，也可以不用
   SELECT b.name, b.x, b.y, b.z FROM seen_blocks b
     JOIN block_aliases a ON b.name LIKE '%'||a.pattern||'%'
    WHERE a.alias='矿石' AND b.y < 40 ORDER BY dist(b.x,b.y,b.z)
+  -- 站得住脚的位置：看过的方块，头顶两格确认为空
+  SELECT b.x, b.y+1 AS y, b.z FROM seen_blocks b
+    JOIN seen_empty a ON a.x=b.x AND a.y=b.y+1 AND a.z=b.z
+    JOIN seen_empty c ON c.x=b.x AND c.y=b.y+2 AND c.z=b.z
+   ORDER BY dist(b.x,b.y,b.z) LIMIT 10
   SELECT name, x, y, z FROM seen_blocks, me WHERE y > me.y + 3
 
-**这张表只装你看见过、而且当时露出面的方块。** 埋在石头里的矿脉从来不会
-出现在这里——查不到不等于附近没有，那种只能挖开才知道。"#;
+查得太宽会被行数上限或时间预算截断，如实告诉你；那时把范围收窄（加 WHERE、
+加坐标范围、加 LIMIT），不要重发同一条。"#;
 
 /// 一次查询的结果：表格文本 + 是否被上限截断。
 pub(crate) fn run(
-    memory: &BlockMemory,
+    memory: Arc<BlockMemory>,
     origin: [f64; 3],
     aliases: &[(&str, &[&str])],
     query: &str,
@@ -106,7 +138,8 @@ pub(crate) fn run(
     }
 
     let connection = Connection::open_in_memory().map_err(|error| format!("开库失败：{error}"))?;
-    materialize(&connection, memory, origin, aliases)?;
+    vtab::load_modules(&connection, memory).map_err(|error| format!("装虚表失败：{error}"))?;
+    materialize(&connection, origin, aliases)?;
     install_functions(&connection, origin)?;
 
     // query_only 要在装授权器之前设——装上之后 PRAGMA 就被拒了。
@@ -142,44 +175,22 @@ pub(crate) fn run(
     }
 }
 
-/// 把记忆与此时此地物化成表。`seen_blocks` 是记忆的纯函数——位置不进它，
-/// 单独摆在 [`ME`] 那一行里，距离由 `dist()` 按需现算。
+/// 建两张真正需要物化的小表：此时此地，与说法词表。
+///
+/// **世界那两张不在这里**——`seen_blocks` 与 `seen_empty` 是虚表，一行都不产生。
+/// 剩下这两张一共十几行，都是常量或者一行，现建的代价可以忽略。
 fn materialize(
     connection: &Connection,
-    memory: &BlockMemory,
     origin: [f64; 3],
     aliases: &[(&str, &[&str])],
 ) -> Result<(), String> {
     connection
         .execute_batch(&format!(
-            "CREATE TABLE {SEEN_BLOCKS}(
-                 x INTEGER, y INTEGER, z INTEGER,
-                 name TEXT, label TEXT, props TEXT);
-             CREATE TABLE {BLOCK_ALIASES}(alias TEXT, pattern TEXT);
+            "CREATE TABLE {BLOCK_ALIASES}(alias TEXT, pattern TEXT);
              CREATE TABLE {ME}(x REAL, y REAL, z REAL);"
         ))
         .map_err(|error| format!("建表失败：{error}"))?;
 
-    {
-        let mut insert = connection
-            .prepare(&format!(
-                "INSERT INTO {SEEN_BLOCKS} VALUES (?1,?2,?3,?4,?5,?6)"
-            ))
-            .map_err(|error| format!("准备插入失败：{error}"))?;
-        for (at, fact) in memory.iter() {
-            let props = serde_json::to_string(&fact.properties).unwrap_or_else(|_| "{}".to_owned());
-            insert
-                .execute(rusqlite::params![
-                    at[0],
-                    at[1],
-                    at[2],
-                    fact.name.as_str(),
-                    world::visible_block_label(&fact.name, &fact.properties),
-                    props,
-                ])
-                .map_err(|error| format!("写入失败：{error}"))?;
-        }
-    }
     {
         let mut insert = connection
             .prepare(&format!("INSERT INTO {BLOCK_ALIASES} VALUES (?1,?2)"))
@@ -192,21 +203,14 @@ fn materialize(
             }
         }
     }
+
     connection
         .execute(
             &format!("INSERT INTO {ME} VALUES (?1,?2,?3)"),
             rusqlite::params![origin[0], origin[1], origin[2]],
         )
         .map_err(|error| format!("写入失败：{error}"))?;
-
-    // 坐标上的索引：点查与自连接（「这一格上方两格是不是空的」）全靠它。
-    // 没有它，最该快的那个操作反而是全表扫描。
-    connection
-        .execute_batch(&format!(
-            "CREATE INDEX seen_name ON {SEEN_BLOCKS}(name);
-             CREATE INDEX seen_at ON {SEEN_BLOCKS}(x, y, z);"
-        ))
-        .map_err(|error| format!("建索引失败：{error}"))
+    Ok(())
 }
 
 /// 补两个标量函数。
@@ -339,8 +343,11 @@ fn explain(error: rusqlite::Error) -> String {
     if text.contains("not authorized") {
         return format!(
             "这条查询碰了不让碰的东西：只读、一次一条 SELECT，只能读 {SEEN_BLOCKS}、\
-{BLOCK_ALIASES} 与 {ME}。（{text}）"
+{SEEN_EMPTY}、{BLOCK_ALIASES} 与 {ME}。（{text}）"
         );
+    }
+    if text.contains("may not be modified") {
+        return format!("这张表只能读，不能改：只读，一次一条 SELECT。（{text}）");
     }
     if text.contains("interrupted") {
         return format!("查询被中断（多半是跑太久）。（{text}）");
@@ -383,7 +390,7 @@ mod tests {
     }
 
     fn ask(query: &str) -> Result<String, String> {
-        run(&memory(), [0.5, 64.5, 0.5], ALIASES, query)
+        run(Arc::new(memory()), [0.5, 64.5, 0.5], ALIASES, query)
     }
 
     #[test]
@@ -412,13 +419,93 @@ mod tests {
         assert!(text.contains("0.5 | 64.5 | 0.5"), "{text}");
     }
 
-    /// 坐标索引在：自连接（「这一格上方是不是也记着东西」）不该退化成全表扫描。
+    /// 三格方块之外再记一片确认为空的空间。
+    ///
+    /// 规模差异**就是**规划器选边的依据：三格对三格的玩具数据里，全扫和点探
+    /// 一样便宜，计划好坏根本看不出来。这里 5120 格空 对 3 格方块。
+    fn memory_with_space() -> BlockMemory {
+        let mut memory = memory();
+        for x in 0..16 {
+            for y in 65..85 {
+                for z in 0..16 {
+                    memory.observe([x, y, z], None, 0);
+                }
+            }
+        }
+        memory
+    }
+
+    fn ask_in_space(query: &str) -> Result<String, String> {
+        run(
+            Arc::new(memory_with_space()),
+            [0.5, 64.5, 0.5],
+            ALIASES,
+            query,
+        )
+    }
+
+    /// **xBestIndex 决定的是量级，不是常数。**
+    ///
+    /// 「哪些方块头顶两格是空的」这条自连接，两种计划差着数量级：方块表驱动、
+    /// 空气表内层是每行两次位测试；反过来是几千格全扫再回探。选哪个完全由我们
+    /// 报的代价决定，报错了不会有任何报错，只会慢——所以钉的是**计划**，不是
+    /// 耗时（计时断言既不稳又不指人）。
+    ///
+    /// `INDEX 7` = 计划位 0b111 = 三个轴全是等值约束，也就是走了点探那一档。
     #[test]
-    fn coordinates_are_indexed() {
-        let text = ask("EXPLAIN QUERY PLAN SELECT b.name FROM seen_blocks b \
-             JOIN seen_blocks a ON a.x=b.x AND a.y=b.y+1 AND a.z=b.z")
+    fn the_planner_probes_the_empty_table_instead_of_scanning_it() {
+        let text = ask_in_space(
+            "EXPLAIN QUERY PLAN SELECT b.name FROM seen_blocks b \
+             JOIN seen_empty e ON e.x=b.x AND e.y=b.y+1 AND e.z=b.z",
+        )
         .unwrap();
-        assert!(text.contains("seen_at"), "没走坐标索引：{text}");
+        assert!(text.contains("INDEX 7"), "空气表没走点探：{text}");
+    }
+
+    /// 联表查询才是给第二张表的理由：这条问的是「哪些看过的方块，头顶两格
+    /// 确认为空」——也就是站得住脚的位置，用 SQL 声明了一遍寻路的合法性谓词。
+    #[test]
+    fn standable_spots_fall_out_of_joining_the_two_tables() {
+        let text = ask_in_space(
+            "SELECT b.x, b.y, b.z FROM seen_blocks b \
+             JOIN seen_empty a ON a.x=b.x AND a.y=b.y+1 AND a.z=b.z \
+             JOIN seen_empty c ON c.x=b.x AND c.y=b.y+2 AND c.z=b.z \
+             ORDER BY dist(b.x,b.y,b.z)",
+        )
+        .unwrap();
+        assert!(text.contains("1 | 64 | 0"), "{text}");
+        assert!(text.contains("10 | 64 | 0"), "{text}");
+        // 40 号那块在记过的空间之外，头顶是「没看过」而不是「确认为空」。
+        assert!(!text.contains("40 | 64 | 0"), "{text}");
+    }
+
+    /// 三态在 SQL 面上的样子：有东西是一张表的行，确认为空是另一张表的行，
+    /// 没看过是**两张都没有**——补集无界，只能反连接，不能有自己的表。
+    #[test]
+    fn the_three_states_read_out_as_two_tables_and_a_gap() {
+        let there =
+            ask_in_space("SELECT name FROM seen_blocks WHERE x=1 AND y=64 AND z=0").unwrap();
+        assert!(there.contains("iron_ore"), "{there}");
+
+        let empty = ask_in_space("SELECT x FROM seen_empty WHERE x=1 AND y=65 AND z=0").unwrap();
+        assert!(empty.contains("（1 行）"), "{empty}");
+
+        let unseen = ask_in_space(
+            "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM seen_blocks WHERE x=999 AND y=64 AND z=999) \
+               AND NOT EXISTS (SELECT 1 FROM seen_empty WHERE x=999 AND y=64 AND z=999)",
+        )
+        .unwrap();
+        assert!(
+            unseen.contains("（1 行）"),
+            "没看过应当两张表都查不到：{unseen}"
+        );
+    }
+
+    /// 空气表全扫会撞行数上限——不是缺陷，是「别问这么宽的问题」该有的回答。
+    #[test]
+    fn scanning_all_of_the_empty_space_hits_the_row_cap() {
+        let text = ask_in_space("SELECT x, y, z FROM seen_empty").unwrap();
+        assert!(text.contains(&format!("超过 {MAX_ROWS} 行")), "{text}");
     }
 
     /// 别名表是可 JOIN 的数据，不是唯一入口——策展知识留着，表达力不被它堵死。
@@ -487,6 +574,8 @@ mod tests {
         let error = ask("DELETE FROM seen_blocks").unwrap_err();
         assert!(error.contains("seen_blocks"), "{error}");
         assert!(error.contains("只读"), "{error}");
+        let error = ask("INSERT INTO block_aliases VALUES ('x','y')").unwrap_err();
+        assert!(error.contains("只读"), "{error}");
     }
 
     /// 多条语句：第二条可以是任何东西，「只读」的判断会失去意义。
@@ -507,7 +596,7 @@ mod tests {
             .collect();
         memory.absorb_visible(&many, 0);
         let text = run(
-            &memory,
+            Arc::new(memory),
             [0.0, 0.0, 0.0],
             ALIASES,
             "SELECT x FROM seen_blocks",

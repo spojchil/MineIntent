@@ -146,10 +146,15 @@ impl BlocksQuery {
         &self,
         arguments: &serde_json::Map<String, Value>,
     ) -> Result<String, String> {
-        let memory = self
-            .memory
-            .lock()
-            .map_err(|_| "方块记忆锁中毒".to_owned())?;
+        // **短锁取快照，查询期一律不持锁。**记忆按区段分片，克隆只复制一层
+        // 指针；而 SQL 有 300ms 预算，若把锁攥到查询结束，眼睛（每 250ms 写）
+        // 和寻路器（每 tick 上千次读）会一起被按住。
+        let memory = Arc::new(
+            self.memory
+                .lock()
+                .map_err(|_| "方块记忆锁中毒".to_owned())?
+                .clone(),
+        );
         if memory.is_empty() {
             return Err("记忆库是空的——你还没看过任何东西，先 scan 一下".to_owned());
         }
@@ -196,19 +201,20 @@ impl BlocksQuery {
             }
             Some("sql") => {
                 let Some(query) = arguments.get("query").and_then(Value::as_str) else {
-                    return Err("sql 要给 query：一条 SELECT 语句（表结构见 describe）".to_owned());
+                    return Err(
+                        "sql 要给 query：一条 SELECT 语句（表结构见本工具的描述）".to_owned()
+                    );
                 };
                 let snapshot = self.snapshots.latest();
                 let position = &snapshot.self_state.position;
                 return crate::sql::run(
-                    &memory,
+                    memory,
                     [position.x, position.y, position.z],
                     ALIASES,
                     query,
                 );
             }
-            Some("describe") => return Ok(crate::sql::SCHEMA_DOC.to_owned()),
-            _ => return Err("action 必须是 find/around/sql/describe 之一；请改写调用".to_owned()),
+            _ => return Err("action 必须是 find/around/sql 之一；请改写调用".to_owned()),
         };
         Ok(format!(
             "{body}\n（这些是你看过的；记忆里一共 {} 格）",
@@ -223,8 +229,8 @@ pub(crate) fn schema() -> Value {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["find", "around", "sql", "describe"],
-                "description": "find=找某类方块在哪（要 what）；around=看看身边记住了些什么；sql=用一条 SELECT 自己查（要 query，表结构见 describe）；describe=取表结构与例子"
+                "enum": ["find", "around", "sql"],
+                "description": "find=找某类方块在哪（要 what）；around=看看身边记住了些什么；sql=用一条 SELECT 自己查（要 query）"
             },
             "query": { "type": "string", "description": "sql 用：一条只读 SELECT。表结构与例子见工具描述" },
             "what": {
@@ -239,14 +245,34 @@ pub(crate) fn schema() -> Value {
     })
 }
 
-pub(crate) const DESCRIPTION: &str = "\
+/// 常驻描述。表结构接在后面，理由见 [`crate::sql::SCHEMA_DOC`]。
+pub(crate) fn description() -> String {
+    format!("{HEAD}\n\n{}", crate::sql::SCHEMA_DOC)
+}
+
+const HEAD: &str = "\
 查你自己的方块记忆库——**只查得到你看过的东西**，没看过的地方它一无所知（先 scan）。\
-find=某类方块在哪（如 what=「木头」「铁」）；around=身边记住了些什么。\
-答案是坐标与方位距离，怎么解读由你自己判断。不打断任何动作。";
+find=某类方块在哪（如 what=「木头」「铁」）；around=身边记住了些什么；\
+sql=自己写一条 SELECT，表结构见下。答案是坐标，怎么解读由你自己判断。不打断任何动作。";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 表结构必须在**常驻描述**里，不能退回按需拉取的动作。
+    ///
+    /// 工具描述每次请求发一份、不累积，且不进转录、不被压缩；做成 `describe`
+    /// 反而要多一次往返，拿到之后照样每次都发，还会在会话中途被压掉。
+    #[test]
+    fn the_table_layout_travels_with_the_tool_description() {
+        let described = description();
+        for table in ["seen_blocks", "seen_empty", "me", "block_aliases"] {
+            assert!(described.contains(table), "描述里缺 {table}：{described}");
+        }
+        assert!(described.contains("dist("), "{described}");
+        // 「没看过」是补集，必须讲明白，否则模型会去 SELECT 一张不存在的表。
+        assert!(described.contains("NOT EXISTS"), "{described}");
+    }
 
     #[test]
     fn aliases_expand_to_block_names() {
