@@ -18,15 +18,15 @@
 ```
                       companion（组合根，唯一知道所有人的地方）
                           │
-     ┌────────┬───────────┼───────────┬─────────┬────────┐
-     ▼        ▼           ▼           ▼         ▼        ▼
-  context  perception  screens     motion     hand    memory
-     │        │  │        │  │        │  │      │  │     │
-     │        │  └──┐     │  │        │  │      │  │     │
-     ▼        ▼     ▼     ▼  ▼        ▼  ▼      ▼  ▼     ▼
-   render ──→ world      dispatch ──────────────────────→ agent
-     │                       │                              ▲
-     └───────────────────────┴──────────────────────────────┘
+   ┌────────┬─────────┬───┴────┬────────┬───────┬────────┬─────────┐
+   ▼        ▼         ▼        ▼        ▼       ▼        ▼         ▼
+context perception screens   motion   hand    jobs   presence   memory
+   │        │  │      │  │      │  │    │  │    │  │     │  │      │
+   │        │  └───┐  │  │      │  │    │  │    │  │     │  │      │
+   ▼        ▼      ▼  ▼  ▼      ▼  ▼    ▼  ▼    ▼  ▼     ▼  ▼      ▼
+ render ──→ world        dispatch ────────────────────────────────→ agent
+   │                         │                                        ▲
+   └─────────────────────────┴────────────────────────────────────────┘
 ```
 
 两条读法上要注意的：
@@ -41,7 +41,7 @@
 |---|---|---|
 | `world` | 接入 azalea、tick 快照、视口内核 | **直译无损、政策外置**：不过滤、不判重要性、不做丢弃决策 |
 | `render` | 快照 → 模型可读文字 | **全部纯函数**；呈现选择归此处，事实归快照 |
-| `perception` | 主动看（`scan`） | 薄壳：几何全在 world 的视口内核 |
+| `perception` | 主动看（`scan`）、查记忆（`blocks`，含 SQL 面） | 薄壳：几何全在 world 的视口内核；SQL 面读记忆的快照，查询期不持锁 |
 | `screens` | 界面互斥域（`chat_box`/`inventory`/`container`） | 屏的状态转换在此，占用账本在 dispatch；容器屏真相在服务端，组合根随屏事实翻转 |
 | `motion` / `hand` | 位移朝向 / 攻挖用 | 工具只表达意图立刻返回，合法性由原版物理自我仲裁 |
 | `jobs` | 任务表（`list`） | 只读、`ToolClass::Free`；槽位是唯一真相源，不另建镜像 |
@@ -76,21 +76,40 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
 时间窗不是队列：条目自带 `tick` 与单调 `seq`，「取某 seq 之后的条目」
 是读方一行过滤。逐出用原版常量（聊天 100 行、声音 60 tick）。
 
-## 4. `world/machine` 的六个模块
+## 4. `world/machine` 的模块
 
-1590 行的单文件按六件事拆开，各自显式声明依赖（生产码零 `use super::*`）：
+按事情拆开，各自显式声明依赖（生产码零 `use super::*`）：
 
 | 模块 | 做什么 |
 |---|---|
 | `mod.rs` | `Module` 公开面、`ConnectionConfig` |
-| `state.rs` | `Inner`：共享状态、三个时间窗、写口队列——**可脱离 azalea 单测** |
+| `state.rs` | `Inner`：共享状态、时间窗、写口队列——**可脱离 azalea 单测** |
 | `capture.rs` | ECS → `TickSnapshot` 直译 |
-| `movement.rs` | 移动 job 终局判定（纯函数判定表）与轮询 |
+| `job.rs` | `JobSlot`：后台任务的形状，**每个任务恰好一条终局** |
+| `movement.rs` / `mining.rs` | 两个动词各自的判定表与轮询 |
+| `observed.rs` | 合法寻路：只按观察过的方块规划（`BlockSource`） |
 | `connect.rs` | azalea 接入、客户端回调、停机 |
 | `door.rs` | `DoorCommand` 与 tick 内执行 |
 | `blocks.rs` | azalea 世界模型的方块读取原语 |
 
-`viewport/` 同理分出 `geometry.rs`（纯几何原语，不认识读取器）。
+`viewport/` 同理分出 `geometry.rs`（纯几何原语，不认识读取器）与
+`incremental.rs`（方块记忆：三态、按区段分片）。
+
+## 4a. 方块记忆是一张关系，两种表示
+
+`位置 → Option<方块事实>`：`Some` 是「看过、有东西」，`None` 是「看过、是空的」，
+**表里没有这个键就是「没看过」**。三态因此不占第三份存储。
+
+两种表示按 16³ 区段分片、边界对齐：有东西那支是条目表（一格约百字节），
+是空的那支是位图（一格一位，一区段 512 字节定长）——载荷差三个数量级，
+合并表示就是把位图的好处扔掉。分片买到快照便宜（每片一个 `Arc`，写时才分裂）、
+盒扫可行、两支代价对称。
+
+**写口只有 `observe(at, Option<fact>, tick)` 一个**，删除这个操作在 API 上不存在：
+「亲眼见空」是一条载荷为空的观察，不是把记录删掉。
+
+模型面是两张虚表（`crates/perception/src/vtab.rs`），底下就是这本记忆，
+一行都不产生；「没看过」只能以两表反连接的形式出现，因为补集无界。
 
 ## 5. `agent` 是 git 依赖 midturn
 
