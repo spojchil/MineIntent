@@ -101,7 +101,9 @@ pub(crate) fn description() -> String {
 
 const HEAD: &str = "\
 用 SQL 查你自己的方块记忆——**只查得到你看过的东西**，没看过的地方它一无所知（先 scan）。\
-答案是坐标与计数，怎么解读由你自己判断。不打断任何动作。";
+答案是坐标与计数，怎么解读由你自己判断。不打断任何动作。\n\
+**查得很快，不用替它省。** 坐标是有索引的：定点查、按坐标的连接都是直取，不是全表扫；\
+想到什么就问，不用攒成一条大的，也不用先猜个范围再问。";
 
 #[cfg(test)]
 mod tests {
@@ -120,6 +122,21 @@ mod tests {
         assert!(described.contains("dist("), "{described}");
         // 「没看过」是补集，必须讲明白，否则模型会去 SELECT 一张不存在的表。
         assert!(described.contains("NOT EXISTS"), "{described}");
+    }
+
+    /// 成本要说出口。第四跑里模型一次都没用过这条查询，全程只靠 scan 硬看——
+    /// 一个不知道代价的工具，模型会按最坏情况估，然后省着不用。既然虚表按坐标
+    /// 走索引、点查是直取，就该明说，否则等于白建。
+    #[test]
+    fn the_description_tells_the_model_the_query_is_cheap() {
+        let described = description();
+        assert!(described.contains("查得很快"), "{described}");
+        assert!(described.contains("索引"), "{described}");
+        // 换行要真的是换行，不能是字面的反斜杠 n。
+        assert!(
+            !described.contains("\\n"),
+            "描述里混进了字面转义：{described}"
+        );
     }
 
     /// 别名表删干净：描述里不该再出现它，否则模型会去 JOIN 一张不存在的表。
