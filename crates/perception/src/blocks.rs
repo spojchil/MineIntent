@@ -155,7 +155,9 @@ impl BlocksQuery {
                 .map_err(|_| "方块记忆锁中毒".to_owned())?
                 .clone(),
         );
-        if memory.is_empty() {
+        // 判据是「一格都没观察过」，不是「记住的方块数为零」：只见过空气
+        // 也是看过，那时该答「没有你要的东西」，不是叫它去 scan。
+        if memory.nothing_observed() {
             return Err("记忆库是空的——你还没看过任何东西，先 scan 一下".to_owned());
         }
         let origin = self.origin();

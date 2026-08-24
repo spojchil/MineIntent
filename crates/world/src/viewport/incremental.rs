@@ -230,13 +230,6 @@ impl BlockMemory {
         })
     }
 
-    /// 确认为空的每一格。按字走位，空旷区域近乎零成本。
-    pub fn iter_known_empty(&self) -> impl Iterator<Item = [i32; 3]> + '_ {
-        self.sections
-            .iter()
-            .flat_map(|(section, data)| super::observed_space::set_bits(*section, &data.empty))
-    }
-
     /// 记住的方块格数。**不含「确认为空」那一支**——那一支的基数不是一个量级，
     /// 混在一起报数会让「记住了多少」失去意义。
     pub fn len(&self) -> usize {
@@ -275,13 +268,8 @@ impl BlockMemory {
         self.sections.len()
     }
 
-    /// 分片的区段坐标。**给查询侧的计划用**：先圈区段，再在区段内逐格走，
-    /// 就不必把整本记忆一次抖成一个大数组。
-    pub fn section_keys(&self) -> Vec<[i32; 3]> {
-        self.sections.keys().copied().collect()
-    }
-
-    /// 与坐标盒相交、且真的观察过的区段。
+    /// 与坐标盒相交、且真的观察过的区段。**给查询侧的计划用**：先圈区段，
+    /// 再在区段内逐格走，就不必把整本记忆一次抖成一个大数组。
     ///
     /// 两条路取小的那条：盒小就枚举盒覆盖的区段坐标去表里点查，盒大就遍历
     /// 已有区段做筛。没有这一步，「盒扫」在稀疏世界里会退化成全表扫描。
