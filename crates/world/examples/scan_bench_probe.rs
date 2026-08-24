@@ -161,11 +161,10 @@ async fn main() -> Result<(), String> {
 
     // 记忆那一层单独量一次：眼睛现在走全量吸收，不算 diff。
     let memory = Mutex::new(BlockMemory::new());
-    let space = Mutex::new(world::ObservedSpace::new());
     let mut absorb = Vec::with_capacity(rounds);
     for _ in 0..rounds {
         let started = Instant::now();
-        let _ = module.absorb(&memory, &space, &ViewportOptions::for_memory());
+        let _ = module.absorb(&memory, &ViewportOptions::for_memory());
         absorb.push(started.elapsed());
     }
     report("吸收进记忆 + 标记已观察空间（32 格，不限）", absorb);
@@ -175,12 +174,12 @@ async fn main() -> Result<(), String> {
     );
     // 三态里「确认为空」那一位的产量与占用：位图是定长的，区段数乘 512 字节
     // 就是全部开销，与看了多少次无关。
-    if let Ok(space) = space.lock() {
+    if let Ok(memory) = memory.lock() {
         println!(
             "已观察为空 {} 格，占 {} 个区段 = {} KB",
-            space.len(),
-            space.section_count(),
-            space.section_count() * 512 / 1024
+            memory.known_empty_len(),
+            memory.section_count(),
+            memory.section_count() * 512 / 1024
         );
     }
 

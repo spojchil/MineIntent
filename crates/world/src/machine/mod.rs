@@ -359,18 +359,18 @@ impl Module {
     pub fn absorb(
         &self,
         memory: &std::sync::Mutex<crate::BlockMemory>,
-        space: &std::sync::Mutex<crate::ObservedSpace>,
         options: &crate::ViewportOptions,
     ) -> Result<usize, String> {
-        // 空间先于记忆推进，两把锁不同时持有：眼睛是唯一写者，
-        // 中间态最多是「空标了、方块还没上账」，读方看到的仍然是保守的一侧。
+        // 自由空间先落在一份本次投影专用的暂存里，**投影全程不持记忆的锁**：
+        // 投影约十毫秒，而寻路器每 tick 要读这本记忆上千次。
         // 观察发生的刻取自同一份快照：投影读的就是它的姿态与实体。
         let at_tick = self.latest().tick;
-        let projection = {
-            let mut space = space.lock().map_err(|_| "已观察空间锁中毒".to_owned())?;
-            self.scan_observing(options, &mut space)?
-        };
+        let mut free_space = crate::ObservedSpace::new();
+        let projection = self.scan_observing(options, &mut free_space)?;
         let mut memory = memory.lock().map_err(|_| "方块记忆锁中毒".to_owned())?;
+        // 空的先上账、方块后上账：两者由构造保证不相交（射线撞到第一个非空气
+        // 就停），万一相交也让「有东西」赢，与三态的优先级一致。
+        memory.absorb_empty(&free_space, at_tick);
         memory.absorb_visible(&projection.visible_blocks.blocks, at_tick);
         for block in [&projection.standing_on_block, &projection.looked_at_block]
             .into_iter()

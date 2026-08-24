@@ -14,7 +14,7 @@ mod geometry;
 mod incremental;
 mod observed_space;
 
-pub use incremental::{diff, BlockChange, BlockFact, BlockMemory};
+pub use incremental::{diff, BlockChange, BlockFact, BlockMemory, Known};
 pub use observed_space::ObservedSpace;
 
 use geometry::{

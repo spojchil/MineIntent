@@ -1,31 +1,17 @@
-//! 观察过的空间：一格「我看过这里」的位，与 [`BlockMemory`] 合起来才是三态世界。
+//! 一次投影的自由空间暂存：射线途经的空格先落在这里，再折进方块记忆。
 //!
-//! # 为什么缺这一位
+//! # 为什么是暂存而不是第二本记忆
 //!
-//! [`BlockMemory`] 只记非空气（见 [`super::incremental`] 模块头），于是
-//! `get() == None` 同时意味着**「从没看过」**和**「看过，是空的」**。这是把
-//! 三值世界压成二值表，有损：空气的全部内容恰恰是「确认没有」，而这一位被丢了。
-//!
-//! 补上之后判据是三条：
-//!
-//! | 条件 | 含义 |
-//! |---|---|
-//! | 记忆有条目 | 有东西（含水、草这类**非空气**方块） |
-//! | 记忆没有、本表置位 | **确认为空** |
-//! | 本表未置位 | 没看过 |
-//!
-//! 消费者不止一个，也不是为了画图：寻路合法域要「同伴曾见的可通行空间」
-//! （[`super::incremental`] 模块头早已为此留口），查询要能回答「北边有没有
-//! 通路」的三种答案，勘探要知道边界在哪。
+//! 三态（有东西／确认为空／没看过）的存储在 [`crate::BlockMemory`] 里，两种
+//! 表示挂在同一个区段下。本类型只承担**一次投影的产出**：投影约十毫秒，而
+//! 寻路器每 tick 要读那本记忆上千次——先写暂存、再短锁折进去，就不必在投影
+//! 全程持有记忆的锁。
 //!
 //! # 为什么是位图不是行
 //!
 //! 一次视野的自由体积在数万格量级。按行存，一格是名字加属性的百字节量级；
 //! 位图一格一位，一个 16³ 区段 4096 位 = **512 字节定长**，与看过多少次无关。
-//! 差三个数量级，而且不随观察次数增长。
-//!
-//! 给模型的 SQL 面不受影响：那张表是每次查询现建的，空气用标量函数回答，
-//! 不产生行——顺带也就不会撞上单次输出的行数上限。
+//! 而且射线之间大量重叠，位图顺带把重复标记去掉了。
 //!
 //! # 边界：这一位只装射线确认的空
 //!
@@ -34,18 +20,24 @@
 //! 一致——少标是「还没看过」，多标是让同伴知道它没看过的事。
 //!
 //! 「身体走过的地方当时必然通得过」是另一条**更弱**的证据：水、草、花都通得过，
-//! 但它们不是空气。那条证据不属于本表；要用得单独记，不能混进这一位，
-//! 否则「这里能不能放方块」会拿到一个错的答案。
+//! 但它们不是空气。那条证据不属于本表；真要用，最便宜的形式是同一张位图上加
+//! 第二个位平面，而不是再开一本。
+//!
+//! # 与方块记忆的判据不对称
+//!
+//! **记录对称，采集不对称。**方块那一支的判据是露出面（埋在石头里的矿脉不进
+//! 表），本表的判据是射线穿过（看天的方向、玻璃水树叶身后不进表）。两支都保守，
+//! 但保守的方向和覆盖的集合都不同，别拿一支的缺失去推断另一支。
 
 use std::collections::HashMap;
 
 use super::SECTION_SIZE;
 
 /// 一个区段 16×16×16 = 4096 格，一格一位 = 64 个 u64。
-const WORDS_PER_SECTION: usize = 4096 / 64;
+pub(super) const WORDS_PER_SECTION: usize = 4096 / 64;
 
 /// 区段内的位下标，与原版体素次序一致：`y<<8 | z<<4 | x`。
-fn bit_index(at: [i32; 3]) -> usize {
+pub(super) fn bit_index(at: [i32; 3]) -> usize {
     let x = (at[0] & 15) as usize;
     let y = (at[1] & 15) as usize;
     let z = (at[2] & 15) as usize;
@@ -53,7 +45,7 @@ fn bit_index(at: [i32; 3]) -> usize {
 }
 
 /// 所属区段坐标。除法要向下取整，负坐标不能用 `/`。
-fn section_of(at: [i32; 3]) -> [i32; 3] {
+pub(super) fn section_of(at: [i32; 3]) -> [i32; 3] {
     [
         at[0].div_euclid(SECTION_SIZE),
         at[1].div_euclid(SECTION_SIZE),
@@ -111,6 +103,53 @@ impl ObservedSpace {
     pub fn section_count(&self) -> usize {
         self.sections.len()
     }
+
+    /// 遍历标记过的每一格。
+    pub fn iter(&self) -> impl Iterator<Item = [i32; 3]> + '_ {
+        self.sections
+            .iter()
+            .flat_map(|(section, words)| set_bits(*section, words))
+    }
+}
+
+/// 遍历一个区段位图里的置位，还原成世界坐标。
+///
+/// **按字走位，不按格走**：一个区段 64 个 `u64`，`word == 0` 一次比较跳过
+/// 64 格，非零字用 `trailing_zeros` 逐位取。空旷区域近乎零成本——位图省的
+/// 不只是内存，扫也快。
+pub(super) fn set_bits(
+    section: [i32; 3],
+    words: &[u64; WORDS_PER_SECTION],
+) -> impl Iterator<Item = [i32; 3]> + '_ {
+    let base = [
+        section[0] * SECTION_SIZE,
+        section[1] * SECTION_SIZE,
+        section[2] * SECTION_SIZE,
+    ];
+    words
+        .iter()
+        .enumerate()
+        .filter(|(_, word)| **word != 0)
+        .flat_map(move |(index, word)| {
+            let mut rest = *word;
+            std::iter::from_fn(move || {
+                if rest == 0 {
+                    return None;
+                }
+                let offset = rest.trailing_zeros() as usize;
+                rest &= rest - 1;
+                Some(position_of(base, index * 64 + offset))
+            })
+        })
+}
+
+/// 位下标还原成世界坐标。与 [`bit_index`] 互逆。
+fn position_of(base: [i32; 3], bit: usize) -> [i32; 3] {
+    [
+        base[0] + (bit & 15) as i32,
+        base[1] + (bit >> 8) as i32,
+        base[2] + ((bit >> 4) & 15) as i32,
+    ]
 }
 
 #[cfg(test)]

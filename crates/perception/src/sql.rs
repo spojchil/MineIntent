@@ -321,11 +321,14 @@ mod tests {
         let mut axis = std::collections::BTreeMap::new();
         axis.insert("axis".to_owned(), "y".to_owned());
         let mut memory = BlockMemory::new();
-        memory.absorb_visible(&[
-            block([1, 64, 0], "minecraft:iron_ore", Default::default()),
-            block([10, 64, 0], "minecraft:jungle_log", axis),
-            block([40, 64, 0], "minecraft:stone", Default::default()),
-        ], 0);
+        memory.absorb_visible(
+            &[
+                block([1, 64, 0], "minecraft:iron_ore", Default::default()),
+                block([10, 64, 0], "minecraft:jungle_log", axis),
+                block([40, 64, 0], "minecraft:stone", Default::default()),
+            ],
+            0,
+        );
         memory
     }
 

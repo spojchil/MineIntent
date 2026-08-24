@@ -1067,10 +1067,12 @@ fn memory_and_space_together_answer_three_states() {
     )
     .expect("射线应当可判定");
 
-    // 有东西
-    assert!(memory.get([0, 1, 3]).is_some());
-    // 确认为空：记忆没有，空间置位
-    assert!(memory.get([0, 1, 2]).is_none() && space.contains([0, 1, 2]));
-    // 没看过：两边都没有
-    assert!(memory.get([99, 1, 99]).is_none() && !space.contains([99, 1, 99]));
+    // 暂存折进记忆之后，三态从同一个出口给出。
+    memory.absorb_empty(&space, 0);
+    assert!(
+        matches!(memory.state_at([0, 1, 3]), Known::Block(_)),
+        "有东西"
+    );
+    assert_eq!(memory.state_at([0, 1, 2]), Known::Empty, "确认为空");
+    assert_eq!(memory.state_at([99, 1, 99]), Known::Unseen, "没看过");
 }
