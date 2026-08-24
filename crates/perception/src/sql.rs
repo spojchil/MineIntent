@@ -56,10 +56,9 @@ const TIME_BUDGET: Duration = Duration::from_millis(300);
 /// 进度回调的检查粒度（虚拟机指令数）。小到能及时中断，大到不拖慢正常查询。
 const PROGRESS_OPS: i32 = 10_000;
 
-/// 模型看得见的表。世界那两张是虚表（见 [`crate::vtab`]），另两张现建。
+/// 模型看得见的表。世界那两张是虚表（见 [`crate::vtab`]），`me` 现建。
 const SEEN_BLOCKS: &str = "seen_blocks";
 const SEEN_EMPTY: &str = "seen_empty";
-const BLOCK_ALIASES: &str = "block_aliases";
 /// 此时此地：一行，把「当下」从那张陈旧的表里剥出来单独放。
 const ME: &str = "me";
 
@@ -72,7 +71,7 @@ const ME: &str = "me";
 /// 它还不会知道自己丢了。表结构一个字都不会变，没有「按需」的前提。
 pub(crate) const SCHEMA_DOC: &str = r#"你的方块记忆可以用 SQL 查。只读，一次一条 SELECT。
 
-三张世界表加一份词表：
+三张表：
 
 seen_blocks —— 看过、**有东西**的格，每格一行
   x, y, z     整数坐标
@@ -85,10 +84,6 @@ seen_empty —— 看过、**是空的**格，每格一行
 
 me —— 你此刻在哪，只有一行
   x, y, z     当前位置（小数）
-
-block_aliases —— 说法到方块名的对照，可以 JOIN，也可以不用
-  alias       说法，如「木头」「矿石」
-  pattern     该说法涵盖的名字片段，如 _log、_ore
 
 函数：dist(x,y,z) 那一格离你多少格。标准数学函数也在：sqrt、floor、ceil、pow、mod。
 把小数坐标（me 那三列）对回方块格要用 floor，不能用 CAST——负坐标上会差一格。
@@ -108,9 +103,10 @@ seen_empty 只装**射线穿过**的空格——看天的方向、玻璃水树�
   SELECT name, x, y, z, dist(x,y,z) d FROM seen_blocks
    WHERE name LIKE '%iron_ore%' ORDER BY d LIMIT 5
   SELECT name, COUNT(*) n FROM seen_blocks GROUP BY name ORDER BY n DESC LIMIT 10
-  SELECT b.name, b.x, b.y, b.z FROM seen_blocks b
-    JOIN block_aliases a ON b.name LIKE '%'||a.pattern||'%'
-   WHERE a.alias='矿石' AND b.y < 40 ORDER BY dist(b.x,b.y,b.z)
+  -- 一类方块：名字片段自己写，你知道哪些名字属于哪一类
+  SELECT name, x, y, z FROM seen_blocks
+   WHERE (name LIKE '%_ore' OR name LIKE '%_log') AND y < 40
+   ORDER BY dist(x,y,z) LIMIT 10
   -- 站得住脚的位置：看过的方块，头顶两格确认为空
   SELECT b.x, b.y+1 AS y, b.z FROM seen_blocks b
     JOIN seen_empty a ON a.x=b.x AND a.y=b.y+1 AND a.z=b.z
@@ -125,7 +121,6 @@ seen_empty 只装**射线穿过**的空格——看天的方向、玻璃水树�
 pub(crate) fn run(
     memory: Arc<BlockMemory>,
     origin: [f64; 3],
-    aliases: &[(&str, &[&str])],
     query: &str,
 ) -> Result<String, String> {
     let trimmed = query.trim().trim_end_matches(';');
@@ -140,7 +135,7 @@ pub(crate) fn run(
 
     let connection = Connection::open_in_memory().map_err(|error| format!("开库失败：{error}"))?;
     vtab::load_modules(&connection, memory).map_err(|error| format!("装虚表失败：{error}"))?;
-    materialize(&connection, origin, aliases)?;
+    materialize(&connection, origin)?;
     install_functions(&connection, origin)?;
 
     // query_only 要在装授权器之前设——装上之后 PRAGMA 就被拒了。
@@ -176,34 +171,14 @@ pub(crate) fn run(
     }
 }
 
-/// 建两张真正需要物化的小表：此时此地，与说法词表。
+/// 建唯一需要物化的小表：此时此地。
 ///
 /// **世界那两张不在这里**——`seen_blocks` 与 `seen_empty` 是虚表，一行都不产生。
-/// 剩下这两张一共十几行，都是常量或者一行，现建的代价可以忽略。
-fn materialize(
-    connection: &Connection,
-    origin: [f64; 3],
-    aliases: &[(&str, &[&str])],
-) -> Result<(), String> {
+/// 剩下的只有 `me` 一行，现建的代价可以忽略。
+fn materialize(connection: &Connection, origin: [f64; 3]) -> Result<(), String> {
     connection
-        .execute_batch(&format!(
-            "CREATE TABLE {BLOCK_ALIASES}(alias TEXT, pattern TEXT);
-             CREATE TABLE {ME}(x REAL, y REAL, z REAL);"
-        ))
+        .execute_batch(&format!("CREATE TABLE {ME}(x REAL, y REAL, z REAL);"))
         .map_err(|error| format!("建表失败：{error}"))?;
-
-    {
-        let mut insert = connection
-            .prepare(&format!("INSERT INTO {BLOCK_ALIASES} VALUES (?1,?2)"))
-            .map_err(|error| format!("准备插入失败：{error}"))?;
-        for (alias, patterns) in aliases {
-            for pattern in *patterns {
-                insert
-                    .execute(rusqlite::params![alias, pattern])
-                    .map_err(|error| format!("写入失败：{error}"))?;
-            }
-        }
-    }
 
     connection
         .execute(
@@ -339,7 +314,7 @@ fn explain(error: rusqlite::Error) -> String {
     if text.contains("not authorized") {
         return format!(
             "这条查询碰了不让碰的东西：只读、一次一条 SELECT，只能读 {SEEN_BLOCKS}、\
-{SEEN_EMPTY}、{BLOCK_ALIASES} 与 {ME}。（{text}）"
+{SEEN_EMPTY} 与 {ME}。（{text}）"
         );
     }
     if text.contains("may not be modified") {
@@ -354,8 +329,6 @@ fn explain(error: rusqlite::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const ALIASES: &[(&str, &[&str])] = &[("矿石", &["_ore"]), ("木头", &["_log"])];
 
     fn block(
         at: [i32; 3],
@@ -386,7 +359,7 @@ mod tests {
     }
 
     fn ask(query: &str) -> Result<String, String> {
-        run(Arc::new(memory()), [0.5, 64.5, 0.5], ALIASES, query)
+        run(Arc::new(memory()), [0.5, 64.5, 0.5], query)
     }
 
     #[test]
@@ -444,12 +417,7 @@ mod tests {
     }
 
     fn ask_in_space(query: &str) -> Result<String, String> {
-        run(
-            Arc::new(memory_with_space()),
-            [0.5, 64.5, 0.5],
-            ALIASES,
-            query,
-        )
+        run(Arc::new(memory_with_space()), [0.5, 64.5, 0.5], query)
     }
 
     /// **xBestIndex 决定的是量级，不是常数。**
@@ -516,14 +484,22 @@ mod tests {
         assert!(text.contains(&format!("超过 {MAX_ROWS} 行")), "{text}");
     }
 
-    /// 别名表是可 JOIN 的数据，不是唯一入口——策展知识留着，表达力不被它堵死。
+    /// 词表删掉之后，「找矿石」这类问题照样问得出来——名字片段由模型自己写。
+    /// 这条钉的是删除的前提：翻译能力没有消失，只是搬回了模型的常识里。
     #[test]
-    fn aliases_are_joinable() {
-        let text = ask("SELECT b.name FROM seen_blocks b JOIN block_aliases a \
-             ON b.name LIKE '%'||a.pattern||'%' WHERE a.alias='矿石'")
-        .unwrap();
+    fn a_category_question_still_works_without_any_alias_table() {
+        let text = ask("SELECT name FROM seen_blocks WHERE name LIKE '%_ore'").unwrap();
         assert!(text.contains("iron_ore"), "{text}");
         assert!(!text.contains("stone"), "{text}");
+    }
+
+    /// 词表真的不在了：查它应当报错，而不是悄悄返回空集。
+    #[test]
+    fn the_alias_table_is_gone_and_says_so() {
+        let error = ask("SELECT * FROM block_aliases").unwrap_err();
+        // 话术不复述表名清单：表结构在常驻工具描述里，每次请求都跟着发，
+        // 模型手上本来就有，错误里再抄一遍是冗余。
+        assert!(error.contains("block_aliases"), "{error}");
     }
 
     #[test]
@@ -582,7 +558,7 @@ mod tests {
         let error = ask("DELETE FROM seen_blocks").unwrap_err();
         assert!(error.contains("seen_blocks"), "{error}");
         assert!(error.contains("只读"), "{error}");
-        let error = ask("INSERT INTO block_aliases VALUES ('x','y')").unwrap_err();
+        let error = ask("INSERT INTO seen_empty VALUES (0,0,0)").unwrap_err();
         assert!(error.contains("只读"), "{error}");
     }
 
@@ -606,7 +582,6 @@ mod tests {
         let text = run(
             Arc::new(memory),
             [0.0, 0.0, 0.0],
-            ALIASES,
             "SELECT x FROM seen_blocks",
         )
         .unwrap();
