@@ -26,6 +26,7 @@ pub trait ViewportDoor: Send + Sync {
 }
 
 mod blocks;
+mod sql;
 
 const TOOL_NAME: &str = "scan";
 
