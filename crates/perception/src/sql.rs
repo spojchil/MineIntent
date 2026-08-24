@@ -325,7 +325,7 @@ mod tests {
             block([1, 64, 0], "minecraft:iron_ore", Default::default()),
             block([10, 64, 0], "minecraft:jungle_log", axis),
             block([40, 64, 0], "minecraft:stone", Default::default()),
-        ]);
+        ], 0);
         memory
     }
 
@@ -427,7 +427,7 @@ mod tests {
         let many: Vec<world::ViewportBlock> = (0..(MAX_ROWS as i32 + 50))
             .map(|index| block([index, 64, 0], "minecraft:stone", Default::default()))
             .collect();
-        memory.absorb_visible(&many);
+        memory.absorb_visible(&many, 0);
         let text = run(
             &memory,
             [0.0, 0.0, 0.0],
