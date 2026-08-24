@@ -9,6 +9,12 @@
 //! 给 SQL 不是"更强的检索"，是把**提问的自由**还给模型：它写得出的问题，
 //! 不该被我们的动作表挡住。
 //!
+//! # 表是记忆的纯函数
+//!
+//! 位置不进 `seen_blocks`。带一列算好的距离看着方便，代价是这张表变成
+//! `(记忆, 当前位置)` 的函数，而且把「当下的位置」和「陈旧的观察」拼进同一行，
+//! 整张表读起来像实时快照。现在位置单独占 [`ME`] 那一行，要用得显式跨过去。
+//!
 //! # 为什么这不越界
 //!
 //! 库里只有观察过的方块，SQL 查不出没看过的东西——[`crate::blocks`] 那条
@@ -45,9 +51,11 @@ const TIME_BUDGET: Duration = Duration::from_millis(300);
 /// 进度回调的检查粒度（虚拟机指令数）。小到能及时中断，大到不拖慢正常查询。
 const PROGRESS_OPS: i32 = 10_000;
 
-/// 模型看得见的两张表。授权器只认这两个名字。
+/// 模型看得见的表。
 const SEEN_BLOCKS: &str = "seen_blocks";
 const BLOCK_ALIASES: &str = "block_aliases";
+/// 此时此地：一行，把「当下」从那张陈旧的表里剥出来单独放。
+const ME: &str = "me";
 
 /// 表结构说明。随 `describe` 给出，不进常驻工具描述——静态文本每次都发一遍
 /// 是纯浪费，而它一个字都不会变。
@@ -55,22 +63,27 @@ pub(crate) const SCHEMA_DOC: &str = r#"你的方块记忆是一张可以用 SQL 
 
 seen_blocks —— 你**亲眼看见过**的方块，每格一行
   x, y, z     整数坐标
-  name        方块名，去掉了 minecraft: 前缀（如 iron_ore、jungle_log）
+  name        方块名（如 iron_ore、jungle_log）
   label       带可见属性的完整标签（如 jungle_log[axis=y]），和清单里显示的一致
-  distance    离你现在的位置多少格（已经算好，可以直接 ORDER BY）
   props       属性的 JSON，可用 json_extract(props,'$.axis')
+
+me —— 你此刻在哪，只有一行
+  x, y, z     当前位置（小数）
 
 block_aliases —— 说法到方块名的对照，可以 JOIN，也可以不用
   alias       说法，如「木头」「矿石」
   pattern     该说法涵盖的名字片段，如 _log、_ore
 
+另有两个函数：dist(x,y,z) 给出那一格离你多少格；sqrt(v) 开方。
+
 例子：
-  SELECT name, x, y, z, distance FROM seen_blocks
-   WHERE name LIKE '%iron_ore%' ORDER BY distance LIMIT 5
+  SELECT name, x, y, z, dist(x,y,z) d FROM seen_blocks
+   WHERE name LIKE '%iron_ore%' ORDER BY d LIMIT 5
   SELECT name, COUNT(*) n FROM seen_blocks GROUP BY name ORDER BY n DESC LIMIT 10
   SELECT b.name, b.x, b.y, b.z FROM seen_blocks b
     JOIN block_aliases a ON b.name LIKE '%'||a.pattern||'%'
-   WHERE a.alias='矿石' AND b.y < 40 ORDER BY b.distance
+   WHERE a.alias='矿石' AND b.y < 40 ORDER BY dist(b.x,b.y,b.z)
+  SELECT name, x, y, z FROM seen_blocks, me WHERE y > me.y + 3
 
 **这张表只装你看见过、而且当时露出面的方块。** 埋在石头里的矿脉从来不会
 出现在这里——查不到不等于附近没有，那种只能挖开才知道。"#;
@@ -94,6 +107,7 @@ pub(crate) fn run(
 
     let connection = Connection::open_in_memory().map_err(|error| format!("开库失败：{error}"))?;
     materialize(&connection, memory, origin, aliases)?;
+    install_functions(&connection, origin)?;
 
     // query_only 要在装授权器之前设——装上之后 PRAGMA 就被拒了。
     connection
@@ -128,7 +142,8 @@ pub(crate) fn run(
     }
 }
 
-/// 把记忆物化成两张表。距离在这里算好，模型不用自己开方。
+/// 把记忆与此时此地物化成表。`seen_blocks` 是记忆的纯函数——位置不进它，
+/// 单独摆在 [`ME`] 那一行里，距离由 `dist()` 按需现算。
 fn materialize(
     connection: &Connection,
     memory: &BlockMemory,
@@ -139,32 +154,27 @@ fn materialize(
         .execute_batch(&format!(
             "CREATE TABLE {SEEN_BLOCKS}(
                  x INTEGER, y INTEGER, z INTEGER,
-                 name TEXT, label TEXT, distance REAL, props TEXT);
-             CREATE TABLE {BLOCK_ALIASES}(alias TEXT, pattern TEXT);"
+                 name TEXT, label TEXT, props TEXT);
+             CREATE TABLE {BLOCK_ALIASES}(alias TEXT, pattern TEXT);
+             CREATE TABLE {ME}(x REAL, y REAL, z REAL);"
         ))
         .map_err(|error| format!("建表失败：{error}"))?;
 
     {
         let mut insert = connection
             .prepare(&format!(
-                "INSERT INTO {SEEN_BLOCKS} VALUES (?1,?2,?3,?4,?5,?6,?7)"
+                "INSERT INTO {SEEN_BLOCKS} VALUES (?1,?2,?3,?4,?5,?6)"
             ))
             .map_err(|error| format!("准备插入失败：{error}"))?;
         for (at, fact) in memory.iter() {
-            let bare = fact.name.strip_prefix("minecraft:").unwrap_or(&fact.name);
-            let dx = f64::from(at[0]) + 0.5 - origin[0];
-            let dy = f64::from(at[1]) + 0.5 - origin[1];
-            let dz = f64::from(at[2]) + 0.5 - origin[2];
-            let distance = (dx * dx + dy * dy + dz * dz).sqrt();
             let props = serde_json::to_string(&fact.properties).unwrap_or_else(|_| "{}".to_owned());
             insert
                 .execute(rusqlite::params![
                     at[0],
                     at[1],
                     at[2],
-                    bare,
+                    fact.name.as_str(),
                     world::visible_block_label(&fact.name, &fact.properties),
-                    distance,
                     props,
                 ])
                 .map_err(|error| format!("写入失败：{error}"))?;
@@ -183,11 +193,51 @@ fn materialize(
         }
     }
     connection
+        .execute(
+            &format!("INSERT INTO {ME} VALUES (?1,?2,?3)"),
+            rusqlite::params![origin[0], origin[1], origin[2]],
+        )
+        .map_err(|error| format!("写入失败：{error}"))?;
+
+    // 坐标上的索引：点查与自连接（「这一格上方两格是不是空的」）全靠它。
+    // 没有它，最该快的那个操作反而是全表扫描。
+    connection
         .execute_batch(&format!(
             "CREATE INDEX seen_name ON {SEEN_BLOCKS}(name);
-             CREATE INDEX seen_distance ON {SEEN_BLOCKS}(distance);"
+             CREATE INDEX seen_at ON {SEEN_BLOCKS}(x, y, z);"
         ))
         .map_err(|error| format!("建索引失败：{error}"))
+}
+
+/// 补两个标量函数。
+///
+/// **`bundled` 的 SQLite 没开 `SQLITE_ENABLE_MATH_FUNCTIONS`**（见
+/// libsqlite3-sys 的 build.rs 里那串 `-DSQLITE_ENABLE_*`，没有 MATH），
+/// 所以 `sqrt` 本来不存在。没有开方，「多远」就只能写成平方距离——排序是对的，
+/// 但显示出来骗人：10 格会显示成 100。所以自己补上。
+///
+/// `dist` 把观察者的位置闭包进来。有了它，[`SEEN_BLOCKS`] 就不必带 `distance`
+/// 列：那一列会让表变成 `(记忆, 位置)` 的函数而不是记忆的函数，而且把「当下的
+/// 位置」和「陈旧的观察」拼进同一行。现在距离按需现算，只对查询真正碰到的行
+/// 付钱，位置则单独摆在 [`ME`] 那一行里，要用得显式跨过去。
+///
+/// 坐标按方块角算（`+0.5` 取格心），与格坐标本身的含义一致。
+fn install_functions(connection: &Connection, origin: [f64; 3]) -> Result<(), String> {
+    use rusqlite::functions::FunctionFlags;
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    connection
+        .create_scalar_function("sqrt", 1, flags, |context| {
+            Ok(context.get::<f64>(0)?.sqrt())
+        })
+        .map_err(|error| format!("装 sqrt 失败：{error}"))?;
+    connection
+        .create_scalar_function("dist", 3, flags, move |context| {
+            let dx = context.get::<f64>(0)? + 0.5 - origin[0];
+            let dy = context.get::<f64>(1)? + 0.5 - origin[1];
+            let dz = context.get::<f64>(2)? + 0.5 - origin[2];
+            Ok((dx * dx + dy * dy + dz * dz).sqrt())
+        })
+        .map_err(|error| format!("装 dist 失败：{error}"))
 }
 
 /// 授权器：挡住**写入与逃逸**，不去挡读。
@@ -288,8 +338,8 @@ fn explain(error: rusqlite::Error) -> String {
     let text = error.to_string();
     if text.contains("not authorized") {
         return format!(
-            "这条查询碰了不让碰的东西：只读、一次一条 SELECT，只能读 {SEEN_BLOCKS} 与 \
-{BLOCK_ALIASES} 两张表。（{text}）"
+            "这条查询碰了不让碰的东西：只读、一次一条 SELECT，只能读 {SEEN_BLOCKS}、\
+{BLOCK_ALIASES} 与 {ME}。（{text}）"
         );
     }
     if text.contains("interrupted") {
@@ -323,9 +373,9 @@ mod tests {
         let mut memory = BlockMemory::new();
         memory.absorb_visible(
             &[
-                block([1, 64, 0], "minecraft:iron_ore", Default::default()),
-                block([10, 64, 0], "minecraft:jungle_log", axis),
-                block([40, 64, 0], "minecraft:stone", Default::default()),
+                block([1, 64, 0], "iron_ore", Default::default()),
+                block([10, 64, 0], "jungle_log", axis),
+                block([40, 64, 0], "stone", Default::default()),
             ],
             0,
         );
@@ -338,12 +388,37 @@ mod tests {
 
     #[test]
     fn basic_select_answers_with_addresses_and_distance() {
-        let text =
-            ask("SELECT name, x, y, z, distance FROM seen_blocks ORDER BY distance").unwrap();
+        let text = ask("SELECT name, x, y, z, dist(x,y,z) d FROM seen_blocks ORDER BY d").unwrap();
         assert!(text.contains("iron_ore | 1 | 64 | 0 | 1.0"), "{text}");
         // 距离按一位小数给：模型要的是「多远」，不是十七位有效数字。
         assert!(!text.contains("1.0000000"), "{text}");
         assert!(text.contains("（3 行）"), "{text}");
+    }
+
+    /// `bundled` 的 SQLite 没有 `sqrt`，我们自己补的。没有它，「多远」只能用
+    /// 平方距离表达，显示出来会把 10 格说成 100。
+    #[test]
+    fn square_root_is_available_because_we_supply_it() {
+        let text = ask("SELECT sqrt(100.0) AS r").unwrap();
+        assert!(text.contains("10.0"), "{text}");
+    }
+
+    /// 距离不再是表上的一列：表是记忆的纯函数，位置单独摆在 me 那一行。
+    #[test]
+    fn the_table_carries_no_position_derived_column() {
+        let error = ask("SELECT distance FROM seen_blocks").unwrap_err();
+        assert!(error.contains("distance"), "{error}");
+        let text = ask("SELECT x, y, z FROM me").unwrap();
+        assert!(text.contains("0.5 | 64.5 | 0.5"), "{text}");
+    }
+
+    /// 坐标索引在：自连接（「这一格上方是不是也记着东西」）不该退化成全表扫描。
+    #[test]
+    fn coordinates_are_indexed() {
+        let text = ask("EXPLAIN QUERY PLAN SELECT b.name FROM seen_blocks b \
+             JOIN seen_blocks a ON a.x=b.x AND a.y=b.y+1 AND a.z=b.z")
+        .unwrap();
+        assert!(text.contains("seen_at"), "没走坐标索引：{text}");
     }
 
     /// 别名表是可 JOIN 的数据，不是唯一入口——策展知识留着，表达力不被它堵死。
@@ -428,7 +503,7 @@ mod tests {
     fn row_cap_truncates_and_says_so() {
         let mut memory = BlockMemory::new();
         let many: Vec<world::ViewportBlock> = (0..(MAX_ROWS as i32 + 50))
-            .map(|index| block([index, 64, 0], "minecraft:stone", Default::default()))
+            .map(|index| block([index, 64, 0], "stone", Default::default()))
             .collect();
         memory.absorb_visible(&many, 0);
         let text = run(

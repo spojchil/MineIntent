@@ -275,6 +275,63 @@ impl BlockMemory {
         self.sections.len()
     }
 
+    /// 分片的区段坐标。**给查询侧的计划用**：先圈区段，再在区段内逐格走，
+    /// 就不必把整本记忆一次抖成一个大数组。
+    pub fn section_keys(&self) -> Vec<[i32; 3]> {
+        self.sections.keys().copied().collect()
+    }
+
+    /// 与坐标盒相交、且真的观察过的区段。
+    ///
+    /// 两条路取小的那条：盒小就枚举盒覆盖的区段坐标去表里点查，盒大就遍历
+    /// 已有区段做筛。没有这一步，「盒扫」在稀疏世界里会退化成全表扫描。
+    pub fn section_keys_in(&self, min: [i32; 3], max: [i32; 3]) -> Vec<[i32; 3]> {
+        let low = section_of(min);
+        let high = section_of(max);
+        let span = |axis: usize| (high[axis] - low[axis] + 1).max(0) as u64;
+        let boxed = span(0).saturating_mul(span(1)).saturating_mul(span(2));
+        if boxed >= self.sections.len() as u64 {
+            return self
+                .sections
+                .keys()
+                .filter(|section| {
+                    (0..3).all(|axis| section[axis] >= low[axis] && section[axis] <= high[axis])
+                })
+                .copied()
+                .collect();
+        }
+        let mut keys = Vec::new();
+        for x in low[0]..=high[0] {
+            for y in low[1]..=high[1] {
+                for z in low[2]..=high[2] {
+                    if self.sections.contains_key(&[x, y, z]) {
+                        keys.push([x, y, z]);
+                    }
+                }
+            }
+        }
+        keys
+    }
+
+    /// 某个区段里记住的方块。区段不存在就是空迭代。
+    pub fn facts_in_section(
+        &self,
+        section: [i32; 3],
+    ) -> impl Iterator<Item = ([i32; 3], &BlockFact)> + '_ {
+        self.sections
+            .get(&section)
+            .into_iter()
+            .flat_map(|data| data.facts.iter().map(|(at, entry)| (*at, &entry.fact)))
+    }
+
+    /// 某个区段里确认为空的格。按字走位。
+    pub fn known_empty_in_section(&self, section: [i32; 3]) -> impl Iterator<Item = [i32; 3]> + '_ {
+        self.sections
+            .get(&section)
+            .into_iter()
+            .flat_map(move |data| super::observed_space::set_bits(section, &data.empty))
+    }
+
     /// 记住的方块坐标（[`diff`] 的销账候选用）。
     fn positions(&self) -> impl Iterator<Item = [i32; 3]> + '_ {
         self.sections

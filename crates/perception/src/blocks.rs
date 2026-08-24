@@ -226,7 +226,7 @@ pub(crate) fn schema() -> Value {
                 "enum": ["find", "around", "sql", "describe"],
                 "description": "find=找某类方块在哪（要 what）；around=看看身边记住了些什么；sql=用一条 SELECT 自己查（要 query，表结构见 describe）；describe=取表结构与例子"
             },
-            "query": { "type": "string", "description": "sql 用：一条只读 SELECT。表是 seen_blocks（x,y,z,name,label,distance,props）与 block_aliases（alias,pattern）" },
+            "query": { "type": "string", "description": "sql 用：一条只读 SELECT。表结构与例子见工具描述" },
             "what": {
                 "type": "string",
                 "description": "find 用：找什么。可用「木头/树叶/石头/矿石/铁/煤/水/岩浆/沙子/土/容器/炉子/工作台/床/门」，也可以直接写方块名（如 spruce_log）"
