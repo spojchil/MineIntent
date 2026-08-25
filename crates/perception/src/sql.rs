@@ -90,7 +90,8 @@ block_aliases —— 说法到方块名的对照，可以 JOIN，也可以不用
   alias       说法，如「木头」「矿石」
   pattern     该说法涵盖的名字片段，如 _log、_ore
 
-函数：dist(x,y,z) 那一格离你多少格；sqrt(v) 开方。
+函数：dist(x,y,z) 那一格离你多少格。标准数学函数也在：sqrt、floor、ceil、pow、mod。
+把小数坐标（me 那三列）对回方块格要用 floor，不能用 CAST——负坐标上会差一格。
 
 **没看过 = 两张表都没有。** 它没有自己的表，因为世界无界、补集数不完；
 要问就写反连接，而且自己圈好坐标范围：
@@ -213,14 +214,14 @@ fn materialize(
     Ok(())
 }
 
-/// 补两个标量函数。
+/// 补一个标量函数。
 ///
-/// **`bundled` 的 SQLite 没开 `SQLITE_ENABLE_MATH_FUNCTIONS`**（见
-/// libsqlite3-sys 的 build.rs 里那串 `-DSQLITE_ENABLE_*`，没有 MATH），
-/// 所以 `sqrt` 本来不存在。没有开方，「多远」就只能写成平方距离——排序是对的，
-/// 但显示出来骗人：10 格会显示成 100。所以自己补上。
+/// 只补一个：数学函数那一整批（`sqrt` `floor` `ceil` `pow` `mod` …）由
+/// `.cargo/config.toml` 里的 `LIBSQLITE3_FLAGS` 开出来，不在这里手写。手写垫片
+/// 要求我们预判哪些函数不存在，而这件事已经证明预判不了——所以整套开齐，用
+/// [`tests::math_functions_are_compiled_in`] 那条哨兵守住。
 ///
-/// `dist` 把观察者的位置闭包进来。有了它，[`SEEN_BLOCKS`] 就不必带 `distance`
+/// `dist` 不属于那一批：它补的不是数学，是两件本地知识。有了它，[`SEEN_BLOCKS`] 就不必带 `distance`
 /// 列：那一列会让表变成 `(记忆, 位置)` 的函数而不是记忆的函数，而且把「当下的
 /// 位置」和「陈旧的观察」拼进同一行。现在距离按需现算，只对查询真正碰到的行
 /// 付钱，位置则单独摆在 [`ME`] 那一行里，要用得显式跨过去。
@@ -229,11 +230,6 @@ fn materialize(
 fn install_functions(connection: &Connection, origin: [f64; 3]) -> Result<(), String> {
     use rusqlite::functions::FunctionFlags;
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
-    connection
-        .create_scalar_function("sqrt", 1, flags, |context| {
-            Ok(context.get::<f64>(0)?.sqrt())
-        })
-        .map_err(|error| format!("装 sqrt 失败：{error}"))?;
     connection
         .create_scalar_function("dist", 3, flags, move |context| {
             let dx = context.get::<f64>(0)? + 0.5 - origin[0];
@@ -402,12 +398,24 @@ mod tests {
         assert!(text.contains("（3 行）"), "{text}");
     }
 
-    /// `bundled` 的 SQLite 没有 `sqrt`，我们自己补的。没有它，「多远」只能用
-    /// 平方距离表达，显示出来会把 10 格说成 100。
+    /// 数学函数靠 `.cargo/config.toml` 里的构建期开关，没设也能编译通过，洞只在
+    /// 模型发出查询时才露出来。这条把静默的运行时缺函数变成红色的测试。
+    ///
+    /// **哨兵是 `floor` 不是 `sqrt`**：`dist` 之外我们不再注册任何东西，但历史上
+    /// 手写过 `sqrt`，而手写的会覆盖内建的同名函数——拿它当哨兵，开关丢了也照样绿。
+    /// 而 `floor` 正是没有它就会静默错一格的那个：`CAST(-3.5 AS INTEGER)` 和
+    /// `-7/2` 都向零截断，负坐标上答案差一格且不报错。
     #[test]
-    fn square_root_is_available_because_we_supply_it() {
-        let text = ask("SELECT sqrt(100.0) AS r").unwrap();
-        assert!(text.contains("10.0"), "{text}");
+    fn math_functions_are_compiled_in() {
+        let text = ask("SELECT floor(-3.5) AS f").unwrap();
+        assert!(
+            text.contains("-4"),
+            "floor 不在，检查 LIBSQLITE3_FLAGS：{text}"
+        );
+        for call in ["sqrt(100.0)", "ceil(1.2)", "pow(2.0,3.0)", "mod(7.0,3.0)"] {
+            ask(&format!("SELECT {call}"))
+                .unwrap_or_else(|error| panic!("{call} 不在，检查 LIBSQLITE3_FLAGS：{error}"));
+        }
     }
 
     /// 距离不再是表上的一列：表是记忆的纯函数，位置单独摆在 me 那一行。
