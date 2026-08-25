@@ -28,9 +28,13 @@
 //! 到 `wait` 真正开始等，中间隔着一次模型推理（实测 3–4 秒）。这段时间里
 //! 送达的唤醒已经并进了这一轮，模型却要等到 `wait` 返回才看得见。
 //!
-//! 所以判据取两个计数的差：内核每收一批信件记一次数（`MailboxEnqueued`），
-//! 每开始一次模型请求把当时的计数拍一张快照（`ModelRequestStarted`）。
-//! **计数比快照大 = 有它没看过的信**，那就一秒都不该等。
+//! 所以判据取两个计数的差：**每投递一批唤醒**记一次数，每开始一次模型请求把当时
+//! 的计数拍一张快照。**计数比快照大 = 有它没看过的信**，那就一秒都不该等。
+//!
+//! 记数的地方不在本 crate，也不在内核。这里只把问题定义成 [`Interruptions`]，
+//! 由组合根回答——**不能听内核的 `MailboxEnqueued`**：帧和唤醒走的是同一条投递
+//! 通道，那个事件分不出是哪一种，而帧不该打断等待（帧的闸门是「身体还在动」，
+//! 拿它当打断就退回轮询）。完整理由在组合根的 `doorbell` 模块头。
 //!
 //! 这与「推事件、拉状态」是同一条纪律的另一面：模型的时间锚是它自己的动作，
 //! 任何「现在」的判断都必须钉在某个动作上，不能钉在墙钟上。
@@ -50,7 +54,10 @@ const MAX_SECONDS: u64 = 300;
 /// 一次等待的结局。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Woke {
-    /// 等满了，这段时间里没有新的信件。
+    /// 等满了，其间没有需要叫醒它的事。
+    ///
+    /// **不等于「什么都没发生」**：身体照常动，在途任务的进展照常成帧投递，只是
+    /// 那些不叫醒人。措辞必须留住这个区别，否则回执会和紧随其后的进展行打架。
     Timeout,
     /// 有它还没看见的信件，提前醒。
     Interrupted,
@@ -108,7 +115,7 @@ impl WaitTools {
                     format!("等了 {waited} 秒，有事发生，提前醒了——就在下面。")
                 }
                 Woke::Timeout => {
-                    format!("等满 {seconds} 秒，这段时间里什么都没发生。")
+                    format!("等满 {seconds} 秒，没有需要叫醒你的事。")
                 }
             })],
         )
@@ -196,15 +203,23 @@ mod tests {
             .collect()
     }
 
+    /// 等满了只能说「没有需要叫醒你的事」，不能说「什么都没发生」。
+    ///
+    /// 帧不敲铃（那是对的），所以等待期间在途任务的进展照常成帧，并在 `wait`
+    /// 返回后紧接着投递。说「什么都没发生」，模型下一行就会读到方块又碎了两块。
     #[tokio::test]
-    async fn waiting_out_the_full_span_says_nothing_happened() {
+    async fn waiting_out_the_full_span_claims_only_that_nothing_woke_it() {
         let bell = FakeBell::new(Woke::Timeout);
         let tools = WaitTools::new(bell.clone());
         let result = tools.dispatch_wait(call(json!(30))).await;
         assert_eq!(result.status, ToolResultStatus::Success);
         let text = text_of(&result);
         assert!(text.contains("等满 30 秒"), "{text}");
-        assert!(text.contains("什么都没发生"), "{text}");
+        assert!(text.contains("没有需要叫醒你的事"), "{text}");
+        assert!(
+            !text.contains("什么都没发生"),
+            "身体照常动、进展照常成帧，不能说什么都没发生：{text}"
+        );
         assert_eq!(
             bell.asked.lock().unwrap().as_slice(),
             &[Duration::from_secs(30)]

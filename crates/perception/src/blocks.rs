@@ -102,8 +102,11 @@ pub(crate) fn description() -> String {
 const HEAD: &str = "\
 用 SQL 查你自己的方块记忆——**只查得到你看过的东西**，没看过的地方它一无所知（先 scan）。\
 答案是坐标与计数，怎么解读由你自己判断。不打断任何动作。\n\
-**查得很快，不用替它省。** 坐标是有索引的：定点查、按坐标的连接都是直取，不是全表扫；\
-想到什么就问，不用攒成一条大的，也不用先猜个范围再问。";
+**带坐标条件的问法是直取。** 定点（x=.. AND y=.. AND z=..）、坐标范围、按坐标的连接都走索引，\
+不扫全表——想到就问，不用攒成一条大的。\n\
+**不带坐标条件的会扫过整份记忆**：按名字找、GROUP BY、只靠 ORDER BY dist 排序，都是这一类\
+（连接里被扫的是驱动那张表，被探的那张仍是直取）。记忆不大时无所谓；攒大了就补一段坐标范围，\
+否则可能撞上超时——真超了会明说，不会假装查完了。";
 
 #[cfg(test)]
 mod tests {
@@ -128,10 +131,19 @@ mod tests {
     /// 一个不知道代价的工具，模型会按最坏情况估，然后省着不用。既然虚表按坐标
     /// 走索引、点查是直取，就该明说，否则等于白建。
     #[test]
-    fn the_description_tells_the_model_the_query_is_cheap() {
+    fn the_description_tells_the_model_both_halves_of_the_cost() {
         let described = description();
-        assert!(described.contains("查得很快"), "{described}");
+        // 便宜的那一半：坐标有约束才走索引。
         assert!(described.contains("索引"), "{described}");
+        // **贵的那一半也必须说。** `vtab::plan` 只看坐标约束，既不消费 ORDER BY，
+        // SQLite 也不把 LIMIT 下推进虚表；描述自带的例子里，按名字找、GROUP BY、
+        // 以及站得住脚位置那条自连接的驱动表，都是整份记忆扫过去。只说前一半，
+        // 模型撞上 300ms 中断时会读到「加 WHERE、加 LIMIT」——与描述互相打脸。
+        assert!(
+            described.contains("扫过整份记忆"),
+            "只说了便宜那一半：{described}"
+        );
+        assert!(described.contains("超时"), "{described}");
         // 换行要真的是换行，不能是字面的反斜杠 n。
         assert!(
             !described.contains("\\n"),
