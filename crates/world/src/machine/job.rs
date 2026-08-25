@@ -11,12 +11,12 @@
 //! # 不变量：沉默不等于成功
 //!
 //! **每个任务恰好一条终局，任何终止路径都必须写出它。**这里靠 API 形状保证：
-//! 槽位内部的 `Option` 不外露，清空只有三条路——[`JobSlot::begin`] 顶替、
-//! [`JobSlot::poll`] 返回 [`Step::End`]、[`JobSlot::cancel`]——每条都必然落一条
-//! 终局事实。**没有 `take()`，所以忘不掉。**
+//! 槽位内部的 `Option` 不外露，清空只有四条路——[`JobSlot::begin`] 顶替、
+//! [`JobSlot::poll`] 返回 [`Step::End`]、[`JobSlot::cancel`]、连接生命周期结束——
+//! 每条都必然落一条终局事实。**没有对外的 `take()`，所以忘不掉。**
 //!
-//! 看门狗是最后一道：动词自己的判定万一走不到（`pillar_up` 就是被重发重置了
-//! 期限），槽位到点自己发终局。它是兜底，不是主路径。
+//! 槽位本身不设泛化看门狗：那会把动词漏掉终局的实现缺陷伪装成普通超时。
+//! 真正需要时间边界的动词必须在自己的可观察状态机里明确建模并测试。
 
 use parking_lot::Mutex;
 
@@ -35,14 +35,8 @@ pub(super) trait JobVerb: Sized {
     fn replaced() -> Self::Event;
     /// 被停止动词取消时落哪个事件。
     fn cancelled() -> Self::Event;
-    /// 看门狗到点时落哪个事件。
-    fn timed_out() -> Self::Event;
-
-    /// 看门狗期限：这么多 tick 既无进展也无终局，就判超时。
-    ///
-    /// **它是兜底，不是动词自己的判据**——所以要比动词自己的期限宽得多，
-    /// 正常情况下永远走不到。
-    const WATCHDOG_TICKS: u64;
+    /// 连接或整个模块结束时落哪个事件。
+    fn connection_ended() -> Self::Event;
 
     /// 只读现状，供任务表用。
     fn status(&self, id: JobId, started_tick: u64, now_tick: u64) -> JobStatus;
@@ -62,8 +56,6 @@ struct Live<J> {
     id: JobId,
     job: J,
     started_tick: u64,
-    /// 上一次有进展的 tick。看门狗按它算——长任务只要还在推进就不该被判超时。
-    last_progress_tick: u64,
 }
 
 /// 单意图槽：同一动词同一时刻只有一个任务，新的顶替旧的。
@@ -84,20 +76,17 @@ impl<J: JobVerb> JobSlot<J> {
     pub(super) fn begin(&self, inner: &Inner, job: J) -> JobId {
         let now = inner.now_tick();
         let id = inner.next_job_id();
-        let displaced = {
-            let mut slot = self.live.lock();
-            let previous = slot.take();
-            *slot = Some(Live {
-                id,
-                job,
-                started_tick: now,
-                last_progress_tick: now,
-            });
-            previous.map(|live| (live.id, live.job.fact(J::replaced())))
-        };
-        // 锁外落事实：窗口另有一把锁，不在槽锁里嵌套。
-        if let Some((displaced_id, fact)) = displaced {
-            inner.push_job_fact(displaced_id, fact);
+        let mut slot = self.live.lock();
+        let previous = slot.take();
+        *slot = Some(Live {
+            id,
+            job,
+            started_tick: now,
+        });
+        if let Some(live) = previous {
+            // 固定锁序为 slot → jobs_window。状态转换与事实提交必须原子，否则并发
+            // 生命周期收束可能夹进来，让同一任务的终局排在旧 Progress/Replaced 前面。
+            inner.push_job_fact(live.id, live.job.fact(J::replaced()));
         }
         id
     }
@@ -111,40 +100,22 @@ impl<J: JobVerb> JobSlot<J> {
         inner: &Inner,
         decide: impl FnOnce(&mut J) -> Step<J::Event>,
     ) -> Option<J::Event> {
-        let now = inner.now_tick();
         let mut slot = self.live.lock();
         let live = slot.as_mut()?;
-
-        // 看门狗：动词自己的判定万一走不到，这里兜底收槽。
-        if now.saturating_sub(live.last_progress_tick) >= J::WATCHDOG_TICKS {
-            let live = slot.take().expect("上面刚借到 Some");
-            drop(slot);
-            let event = J::timed_out();
-            inner.push_job_fact(live.id, live.job.fact(event));
-            return Some(event);
-        }
 
         match decide(&mut live.job) {
             Step::Keep => None,
             Step::Progress(event) => {
-                debug_assert!(
-                    !live.job.fact(event).is_terminal(),
-                    "Step::Progress 收到终局事件 {event:?}"
-                );
-                live.last_progress_tick = now;
-                let (id, fact) = (live.id, live.job.fact(event));
-                drop(slot);
-                inner.push_job_fact(id, fact);
+                let fact = live.job.fact(event);
+                debug_assert!(!fact.is_terminal(), "Step::Progress 收到终局事件 {event:?}");
+                inner.push_job_fact(live.id, fact);
                 Some(event)
             }
             Step::End(event) => {
                 let live = slot.take().expect("上面刚借到 Some");
-                drop(slot);
-                debug_assert!(
-                    live.job.fact(event).is_terminal(),
-                    "Step::End 收到非终局事件 {event:?}"
-                );
-                inner.push_job_fact(live.id, live.job.fact(event));
+                let fact = live.job.fact(event);
+                debug_assert!(fact.is_terminal(), "Step::End 收到非终局事件 {event:?}");
+                inner.push_job_fact(live.id, fact);
                 Some(event)
             }
         }
@@ -152,10 +123,24 @@ impl<J: JobVerb> JobSlot<J> {
 
     /// 取消在途任务。没有任务时不是错误（与 `release`／`stop` 的语义一致）。
     pub(super) fn cancel(&self, inner: &Inner) {
-        let ended = self.live.lock().take();
-        if let Some(live) = ended {
-            inner.push_job_fact(live.id, live.job.fact(J::cancelled()));
-        }
+        self.finish(inner, J::cancelled());
+    }
+
+    /// 连接一旦结束就不再有 tick；在生命周期边界同步收槽。
+    /// 返回是否真的结束了一个任务，重复的 client/swarm/thread 断线通知因此无害。
+    pub(super) fn connection_ended(&self, inner: &Inner) -> bool {
+        self.finish(inner, J::connection_ended())
+    }
+
+    fn finish(&self, inner: &Inner, event: J::Event) -> bool {
+        let mut slot = self.live.lock();
+        let Some(live) = slot.take() else {
+            return false;
+        };
+        let fact = live.job.fact(event);
+        debug_assert!(fact.is_terminal(), "生命周期收槽收到非终局事件 {event:?}");
+        inner.push_job_fact(live.id, fact);
+        true
     }
 
     /// 在途任务的只读现状。`None` = 现在没有在跑。
@@ -173,6 +158,10 @@ impl<J: JobVerb> JobSlot<J> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
     use super::*;
     use crate::{JobStatusKind, MoveEvent};
 
@@ -194,15 +183,59 @@ mod tests {
         fn cancelled() -> MoveEvent {
             MoveEvent::Cancelled
         }
-        fn timed_out() -> MoveEvent {
-            MoveEvent::TimedOut
+        fn connection_ended() -> MoveEvent {
+            MoveEvent::ConnectionEnded
         }
-        const WATCHDOG_TICKS: u64 = 10;
         fn status(&self, id: JobId, started_tick: u64, now_tick: u64) -> JobStatus {
             JobStatus {
                 id,
                 kind: JobStatusKind::Move {
                     destination: self.destination,
+                    leg: None,
+                },
+                started_tick,
+                elapsed_ticks: now_tick.saturating_sub(started_tick),
+            }
+        }
+    }
+
+    struct BlockingFake {
+        entered_fact: Arc<Barrier>,
+        release_fact: Arc<Barrier>,
+        blocked_once: AtomicBool,
+    }
+
+    impl JobVerb for BlockingFake {
+        type Event = MoveEvent;
+
+        fn fact(&self, event: MoveEvent) -> JobFact {
+            if matches!(event, MoveEvent::Leg { .. })
+                && !self.blocked_once.swap(true, Ordering::AcqRel)
+            {
+                self.entered_fact.wait();
+                self.release_fact.wait();
+            }
+            JobFact::Move {
+                destination: [1, 0, 0],
+                event,
+            }
+        }
+
+        fn replaced() -> MoveEvent {
+            MoveEvent::Replaced
+        }
+        fn cancelled() -> MoveEvent {
+            MoveEvent::Cancelled
+        }
+        fn connection_ended() -> MoveEvent {
+            MoveEvent::ConnectionEnded
+        }
+
+        fn status(&self, id: JobId, started_tick: u64, now_tick: u64) -> JobStatus {
+            JobStatus {
+                id,
+                kind: JobStatusKind::Move {
+                    destination: [1, 0, 0],
                     leg: None,
                 },
                 started_tick,
@@ -244,6 +277,78 @@ mod tests {
         assert_eq!(events(&inner), vec![MoveEvent::Replaced]);
     }
 
+    #[test]
+    fn connection_end_closes_a_live_job_exactly_once_without_more_ticks() {
+        let inner = Inner::new();
+        let slot = JobSlot::<Fake>::default();
+        slot.begin(
+            &inner,
+            Fake {
+                destination: [1, 0, 0],
+            },
+        );
+
+        assert!(slot.connection_ended(&inner));
+        assert!(!slot.connection_ended(&inner));
+        assert_eq!(events(&inner), vec![MoveEvent::ConnectionEnded]);
+        assert!(slot.status(inner.now_tick()).is_none());
+    }
+
+    #[test]
+    fn concurrent_connection_end_cannot_overtake_an_inflight_progress_fact() {
+        let inner = Arc::new(Inner::new());
+        let slot = Arc::new(JobSlot::<BlockingFake>::default());
+        let entered_fact = Arc::new(Barrier::new(2));
+        let release_fact = Arc::new(Barrier::new(2));
+        slot.begin(
+            &inner,
+            BlockingFake {
+                entered_fact: entered_fact.clone(),
+                release_fact: release_fact.clone(),
+                blocked_once: AtomicBool::new(false),
+            },
+        );
+
+        let polling = {
+            let inner = inner.clone();
+            let slot = slot.clone();
+            std::thread::spawn(move || {
+                slot.poll(&inner, |_| Step::Progress(MoveEvent::Leg { to: [1, 0, 0] }))
+            })
+        };
+        entered_fact.wait();
+
+        let (ended_tx, ended_rx) = std::sync::mpsc::channel();
+        let end_started = Arc::new(Barrier::new(2));
+        let ending = {
+            let inner = inner.clone();
+            let slot = slot.clone();
+            let end_started = end_started.clone();
+            std::thread::spawn(move || {
+                end_started.wait();
+                ended_tx.send(slot.connection_ended(&inner)).unwrap();
+            })
+        };
+        end_started.wait();
+        assert!(
+            ended_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "连接终局必须等在途 Progress 完成事实提交"
+        );
+
+        release_fact.wait();
+        assert_eq!(
+            polling.join().unwrap(),
+            Some(MoveEvent::Leg { to: [1, 0, 0] })
+        );
+        ending.join().unwrap();
+        assert!(ended_rx.recv().unwrap());
+        assert_eq!(
+            events(&inner),
+            vec![MoveEvent::Leg { to: [1, 0, 0] }, MoveEvent::ConnectionEnded],
+            "终局之后不能再补写进展"
+        );
+    }
+
     /// 取消也必然收口；没有任务时取消不是事件。
     #[test]
     fn cancelling_closes_and_cancelling_nothing_is_silent() {
@@ -259,44 +364,5 @@ mod tests {
         slot.cancel(&inner);
         assert_eq!(events(&inner), vec![MoveEvent::Cancelled]);
         assert!(slot.status(0).is_none());
-    }
-
-    /// 看门狗兜底：动词判定万一走不到，槽位到点自己发终局。
-    /// 这正是 `pillar_up` 缺的那一道——它 83 次调用一条终局都没发出。
-    #[test]
-    fn the_watchdog_closes_a_job_that_never_reports() {
-        let inner = Inner::new();
-        let slot = JobSlot::<Fake>::default();
-        slot.begin(
-            &inner,
-            Fake {
-                destination: [1, 0, 0],
-            },
-        );
-        for _ in 0..Fake::WATCHDOG_TICKS {
-            inner.tick.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            slot.poll(&inner, |_| Step::Keep);
-        }
-        assert_eq!(events(&inner), vec![MoveEvent::TimedOut]);
-        assert!(slot.status(0).is_none(), "看门狗收槽后表里不该还有它");
-    }
-
-    /// 有进展就不算沉默：看门狗按最近一次进展算，长任务不会被误收。
-    #[test]
-    fn progress_keeps_the_watchdog_at_bay() {
-        let inner = Inner::new();
-        let slot = JobSlot::<Fake>::default();
-        slot.begin(
-            &inner,
-            Fake {
-                destination: [1, 0, 0],
-            },
-        );
-        for _ in 0..Fake::WATCHDOG_TICKS * 3 {
-            inner.tick.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            slot.poll(&inner, |_| Step::Progress(MoveEvent::Leg { to: [1, 0, 0] }));
-        }
-        assert!(slot.status(0).is_some(), "一直有进展的任务不该被看门狗收掉");
-        assert!(events(&inner).iter().all(|e| !e.is_terminal()));
     }
 }

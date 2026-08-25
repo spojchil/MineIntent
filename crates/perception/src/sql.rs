@@ -337,6 +337,7 @@ mod tests {
     ) -> world::ViewportBlock {
         world::ViewportBlock {
             name: name.to_owned(),
+            state_id: 1,
             properties,
             position: at,
         }

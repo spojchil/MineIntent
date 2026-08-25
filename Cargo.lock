@@ -151,7 +151,7 @@ dependencies = [
 [[package]]
 name = "azalea"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "azalea-auth",
  "azalea-block",
@@ -187,7 +187,7 @@ dependencies = [
 [[package]]
 name = "azalea-auth"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "azalea-buf",
  "azalea-crypto",
@@ -206,7 +206,7 @@ dependencies = [
 [[package]]
 name = "azalea-block"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "azalea-block-macros",
  "azalea-buf",
@@ -216,7 +216,7 @@ dependencies = [
 [[package]]
 name = "azalea-block-macros"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -226,7 +226,7 @@ dependencies = [
 [[package]]
 name = "azalea-brigadier"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "azalea-buf",
  "azalea-chat",
@@ -236,7 +236,7 @@ dependencies = [
 [[package]]
 name = "azalea-buf"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "azalea-buf-macros",
  "byteorder",
@@ -251,7 +251,7 @@ dependencies = [
 [[package]]
 name = "azalea-buf-macros"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -261,7 +261,7 @@ dependencies = [
 [[package]]
 name = "azalea-chat"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "azalea-buf",
  "azalea-language",
@@ -275,7 +275,7 @@ dependencies = [
 [[package]]
 name = "azalea-client"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "async-compat",
  "azalea-auth",
@@ -312,7 +312,7 @@ dependencies = [
 [[package]]
 name = "azalea-core"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "azalea-buf",
  "azalea-chat",
@@ -333,7 +333,7 @@ dependencies = [
 [[package]]
 name = "azalea-crypto"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "aes",
  "azalea-buf",
@@ -352,7 +352,7 @@ dependencies = [
 [[package]]
 name = "azalea-entity"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "azalea-block",
  "azalea-buf",
@@ -375,7 +375,7 @@ dependencies = [
 [[package]]
 name = "azalea-inventory"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "azalea-auth",
  "azalea-buf",
@@ -393,7 +393,7 @@ dependencies = [
 [[package]]
 name = "azalea-inventory-macros"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -403,7 +403,7 @@ dependencies = [
 [[package]]
 name = "azalea-language"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "compact_str",
  "serde_json",
@@ -412,7 +412,7 @@ dependencies = [
 [[package]]
 name = "azalea-physics"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "azalea-block",
  "azalea-core",
@@ -429,7 +429,7 @@ dependencies = [
 [[package]]
 name = "azalea-protocol"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "azalea-auth",
  "azalea-block",
@@ -463,7 +463,7 @@ dependencies = [
 [[package]]
 name = "azalea-protocol-macros"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -473,7 +473,7 @@ dependencies = [
 [[package]]
 name = "azalea-registry"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "azalea-buf",
  "azalea-registry-macros",
@@ -484,7 +484,7 @@ dependencies = [
 [[package]]
 name = "azalea-registry-macros"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "quote",
  "syn 2.0.119",
@@ -493,7 +493,7 @@ dependencies = [
 [[package]]
 name = "azalea-world"
 version = "0.16.0+mc26.1"
-source = "git+https://github.com/spojchil/azalea?rev=6ebf6b7efe196baad8fbbe6c8fbed165a72facc4#6ebf6b7efe196baad8fbbe6c8fbed165a72facc4"
+source = "git+https://github.com/spojchil/azalea?rev=cce19dfa7b120eef090c48d96f5b25851cd89d9a#cce19dfa7b120eef090c48d96f5b25851cd89d9a"
 dependencies = [
  "azalea-block",
  "azalea-buf",
@@ -3738,6 +3738,16 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "wait"
+version = "0.0.1"
+dependencies = [
+ "dispatch",
+ "midturn",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "walkdir"

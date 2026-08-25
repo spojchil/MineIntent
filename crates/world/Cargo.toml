@@ -31,6 +31,10 @@ name = "legal_path_probe"
 required-features = ["azalea"]
 
 [[example]]
+name = "fog_goto_probe"
+required-features = ["azalea"]
+
+[[example]]
 name = "pillar_probe"
 required-features = ["azalea"]
 

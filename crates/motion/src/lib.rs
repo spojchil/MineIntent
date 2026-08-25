@@ -4,11 +4,8 @@
 //! 合法性检查都在模块一的写口后面——能不能跑由原版物理自我仲裁
 //! （饱食度、前进冲量、被物品减速），我们不复刻这些规则，门拒绝就如实转达。
 //!
-//! ⚠ 已知越界：go_to/forward 复用 azalea 寻路器，
-//! 它在**整个已加载世界模型**上做 A*——包括同伴从未看见过的方块（背后、
-//! 未扫过的地形）。这越过了"感知只给看得见的"的视口纪律：寻路结果隐含
-//! 泄露未见地形的可通行性。收敛方案（限制搜索域为已见方块/已探索区域）
-//! 随高级移动打磨再议。
+//! go_to/forward 的可执行图只使用同伴最后观察到的三态地图；未知格不会被当成空气。
+//! 路段走到知识边界后，连接机器主动环视，再在新冻结图上直达或选择观察 frontier。
 //!
 //! 单意图槽：新意图顶替旧意图（门的语义）；屏开着时被编排压制（Body 类）。
 //! 屏压制掐掉的移动意图作废，关屏后不续走——模型想走再说一次。
@@ -119,9 +116,11 @@ impl MotionTools {
 }
 
 fn read_vec3(value: Option<&Value>) -> Result<[f64; 3], String> {
-    let coords: Option<Vec<f64>> = value
-        .and_then(Value::as_array)
-        .map(|array| array.iter().filter_map(Value::as_f64).collect());
+    let coords: Option<Vec<f64>> = value.and_then(Value::as_array).and_then(|array| {
+        (array.len() == 3)
+            .then(|| array.iter().map(Value::as_f64).collect::<Option<Vec<_>>>())
+            .flatten()
+    });
     match coords {
         Some(coords) if coords.len() == 3 && coords.iter().all(|axis| axis.is_finite()) => {
             Ok([coords[0], coords[1], coords[2]])
@@ -160,7 +159,7 @@ impl ToolProvider for MotionTools {
                     },
                     "target": {
                         "type": "array", "items": {"type": "number"},
-                        "description": "go_to 用：[x, y, z]"
+                        "description": "go_to 用：[x, y, z]——你要**站进去**的那一格，不是脚下踩的那块方块"
                     },
                     "blocks": { "type": "number", "description": "forward 用：走几格" },
                     "on": { "type": "boolean", "description": "sneak/sprint 用：开或关" }
@@ -171,7 +170,11 @@ impl ToolProvider for MotionTools {
         );
         motion.description = Some(
             "移动。发出意图立刻返回，行走在后台继续；新意图顶替旧意图。\
-能不能跑动由世界决定（饱食度、被阻挡等）；到达、走不到或途中卡住会收到通知。"
+能不能跑动由世界决定（饱食度、被阻挡等）；到达、走不到或途中卡住会收到通知。\
+\n\n**go_to 的目标是你身体要站进去的那一格，不是你看到的地面方块。**\
+你看见 (12,164,10) 是 grass_block、想走过去，目标要写 (12,165,10)——\
+人站在方块**上面**，不是站在方块里面。写成方块本身那一格，身体挤不进去，\
+到不了。"
                 .to_owned(),
         );
 
@@ -337,6 +340,14 @@ mod tests {
         let (tools, door) = tools(false);
         for (tool, arguments) in [
             (MOTION_TOOL, json!({"action": "go_to", "target": [1, 2]})),
+            (
+                MOTION_TOOL,
+                json!({"action": "go_to", "target": [1, "bad", 64, -3]}),
+            ),
+            (
+                LOOK_TOOL,
+                json!({"action": "look_at", "target": [1, "bad", -3]}),
+            ),
             (MOTION_TOOL, json!({"action": "forward", "blocks": -1})),
             (MOTION_TOOL, json!({"action": "sneak"})),
             (MOTION_TOOL, json!({"action": "dance"})),

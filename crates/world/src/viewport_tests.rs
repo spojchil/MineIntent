@@ -79,6 +79,7 @@ fn projection_reports_pose_and_first_hit_in_absolute_coordinates() {
         projection.looked_at_block,
         Some(ViewportBlock {
             name: "stone".to_owned(),
+            state_id: 1,
             properties: BTreeMap::new(),
             position: [0, 2, -1],
         })
@@ -304,6 +305,7 @@ fn changes_mode_reports_appearance_silence_vanish_and_ignores_whats_behind() {
             at: [0, 2, 3],
             fact: BlockFact {
                 name: "stone".to_owned(),
+                state_id: 1,
                 properties: BTreeMap::new(),
             },
         }],
@@ -946,6 +948,7 @@ fn stone_at(solid: Vec<BlockPosition>) -> impl Fn(BlockPosition) -> BlockReadRes
 fn seen(position: [i32; 3]) -> ViewportBlock {
     ViewportBlock {
         name: "stone".to_owned(),
+        state_id: 1,
         properties: BTreeMap::new(),
         position,
     }
@@ -967,6 +970,7 @@ fn free_space_along_the_ray_to_a_seen_block_is_recorded() {
             z: 0.5,
         },
         &[seen([0, 1, 5])],
+        None,
         &mut space,
         &mut || Ok(()),
     )
@@ -979,6 +983,39 @@ fn free_space_along_the_ray_to_a_seen_block_is_recorded() {
         !space.contains([0, 1, 5]),
         "方块那一格不是空的，不该标成已观察为空"
     );
+}
+
+/// 开放方向没有可见方块可当射线终点；准星落在 AIR 时仍应把整条真实可读射线
+/// 记成自由空间，否则看向空走廊反而学不到路。
+#[test]
+fn looked_at_air_records_the_open_gaze_ray() {
+    let read = stone_at(Vec::new());
+    let mut reader = WorldReader::new(|position| BlockProbe::from_read(&read(position)), &read);
+    let mut space = ObservedSpace::new();
+    let looked_at = ViewportBlock {
+        name: "air".to_owned(),
+        state_id: 0,
+        properties: BTreeMap::new(),
+        position: [0, 1, 5],
+    };
+
+    observe_free_space(
+        &mut reader,
+        Point3 {
+            x: 0.5,
+            y: 1.5,
+            z: 0.5,
+        },
+        &[],
+        Some(&looked_at),
+        &mut space,
+        &mut || Ok(()),
+    )
+    .expect("开放射线应当可判定");
+
+    for z in 1..=5 {
+        assert!(space.contains([0, 1, z]), "(0,1,{z}) 应被亲眼确认为空");
+    }
 }
 
 /// **不多标**：中心线被墙挡住时，墙后面的空格一格都不许标。
@@ -999,6 +1036,7 @@ fn nothing_behind_an_occluder_is_recorded() {
             z: 0.5,
         },
         &[seen([0, 1, 5])],
+        None,
         &mut space,
         &mut || Ok(()),
     )
@@ -1033,6 +1071,7 @@ fn an_unloaded_cell_stops_the_walk_instead_of_being_called_empty() {
             z: 0.5,
         },
         &[seen([0, 1, 6])],
+        None,
         &mut space,
         &mut || Ok(()),
     )
@@ -1062,6 +1101,7 @@ fn memory_and_space_together_answer_three_states() {
             z: 0.5,
         },
         &[seen([0, 1, 3])],
+        None,
         &mut space,
         &mut || Ok(()),
     )

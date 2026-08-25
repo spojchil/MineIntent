@@ -279,6 +279,7 @@ mod tests {
                         .map(|at| world::DirectedSeenBlock {
                             at,
                             name: "stone".to_owned(),
+                            state_id: 1,
                             properties: Default::default(),
                         })
                         .collect(),
@@ -293,6 +294,7 @@ mod tests {
                     at: [3, 64, 3],
                     fact: world::BlockFact {
                         name: "oak_log".to_owned(),
+                        state_id: 1,
                         properties: Default::default(),
                     },
                 }])

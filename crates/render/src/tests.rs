@@ -261,15 +261,90 @@ fn job_entries_render_each_outcome_in_world_language() {
         render_job_entry(&entry(world::MoveEvent::Arrived)),
         "你到达了目的地 (10, 64, -3)。"
     );
-    assert!(render_job_entry(&entry(world::MoveEvent::PathEnded)).contains("没能到达"));
+    let unclassified = render_job_entry(&entry(world::MoveEvent::PathEnded));
+    assert!(unclassified.contains("没有到达"));
+    assert!(unclassified.contains("没有足够证据"));
+    let occupied = render_job_entry(&entry(world::MoveEvent::DestinationRejected {
+        at: [9, 64, -3],
+    }));
+    assert!(occupied.contains("自动寻路规则"));
+    assert!(occupied.contains("精确身体节点"));
+    assert!(!occupied.contains("有碰撞体"));
+    assert!(!occupied.contains("身体不能进入"));
+    let limited = render_job_entry(&entry(world::MoveEvent::NavigationLimitReached {
+        at: [8, 64, -2],
+        plans: 41,
+        travelled: 23,
+    }));
+    assert!(limited.contains("工作上限"));
+    assert!(limited.contains("不证明目的地不可达"));
+    assert!(limited.contains("规划 41 段"));
+    let dispatch = render_job_entry(&entry(world::MoveEvent::DispatchNotObserved {
+        at: [8, 64, -2],
+        ticks: 100,
+    }));
+    assert!(dispatch.contains("listener 一直没有接单"));
+    assert!(dispatch.contains("不是无路可走"));
+    let stationary = render_job_entry(&entry(world::MoveEvent::NoBodyProgressLimitReached {
+        at: [8, 64, -2],
+        ticks: 1_200,
+    }));
+    assert!(stationary.contains("身体连续 1200 tick 没有换格"));
+    assert!(stationary.contains("不证明目的地不可达"));
     assert!(render_job_entry(&entry(world::MoveEvent::Stalled)).contains("卡住"));
     assert_eq!(
         render_job_entry(&entry(world::MoveEvent::Cancelled)),
         "你停下了移动。"
     );
     assert!(render_job_entry(&entry(world::MoveEvent::Replaced)).contains("顶替"));
-    // 看门狗收槽也要有话说——沉默才是这套设计最怕的东西。
-    assert!(render_job_entry(&entry(world::MoveEvent::TimedOut)).contains("没了下文"));
+    let disconnected = render_job_entry(&entry(world::MoveEvent::ConnectionEnded));
+    assert!(disconnected.contains("连接结束"));
+    assert!(disconnected.contains("没有到达结论"));
+}
+
+#[test]
+fn mining_failures_name_the_observed_boundary() {
+    let entry = |event| world::JobEntry {
+        seq: 1,
+        tick: 100,
+        occurred_at: SystemTime::now(),
+        id: world::JobId(8),
+        fact: world::JobFact::Mine {
+            targets: vec![[1, 64, 2], [2, 64, 2]],
+            done: 0,
+            event,
+        },
+    };
+
+    let stalled = render_job_entry(&entry(world::MineEvent::Blocked { at: [1, 64, 2] }));
+    assert!(stalled.contains("仍是实心"));
+    assert!(stalled.contains("挖掘进度连续没有增长"));
+    assert!(!stalled.contains("读不到"));
+
+    let dispatch = render_job_entry(&entry(world::MineEvent::DispatchNotObserved {
+        at: [1, 64, 2],
+        ticks: 100,
+    }));
+    assert!(dispatch.contains("调度链始终没有进入"));
+    assert!(dispatch.contains("不是方块挖不动"));
+
+    let ended = render_job_entry(&entry(world::MineEvent::RequestEnded { at: [1, 64, 2] }));
+    assert!(ended.contains("请求曾经排队"));
+    assert!(ended.contains("没有提供更细原因"));
+
+    let prediction = render_job_entry(&entry(world::MineEvent::PredictionNotSettled {
+        at: [1, 64, 2],
+        ticks: 400,
+    }));
+    assert!(prediction.contains("本地方块预测"));
+    assert!(prediction.contains("服务端确认或回滚"));
+    assert!(prediction.contains("既不是挖掘成功，也不是方块不可挖"));
+
+    let unavailable = render_job_entry(&entry(world::MineEvent::TargetUnavailable {
+        at: [1, 64, 2],
+    }));
+    assert!(unavailable.contains("当前世界模型读不到"));
+    assert!(unavailable.contains("没有猜它是实心或空气"));
 }
 
 /// 「卡住」是进展不是终局：类型上就该分得开，呈现也不该说成结束了。
@@ -279,6 +354,18 @@ fn stalling_is_progress_while_giving_up_is_terminal() {
     assert!(world::MoveEvent::PathEnded.is_terminal());
     assert!(!world::MineEvent::Broke { done: 1, total: 3 }.is_terminal());
     assert!(world::MineEvent::Blocked { at: [1, 2, 3] }.is_terminal());
+    assert!(world::MineEvent::DispatchNotObserved {
+        at: [1, 2, 3],
+        ticks: 100
+    }
+    .is_terminal());
+    assert!(world::MineEvent::RequestEnded { at: [1, 2, 3] }.is_terminal());
+    assert!(world::MineEvent::PredictionNotSettled {
+        at: [1, 2, 3],
+        ticks: 400
+    }
+    .is_terminal());
+    assert!(world::MineEvent::TargetUnavailable { at: [1, 2, 3] }.is_terminal());
 }
 
 #[test]

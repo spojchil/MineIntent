@@ -11,6 +11,7 @@ members = [
     "crates/presence",
     "crates/render",
     "crates/screens",
+    "crates/wait",
     "crates/world",
 ]
 resolver = "2"
@@ -23,14 +24,17 @@ repository = "https://github.com/spojchil/MineIntent"
 publish = false
 
 [workspace.dependencies]
-# 自有 fork：为每次 join 尝试铸不可变 AttemptToken 并支持 pre-Init 精确取消。
+# 自有 fork：除连接 AttemptToken 外，还提供 generation-safe pathfinder lifecycle、
+# 可关闭 partial 自动续算的选项、严格未知方块 fallback，以及「规划期禁止挖掘则
+# 执行期也禁止」——上游执行器硬编码 can_mine: true 且读真实加载世界，会把规划期
+# 当成空气的未观察格真挖掉。
 # rev 钉死，升级时在此处记录新 rev 与改动理由。
 #
 # packet-event 在此统一开启，而不是只由 world 单独要求。理由是 Cargo 对同一
 # 次编译中的 feature 取并集：分开声明只会让「构建口径不同、azalea 编出来的
 # 东西也不同」，`-p world` 与 `--workspace` 得到两套指纹，来回切就整棵重编。
 # 现在只有一个消费者，统一声明既真实又省事。
-azalea = { git = "https://github.com/spojchil/azalea", rev = "6ebf6b7efe196baad8fbbe6c8fbed165a72facc4", default-features = false, features = [
+azalea = { git = "https://github.com/spojchil/azalea", rev = "cce19dfa7b120eef090c48d96f5b25851cd89d9a", default-features = false, features = [
     "log",
     "packet-event",
 ] }
@@ -67,4 +71,3 @@ unsafe_code = "deny"
 [workspace.lints.clippy]
 # 与既有代码风格一致：字符串字面量统一 to_owned。
 str_to_string = "warn"
-

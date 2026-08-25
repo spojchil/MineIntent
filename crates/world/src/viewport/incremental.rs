@@ -54,6 +54,8 @@ use super::{ObservedSpace, ViewportBlock};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockFact {
     pub name: String,
+    /// 观察发生时的注册表状态。寻路只读这份最后所见，不回读离屏世界。
+    pub state_id: u32,
     pub properties: BTreeMap<String, String>,
 }
 
@@ -61,6 +63,7 @@ impl BlockFact {
     fn of(block: &ViewportBlock) -> Self {
         Self {
             name: block.name.clone(),
+            state_id: block.state_id,
             properties: block.properties.clone(),
         }
     }
@@ -136,6 +139,10 @@ impl Default for Section {
 #[derive(Clone, Debug, Default)]
 pub struct BlockMemory {
     sections: HashMap<[i32; 3], Arc<Section>>,
+    /// 观察图的内容版本。只有三态或方块身份真正变化时才推进；重复看见同一事实
+    /// 只刷新 `last_seen`，不会制造一次假的「地图变了」。寻路据此把重规划绑定到
+    /// 新证据，而不是按定时器反复计算同一张图。
+    revision: u64,
 }
 
 impl BlockMemory {
@@ -150,24 +157,42 @@ impl BlockMemory {
     /// 于是挖掉一块方块之后那一格会退回「没看过」，而我们明明看着它消失。
     /// 现在删除这个操作从 API 上消失了，只剩「观察到了什么」。
     pub fn observe(&mut self, at: [i32; 3], fact: Option<BlockFact>, tick: u64) {
-        let section = Arc::make_mut(self.sections.entry(section_of(at)).or_default());
-        let bit = bit_index(at);
-        match fact {
-            Some(fact) => {
-                section.empty[bit / 64] &= !(1_u64 << (bit % 64));
-                section.facts.insert(
-                    at,
-                    Entry {
-                        fact,
-                        last_seen: tick,
-                    },
-                );
+        let changed = {
+            let section = Arc::make_mut(self.sections.entry(section_of(at)).or_default());
+            let bit = bit_index(at);
+            match fact {
+                Some(fact) => {
+                    let changed = section
+                        .facts
+                        .get(&at)
+                        .is_none_or(|entry| entry.fact != fact)
+                        || section.empty[bit / 64] & (1_u64 << (bit % 64)) != 0;
+                    section.empty[bit / 64] &= !(1_u64 << (bit % 64));
+                    section.facts.insert(
+                        at,
+                        Entry {
+                            fact,
+                            last_seen: tick,
+                        },
+                    );
+                    changed
+                }
+                None => {
+                    let was_empty = section.empty[bit / 64] & (1_u64 << (bit % 64)) != 0;
+                    let had_block = section.facts.remove(&at).is_some();
+                    section.empty[bit / 64] |= 1_u64 << (bit % 64);
+                    had_block || !was_empty
+                }
             }
-            None => {
-                section.facts.remove(&at);
-                section.empty[bit / 64] |= 1_u64 << (bit % 64);
-            }
+        };
+        if changed {
+            self.revision = self.revision.wrapping_add(1);
         }
+    }
+
+    /// 观察图的内容版本。它不是世界 tick；只表示寻路可用的知识有没有变。
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// 这一格现在算什么。三态的唯一读口。
@@ -375,6 +400,7 @@ impl BlockMemory {
             } else {
                 Some(BlockFact {
                     name: seen.name.clone(),
+                    state_id: seen.state_id,
                     properties: seen.properties.clone(),
                 })
             };
@@ -474,6 +500,7 @@ mod tests {
     fn block(at: [i32; 3], name: &str) -> ViewportBlock {
         ViewportBlock {
             name: name.to_owned(),
+            state_id: 1,
             properties: BTreeMap::new(),
             position: at,
         }
@@ -482,6 +509,7 @@ mod tests {
     fn fact(name: &str) -> BlockFact {
         BlockFact {
             name: name.to_owned(),
+            state_id: 1,
             properties: BTreeMap::new(),
         }
     }
@@ -546,6 +574,7 @@ mod tests {
             seen: vec![super::super::DirectedSeenBlock {
                 at: [5, 64, 5],
                 name: "air".to_owned(),
+                state_id: 0,
                 properties: BTreeMap::new(),
             }],
             unseen: Vec::new(),
@@ -567,6 +596,30 @@ mod tests {
         assert!(matches!(snapshot.state_at([0, 64, 0]), Known::Block(_)));
         assert_eq!(snapshot.state_at([0, 64, 1]), Known::Unseen);
         assert_eq!(memory.state_at([0, 64, 0]), Known::Empty);
+    }
+
+    /// 寻路重规划只能由新知识触发：重看同一格只刷新时间，不能伪造地图变化。
+    #[test]
+    fn revision_only_advances_when_the_observed_state_changes() {
+        let mut memory = BlockMemory::new();
+        assert_eq!(memory.revision(), 0);
+
+        memory.observe([0, 64, 0], Some(fact("stone")), 10);
+        assert_eq!(memory.revision(), 1);
+        memory.observe([0, 64, 0], Some(fact("stone")), 20);
+        assert_eq!(memory.revision(), 1, "重复观察不是新地图");
+
+        memory.observe([0, 64, 0], Some(fact("dirt")), 30);
+        assert_eq!(memory.revision(), 2, "方块身份变化要推进版本");
+        memory.observe([0, 64, 0], None, 40);
+        assert_eq!(memory.revision(), 3, "看见空气要推进版本");
+        memory.observe([0, 64, 0], None, 50);
+        assert_eq!(memory.revision(), 3, "重复看见空气也不是新地图");
+
+        let snapshot = memory.clone();
+        memory.observe([1, 64, 0], None, 60);
+        assert_eq!(snapshot.revision(), 3, "快照版本必须随快照冻结");
+        assert_eq!(memory.revision(), 4);
     }
 
     /// 「记住的方块数为零」不等于「什么都没看过」——只见过空气也是看过。
@@ -623,6 +676,7 @@ mod tests {
     fn visible_state_changes_diff_but_protocol_properties_do_not() {
         let lit = |value: &str| ViewportBlock {
             name: "furnace".to_owned(),
+            state_id: 1,
             properties: BTreeMap::from([("lit".to_owned(), value.to_owned())]),
             position: [0, 64, 0],
         };
@@ -639,6 +693,7 @@ mod tests {
         // 白名单外的协议属性（如树叶 distance）变化：沉默。
         let internal = |value: &str| ViewportBlock {
             name: "oak_leaves".to_owned(),
+            state_id: 1,
             properties: BTreeMap::from([("distance".to_owned(), value.to_owned())]),
             position: [1, 70, 0],
         };
@@ -743,11 +798,13 @@ mod tests {
                     DirectedSeenBlock {
                         at: [1, 64, 0],
                         name: "furnace".to_owned(),
+                        state_id: 1,
                         properties: BTreeMap::new(),
                     },
                     DirectedSeenBlock {
                         at: [0, 64, 0],
                         name: "air".to_owned(),
+                        state_id: 0,
                         properties: BTreeMap::new(),
                     },
                 ],
@@ -808,6 +865,7 @@ mod staleness_tests {
     fn block(at: [i32; 3], name: &str) -> ViewportBlock {
         ViewportBlock {
             name: name.to_owned(),
+            state_id: 1,
             properties: BTreeMap::new(),
             position: at,
         }

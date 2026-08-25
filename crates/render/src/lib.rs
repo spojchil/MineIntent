@@ -822,12 +822,34 @@ pub fn render_job_entry(entry: &world::JobEntry) -> String {
             }
             world::MoveEvent::Arrived => format!("你到达了目的地 ({x}, {y}, {z})。"),
             world::MoveEvent::PathEnded => {
-                format!("你没能到达 ({x}, {y}, {z})——路走到了尽头，目的地过不去。")
+                format!("去 ({x}, {y}, {z}) 的这段寻路停了，但你没有到达；机器没有足够证据说明是哪里过不去。")
             }
+            world::MoveEvent::DestinationRejected { at: [ax, ay, az] } => format!(
+                "你停在 ({ax}, {ay}, {az})：目的地 ({x}, {y}, {z}) 这一格最后观察到的状态不被当前自动寻路规则接受为精确身体节点（可能是实心或危险格）。请改给一个寻路器接受的身体格。"
+            ),
+            world::MoveEvent::NavigationLimitReached {
+                at: [ax, ay, az],
+                plans,
+                travelled,
+            } => format!(
+                "你停在 ({ax}, {ay}, {az})：前往 ({x}, {y}, {z}) 的本次战争迷雾导航达到机器工作上限（规划 {plans} 段、累计移动 {travelled} 格）。你没有精确到达；这不证明目的地不可达。"
+            ),
+            world::MoveEvent::DispatchNotObserved {
+                at: [ax, ay, az],
+                ticks,
+            } => format!(
+                "你停在 ({ax}, {ay}, {az})：前往 ({x}, {y}, {z}) 的请求在 Azalea 队列里等待了 {ticks} tick，listener 一直没有接单。机器按调度故障收束；这不是无路可走的结论。"
+            ),
+            world::MoveEvent::NoBodyProgressLimitReached {
+                at: [ax, ay, az],
+                ticks,
+            } => format!(
+                "你停在 ({ax}, {ay}, {az})：前往 ({x}, {y}, {z}) 的导航仍活跃，但身体连续 {ticks} tick 没有换格，达到机器的物理推进边界。这不证明目的地不可达。"
+            ),
             world::MoveEvent::Replaced => "先前的移动被新的目标顶替了。".to_owned(),
             world::MoveEvent::Cancelled => "你停下了移动。".to_owned(),
-            world::MoveEvent::TimedOut => format!(
-                "去 ({x}, {y}, {z}) 这件事没了下文，机器把它收了——既没到达也没报错，多半是哪里卡住了。"
+            world::MoveEvent::ConnectionEnded => format!(
+                "前往 ({x}, {y}, {z}) 期间连接结束了，移动任务随连接收束；没有到达结论。"
             ),
         },
         world::JobFact::Mine {
@@ -843,7 +865,29 @@ pub fn render_job_entry(entry: &world::JobEntry) -> String {
                 ),
                 world::MineEvent::Cleared => format!("你挖完了这一串 {total} 块方块。"),
                 world::MineEvent::Blocked { at: [x, y, z] } => format!(
-                    "挖到第 {} 块就卡住了：({x}, {y}, {z}) 迟迟不碎——多半是够不着、被挡住，或者手上的工具挖不动它。前面 {done} 块已经挖掉了。",
+                    "挖到第 {} 块就停下了：({x}, {y}, {z}) 仍是实心，但底层挖掘进度连续没有增长；可能是交互被拒绝、够不着，或手上的工具无法产生进度。前面 {done} 块已经挖掉了。",
+                    done + 1
+                ),
+                world::MineEvent::DispatchNotObserved {
+                    at: [x, y, z],
+                    ticks,
+                } => format!(
+                    "挖第 {} 块的请求在 Azalea 队列里等待了 {ticks} tick，调度链始终没有进入 ({x}, {y}, {z}) 的活跃挖掘。机器按调度故障收束；这不是方块挖不动的结论。前面 {done} 块已经挖掉了。",
+                    done + 1
+                ),
+                world::MineEvent::RequestEnded { at: [x, y, z] } => format!(
+                    "挖第 {} 块的请求曾经排队，随后在进入 ({x}, {y}, {z}) 的活跃挖掘前结束。底层没有提供更细原因；机器没有把它说成够不着或工具挖不动。前面 {done} 块已经挖掉了。",
+                    done + 1
+                ),
+                world::MineEvent::PredictionNotSettled {
+                    at: [x, y, z],
+                    ticks,
+                } => format!(
+                    "挖第 {} 块后，对 ({x}, {y}, {z}) 的本地方块预测等待了 {ticks} tick，仍没有得到服务端确认或回滚。机器按协议确认悬挂收束；这既不是挖掘成功，也不是方块不可挖的结论。前面 {done} 块已经挖掉了。",
+                    done + 1
+                ),
+                world::MineEvent::TargetUnavailable { at: [x, y, z] } => format!(
+                    "挖到第 {} 块时，当前世界模型读不到 ({x}, {y}, {z})（例如区块尚未加载或坐标在世界高度外）。机器没有猜它是实心或空气，队列已停；前面 {done} 块已经挖掉了。",
                     done + 1
                 ),
                 world::MineEvent::Replaced => {
@@ -852,8 +896,8 @@ pub fn render_job_entry(entry: &world::JobEntry) -> String {
                 world::MineEvent::Cancelled => {
                     format!("你停下了挖掘（已挖掉 {done}/{total} 块）。")
                 }
-                world::MineEvent::TimedOut => format!(
-                    "这串挖掘没了下文，机器把它收了（已挖掉 {done}/{total} 块）——既没挖完也没报卡住。"
+                world::MineEvent::ConnectionEnded => format!(
+                    "挖掘期间连接结束了，任务随连接收束（已挖掉 {done}/{total} 块）。"
                 ),
             }
         }

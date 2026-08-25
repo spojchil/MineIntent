@@ -135,11 +135,13 @@ impl perception::ViewportDoor for NoDoor {
                 },
                 standing_on_block: Some(world::ViewportBlock {
                     name: "grass_block".to_owned(),
+                    state_id: 1,
                     properties: Default::default(),
                     position: [10, 71, 3],
                 }),
                 looked_at_block: Some(world::ViewportBlock {
                     name: "oak_log".to_owned(),
+                    state_id: 1,
                     properties: Default::default(),
                     position: [6, 72, 3],
                 }),
@@ -155,11 +157,13 @@ impl perception::ViewportDoor for NoDoor {
                     blocks: vec![
                         world::ViewportBlock {
                             name: "oak_log".to_owned(),
+                            state_id: 1,
                             properties: Default::default(),
                             position: [6, 72, 3],
                         },
                         world::ViewportBlock {
                             name: "oak_log".to_owned(),
+                            state_id: 1,
                             properties: Default::default(),
                             position: [6, 73, 3],
                         },
@@ -178,6 +182,7 @@ impl perception::ViewportDoor for NoDoor {
                 seen: vec![world::DirectedSeenBlock {
                     at: [6, 72, 3],
                     name: "oak_log".to_owned(),
+                    state_id: 1,
                     properties: Default::default(),
                 }],
                 unseen: vec![world::DirectedUnseenBlock {
@@ -201,6 +206,7 @@ impl perception::ViewportDoor for NoDoor {
                     at: [8, 72, 4],
                     fact: world::BlockFact {
                         name: "chest".to_owned(),
+                        state_id: 1,
                         properties: Default::default(),
                     },
                 },
@@ -208,6 +214,7 @@ impl perception::ViewportDoor for NoDoor {
                     at: [6, 72, 3],
                     was: world::BlockFact {
                         name: "furnace".to_owned(),
+                        state_id: 1,
                         properties: std::collections::BTreeMap::from([
                             ("facing".to_owned(), "north".to_owned()),
                             ("lit".to_owned(), "false".to_owned()),
@@ -215,6 +222,7 @@ impl perception::ViewportDoor for NoDoor {
                     },
                     now: world::BlockFact {
                         name: "furnace".to_owned(),
+                        state_id: 1,
                         properties: std::collections::BTreeMap::from([
                             ("facing".to_owned(), "north".to_owned()),
                             ("lit".to_owned(), "true".to_owned()),
@@ -225,6 +233,7 @@ impl perception::ViewportDoor for NoDoor {
                     at: [6, 73, 3],
                     was: world::BlockFact {
                         name: "oak_log".to_owned(),
+                        state_id: 1,
                         properties: Default::default(),
                     },
                 },
@@ -752,9 +761,23 @@ async fn main() {
         world::MoveEvent::Stalled,
         world::MoveEvent::Arrived,
         world::MoveEvent::PathEnded,
+        world::MoveEvent::DestinationRejected { at: [18, 70, 1] },
+        world::MoveEvent::NavigationLimitReached {
+            at: [17, 70, 2],
+            plans: 41,
+            travelled: 23,
+        },
+        world::MoveEvent::DispatchNotObserved {
+            at: [17, 70, 2],
+            ticks: 100,
+        },
+        world::MoveEvent::NoBodyProgressLimitReached {
+            at: [17, 70, 2],
+            ticks: 1_200,
+        },
         world::MoveEvent::Replaced,
         world::MoveEvent::Cancelled,
-        world::MoveEvent::TimedOut,
+        world::MoveEvent::ConnectionEnded,
     ] {
         let entry = world::JobEntry {
             seq: 1,
@@ -773,6 +796,52 @@ async fn main() {
                 | world::MoveEvent::Cancelled
                 | world::MoveEvent::Leg { .. }
                 | world::MoveEvent::Stalled
+        );
+        println!(
+            "- {}`{}`",
+            match (terminal, wakes) {
+                (false, _) => "（进展·搭帧）",
+                (true, true) => "",
+                (true, false) => "（终局·入窗不叫醒）",
+            },
+            render::render_job_entry(&entry)
+        );
+    }
+    for event in [
+        world::MineEvent::Broke { done: 1, total: 2 },
+        world::MineEvent::Cleared,
+        world::MineEvent::Blocked { at: [36, 71, 3] },
+        world::MineEvent::DispatchNotObserved {
+            at: [36, 71, 3],
+            ticks: 100,
+        },
+        world::MineEvent::RequestEnded { at: [36, 71, 3] },
+        world::MineEvent::PredictionNotSettled {
+            at: [36, 71, 3],
+            ticks: 400,
+        },
+        world::MineEvent::TargetUnavailable { at: [36, 71, 3] },
+        world::MineEvent::Replaced,
+        world::MineEvent::Cancelled,
+        world::MineEvent::ConnectionEnded,
+    ] {
+        let entry = world::JobEntry {
+            seq: 1,
+            tick: 100,
+            occurred_at: std::time::SystemTime::UNIX_EPOCH,
+            id: world::JobId(4),
+            fact: world::JobFact::Mine {
+                targets: vec![[36, 71, 3], [37, 71, 3]],
+                done: usize::from(matches!(event, world::MineEvent::Broke { .. })),
+                event,
+            },
+        };
+        let terminal = entry.fact.is_terminal();
+        let wakes = !matches!(
+            event,
+            world::MineEvent::Replaced
+                | world::MineEvent::Cancelled
+                | world::MineEvent::Broke { .. }
         );
         println!(
             "- {}`{}`",

@@ -128,7 +128,11 @@ git 依赖、不再是工作区成员，那个示例**跑不到本仓**（`cargo
 
 投影是纯 CPU 重活，组合根放 `spawn_blocking`，不占异步线程。
 
-## 已知越界
+## 寻路观察边界
 
-寻路器在**整个已加载世界模型**上做 A\*，隐含泄露同伴未看见地形的可通行性，
-越过视口纪律。收敛方案随高级移动打磨裁定。
+`go_to` / `forward` 的 A\* 只使用最后观察到的三态地图：Known Block 恢复最后所见
+`state_id`，Known Empty 是空气，Unseen 是规划专用屏障。单次 A\* 使用冻结快照；路径
+交给腿以后，局部障碍/卡住修补可以读取更新后的最后所见，但不回读离屏实时世界。
+Azalea fork 的 partial continuation 已关闭，完整重规划由 Direct/Survey/Frontier 接管；
+严格观察图同时关闭自动挖掘，因为挖掘成本分支仍会读取 loaded world。
+战争迷雾的扩张流程与终止边界见[架构说明](../architecture.md#4b-战争迷雾-go_to)。
