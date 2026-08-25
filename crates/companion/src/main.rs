@@ -829,10 +829,11 @@ async fn main() -> Result<(), String> {
                     pace.next_interval().as_millis()
                 );
                 let item: agent::TranscriptItem = InputMessage::text("user", text).into();
-                // WhenIdle 而非 Passive：世界真的变了就值得叫醒空闲的同伴——
-                // 挖穿、别人动土、熔炉灭火都在这条通道上。忙时它排在轮末，
-                // 天然与进行中的轮合并，不插队。
-                if let Err(rejected) = session.enqueue(MailboxInput::when_idle(vec![item])).await {
+                // 为什么是 `NextModelRequest` 而不是 `WhenIdle`，见 `frame` 的头注释。
+                if let Err(rejected) = session
+                    .enqueue(MailboxInput::next_model_request(vec![item]))
+                    .await
+                {
                     eprintln!("[组合根] 投递被拒：{:?}", rejected.reason);
                 }
             }
