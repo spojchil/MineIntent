@@ -121,6 +121,13 @@ impl hand::HandDoor for NoDoor {
         Box::pin(async { Ok(()) })
     }
 }
+/// 导出只打印工具定义，不真的等；给一个永远等满的打断源即可。
+impl wait::Interruptions for NoDoor {
+    fn until_woken<'a>(&'a self, _at_most: std::time::Duration) -> PortFuture<'a, wait::Woke> {
+        Box::pin(async { wait::Woke::Timeout })
+    }
+}
+
 impl perception::ViewportDoor for NoDoor {
     fn scan<'a>(
         &'a self,
@@ -524,6 +531,7 @@ async fn main() {
                 snapshots.clone(),
             )),
         ),
+        ("wait", Box::new(wait::WaitTools::new(door.clone()))),
     ];
     for (label, provider) in &providers {
         for (definition, class) in provider.tools() {

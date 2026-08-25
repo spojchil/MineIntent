@@ -19,13 +19,13 @@
 ```
                       companion（组合根，唯一知道所有人的地方）
                           │
-   ┌────────┬─────────┬───┴────┬────────┬───────┬────────┬─────────┐
-   ▼        ▼         ▼        ▼        ▼       ▼        ▼         ▼
-context perception screens   motion   hand    jobs   presence   memory
-   │        │  │      │  │      │  │    │  │    │  │     │  │      │
-   │        │  └───┐  │  │      │  │    │  │    │  │     │  │      │
-   ▼        ▼      ▼  ▼  ▼      ▼  ▼    ▼  ▼    ▼  ▼     ▼  ▼      ▼
- render ──→ world        dispatch ────────────────────────────────→ agent
+   ┌────────┬─────────┬───┴────┬────────┬───────┬────────┬─────────┬──────┐
+   ▼        ▼         ▼        ▼        ▼       ▼        ▼         ▼      ▼
+context perception screens   motion   hand    jobs   presence   memory  wait
+   │        │  │      │  │      │  │    │  │    │  │     │  │      │      │
+   │        │  └───┐  │  │      │  │    │  │    │  │     │  │      │      │
+   ▼        ▼      ▼  ▼  ▼      ▼  ▼    ▼  ▼    ▼  ▼     ▼  ▼      ▼      ▼
+ render ──→ world        dispatch ────────────────────────────────────→ agent
    │                         │                                        ▲
    └─────────────────────────┴────────────────────────────────────────┘
 ```
@@ -48,10 +48,27 @@ context perception screens   motion   hand    jobs   presence   memory
 | `jobs` | 任务表（`list`） | 只读、`ToolClass::Free`；槽位是唯一真相源，不另建镜像 |
 | `presence` | 生死去留（`respawn`） | 死亡时唯一还放行的一类（`ToolClass::Vital`）；自动重生已关，起不起来是模型自己的事 |
 | `memory` | 单文件长期记忆 | 一个文件、两张脸（工具面 `remember` 与策略面落盘）、一个出口 |
+| `wait` | 让时间过去（`wait`） | `ToolClass::Free`；**永远可打断**，判据由组合根的门铃给（见下） |
 | `context` | 提示装配与压缩 | 受保护**两段**（人设、记忆）每轮现拉、永不参与压缩；处境不在前缀里，随帧追加 |
 | `dispatch` | 工具编排 | 互斥域账本归此层；工具模块只做状态转换 |
 | `agent` | 模型—工具循环内核 | 零项目依赖；见 §5 |
 | `companion` | 组合根 | 唯一 `main`；唤醒脚手架也在这里 |
+
+`wait` 的打断判据不在 `wait` 里，因为它要读内核事件：组合根的 `doorbell.rs` 同时是
+`agent::Observer` 和 `wait::Interruptions`，数 `MailboxEnqueued`、在 `ModelRequestStarted`
+拍快照，**计数比快照大 = 有模型还没看见的信**，那就一秒都不等。这条差补上了「模型
+决定要等」到「等真的开始」之间那次推理（实测 3–4 秒）的窗口。
+
+**只有 `Delivery::NextModelRequest` 算数。**组合根两条通道装的东西不同：唤醒通道是
+别人说话、受伤、任务**终局**；`WhenIdle` 是帧，装任务**进展**、处境与拾取。帧的闸门
+是「任务还在进行中」（`frame::FrameComposer` 的 `progress.is_empty()`），只要同伴在动
+就一直来——把它算作打断，等待会在它最主要的用途上当场失效：开始挖、`wait`、进展帧、
+立刻醒、再 `wait`，正是这件工具要消灭的轮询。这与 `wake.rs` 的既有口径一致：进展
+「是『还在走』，不是『出事了』」。
+
+等待**被打断时**会把攒着的 `WhenIdle` 提成 `NextModelRequest` 捎上——下一次请求马上
+就要发生，让帧搭这趟车，好过堆到轮末一次性倒出来。只在醒来时提，不在开始等时提：
+后者会让等待自己把帧变成打断源，绕回上面那个环。
 
 ## 3. 数据怎么到模型
 

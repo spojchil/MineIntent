@@ -26,10 +26,12 @@ use screens::{
 };
 use world::{ConnectionConfig, DoorCommand, Module, SnapshotSource};
 
+mod doorbell;
 mod frame;
 mod situation;
 mod wake;
 
+use doorbell::Doorbell;
 use frame::FrameComposer;
 use wake::{ScreenDirective, SelfIdentity, WakeCursors};
 
@@ -642,6 +644,8 @@ async fn main() -> Result<(), String> {
     let memory_file = Arc::new(MemoryFile::new(memory_path));
     let snapshots: Arc<dyn SnapshotSource> = module.clone();
 
+    // 门铃同时是等待工具的打断源和内核的观察者，所以要早于两者建出来。
+    let doorbell = Doorbell::new();
     let providers: Vec<Arc<dyn ToolProvider>> = vec![
         Arc::new(ChatBox::new(
             occupancy.clone(),
@@ -678,6 +682,7 @@ async fn main() -> Result<(), String> {
         Arc::new(PresenceTools::new(Arc::new(ModulePresenceDoor(
             module.clone(),
         )))),
+        Arc::new(wait::WaitTools::new(doorbell.clone())),
     ];
     let life: Arc<dyn LifeGate> = Arc::new(SnapshotLifeGate(snapshots.clone()));
     let dispatcher = Arc::new(
@@ -731,8 +736,10 @@ async fn main() -> Result<(), String> {
     // 压缩完成的旗子：压缩把对话换成摘要，先前追加的处境随之消失，
     // 下一帧要把处境从头说一遍。
     let compacted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut observers: Vec<Arc<dyn agent::Observer>> =
-        vec![Arc::new(CompactionFlag(compacted.clone()))];
+    let mut observers: Vec<Arc<dyn agent::Observer>> = vec![
+        Arc::new(CompactionFlag(compacted.clone())),
+        doorbell.clone(),
+    ];
     if let Ok(path) = std::env::var("MINEINTENT_TRACE_FILE") {
         let trace = Arc::new(TraceObserver::open(&path)?);
         assembled = assembled.with_content_observer(trace.clone());
@@ -742,6 +749,8 @@ async fn main() -> Result<(), String> {
     // 内核的观察者是单槽（装第二个会顶掉第一个），所以这里自己分发。
     assembled = assembled.with_observer(Arc::new(FanOut(observers)));
     let session = Arc::new(assembled);
+    // 迟绑：门铃要用会话把扣在轮末的信提上来，而会话要装完观察者才建得出。
+    doorbell.attach(&session);
     {
         let session = session.clone();
         let module = module.clone();
