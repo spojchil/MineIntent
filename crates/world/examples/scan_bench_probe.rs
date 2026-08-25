@@ -4,7 +4,7 @@
 //!   `scan`         —— 纯投影（视锥 + 遮挡 + 聚合）
 //!   `scan_changes` —— 投影 + 与方块记忆逐格 diff + apply
 //!
-//! 缘起：实盘轮末帧曾量到 180ms，需要知道慢在哪一层。
+//! 缘起：实盘眼睛那一趟曾量到 180ms，需要知道慢在哪一层。
 //!
 //! 本探针给出的答案（默认参数、空闲站立）：纯 scan 中位 8.8ms，scan_changes
 //! 13.3ms——记忆那层 +3.7ms（35%）。三项旧优化（section 剔除、ExposedFace
@@ -167,11 +167,21 @@ async fn main() -> Result<(), String> {
         let _ = module.absorb(&memory, &ViewportOptions::for_memory());
         absorb.push(started.elapsed());
     }
-    report("吸收进记忆（32 格，不限）", absorb);
+    report("吸收进记忆 + 标记已观察空间（32 格，不限）", absorb);
     println!(
         "记忆里现在 {} 格",
         memory.lock().map(|m| m.len()).unwrap_or(0)
     );
+    // 三态里「确认为空」那一位的产量与占用：位图是定长的，区段数乘 512 字节
+    // 就是全部开销，与看了多少次无关。
+    if let Ok(memory) = memory.lock() {
+        println!(
+            "已观察为空 {} 格，占 {} 个区段 = {} KB",
+            memory.known_empty_len(),
+            memory.section_count(),
+            memory.section_count() * 512 / 1024
+        );
+    }
 
     if let Err(reason) = module.stop("基准结束").await {
         eprintln!("[基准] 停机未合流（{reason}）");

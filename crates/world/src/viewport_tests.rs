@@ -277,7 +277,7 @@ fn changes_mode_reports_appearance_silence_vanish_and_ignores_whats_behind() {
     );
 
     // 推进后同景再看：无话可说。
-    memory.apply(&first);
+    memory.apply(&first, 0);
     let silent = project_changes(
         &pose(180.0),
         &memory,
@@ -299,13 +299,16 @@ fn changes_mode_reports_appearance_silence_vanish_and_ignores_whats_behind() {
 
     // 背后的记忆（视锥外）：即使世界全空也保持沉默——看不到就不下结论。
     let mut behind = BlockMemory::new();
-    behind.apply(&[BlockChange::Appeared {
-        at: [0, 2, 3],
-        fact: BlockFact {
-            name: "stone".to_owned(),
-            properties: BTreeMap::new(),
-        },
-    }]);
+    behind.apply(
+        &[BlockChange::Appeared {
+            at: [0, 2, 3],
+            fact: BlockFact {
+                name: "stone".to_owned(),
+                properties: BTreeMap::new(),
+            },
+        }],
+        0,
+    );
     let quiet = project_changes(&pose(180.0), &behind, all_air, &options(), world_bounds())
         .expect("fixture options should be valid");
     assert!(quiet.is_empty(), "{quiet:?}");
@@ -921,4 +924,155 @@ fn player_named_after_a_mob_stays_distinguishable() {
             ("sheep".to_owned(), None),
         ]
     );
+}
+
+// ---- 已观察空间：射线走过的空格 ----
+
+/// 造一个只有指定坐标是石头、其余全空气的世界读取器。
+fn stone_at(solid: Vec<BlockPosition>) -> impl Fn(BlockPosition) -> BlockReadResult {
+    move |position: BlockPosition| {
+        if solid.contains(&position) {
+            BlockReadResult::Loaded {
+                block: block("stone", false),
+            }
+        } else {
+            BlockReadResult::Loaded {
+                block: block("air", true),
+            }
+        }
+    }
+}
+
+fn seen(position: [i32; 3]) -> ViewportBlock {
+    ViewportBlock {
+        name: "stone".to_owned(),
+        properties: BTreeMap::new(),
+        position,
+    }
+}
+
+/// 主线：眼睛到已见方块之间的空格全部记下，方块自己那一格不算空。
+#[test]
+fn free_space_along_the_ray_to_a_seen_block_is_recorded() {
+    let target = BlockPosition { x: 0, y: 1, z: 5 };
+    let read = stone_at(vec![target.clone()]);
+    let mut reader = WorldReader::new(|position| BlockProbe::from_read(&read(position)), &read);
+    let mut space = ObservedSpace::new();
+
+    observe_free_space(
+        &mut reader,
+        Point3 {
+            x: 0.5,
+            y: 1.5,
+            z: 0.5,
+        },
+        &[seen([0, 1, 5])],
+        &mut space,
+        &mut || Ok(()),
+    )
+    .expect("射线应当可判定");
+
+    for z in 1..=4 {
+        assert!(space.contains([0, 1, z]), "(0,1,{z}) 在射线上且是空的");
+    }
+    assert!(
+        !space.contains([0, 1, 5]),
+        "方块那一格不是空的，不该标成已观察为空"
+    );
+}
+
+/// **不多标**：中心线被墙挡住时，墙后面的空格一格都不许标。
+/// 可见性由暴露面射线判定（射向面，不射向中心），所以这一支确实会发生。
+#[test]
+fn nothing_behind_an_occluder_is_recorded() {
+    let wall = BlockPosition { x: 0, y: 1, z: 2 };
+    let target = BlockPosition { x: 0, y: 1, z: 5 };
+    let read = stone_at(vec![wall, target.clone()]);
+    let mut reader = WorldReader::new(|position| BlockProbe::from_read(&read(position)), &read);
+    let mut space = ObservedSpace::new();
+
+    observe_free_space(
+        &mut reader,
+        Point3 {
+            x: 0.5,
+            y: 1.5,
+            z: 0.5,
+        },
+        &[seen([0, 1, 5])],
+        &mut space,
+        &mut || Ok(()),
+    )
+    .expect("射线应当可判定");
+
+    assert!(space.contains([0, 1, 1]), "墙之前的空格照记");
+    for z in 2..=5 {
+        assert!(!space.contains([0, 1, z]), "(0,1,{z}) 在墙之后，不得标记");
+    }
+}
+
+/// 没加载的地方不能声称看过：探针答 Unloaded 就停，别把未知说成空。
+#[test]
+fn an_unloaded_cell_stops_the_walk_instead_of_being_called_empty() {
+    let read = |position: BlockPosition| {
+        if position.z >= 3 {
+            BlockReadResult::Unloaded
+        } else {
+            BlockReadResult::Loaded {
+                block: block("air", true),
+            }
+        }
+    };
+    let mut reader = WorldReader::new(|position| BlockProbe::from_read(&read(position)), &read);
+    let mut space = ObservedSpace::new();
+
+    observe_free_space(
+        &mut reader,
+        Point3 {
+            x: 0.5,
+            y: 1.5,
+            z: 0.5,
+        },
+        &[seen([0, 1, 6])],
+        &mut space,
+        &mut || Ok(()),
+    )
+    .expect("射线应当可判定");
+
+    assert!(space.contains([0, 1, 2]), "加载了的空格照记");
+    for z in 3..=6 {
+        assert!(!space.contains([0, 1, z]), "(0,1,{z}) 没加载，不得当成空");
+    }
+}
+
+/// 三态判据合起来读：同一份记忆加同一份空间，答三种话。
+#[test]
+fn memory_and_space_together_answer_three_states() {
+    let target = BlockPosition { x: 0, y: 1, z: 3 };
+    let read = stone_at(vec![target.clone()]);
+    let mut reader = WorldReader::new(|position| BlockProbe::from_read(&read(position)), &read);
+    let mut space = ObservedSpace::new();
+    let mut memory = BlockMemory::new();
+    memory.absorb_visible(&[seen([0, 1, 3])], 0);
+
+    observe_free_space(
+        &mut reader,
+        Point3 {
+            x: 0.5,
+            y: 1.5,
+            z: 0.5,
+        },
+        &[seen([0, 1, 3])],
+        &mut space,
+        &mut || Ok(()),
+    )
+    .expect("射线应当可判定");
+
+    // 暂存折进记忆之后，三态从同一个出口给出。
+    memory.absorb_empty(&space, 0);
+    assert!(
+        matches!(memory.state_at([0, 1, 3]), Known::Block(_)),
+        "有东西"
+    );
+    assert_eq!(memory.state_at([0, 1, 2]), Known::Empty, "确认为空");
+    assert_eq!(memory.state_at([99, 1, 99]), Known::Unseen, "没看过");
 }

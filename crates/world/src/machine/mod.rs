@@ -216,6 +216,46 @@ impl Module {
         .map_err(|error| error.to_string())
     }
 
+    /// 同 [`Module::scan`]，另把射线走过的空格记进 [`crate::ObservedSpace`]。
+    ///
+    /// 单独一个入口而不是给 `scan` 加参数：`scan` 服务的是**工具回执**（模型问
+    /// 「我看见什么」），一次性；本入口服务的是**眼睛**，每帧都跑，是三态记忆
+    /// 里「确认为空」那一位的唯一产生方。
+    fn scan_observing(
+        &self,
+        options: &crate::ViewportOptions,
+        space: &mut crate::ObservedSpace,
+    ) -> Result<crate::ViewportProjection, String> {
+        let snapshot = self.latest();
+        if !matches!(snapshot.phase, ConnectionPhase::Ready) {
+            return Err("尚未连接到世界，无法观察".to_owned());
+        }
+        let world = self
+            .inner
+            .world_handle
+            .lock()
+            .clone()
+            .ok_or_else(|| "世界模型尚未就绪".to_owned())?;
+        let world = world.read();
+        let pose = crate::viewport::Pose {
+            position: snapshot.self_state.position,
+            yaw: snapshot.self_state.yaw,
+            pitch: snapshot.self_state.pitch,
+        };
+        crate::viewport::project_observing(
+            &pose,
+            &snapshot.entities,
+            crate::viewport::WorldReader::new(
+                |position| probe_block_from_world(&world, position),
+                |position| read_block_from_world(&world, position),
+            ),
+            options,
+            || Ok(()),
+            space,
+        )
+        .map_err(|error| error.to_string())
+    }
+
     /// 定向视口投影：约束同 [`Module::scan`]。
     pub fn scan_directed(
         &self,
@@ -259,7 +299,7 @@ impl Module {
     /// （不调用就是原样——azalea 读服务端推来的全部已加载区块，包括同伴从没看过的
     /// 地方，那会泄露未见地形；理由详见 `machine::observed` 模块文档）。
     ///
-    /// 传进来的必须是**组合根那一份**记忆：轮末帧每 250ms 往里推进增量，寻路要
+    /// 传进来的必须是**组合根那一份**记忆：眼睛每 250ms 往里推进增量，寻路要
     /// 看到的正是同一份，两份会各说各话。
     pub fn use_observed_pathfinding(
         &self,
@@ -321,14 +361,22 @@ impl Module {
         memory: &std::sync::Mutex<crate::BlockMemory>,
         options: &crate::ViewportOptions,
     ) -> Result<usize, String> {
-        let projection = self.scan(options)?;
+        // 自由空间先落在一份本次投影专用的暂存里，**投影全程不持记忆的锁**：
+        // 投影约十毫秒，而寻路器每 tick 要读这本记忆上千次。
+        // 观察发生的刻取自同一份快照：投影读的就是它的姿态与实体。
+        let at_tick = self.latest().tick;
+        let mut free_space = crate::ObservedSpace::new();
+        let projection = self.scan_observing(options, &mut free_space)?;
         let mut memory = memory.lock().map_err(|_| "方块记忆锁中毒".to_owned())?;
-        memory.absorb_visible(&projection.visible_blocks.blocks);
+        // 空的先上账、方块后上账：两者由构造保证不相交（射线撞到第一个非空气
+        // 就停），万一相交也让「有东西」赢，与三态的优先级一致。
+        memory.absorb_empty(&free_space, at_tick);
+        memory.absorb_visible(&projection.visible_blocks.blocks, at_tick);
         for block in [&projection.standing_on_block, &projection.looked_at_block]
             .into_iter()
             .flatten()
         {
-            memory.absorb_visible(std::slice::from_ref(block));
+            memory.absorb_visible(std::slice::from_ref(block), at_tick);
         }
         Ok(projection.visible_blocks.blocks.len())
     }
@@ -365,7 +413,7 @@ impl Module {
             options,
             bounds,
         )?;
-        memory.apply(&changes);
+        memory.apply(&changes, snapshot.tick);
         Ok(changes)
     }
 

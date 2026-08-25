@@ -26,10 +26,11 @@ use screens::{
 };
 use world::{ConnectionConfig, DoorCommand, Module, SnapshotSource};
 
+mod frame;
 mod situation;
 mod wake;
 
-use situation::SituationTracker;
+use frame::FrameComposer;
 use wake::{ScreenDirective, SelfIdentity, WakeCursors};
 
 /// 人设占位（Q01 未裁；正式文本由维护者给出后替换）。
@@ -630,8 +631,8 @@ async fn main() -> Result<(), String> {
     // ---- 中间层装配 ----
     let occupancy = Arc::new(Occupancy::new());
     let screen_state = Arc::new(ScreenState::new());
-    // 方块记忆：同伴「已知道什么」的共享认知状态。当前由 scan 回执喂入；
-    // 增量呈现与寻路合法域随后也读写这一本。
+    // 方块记忆：同伴「已知道什么」的共享认知状态，三态（有东西／确认为空／
+    // 没看过）都在这一本里。眼睛每 250ms 写，寻路与查询读。
     let block_memory = Arc::new(std::sync::Mutex::new(world::BlockMemory::new()));
     // 合法寻路：寻路只按这本记忆里观察过的方块规划，不再读服务端推来的全量世界。
     // 必须是同一本——眼睛每 250ms 把看见的写进去，寻路要读的正是那一份。
@@ -750,14 +751,8 @@ async fn main() -> Result<(), String> {
         let compacted = compacted.clone();
         tokio::spawn(async move {
             let mut pace = FramePace::new();
-            let mut situation = SituationTracker::new();
-            // job 进展的游标，与 wake 那条各走各的：进展是「还在走」，不该叫醒，
-            // 由帧搭车呈现；终局才是事件，走 wake。
-            let mut progress_seq: Option<u64> = None;
-            // 拾取游标与攒下的句子。**每帧都排空，投递时才吐**——不排空的话，
-            // 窗只有 64 条，挖得快就会在两次投递之间被挤掉。
-            let mut pickup_seq: Option<u64> = None;
-            let mut pickup_lines: Vec<String> = Vec::new();
+            // 攒什么、什么时候发车，都在 `frame` 里，带单测；这里只负责取快照与投递。
+            let mut frames = FrameComposer::new();
             loop {
                 // 两个触发源，谁先到算谁：
                 //   一、模型响应落定（工具刚跑完，世界多半刚变）；
@@ -782,6 +777,16 @@ async fn main() -> Result<(), String> {
                 //   round —— 派发 + 在阻塞池排队 + 执行 + join。节律按它退让。
                 // 分开后实测排队开销 ≈0ms（1000 次采样，两者均值同为 26ms）；两个数
                 // 留着，是因为阻塞池一旦真忙起来它们会分开，而节律要跟着退。
+
+                // **方块信息不进会话区**：diff 照常算、照常
+                // 推进记忆——那是给机器用的（寻路读它，`blocks` 工具查它）——但一格
+                // 都不推给模型。
+                //
+                // 逐格推送在数学上走不通：站着转两分钟就能攒几千格，按 10.5 token/格
+                // 折算，半个 1M 窗口只装得下约 4.8 万格。不是优化得好不好的问题。
+                //
+                // 模型要方块就自己 `scan`（睁眼，填记忆）再查记忆库——就像改代码时
+                // 从不加载整个仓库，而是 grep 到行号再读那几行。
                 let dispatched = std::time::Instant::now();
                 let outcome = tokio::task::spawn_blocking(move || {
                     let at = std::time::Instant::now();
@@ -804,76 +809,16 @@ async fn main() -> Result<(), String> {
 
                 // 未连接/世界未就绪等如实拒绝：静默跳过，不是错误。
                 let Ok(absorbed) = absorbed else { continue };
-                // 压缩旗子先收：`request_full_resend` 只置位，真正重投在下面的
-                // `take` 里发生——本轮没进展而提前返回，位也留着不会丢。
+                // 压缩旗子先收：只置位，真正重投在下面的 `compose` 里发生——
+                // 本轮没进展而提前返回，位也留着不会丢。
                 if compacted.swap(false, std::sync::atomic::Ordering::Relaxed) {
                     // 摘要按指令不含世界状态，先前追加的处境也随对话一起没了。
-                    situation.request_full_resend();
+                    frames.resend_situation();
                 }
-                // 在途 job 的进展：多段行走每一程的终点、挖掘每碎一块。
-                //
-                // **只有它触发投递。**处境里的位置走路时每帧都变，让它自己触发就等于
-                // 每 250ms 投一帧：位置单行变化会淹没信箱，模型忙着时一次并进就是
-                // 上万 token 的无意义重复。
                 let snapshot = snapshots.latest();
-
-                // 拾取：世界事件，不受开屏与否管。
-                //
-                // **它搭车，不触发。** 挖矿时在途 job 的进展本来就在触发投递，
-                // 自己捡的东西顺势就出去了；空闲时被人塞了东西则要等下一次
-                // 投递——那属于「空闲唤醒源」（issue #135），这里不替它裁。
-                {
-                    let fresh: Vec<world::PickupEntry> = snapshot
-                        .pickups
-                        .entries
-                        .iter()
-                        .filter(|entry| !pickup_seq.is_some_and(|seen| entry.seq <= seen))
-                        .cloned()
-                        .collect();
-                    if let Some(last) = fresh.last() {
-                        pickup_seq = Some(last.seq);
-                    }
-                    pickup_lines.extend(render::render_pickups(&fresh));
-                    // 攒太多就只留最近的：真到这一步说明久没投递，
-                    // 旧的拾取对「我现在有什么」已经由快捷栏那行代答了。
-                    const PICKUP_BACKLOG: usize = 32;
-                    if pickup_lines.len() > PICKUP_BACKLOG {
-                        let drop = pickup_lines.len() - PICKUP_BACKLOG;
-                        pickup_lines.drain(..drop);
-                    }
-                }
-
-                let mut progress = Vec::new();
-                for entry in &snapshot.jobs.entries {
-                    if progress_seq.is_some_and(|seen| entry.seq <= seen) {
-                        continue;
-                    }
-                    progress_seq = Some(entry.seq);
-                    if !entry.fact.is_terminal() {
-                        progress.push(render::render_job_entry(entry));
-                    }
-                }
-                if progress.is_empty() {
+                let Some(sections) = frames.compose(&snapshot, read_mark.position()) else {
                     continue;
-                }
-
-                // 处境搭这趟车。**取它必须在决定投递之后**——`take` 会立刻推进比对
-                // 基准，先取后放弃就等于把那次差异吞掉，模型再也听不到。
-                let mut sections = situation.take(render::render_situation_lines(
-                    &snapshot,
-                    read_mark.position(),
-                ));
-                sections.append(&mut pickup_lines);
-                sections.extend(progress);
-                // **方块信息不进会话区**：diff 照常算、照常
-                // 推进记忆——那是给机器用的（寻路读它，`blocks` 工具查它）——但一格
-                // 都不推给模型。
-                //
-                // 逐格推送在数学上走不通：站着转两分钟就能攒几千格，按 10.5 token/格
-                // 折算，半个 1M 窗口只装得下约 4.8 万格。不是优化得好不好的问题。
-                //
-                // 模型要方块就自己 `scan`（睁眼，填记忆）再查记忆库——就像改代码时
-                // 从不加载整个仓库，而是 grep 到行号再读那几行。
+                };
                 let text = sections.join("\n");
                 println!(
                     "[组合根] 投递 {} 行（本次看进记忆 {absorbed} 格；投影 {}ms，含排队 {}ms，均值 {}ms，下次间隔 {}ms）",
@@ -884,10 +829,11 @@ async fn main() -> Result<(), String> {
                     pace.next_interval().as_millis()
                 );
                 let item: agent::TranscriptItem = InputMessage::text("user", text).into();
-                // WhenIdle 而非 Passive：世界真的变了就值得叫醒空闲的同伴——
-                // 挖穿、别人动土、熔炉灭火都在这条通道上。忙时它排在轮末，
-                // 天然与进行中的轮合并，不插队。
-                if let Err(rejected) = session.enqueue(MailboxInput::when_idle(vec![item])).await {
+                // 为什么是 `NextModelRequest` 而不是 `WhenIdle`，见 `frame` 的头注释。
+                if let Err(rejected) = session
+                    .enqueue(MailboxInput::next_model_request(vec![item]))
+                    .await
+                {
                     eprintln!("[组合根] 投递被拒：{:?}", rejected.reason);
                 }
             }

@@ -111,7 +111,7 @@ git 依赖、不再是工作区成员，那个示例**跑不到本仓**（`cargo
 | | 死亡期间 | 依据 |
 |---|---|---|
 | 看世界、听声音 | **可以**（`Free` 类照常） | 死亡屏不暂停：`DeathScreen.isPauseScreen()` 恒 false，且多人下 `Minecraft.pause` 的第一道闸 `hasSingleplayerServer()` 本就为 false |
-| 收到别人说话 | **可以**（唤醒与轮末帧照常走） | 聊天 HUD 归 `Gui` 渲染，不经 screen |
+| 收到别人说话 | **可以**（唤醒与帧照常走） | 聊天 HUD 归 `Gui` 渲染，不经 screen |
 | 说话、移动、动手、开屏 | **不可以**（`Body` 类全拦） | `handleKeybinds()` 只在 `screen == null` 时调用，死亡屏是非空 screen |
 | 复活 | **可以**（`Vital` 类不受闸门压制） | 归进 `Body` 就没有出路了 |
 

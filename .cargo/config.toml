@@ -1,0 +1,12 @@
+# SQLite 的数学函数是编译期开关，而 libsqlite3-sys 的 bundled 默认不开——sqrt、
+# floor、ceil、pow、mod 全都不存在。缺 floor 尤其危险：把观察者的小数坐标对回
+# 方块格，CAST 和整除都是向零截断，负坐标上会静默错一格，而负坐标遍地都是。
+#
+# 这是构建期环境变量，没设的话编译照样通过，洞只在模型发出查询时才露出来。哨兵是
+# crates/perception/src/sql.rs 里那条 floor 测试——别拿 sqrt 当哨兵。
+#
+# force：[env] 默认不覆盖 shell 里已有的同名变量，环境里恰好有个陈旧的
+# LIBSQLITE3_FLAGS 就会把这里顶掉（实测会）。这不是给人从环境里拨的旋钮，是本仓库
+# 的正确性前提，所以强制。要加别的编译标志，改这一行。
+[env]
+LIBSQLITE3_FLAGS = { value = "SQLITE_ENABLE_MATH_FUNCTIONS", force = true }

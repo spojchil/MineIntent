@@ -26,6 +26,8 @@ pub trait ViewportDoor: Send + Sync {
 }
 
 mod blocks;
+mod sql;
+mod vtab;
 
 const TOOL_NAME: &str = "scan";
 
@@ -37,6 +39,8 @@ pub struct PerceptionTools {
     /// 「模型知道的事实」，在此吸收。内核的 settled 通道保证已定回执必达，
     /// 所以产出时直接记账即可，不需要请求级 commit 钩子。
     memory: Arc<Mutex<BlockMemory>>,
+    /// 上账要标「第几刻看到的」：这具身体没有「同时」，每条事实自带陈旧度。
+    snapshots: Arc<dyn world::SnapshotSource>,
 }
 
 impl PerceptionTools {
@@ -47,20 +51,22 @@ impl PerceptionTools {
     ) -> Self {
         Self {
             door,
-            blocks: blocks::BlocksQuery::new(memory.clone(), snapshots),
+            blocks: blocks::BlocksQuery::new(memory.clone(), snapshots.clone()),
             memory,
+            snapshots,
         }
     }
 
     fn absorb_projection(&self, projection: &ViewportProjection) {
+        let at_tick = self.snapshots.latest().tick;
         let mut memory = self.memory.lock().expect("方块记忆锁不应中毒");
-        memory.absorb_visible(&projection.visible_blocks.blocks);
+        memory.absorb_visible(&projection.visible_blocks.blocks, at_tick);
         // 脚下与注视方块同样呈现给了模型，一并上账。
         for block in [&projection.standing_on_block, &projection.looked_at_block]
             .into_iter()
             .flatten()
         {
-            memory.absorb_visible(std::slice::from_ref(block));
+            memory.absorb_visible(std::slice::from_ref(block), at_tick);
         }
     }
 
@@ -145,10 +151,11 @@ impl PerceptionTools {
                 };
                 match self.door.scan_directed(positions).await {
                     Ok(projection) => {
+                        let at_tick = self.snapshots.latest().tick;
                         self.memory
                             .lock()
                             .expect("方块记忆锁不应中毒")
-                            .absorb_directed(&projection);
+                            .absorb_directed(&projection, at_tick);
                         ToolResult::success(
                             call_id,
                             vec![agent::ContentPart::text(render::render_directed(
@@ -193,7 +200,7 @@ impl ToolProvider for PerceptionTools {
                 .to_owned(),
         );
         let mut library = ToolDefinition::new(blocks::TOOL_NAME, blocks::schema());
-        library.description = Some(blocks::DESCRIPTION.to_owned());
+        library.description = Some(blocks::description());
         vec![(definition, ToolClass::Free), (library, ToolClass::Free)]
     }
 
