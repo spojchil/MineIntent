@@ -72,7 +72,7 @@ impl Plugin for MachineShutdownPlugin {
 }
 
 fn emit_app_exit_when_stopping(mut app_exit: MessageWriter<AppExit>, state: Res<SwarmState>) {
-    if state.inner.stopping.load(Ordering::Acquire) {
+    if state.inner.is_stopping() {
         app_exit.write(AppExit::Success);
     }
 }
@@ -139,18 +139,19 @@ pub(super) async fn run_swarm(inner: Arc<Inner>, config: ConnectionConfig) {
 async fn handle_swarm(_swarm: Swarm, event: SwarmEvent, state: SwarmState) {
     if let SwarmEvent::Disconnect(_account, _join_opts, _token) = event {
         // 重连政策 Never：断线是要保持的事实，不是要修复的故障。
-        if !state.inner.stopping.load(Ordering::Acquire) {
+        state.inner.end_running_jobs();
+        if !state.inner.is_stopping() {
             state.inner.publish_phase(ConnectionPhase::Disconnected {
                 reason: "与服务器的连接已断开".to_owned(),
             });
         }
-        state.inner.fail_all_pending_chat("连接已断开");
+        state.inner.fail_all_pending_commands("连接已断开");
     }
 }
 
 async fn handle_client(bot: Client, event: Event, state: BotState) {
     let inner = &state.inner;
-    if inner.stopping.load(Ordering::Acquire) {
+    if inner.is_stopping() {
         return;
     }
     match event {
@@ -299,12 +300,13 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             _ => {}
         },
         Event::Disconnect(reason) => {
+            inner.end_running_jobs();
             inner.publish_phase(ConnectionPhase::Disconnected {
                 reason: reason
                     .map(|text| text.to_string())
                     .unwrap_or_else(|| "与服务器的连接已断开".to_owned()),
             });
-            inner.fail_all_pending_chat("连接已断开");
+            inner.fail_all_pending_commands("连接已断开");
         }
         Event::Tick => {
             inner.tick.fetch_add(1, Ordering::AcqRel);

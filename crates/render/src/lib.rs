@@ -696,70 +696,6 @@ pub fn render_viewport(projection: &world::ViewportProjection) -> String {
     lines.join("\n")
 }
 
-/// 记忆库查询结果的呈现。
-///
-/// **只给方块事实**：挑选、聚合、坐标、方位距离归机器；「这是悬崖」「那片林子」
-/// 那类解释归模型——机器产出解释，本质是替模型下结论。
-///
-/// `matches` 要按距离从近到远给好；同标签聚合成一组，报数量与最近的那一处。
-pub fn render_memory_matches(origin: [i32; 3], matches: &[([i32; 3], String)]) -> String {
-    if matches.is_empty() {
-        return "记忆里没有符合的方块。".to_owned();
-    }
-    let mut groups: Vec<(String, usize, [i32; 3])> = Vec::new();
-    for (at, label) in matches {
-        match groups.iter_mut().find(|(seen, ..)| seen == label) {
-            Some((_, count, _)) => *count += 1,
-            None => groups.push((label.clone(), 1, *at)),
-        }
-    }
-    let described: Vec<String> = groups
-        .into_iter()
-        .map(|(label, count, at)| {
-            let [x, y, z] = at;
-            let where_ = format!(
-                "{x},{y},{z}，{} 格·{}",
-                block_distance(origin, at).round() as i64,
-                compass_from_delta(x - origin[0], z - origin[2])
-            );
-            if count > 1 {
-                format!("{label} ×{count}（最近 {where_}）")
-            } else {
-                format!("{label}（{where_}）")
-            }
-        })
-        .collect();
-    described.join("；")
-}
-
-fn block_distance(a: [i32; 3], b: [i32; 3]) -> f64 {
-    let (dx, dy, dz) = (
-        f64::from(b[0] - a[0]),
-        f64::from(b[1] - a[1]),
-        f64::from(b[2] - a[2]),
-    );
-    (dx * dx + dy * dy + dz * dz).sqrt()
-}
-
-/// 八向方位。x 东正、z 南正（原版坐标系）。
-fn compass_from_delta(dx: i32, dz: i32) -> &'static str {
-    if dx == 0 && dz == 0 {
-        return "就在脚下";
-    }
-    let angle = f64::from(dx).atan2(-f64::from(dz)).to_degrees();
-    let normalized = (angle + 360.0) % 360.0;
-    match ((normalized + 22.5) / 45.0) as usize % 8 {
-        0 => "北",
-        1 => "东北",
-        2 => "东",
-        3 => "东南",
-        4 => "南",
-        5 => "西南",
-        6 => "西",
-        _ => "西北",
-    }
-}
-
 /// 增量查看结果的呈现：git 式 diff——只说变了什么，不说没变的。
 ///
 /// 基线是记忆整体，不是「上一次报告」——比较不带时间性。每行是一个
@@ -886,12 +822,34 @@ pub fn render_job_entry(entry: &world::JobEntry) -> String {
             }
             world::MoveEvent::Arrived => format!("你到达了目的地 ({x}, {y}, {z})。"),
             world::MoveEvent::PathEnded => {
-                format!("你没能到达 ({x}, {y}, {z})——路走到了尽头，目的地过不去。")
+                format!("去 ({x}, {y}, {z}) 的这段寻路停了，但你没有到达；机器没有足够证据说明是哪里过不去。")
             }
+            world::MoveEvent::DestinationRejected { at: [ax, ay, az] } => format!(
+                "你停在 ({ax}, {ay}, {az})：目的地 ({x}, {y}, {z}) 这一格最后观察到的状态不被当前自动寻路规则接受为精确身体节点（可能是实心或危险格）。请改给一个寻路器接受的身体格。"
+            ),
+            world::MoveEvent::NavigationLimitReached {
+                at: [ax, ay, az],
+                plans,
+                travelled,
+            } => format!(
+                "你停在 ({ax}, {ay}, {az})：前往 ({x}, {y}, {z}) 的本次战争迷雾导航达到机器工作上限（规划 {plans} 段、累计移动 {travelled} 格）。你没有精确到达；这不证明目的地不可达。"
+            ),
+            world::MoveEvent::DispatchNotObserved {
+                at: [ax, ay, az],
+                ticks,
+            } => format!(
+                "你停在 ({ax}, {ay}, {az})：前往 ({x}, {y}, {z}) 的请求在 Azalea 队列里等待了 {ticks} tick，listener 一直没有接单。机器按调度故障收束；这不是无路可走的结论。"
+            ),
+            world::MoveEvent::NoBodyProgressLimitReached {
+                at: [ax, ay, az],
+                ticks,
+            } => format!(
+                "你停在 ({ax}, {ay}, {az})：前往 ({x}, {y}, {z}) 的导航仍活跃，但身体连续 {ticks} tick 没有换格，达到机器的物理推进边界。这不证明目的地不可达。"
+            ),
             world::MoveEvent::Replaced => "先前的移动被新的目标顶替了。".to_owned(),
             world::MoveEvent::Cancelled => "你停下了移动。".to_owned(),
-            world::MoveEvent::TimedOut => format!(
-                "去 ({x}, {y}, {z}) 这件事没了下文，机器把它收了——既没到达也没报错，多半是哪里卡住了。"
+            world::MoveEvent::ConnectionEnded => format!(
+                "前往 ({x}, {y}, {z}) 期间连接结束了，移动任务随连接收束；没有到达结论。"
             ),
         },
         world::JobFact::Mine {
@@ -907,7 +865,29 @@ pub fn render_job_entry(entry: &world::JobEntry) -> String {
                 ),
                 world::MineEvent::Cleared => format!("你挖完了这一串 {total} 块方块。"),
                 world::MineEvent::Blocked { at: [x, y, z] } => format!(
-                    "挖到第 {} 块就卡住了：({x}, {y}, {z}) 迟迟不碎——多半是够不着、被挡住，或者手上的工具挖不动它。前面 {done} 块已经挖掉了。",
+                    "挖到第 {} 块就停下了：({x}, {y}, {z}) 仍是实心，但底层挖掘进度连续没有增长；可能是交互被拒绝、够不着，或手上的工具无法产生进度。前面 {done} 块已经挖掉了。",
+                    done + 1
+                ),
+                world::MineEvent::DispatchNotObserved {
+                    at: [x, y, z],
+                    ticks,
+                } => format!(
+                    "挖第 {} 块的请求在 Azalea 队列里等待了 {ticks} tick，调度链始终没有进入 ({x}, {y}, {z}) 的活跃挖掘。机器按调度故障收束；这不是方块挖不动的结论。前面 {done} 块已经挖掉了。",
+                    done + 1
+                ),
+                world::MineEvent::RequestEnded { at: [x, y, z] } => format!(
+                    "挖第 {} 块的请求曾经排队，随后在进入 ({x}, {y}, {z}) 的活跃挖掘前结束。底层没有提供更细原因；机器没有把它说成够不着或工具挖不动。前面 {done} 块已经挖掉了。",
+                    done + 1
+                ),
+                world::MineEvent::PredictionNotSettled {
+                    at: [x, y, z],
+                    ticks,
+                } => format!(
+                    "挖第 {} 块后，对 ({x}, {y}, {z}) 的本地方块预测等待了 {ticks} tick，仍没有得到服务端确认或回滚。机器按协议确认悬挂收束；这既不是挖掘成功，也不是方块不可挖的结论。前面 {done} 块已经挖掉了。",
+                    done + 1
+                ),
+                world::MineEvent::TargetUnavailable { at: [x, y, z] } => format!(
+                    "挖到第 {} 块时，当前世界模型读不到 ({x}, {y}, {z})（例如区块尚未加载或坐标在世界高度外）。机器没有猜它是实心或空气，队列已停；前面 {done} 块已经挖掉了。",
                     done + 1
                 ),
                 world::MineEvent::Replaced => {
@@ -916,8 +896,8 @@ pub fn render_job_entry(entry: &world::JobEntry) -> String {
                 world::MineEvent::Cancelled => {
                     format!("你停下了挖掘（已挖掉 {done}/{total} 块）。")
                 }
-                world::MineEvent::TimedOut => format!(
-                    "这串挖掘没了下文，机器把它收了（已挖掉 {done}/{total} 块）——既没挖完也没报卡住。"
+                world::MineEvent::ConnectionEnded => format!(
+                    "挖掘期间连接结束了，任务随连接收束（已挖掉 {done}/{total} 块）。"
                 ),
             }
         }

@@ -32,6 +32,48 @@ cargo test -p render -p context -p dispatch          # 纯函数与策略层
 （`machine/state.rs`）与移动判定表（`machine/movement.rs`）都能脱离 azalea 跑。
 这不是可选项——它是「纯状态转换可单测」这条设计的验收方式。
 
+### 战争迷雾 `go_to`
+
+先在 Azalea fork 的 pinned revision 跑底层生命周期检查：
+
+```sh
+cargo test -p azalea --lib --no-fail-fast
+cargo test -p azalea --doc --no-fail-fast
+cargo clippy -p azalea --lib --tests -- -D warnings
+```
+
+它们覆盖 calculation generation、stop、partial/no-retry 收尾、空执行组件、换世界、
+未知方块 fallback 与极端坐标启发式。MineIntent 的 workspace 不会运行 git 依赖自己的
+单测，因此这组证据不能省略。
+
+再跑本仓的高层状态与契约检查：
+
+```sh
+cargo test -p world --features azalea machine::
+cargo test -p render
+cargo clippy -p world -p render --features world/azalea --all-targets -- -D warnings
+```
+
+它们分别钉住：未知格不进入执行图、最后所见而非离屏实时状态、冻结图一致性、
+Direct/Survey/Frontier 转移、排队 Goto 的本地租约、执行期观察源刷新、A↔B 循环的
+有限工作预算，以及各终局的诚实呈现。它们**不证明**真实 Minecraft 物理下能到达目标。
+
+实服使用生产状态机探针：
+
+```sh
+cargo run --release -p world --features azalea --example fog_goto_probe -- \
+  <host> <port> <username> <dx> <dy> <dz> 180
+```
+
+验收至少分两种场景：一项使用受控平地上可站立的精确身体格，要求 `Arrived`；另一项
+把目标放在首帧视野之外，要求日志出现 Survey/Frontier 链，并在 `Arrived`、
+`DestinationRejected`、`PathEnded`、`NavigationLimitReached`、
+`DispatchNotObserved`、`NoBodyProgressLimitReached` 或 `ConnectionEnded` 中给出
+一条真实终局。终局后探针继续逐 tick 观察 5 秒，必须 `in_flight=0` 且身体格不再移动；
+这是实服交叉证据，Azalea goal/计算/执行组件的严格 retirement 由 fork 生命周期单测
+直接证明。自然地形上“保持同 y 的相对坐标”可能本来就没有可站 stance，不能拿它单独
+充当到达验收。`go_to` 当前是精确身体格；near/reach 仍是 Issue #139 的待决产品语义。
+
 > 内核（依赖键 `agent`，本体是 [midturn](https://github.com/spojchil/midturn)）
 > 自 2026-08-16 起是 git 依赖，**不再是工作区成员**：`cargo test -p agent` 与
 > `cargo test -p midturn` 都跑不了（后者会报「requires dev-dependencies and is
@@ -203,7 +245,8 @@ MINUTES=30 MINEINTENT_ACCEPT_EULA=1 bash long-run.sh
 `i32::MIN`，第一次必然重发；之后一格抖动就再重发，**中间一声不吭**。模型发完
 `go_to` 就永远等着。终局统计 `到达 ×4 / 没能到达 **×0**`，而 08-18 那跑两者都有。
 
-**未修**（2026-08-19 记）。
+当前实现不再按“一格位移”静默重发同一个目标；现行状态机与复验入口见本页顶部
+“战争迷雾 `go_to`”。
 
 ### 观测盲区：投递给模型的内容不进轨迹
 
@@ -524,8 +567,10 @@ usage: input 284,278（其中缓存 275,968）
 
 ### 账五：寻路对不可达目标空转
 
-`No best node found` + `empty path` 每约 120ms 一次，全程数千次（目标高出 18
-格、不可达）。合法寻路本身正常（记忆增长后能规划），问题在不可达时不收敛。
+当前实现使用 fork 的 `recalculate_partial_paths(false)` 关闭 partial continuation，
+同时用 `retry_on_no_path(false)` 关闭无路自动重试；Direct/Survey/Frontier 状态机按
+冻结观察图接管重规划，并用有限导航工作预算保证开放世界中的循环最终给出诚实终局。
+现行复验入口见本页顶部“战争迷雾 `go_to`”。
 
 ### 本跑留档
 

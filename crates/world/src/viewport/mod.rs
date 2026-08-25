@@ -259,10 +259,12 @@ pub struct ViewportPose {
     pub pitch_degrees: f64,
 }
 
-/// 交给读方的方块事实：名字 + 全部原始属性。挑哪些属性示人归渲染层。
+/// 交给读方的方块事实。`state_id` 是这次观察到的注册表状态；名字与属性负责
+/// 呈现，它负责让动作规划忠于最后所见的碰撞体，而不是离屏偷读 live world。
 #[derive(Clone, Debug, PartialEq)]
 pub struct ViewportBlock {
     pub name: String,
+    pub state_id: u32,
     pub properties: std::collections::BTreeMap<String, String>,
     pub position: [i32; 3],
 }
@@ -358,6 +360,7 @@ pub struct DirectedOccluder {
 pub struct DirectedSeenBlock {
     pub at: [i32; 3],
     pub name: String,
+    pub state_id: u32,
     pub properties: std::collections::BTreeMap<String, String>,
 }
 
@@ -569,6 +572,7 @@ where
             &mut reader,
             eye,
             &visible_blocks.blocks,
+            looked_at_block.as_ref(),
             space,
             &mut checkpoint,
         )?;
@@ -711,7 +715,7 @@ where
         // 使「同一个不可变值在两次 match 之间不变」的不变量无需被相信。
         let (target_identity, target_visible) = match &target_result {
             BlockReadResult::Loaded { block } => {
-                let identity = (block.name.clone(), block.properties.clone());
+                let identity = (block.name.clone(), block.state_id, block.properties.clone());
                 let visible = is_visible_candidate(
                     &mut reader,
                     eye,
@@ -736,10 +740,11 @@ where
         };
 
         if target_visible {
-            let (name, properties) = target_identity.expect("已加载目标必有方块身份");
+            let (name, state_id, properties) = target_identity.expect("已加载目标必有方块身份");
             seen.push(DirectedSeenBlock {
                 at: [x, y, z],
                 name,
+                state_id,
                 properties,
             });
             continue;
@@ -769,10 +774,11 @@ where
         }
 
         if why.is_empty() {
-            let (name, properties) = target_identity.expect("已加载目标必有方块身份");
+            let (name, state_id, properties) = target_identity.expect("已加载目标必有方块身份");
             seen.push(DirectedSeenBlock {
                 at: [x, y, z],
                 name,
+                state_id,
                 properties,
             });
         } else {
@@ -985,6 +991,7 @@ where
     Ok(match reader.full(position.clone()) {
         BlockReadResult::Loaded { block } if !is_air_name(&block.name) => Some(ViewportBlock {
             name: block.name,
+            state_id: block.state_id,
             properties: block.properties,
             position: [position.x, position.y, position.z],
         }),
@@ -1056,6 +1063,7 @@ where
         // 注视的方块要交给读方，这里才付完整 DTO 的钱——一次投影一次。
         BlockReadResult::Loaded { block } => Some(ViewportBlock {
             name: block.name,
+            state_id: block.state_id,
             properties: block.properties,
             position: [voxel.x, voxel.y, voxel.z],
         }),
@@ -1179,6 +1187,7 @@ where
         };
         blocks.push(ViewportBlock {
             name: block.name,
+            state_id: block.state_id,
             properties: block.properties,
             position: [position.x, position.y, position.z],
         });
@@ -1465,14 +1474,15 @@ where
 /// 因此永远不会多标。可见性本身是由暴露面射线定的（射向面，不是射向中心），
 /// 中心线可能被挡；被挡就在挡住的地方停下，这一支自然什么都不标。
 ///
-/// 少标的地方有两处，都是有意的保守：射线尽头没有可见面的方向（看天）不在
-/// 本趟之内；玻璃、水、树叶这类**透光但非空气**的格会让步进停下，它们身后
-/// 的空不被标记。少标的后果是「还没看过」，多标的后果是让同伴知道它没看过的
-/// 事——两者不对等。
+/// 开放方向由准星的 AIR 终点补一条射线，因此看天或空走廊也能学习自由空间。
+/// 仍有意保守的一处是玻璃、水、树叶这类**透光但非空气**的格会让步进停下，
+/// 它们身后的空不被标记。少标的后果是「还没看过」，多标的后果是让同伴知道
+/// 它没看过的事——两者不对等。
 fn observe_free_space<P, F, C>(
     reader: &mut WorldReader<P, F>,
     eye: Point3,
     blocks: &[ViewportBlock],
+    looked_at: Option<&ViewportBlock>,
     space: &mut ObservedSpace,
     checkpoint: &mut C,
 ) -> Result<(), ViewportError>
@@ -1481,7 +1491,9 @@ where
     F: FnMut(BlockPosition) -> BlockReadResult,
     C: FnMut() -> Result<(), ViewportError>,
 {
-    for block in blocks {
+    // 准星射线也必须上账。开放方向的终点常是 AIR，不会出现在 visible_blocks；
+    // 没有这条射线，“看向空地/天空”反而一格自由空间都学不到。
+    for block in blocks.iter().chain(looked_at) {
         checkpoint()?;
         let center = Point3 {
             x: f64::from(block.position[0]) + 0.5,

@@ -13,7 +13,7 @@ use azalea::core::direction::Direction;
 use azalea::entity::{LoadedBy, LookDirection, Position};
 use azalea::inventory::operations::{ClickOperation, PickupClick, SwapClick, ThrowClick};
 use azalea::pathfinder::goals::BlockPosGoal;
-use azalea::pathfinder::{PathfinderClientExt, PathfinderOpts};
+use azalea::pathfinder::{player_pos_to_block_pos, PathfinderClientExt, PathfinderOpts};
 use azalea::protocol::packets::game::s_interact::InteractionHand;
 use azalea::protocol::packets::game::s_player_action;
 use azalea::protocol::packets::game::s_use_item_on::{BlockHit, ServerboundUseItemOn};
@@ -95,16 +95,26 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             bot.chat(&line);
             Ok(())
         }
-        DoorCommand::GoTo([x, y, z]) => {
-            let destination = [x.floor() as i32, y.floor() as i32, z.floor() as i32];
-            inner.movement_job.begin(
-                inner,
-                super::movement::MovementJob::new(destination, inner.now_tick()),
-            );
+        DoorCommand::GoTo(target) => {
+            let destination = block_destination(target)?;
+            // 目标是**身体要站进去的那一格**，不是脚下踩的那块方块。
+            // 精确目标的 `success(n) = (n == 目标)` 要求身体恰好占住
+            // 那一格，而后继函数只生成自动寻路接受的身体节点——stone 之类的实心格
+            // 永远不会被生成。所以点在一块方块上的 go_to 是个 A* 永远到不了的点：它会返回空路径，
+            // 默认的 `retry_on_no_path` 又把 goal 留着，于是每 tick 重算一次，一直空转。
+            //
+            // 在这里当场拒掉，而不是让它去跑一趟：跑一趟的结局是「路走到了尽头」，
+            // 那句话对模型毫无用处——它会以为走路工具坏了（实盘里它就是这么想的，
+            // 还发到了公屏上）。
+            if let Some(blocking) = remembered_rejected_stance(inner, destination) {
+                let [bx, by, bz] = destination;
+                return Err(format!(
+                    "({bx}, {by}, {bz}) 那一格最后观察为 {blocking}，当前自动寻路规则不接受它作为精确身体节点。go_to 的目标是你要**站进去**的那一格，不是你看到的地面方块——站的位置在地面方块**上面**一格。"
+                ));
+            }
             // 禁止寻路器隐式挖方块：挖掘是模型的显式动作（hand mine），
             // 不是移动的副作用——实测它会把作为目的地的工作台整个挖掉。
-            begin_goto(bot, destination);
-            Ok(())
+            start_movement_job(inner, bot, destination)
         }
         DoorCommand::Forward(blocks) => {
             // 直走化归为寻路目标：终止条件（到达/受阻）交给寻路器。
@@ -120,24 +130,33 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             // 原版视向量水平分量：x=−sin(yaw)、z=+cos(yaw)（yaw 0=南+z）。
             // z 若取反，「前进」会走成后退。
             let target = BlockPos::new(
-                (position.0 + (-yaw.sin()) * blocks).floor() as i32,
-                position.1.floor() as i32,
-                (position.2 + yaw.cos() * blocks).floor() as i32,
+                floor_block_coordinate(position.0 + (-yaw.sin()) * blocks, "x")?,
+                // 与 Azalea A* 的起点口径一致；半砖、雪层等非完整方块不能直接
+                // 用 position.y.floor()。
+                player_pos_to_block_pos(azalea::Vec3 {
+                    x: position.0,
+                    y: position.1,
+                    z: position.2,
+                })
+                .y,
+                floor_block_coordinate(position.2 + yaw.cos() * blocks, "z")?,
             );
-            inner.movement_job.begin(
-                inner,
-                super::movement::MovementJob::new([target.x, target.y, target.z], inner.now_tick()),
-            );
-            bot.start_goto_with_opts(
-                BlockPosGoal(target),
-                PathfinderOpts::new().allow_mining(false),
-            );
-            Ok(())
+            // 同 go_to 的理由。`forward` 更容易撞上：它算出的目标固定在**当前
+            // 这一层** y，地形一有坡度就落进山体或悬在空中。实盘里 `forward 3`
+            // 算出的那一格是 stone，吃了 52 次空路径。
+            if let Some(blocking) =
+                remembered_rejected_stance(inner, [target.x, target.y, target.z])
+            {
+                return Err(format!(
+                    "朝前 {blocks} 格落在 ({}, {}, {})，那一格最后观察为 {blocking}，当前自动寻路规则不接受它作为身体节点——前面可能是障碍、危险状态或地势起伏（forward 只在当前这一层平着走）。",
+                    target.x, target.y, target.z
+                ));
+            }
+            start_movement_job(inner, bot, [target.x, target.y, target.z])
         }
         DoorCommand::StopMoving => {
             inner.movement_job.cancel(inner);
-            bot.stop_pathfinding();
-            bot.walk(WalkDirection::None);
+            bot.force_retire_pathfinding();
             Ok(())
         }
         DoorCommand::Jump => {
@@ -209,14 +228,20 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
         DoorCommand::ReleaseHand => {
             // 停挖要发真事件（AbortDestroyBlock 由它触发）。旧实现调的
             // left_click_mine(false) 只摘「自动挖准星」组件——从未装过，
-            // 等于停不掉挖掘。守卫：azalea 的停挖处理器在没挖时会 panic
-            // （MineBlockPos 内层 expect），只有真在挖才发。
-            if bot.get_component::<azalea::mining::Mining>().is_some() {
-                bot.ecs
-                    .write()
-                    .write_message(azalea::mining::StopMiningBlockEvent { entity: bot.entity });
+            // 等于停不掉挖掘。同步排队 API 还要求在同一把锁里摘掉 MiningQueued，
+            // 否则 release 早于下一 tick 时，已经取消的请求仍会开始挖。
+            {
+                let mut ecs = bot.ecs.write();
+                let is_mining = ecs.get::<azalea::mining::Mining>(bot.entity).is_some();
+                ecs.entity_mut(bot.entity)
+                    .remove::<azalea::mining::MiningQueued>();
+                // 守卫：Azalea 的停挖处理器在没挖时会 panic（MineBlockPos 内层
+                // expect），只有真在挖才发。
+                if is_mining {
+                    ecs.write_message(azalea::mining::StopMiningBlockEvent { entity: bot.entity });
+                }
             }
-            // 队列也要收：不收的话轮询会不停重发 start_mining，release 等于没停。
+            // MineIntent 的意图队列也要收；否则轮询仍会尝试自愈。
             inner.mining_job.cancel(inner);
             bot.write_packet(s_player_action::ServerboundPlayerAction {
                 action: s_player_action::Action::ReleaseUseItem,
@@ -356,6 +381,28 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             Ok(())
         }
     }
+}
+
+/// Minecraft 方块坐标的有符号 32 位边界。Rust 的浮点转整数会静默饱和；在这里
+/// 显式拒绝，避免一个超范围意图被悄悄改写成世界边缘的另一个目标。
+fn floor_block_coordinate(value: f64, axis: &str) -> Result<i32, String> {
+    let floored = value.floor();
+    if !floored.is_finite() || floored < f64::from(i32::MIN) || floored > f64::from(i32::MAX) {
+        return Err(format!(
+            "目标 {axis}={value} 超出可执行的方块坐标范围 {}..={}",
+            i32::MIN,
+            i32::MAX
+        ));
+    }
+    Ok(floored as i32)
+}
+
+fn block_destination([x, y, z]: [f64; 3]) -> Result<[i32; 3], String> {
+    Ok([
+        floor_block_coordinate(x, "x")?,
+        floor_block_coordinate(y, "y")?,
+        floor_block_coordinate(z, "z")?,
+    ])
 }
 
 /// 三连包中转用的快捷栏按钮（0-8 任选；轮换必复位，不要求为空）。
@@ -813,11 +860,57 @@ pub(super) fn place_block(inner: &Inner, bot: &Client, [x, y, z]: [i32; 3]) -> R
 /// 不是移动的副作用——实测它会把作为目的地的工作台整个挖掉。
 ///
 /// 多段行走每一程都经这里重发，所以口径只有一处。
+/// 记忆里的状态会被当前自动寻路拒绝为身体节点吗。没开合法寻路、或记忆里没有
+/// 这一格，一律 `None`。
+///
+/// 「记忆里没有」包含两种：没看过，和看过是空的。两者都不该拒绝——前者我们
+/// 没资格说，后者本来就通得过。
+fn remembered_rejected_stance(inner: &Inner, [x, y, z]: [i32; 3]) -> Option<String> {
+    inner
+        .observed
+        .lock()
+        .clone()?
+        .rejected_stance_at(BlockPos::new(x, y, z))
+}
+
 pub(super) fn begin_goto(bot: &Client, [x, y, z]: [i32; 3]) {
     bot.start_goto_with_opts(
         BlockPosGoal(BlockPos::new(x, y, z)),
-        PathfinderOpts::new().allow_mining(false),
+        PathfinderOpts::new()
+            .allow_mining(false)
+            .retry_on_no_path(false)
+            .recalculate_partial_paths(false),
     );
+}
+
+/// 接受一个新的移动意图。先同步退休旧一代，再开 job，避免旧组件在同 tick 被
+/// 新 job 认领。已经站在目标时不投递 GotoEvent；本 tick 的统一轮询会直接落
+/// Arrived，也就没有一个稍后才被消费、可能把已结束任务复活的消息。
+fn start_movement_job(inner: &Inner, bot: &Client, destination: [i32; 3]) -> Result<(), String> {
+    let current = bot
+        .try_query_self::<&Position, _>(|position| player_pos_to_block_pos(**position))
+        .map_err(|_| "读不到自身位置，不能启动移动任务".to_owned())?;
+    let already_there = [current.x, current.y, current.z] == destination;
+
+    bot.force_retire_pathfinding();
+    // 计划 key、FrontierGoal 与实际 BlockSource 必须来自同一份冻结快照；活眼睛
+    // 可以继续写主记忆，但不会让正在跑的 A* 混入另一个版本。
+    let observed = inner.observed.lock().clone();
+    let planning = observed.as_ref().and_then(|source| source.snapshot());
+    if let (Some(source), Some(snapshot)) = (&observed, &planning) {
+        source.freeze(snapshot);
+    }
+    let job = super::movement::MovementJob::new(
+        destination,
+        inner.now_tick(),
+        current,
+        planning.as_ref().map(|snapshot| snapshot.key()),
+    );
+    inner.movement_job.begin(inner, job);
+    if !already_there {
+        begin_goto(bot, destination);
+    }
+    Ok(())
 }
 
 pub(super) fn begin_mining(bot: &Client, [x, y, z]: [i32; 3]) {
@@ -834,6 +927,14 @@ pub(super) fn block_is_air(inner: &Inner, at: [i32; 3]) -> Result<bool, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_destination_rejects_huge_finite_coordinates_instead_of_saturating() {
+        assert_eq!(block_destination([1.9, -1.1, 3.0]), Ok([1, -2, 3]));
+        assert!(block_destination([1.0e300, 64.0, 0.0]).is_err());
+        assert!(block_destination([0.0, -1.0e300, 0.0]).is_err());
+        assert!(block_destination([0.0, 64.0, f64::NAN]).is_err());
+    }
 
     fn crafting_menu_geometry() -> MenuGeometry {
         // 工作台屏：0 成品、1-9 摆料、10-36 主背包、37-45 快捷栏、无副手。

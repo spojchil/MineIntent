@@ -11,9 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
-use std::sync::atomic::Ordering;
-use tokio::sync::oneshot;
+use tokio::sync::watch;
 
 use crate::{ConnectionPhase, SnapshotSource, TickSnapshot};
 
@@ -24,6 +22,7 @@ mod door;
 mod job;
 mod mining;
 mod movement;
+mod navigation;
 pub mod observed;
 mod state;
 
@@ -46,16 +45,25 @@ const PICKUP_WINDOW_ENTRIES: usize = 64;
 const SOUND_WINDOW_ENTRIES: usize = 256;
 /// 屏开/关事实窗条目上限。开关稀疏，小窗足矣。
 const SCREEN_WINDOW_ENTRIES: usize = 16;
-/// 移动 job 起步宽限：下令后寻路器要过几个调度周期才可见（GotoEvent 是
-/// Bevy 消息，跨 schedule 投递）；宽限内不判终局。
-const MOVEMENT_ARM_GRACE_TICKS: u64 = 100;
-/// 卡住通知阈值：与 azalea 自己的补路超时同量级（它 3–7 秒就会自救，
-/// 超过 10 秒还没推进说明自救也没起色，值得让模型知道）。
-const MOVEMENT_STALL_TICKS: usize = 200;
+/// stamped Goto 已同步进入 Azalea 队列后，listener 消费它的最大 tick 数。fork 的
+/// `queued_goto_id` 是稳定事实，越界会明确报调度未接单，不冒充普通无路可走。
+const MOVEMENT_DISPATCH_TIMEOUT_TICKS: u64 = 100;
+/// 身体格连续不推进多久后发一次 Stalled 诊断。只读真实身体，不读会被局部 patch
+/// 重置的内部 node 计数。
+const MOVEMENT_STALL_TICKS: u64 = 200;
+/// 活跃导航连续没有真实身体换格的产品资源边界。新腿、重规划和 Leg 文案都不能刷新；
+/// 命中时单独报告物理无进展，不把它伪装成寻路结果或笼统超时。
+const MOVEMENT_NO_BODY_PROGRESS_TICKS: u64 = MOVEMENT_STALL_TICKS * 6;
 
-/// 一块挖不碎的时限。徒手挖石头约 15 秒（300 tick）是原版量级；取 400 tick
-/// 留足余量——超过它仍不碎，多半是够不着、被挡或工具不对，不是慢。
-const MINING_STALL_TICKS: u64 = 400;
+/// 同步写入的 `MiningQueued` 等待 Azalea GameTick 消费的最大 tick 数。命中说明
+/// 调度链没有接单，不是方块挖不动。
+const MINING_DISPATCH_TIMEOUT_TICKS: u64 = 100;
+/// 本地方块预测等待服务端确认的最大 tick 数。它约束的是协议确认悬挂，不能与
+/// `MineProgress` 停滞混为一谈。
+const MINING_PREDICTION_SETTLE_TIMEOUT_TICKS: u64 = 400;
+/// 同一目标的 `MineProgress` 连续多久没有严格增长，才判挖掘没有产生进展。
+/// 这是无进展窗口，不是总工期：再慢的方块只要进度仍在增长，就不会被时间误杀。
+const MINING_NO_PROGRESS_TICKS: u64 = 400;
 
 /// 连接配置。v1 只有离线身份、重连固定 Never。
 #[derive(Clone, Debug)]
@@ -89,7 +97,8 @@ impl ConnectionConfig {
 /// 接入模块：一次连接的所有权句柄。
 pub struct Module {
     inner: Arc<Inner>,
-    done: Mutex<Option<oneshot::Receiver<()>>>,
+    /// 可克隆的完成事实：重复或并发 stop 都必须等同一个 machine-thread 终局。
+    done: watch::Receiver<bool>,
 }
 
 impl Module {
@@ -98,7 +107,7 @@ impl Module {
         config.validate()?;
         let inner = Arc::new(Inner::new());
         let thread_inner = inner.clone();
-        let (done_tx, done_rx) = oneshot::channel();
+        let (done_tx, done_rx) = watch::channel(false);
         std::thread::Builder::new()
             .name("world-machine".to_owned())
             .spawn(move || {
@@ -108,13 +117,28 @@ impl Module {
                     .expect("接入机器线程的 tokio runtime 构建失败");
                 let local = tokio::task::LocalSet::new();
                 local.block_on(&runtime, run_swarm(thread_inner.clone(), config));
-                thread_inner.fail_all_pending_chat("连接已结束");
-                let _ = done_tx.send(());
+                // 完成事实必须晚于 LocalSet/runtime 析构；否则 stop 可能已经返回 Ok，
+                // Azalea 的残留任务却仍在 teardown（甚至卡在已知的上游死锁）。
+                drop(local);
+                drop(runtime);
+                thread_inner.end_running_jobs();
+                if !thread_inner.is_stopping()
+                    && !matches!(
+                        &thread_inner.latest.read().phase,
+                        ConnectionPhase::Disconnected { .. }
+                    )
+                {
+                    thread_inner.publish_phase(ConnectionPhase::Disconnected {
+                        reason: "连接执行流已经结束".to_owned(),
+                    });
+                }
+                thread_inner.fail_all_pending_commands("连接已结束");
+                done_tx.send_replace(true);
             })
             .map_err(|error| format!("接入机器线程启动失败：{error}"))?;
         Ok(Self {
             inner,
-            done: Mutex::new(Some(done_rx)),
+            done: done_rx,
         })
     }
 
@@ -123,6 +147,9 @@ impl Module {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut ticked = self.inner.ticked_tx.subscribe();
         loop {
+            if self.inner.is_stopping() {
+                return Err("连接正在停止".to_owned());
+            }
             match &self.inner.latest.read().phase {
                 ConnectionPhase::Ready => return Ok(()),
                 ConnectionPhase::Disconnected { reason } => {
@@ -146,20 +173,28 @@ impl Module {
 
     /// 停止：断开连接、合流机器线程。完成 = 无活执行流。
     pub async fn stop(&self, reason: &str) -> Result<(), String> {
-        self.inner.stopping.store(true, Ordering::Release);
-        self.inner.shutdown.notify_waiters();
-        self.inner.publish_phase(ConnectionPhase::Stopped {
-            reason: reason.to_owned(),
-        });
-        // 停机标志先行，再排空：入队与排空同锁，晚到的入队看得见标志。
-        self.inner.fail_all_pending_chat("正在停机");
-        let Some(done) = self.done.lock().take() else {
-            return Ok(());
-        };
-        match tokio::time::timeout(Duration::from_secs(10), done).await {
-            Ok(_) => Ok(()),
-            Err(_) => Err("接入机器线程 10 秒内未合流".to_owned()),
+        // 外线程只请求，不清 JobSlot、不触 ECS。已经被 owner thread 领取的命令/tick
+        // 先完成；thread teardown 才是 stop 的线性化点。
+        self.inner.request_stop(reason);
+        // notify_one 会保存 permit，覆盖 stop 早于 run_swarm 建立 waiter 的启动窗口。
+        self.inner.shutdown.notify_one();
+        self.inner.fail_all_pending_commands("正在停机");
+
+        let mut done = self.done.clone();
+        if !*done.borrow() {
+            match tokio::time::timeout(Duration::from_secs(10), done.changed()).await {
+                Ok(Ok(())) if *done.borrow() => {}
+                Ok(Ok(())) => return Err("接入机器线程结束信号无效".to_owned()),
+                Ok(Err(_)) => return Err("接入机器线程异常退出，未报告完成".to_owned()),
+                Err(_) => return Err("接入机器线程 10 秒内未合流".to_owned()),
+            }
         }
+
+        // 此刻 owner thread 与 runtime 均已销毁，才可对外宣告 Stopped。
+        self.inner.publish_phase(ConnectionPhase::Stopped {
+            reason: self.inner.stop_reason().unwrap_or(reason).to_owned(),
+        });
+        Ok(())
     }
 
     /// 睡到快照被替换（新 tick 落地或相变化）。watch 语义，天然合并。
@@ -319,10 +354,15 @@ impl Module {
     ///
     /// 不产生移动，也不装组件——纯粹为了回答「合法之后还找不找得到路、路长多少、
     /// 算多久」。返回 `(全量, 合法)`。
+    ///
+    /// `kind` 把**目标语义**也当变量：实盘里模型给的坐标常是实心方块或悬空点，
+    /// 精确语义下 A* 把可达集穷尽也命不中。两种语义跑在同一份地图上才比得出
+    /// 「是地图太薄」还是「是目标要求太严」。
     pub fn compare_paths(
         &self,
         memory: std::sync::Arc<std::sync::Mutex<crate::BlockMemory>>,
         goal: [i32; 3],
+        kind: crate::machine::observed::GoalKind,
     ) -> Result<
         (
             crate::machine::observed::PathAttempt,
@@ -335,16 +375,15 @@ impl Module {
             return Err("尚未连接到世界".to_owned());
         }
         let position = &snapshot.self_state.position;
-        let start = azalea::BlockPos::new(
-            position.x.floor() as i32,
-            position.y.floor() as i32,
-            position.z.floor() as i32,
-        );
+        let start = azalea::pathfinder::player_pos_to_block_pos(azalea::Vec3::new(
+            position.x, position.y, position.z,
+        ));
         crate::machine::observed::compare(
             &self.inner,
             memory,
             start,
             azalea::BlockPos::new(goal[0], goal[1], goal[2]),
+            kind,
         )
     }
 
@@ -472,5 +511,73 @@ mod tests {
             };
             assert!(config.validate().is_err(), "{config:?} 该被拒绝");
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_waits_for_owner_cleanup_and_is_repeatable() {
+        let inner = Arc::new(Inner::new());
+        inner.movement_job.begin(
+            &inner,
+            movement::MovementJob::new(
+                [10, 64, -3],
+                inner.now_tick(),
+                azalea::BlockPos::new(0, 64, 0),
+                None,
+            ),
+        );
+        let (done_tx, done_rx) = watch::channel(false);
+        let module = Module {
+            inner: inner.clone(),
+            done: done_rx,
+        };
+
+        let machine_inner = inner.clone();
+        let machine = tokio::spawn(async move {
+            // 刻意晚于 stop 建立 waiter，钉住 notify_one 的 retained-permit 语义。
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            machine_inner.shutdown.notified().await;
+            machine_inner.end_running_jobs();
+            done_tx.send_replace(true);
+        });
+
+        module.stop("测试停机").await.unwrap();
+        machine.await.unwrap();
+        module.stop("重复停机").await.unwrap();
+
+        assert!(module.jobs_in_flight().is_empty());
+        let latest = module.latest();
+        assert!(matches!(
+            &latest.phase,
+            ConnectionPhase::Stopped { reason } if reason == "测试停机"
+        ));
+        let ended: Vec<_> = latest
+            .jobs
+            .entries
+            .iter()
+            .filter_map(|entry| match entry.fact {
+                crate::JobFact::Move { event, .. } => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ended, vec![crate::MoveEvent::ConnectionEnded]);
+    }
+
+    #[tokio::test]
+    async fn closed_done_channel_without_true_never_claims_stopped() {
+        let inner = Arc::new(Inner::new());
+        let (done_tx, done_rx) = watch::channel(false);
+        let module = Module {
+            inner: inner.clone(),
+            done: done_rx,
+        };
+        drop(done_tx);
+
+        let error = module.stop("异常停机").await.unwrap_err();
+
+        assert!(error.contains("异常退出"), "意外错误：{error}");
+        assert!(
+            !matches!(&inner.latest.read().phase, ConnectionPhase::Stopped { .. }),
+            "没有 owner 完成事实时绝不能发布 Stopped"
+        );
     }
 }

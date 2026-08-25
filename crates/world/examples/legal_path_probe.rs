@@ -5,7 +5,8 @@
 //!   二、路**长多少**（合法的必然更绕，绕多少）
 //!   三、**算多久**（记忆是 HashMap，取块比 section 直取慢；慢多少）
 //!
-//! 观察量按真实节律攒：反复 `scan_changes` 推进同一份记忆，与眼睛同一条路径。
+//! 观察量按生产眼睛的口径攒：反复 `absorb(for_memory)` 同时记录可见方块与射线
+//! 亲证的空格。`scan_changes` 从空记忆出发不会建立自由空间，不能代表合法寻路图。
 //! 中途转头，因为视锥只覆盖面朝方向——不转头，「合法」会窄得没有代表性。
 //!
 //! 用法（需要 `--features azalea`）：
@@ -14,7 +15,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use world::{BlockMemory, ConnectionConfig, DoorCommand, Module, SnapshotSource, ViewportOptions};
+use world::{
+    BlockMemory, ConnectionConfig, DoorCommand, GoalKind, Module, SnapshotSource, ViewportOptions,
+};
 
 async fn look_around(module: &Arc<Module>, memory: &Arc<Mutex<BlockMemory>>) {
     // 八向各看一眼，另加俯仰两档：视锥只覆盖面朝方向，不转头攒不出可用的地图。
@@ -23,14 +26,14 @@ async fn look_around(module: &Arc<Module>, memory: &Arc<Mutex<BlockMemory>>) {
             let yaw = step as f64 * 45.0;
             let _ = module.execute(DoorCommand::Face { yaw, pitch }).await;
             tokio::time::sleep(Duration::from_millis(180)).await;
-            let _ = module.scan_changes(memory, &ViewportOptions::default());
+            let _ = module.absorb(memory.as_ref(), &ViewportOptions::for_memory());
         }
     }
 }
 
 fn report(label: &str, attempt: &world::PathAttempt) {
     println!(
-        "  {label:<10}｜{}｜节点 {:>4}｜{}｜{} ms",
+        "  {label:<14}｜{}｜节点 {:>4}｜{}｜{} ms",
         if attempt.found {
             "找到 ✓"
         } else {
@@ -87,7 +90,7 @@ async fn main() -> Result<(), String> {
 
     // 先量一次「什么都没看过」的极端：记忆空的时候合法寻路应该寸步难行。
     println!("\n=== 记忆为空（刚进服，还没看过任何东西）===");
-    match module.compare_paths(memory.clone(), [x + 8, y, z]) {
+    match module.compare_paths(memory.clone(), [x + 8, y, z], GoalKind::Exact) {
         Ok((full, legal)) => {
             report("全量世界", &full);
             report("合法地图", &legal);
@@ -99,14 +102,24 @@ async fn main() -> Result<(), String> {
     let known = memory.lock().map(|m| m.len()).unwrap_or(0);
     println!("\n=== 环视一圈之后：记忆里有 {known} 格 ===");
 
+    // 2×2：{全量世界, 合法地图} × {精确, 就近}。
+    //
+    // 两个变量必须在同一次实验里同时动，否则分不清「地图太薄」与「目标要求太严」
+    // ——实盘里 1244 次空路径同时具备这两个嫌疑。
     for distance in distances {
         println!("\n目标 ({}, {y}, {z})　距离 {distance} 格", x + distance);
-        match module.compare_paths(memory.clone(), [x + distance, y, z]) {
-            Ok((full, legal)) => {
-                report("全量世界", &full);
-                report("合法地图", &legal);
+        for (label, kind) in [
+            ("精确", GoalKind::Exact),
+            ("就近 r2", GoalKind::Near(2)),
+            ("就近 r4", GoalKind::Near(4)),
+        ] {
+            match module.compare_paths(memory.clone(), [x + distance, y, z], kind) {
+                Ok((full, legal)) => {
+                    report(&format!("{label} 全量"), &full);
+                    report(&format!("{label} 合法"), &legal);
+                }
+                Err(reason) => println!("  {label} 比不了：{reason}"),
             }
-            Err(reason) => println!("  比不了：{reason}"),
         }
     }
 

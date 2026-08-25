@@ -22,7 +22,7 @@ pub use block::*;
 pub mod slots;
 
 #[cfg(feature = "azalea")]
-pub use machine::observed::PathAttempt;
+pub use machine::observed::{GoalKind, PathAttempt};
 #[cfg(feature = "azalea")]
 pub use machine::{ConnectionConfig, DoorCommand, Module};
 pub use viewport::*;
@@ -353,10 +353,9 @@ impl std::fmt::Display for JobId {
 /// 终局**、可中途查询（[`JobStatus`]）、可取消。与「起一个后台进程，完成时收到
 /// 通知」是同一个模型。
 ///
-/// **沉默不等于成功**：任何终止路径都必须写出终局——做完、放弃、被取消、被顶替、
-/// 看门狗超时，一条都不能少。少了的后果实测过：`pillar_up` 曾 83 次调用一条终局
-/// 都没发出（每次重发都重置了期限判定），模型只能自己猜，猜成了「工具有 bug」
-/// 并写进长期记忆。
+/// **沉默不等于成功**：任何真实终止路径都必须写出终局——做完、放弃、被取消、
+/// 被顶替、连接结束，一条都不能少。槽位不会用泛化超时替动词状态机收尸；确有
+/// 资源边界的动作必须把边界和命中原因建模成自己的明确事件。
 #[derive(Clone, Debug, PartialEq)]
 pub struct JobEntry {
     /// 与 ChatEntry.seq 同源的单调到达序号。
@@ -416,16 +415,28 @@ pub enum MoveEvent {
     Leg { to: [i32; 3] },
     /// 卡住：较长时间没有推进。**不是终局**——寻路器还在自救，任务继续。
     Stalled,
-    /// 寻路器宣告目标达成。
+    /// 按 Azalea 的身体格换算口径，当前位置精确等于目的地。
     Arrived,
-    /// 路走到了尽头但目标未达成（不可达、局部路径尽头）。
+    /// 底层路段停了但目标未达成；原因没有被进一步分类。
     PathEnded,
+    /// 最终**身体格本身**已经观察为寻路安全策略不接受的状态；可能是实心或危险格。
+    DestinationRejected { at: [i32; 3] },
+    /// 本次战争迷雾导航消耗了有限工作预算。只说明机器主动收束；不证明目标不可达。
+    NavigationLimitReached {
+        at: [i32; 3],
+        plans: u64,
+        travelled: u64,
+    },
+    /// stamped 请求仍在 Azalea 队列，超过 listener 的调度履约边界。
+    DispatchNotObserved { at: [i32; 3], ticks: u64 },
+    /// 导航仍活跃，但真实身体格连续指定 tick 数没有变化；不是“目标不可达”证明。
+    NoBodyProgressLimitReached { at: [i32; 3], ticks: u64 },
     /// 被新的意图顶替（单意图槽语义）。
     Replaced,
     /// 被停止动词取消。
     Cancelled,
-    /// 看门狗：既无进展也无终局，超过期限由槽位判定。
-    TimedOut,
+    /// 服务器连接或整个接入模块结束；此后不再有 tick，任务随连接同步收束。
+    ConnectionEnded,
 }
 
 impl MoveEvent {
@@ -441,14 +452,22 @@ pub enum MineEvent {
     Broke { done: usize, total: usize },
     /// 整队挖完。
     Cleared,
-    /// 卡在某一块上（够不着、迟迟不碎、读不到）。队列就此停下。
+    /// 目标仍可读且为实心，但 Azalea 的 `MineProgress` 连续没有增长。队列就此停下。
     Blocked { at: [i32; 3] },
+    /// 同步排队的请求一直没有被 Azalea 调度链消费；不是方块不可挖的结论。
+    DispatchNotObserved { at: [i32; 3], ticks: u64 },
+    /// 请求曾经排队，随后在进入匹配的活跃挖掘前结束；更细原因没有产生方证据。
+    RequestEnded { at: [i32; 3] },
+    /// 本地方块预测在协议边界内一直没有得到服务端确认或回滚；不代表成功或不可挖。
+    PredictionNotSettled { at: [i32; 3], ticks: u64 },
+    /// 当前世界模型读不到目标；没有把未知猜成实心或已挖碎。
+    TargetUnavailable { at: [i32; 3] },
     /// 被新的队列顶替。
     Replaced,
     /// 被 release 取消。
     Cancelled,
-    /// 看门狗：既无进展也无终局，超过期限由槽位判定。
-    TimedOut,
+    /// 服务器连接或整个接入模块结束；此后不再有 tick，任务随连接同步收束。
+    ConnectionEnded,
 }
 
 impl MineEvent {
@@ -461,8 +480,8 @@ impl MineEvent {
 ///
 /// 为什么要有它：工具描述里让模型「别急着重发，完成会通知你」——**要求它不重发，
 /// 就得给它查看的手段**，否则它只能靠重发来试探（`pillar_up` 实测 83 次）。
-/// 它同时是「必有终局」这条不变量的旁证：某个任务在表里挂着不动，就是看门狗
-/// 该发终局而没发。
+/// 它同时是「必有终局」这条不变量的旁证：某个任务在表里挂着不动，说明对应
+/// 动词缺少可观察的终止条件或资源边界，不能靠槽位替它猜一个结果。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JobStatus {
     pub id: JobId,

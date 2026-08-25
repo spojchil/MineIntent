@@ -26,10 +26,12 @@ use screens::{
 };
 use world::{ConnectionConfig, DoorCommand, Module, SnapshotSource};
 
+mod doorbell;
 mod frame;
 mod situation;
 mod wake;
 
+use doorbell::Doorbell;
 use frame::FrameComposer;
 use wake::{ScreenDirective, SelfIdentity, WakeCursors};
 
@@ -642,6 +644,8 @@ async fn main() -> Result<(), String> {
     let memory_file = Arc::new(MemoryFile::new(memory_path));
     let snapshots: Arc<dyn SnapshotSource> = module.clone();
 
+    // 门铃同时是等待工具的打断源和内核的观察者，所以要早于两者建出来。
+    let doorbell = Doorbell::new();
     let providers: Vec<Arc<dyn ToolProvider>> = vec![
         Arc::new(ChatBox::new(
             occupancy.clone(),
@@ -678,6 +682,7 @@ async fn main() -> Result<(), String> {
         Arc::new(PresenceTools::new(Arc::new(ModulePresenceDoor(
             module.clone(),
         )))),
+        Arc::new(wait::WaitTools::new(doorbell.clone())),
     ];
     let life: Arc<dyn LifeGate> = Arc::new(SnapshotLifeGate(snapshots.clone()));
     let dispatcher = Arc::new(
@@ -731,8 +736,10 @@ async fn main() -> Result<(), String> {
     // 压缩完成的旗子：压缩把对话换成摘要，先前追加的处境随之消失，
     // 下一帧要把处境从头说一遍。
     let compacted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut observers: Vec<Arc<dyn agent::Observer>> =
-        vec![Arc::new(CompactionFlag(compacted.clone()))];
+    let mut observers: Vec<Arc<dyn agent::Observer>> = vec![
+        Arc::new(CompactionFlag(compacted.clone())),
+        doorbell.clone(),
+    ];
     if let Ok(path) = std::env::var("MINEINTENT_TRACE_FILE") {
         let trace = Arc::new(TraceObserver::open(&path)?);
         assembled = assembled.with_content_observer(trace.clone());
@@ -911,11 +918,16 @@ async fn main() -> Result<(), String> {
                     }
                 }
                 let session = session.clone();
+                let doorbell = doorbell.clone();
                 tokio::spawn(async move {
-                    match session
-                        .enqueue(MailboxInput::next_model_request(items))
-                        .await
-                    {
+                    let enqueued = session.enqueue(MailboxInput::next_model_request(items)).await;
+                    // 敲铃在投递之后：这样「铃响」蕴含「信确实在信箱里」，等待被
+                    // 叫醒时工具说的「就在下面」才是真的。帧那一侧不敲——帧的节奏
+                    // 是「身体在不在动」，拿它打断等待就退回轮询。
+                    if enqueued.is_ok() {
+                        doorbell.ring();
+                    }
+                    match enqueued {
                         Ok(agent::Enqueued::Started(handle)) => {
                             println!("[组合根] 轮结束:{:?}", handle.join().await);
                         }

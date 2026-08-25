@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use azalea::protocol::packets::game::c_game_event;
@@ -78,7 +78,9 @@ pub(crate) struct Inner {
     /// 合法寻路的知识面。`None` = 没开，寻路照旧读全量世界。
     /// 由 `Module::use_observed_pathfinding` 装上，连接层每 tick 推进它的脚下格。
     pub(super) observed: Mutex<Option<Arc<super::observed::ObservedBlocks>>>,
-    pub(super) stopping: AtomicBool,
+    /// 首次停机请求及其理由。`OnceLock` 同时充当不可逆的 stopping 状态，避免
+    /// “已经请求停止”和“最终该写哪个理由”成为两份可能漂移的状态。
+    stop_reason: OnceLock<String>,
     pub(super) shutdown: Notify,
     pub(super) tick: AtomicU64,
     /// 全部事实窗共用的单调到达序号（聊天/伤害/任务）：
@@ -123,7 +125,7 @@ impl Inner {
             jump_reset: AtomicBool::new(false),
             world_handle: Mutex::new(None),
             observed: Mutex::new(None),
-            stopping: AtomicBool::new(false),
+            stop_reason: OnceLock::new(),
             shutdown: Notify::new(),
             tick: AtomicU64::new(0),
             fact_seq: AtomicU64::new(0),
@@ -135,16 +137,26 @@ impl Inner {
     }
 
     pub(super) fn publish(&self, snapshot: TickSnapshot) {
-        // 停机后在途回调不得把终态改写回 Ready/Disconnected；
-        // Stopped 相自己（stop 发布的那次）放行。
-        if self.stopping.load(Ordering::Acquire)
-            && !matches!(snapshot.phase, ConnectionPhase::Stopped { .. })
-        {
-            return;
-        }
         *self.latest.write() = Arc::new(snapshot);
         // 通知合并：错过十次只醒一次，醒后读方自己取 latest。
         self.ticked_tx.send_modify(|counter| *counter += 1);
+    }
+
+    /// 记录不可逆的停机请求；并发或重复调用保持第一个理由。
+    pub(super) fn request_stop(&self, reason: &str) {
+        if self.stop_reason.set(reason.to_owned()).is_ok() {
+            // wait_ready 等待的是“可观察状态有变化”，停机请求也属于这一事实；否则
+            // owner teardown 卡住时，它只能等到自己的 deadline 才发现 stopping。
+            self.ticked_tx.send_modify(|counter| *counter += 1);
+        }
+    }
+
+    pub(super) fn is_stopping(&self) -> bool {
+        self.stop_reason.get().is_some()
+    }
+
+    pub(super) fn stop_reason(&self) -> Option<&str> {
+        self.stop_reason.get().map(String::as_str)
     }
 
     /// 非就绪相的快照：连接事实 + 各事实窗（窗是机器的记忆，不随相清空）。
@@ -158,6 +170,14 @@ impl Inner {
         snapshot.pickups = self.pickups_window_now();
         snapshot.sounds = self.sounds_window_now();
         self.publish(snapshot);
+    }
+
+    /// 连接生命周期结束后不会再有 tick，两个持续任务必须在这个边界同步落终局。
+    /// client、swarm 与线程退出都可能报告同一次断线；槽位 take 语义保证只落一次。
+    pub(super) fn end_running_jobs(&self) -> bool {
+        let movement = self.movement_job.connection_ended(self);
+        let mining = self.mining_job.connection_ended(self);
+        movement || mining
     }
 
     pub(super) fn chat_window_now(&self) -> Window<ChatEntry> {
@@ -537,7 +557,7 @@ impl Inner {
         let (ack, receiver) = oneshot::channel();
         let mut pending = self.pending.lock();
         let phase_ready = matches!(self.latest.read().phase, ConnectionPhase::Ready);
-        if self.stopping.load(Ordering::Acquire) || !phase_ready {
+        if self.is_stopping() || !phase_ready {
             drop(pending);
             let _ = ack.send(Err("尚未连接到世界，无法行动".to_owned()));
             return receiver;
@@ -546,7 +566,7 @@ impl Inner {
         receiver
     }
 
-    pub(super) fn fail_all_pending_chat(&self, reason: &str) {
+    pub(super) fn fail_all_pending_commands(&self, reason: &str) {
         for pending in self.pending.lock().drain(..) {
             let _ = pending.ack.send(Err(reason.to_owned()));
         }
@@ -556,6 +576,30 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{MineEvent, MoveEvent};
+
+    #[test]
+    fn first_stop_request_wakes_state_waiters_and_preserves_its_reason() {
+        let inner = Inner::new();
+        let mut ticked = inner.ticked_tx.subscribe();
+        assert!(!ticked.has_changed().unwrap());
+
+        inner.request_stop("第一次停机");
+        assert!(inner.is_stopping());
+        assert_eq!(inner.stop_reason(), Some("第一次停机"));
+        assert!(
+            ticked.has_changed().unwrap(),
+            "首次停机请求必须唤醒 wait_ready"
+        );
+        assert_eq!(*ticked.borrow_and_update(), 1);
+
+        inner.request_stop("重复停机");
+        assert_eq!(inner.stop_reason(), Some("第一次停机"));
+        assert!(
+            !ticked.has_changed().unwrap(),
+            "重复请求既不能改理由，也不应制造重复通知"
+        );
+    }
 
     #[test]
     fn chat_window_keeps_at_most_the_vanilla_line_count() {
@@ -594,7 +638,9 @@ mod tests {
     #[test]
     fn movement_job_replacement_and_stop_are_recorded() {
         let inner = Inner::new();
-        let job = |d: [i32; 3]| crate::machine::movement::MovementJob::new(d, 0);
+        let job = |d: [i32; 3]| {
+            crate::machine::movement::MovementJob::new(d, 0, azalea::BlockPos::new(0, 64, 0), None)
+        };
         inner.movement_job.begin(&inner, job([10, 64, -3]));
         inner.movement_job.begin(&inner, job([20, 64, 5])); // 顶替
         inner.movement_job.cancel(&inner); // 停止
@@ -615,6 +661,49 @@ mod tests {
         );
         // 顶替与取消分属两个任务，id 必须不同——否则下游分不出谁的进展。
         assert_ne!(window.entries[0].id, window.entries[1].id);
+    }
+
+    #[test]
+    fn connection_end_closes_both_job_kinds_once_and_phase_snapshot_contains_them() {
+        let inner = Inner::new();
+        inner.movement_job.begin(
+            &inner,
+            crate::machine::movement::MovementJob::new(
+                [10, 64, -3],
+                0,
+                azalea::BlockPos::new(0, 64, 0),
+                None,
+            ),
+        );
+        inner.mining_job.begin(
+            &inner,
+            crate::machine::mining::MiningJob::new(vec![[3, 64, 4]], 0),
+        );
+
+        assert!(inner.end_running_jobs());
+        assert!(!inner.end_running_jobs(), "重复断线通知不能重复产终局");
+        inner.publish_phase(ConnectionPhase::Disconnected {
+            reason: "网络断开".to_owned(),
+        });
+
+        assert!(inner.movement_job.status(inner.now_tick()).is_none());
+        assert!(inner.mining_job.status(inner.now_tick()).is_none());
+        let latest = inner.latest.read();
+        assert_eq!(latest.jobs.entries.len(), 2);
+        assert!(matches!(
+            latest.jobs.entries[0].fact,
+            crate::JobFact::Move {
+                event: MoveEvent::ConnectionEnded,
+                ..
+            }
+        ));
+        assert!(matches!(
+            latest.jobs.entries[1].fact,
+            crate::JobFact::Mine {
+                event: MineEvent::ConnectionEnded,
+                ..
+            }
+        ));
     }
 
     /// 判定表全景：armed 前后各态的行动结论。
@@ -642,14 +731,6 @@ mod tests {
         let inner = Inner::new();
         let ticked = inner.ticked_tx.subscribe();
         inner.push_chat(None, "服务器广播".to_owned());
-        // 停机后 Ready 快照不得改写状态。
-        inner.stopping.store(true, Ordering::Release);
-        inner.publish(TickSnapshot::empty(EPOCH, 9, ConnectionPhase::Ready));
-        assert!(
-            !matches!(inner.latest.read().phase, ConnectionPhase::Ready),
-            "停机期间的在途 Ready 快照应被丢弃"
-        );
-        inner.stopping.store(false, Ordering::Release);
         inner.publish_phase(ConnectionPhase::Disconnected {
             reason: "网络断开".to_owned(),
         });
