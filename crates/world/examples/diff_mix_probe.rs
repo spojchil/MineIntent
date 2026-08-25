@@ -1,6 +1,6 @@
 //! 增量差异的构成探针：一路走，统计 `BlockChange` 三种变体各占多少。
 //!
-//! 为什么要单独量：轮末帧日志只记 `changes.len()`，而渲染出来的**行数**不等于
+//! 为什么要单独量：眼睛的投递日志只记 `changes.len()`，而渲染出来的**行数**不等于
 //! 条数——`Changed` 是两行（先 `-` 后 `+`），`Appeared` / `Vanished` 各一行。
 //! 上下文账要按行算，所以得知道构成。
 //!
@@ -49,7 +49,7 @@ async fn main() -> Result<(), String> {
         start.self_state.position.y.floor() as i32,
         start.self_state.position.z.floor() as i32,
     );
-    println!("[探针] 起点 ({x}, {y}, {z})，走 {seconds} 秒，按轮末帧的节律采样");
+    println!("[探针] 起点 ({x}, {y}, {z})，走 {seconds} 秒，按眼睛的节律采样");
 
     let (mut appeared, mut changed, mut vanished) = (0_usize, 0_usize, 0_usize);
     let mut frames = 0_usize;

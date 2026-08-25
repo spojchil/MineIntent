@@ -104,7 +104,7 @@ pub struct TickSnapshot {
     /// 连接状态是状态，活在快照里。
     pub phase: ConnectionPhase,
 
-    /// 环境事实里的热门部分：维度、天色、天气每轮都与行为相关，进轮末帧。
+    /// 环境事实里的热门部分：维度、天色、天气每轮都与行为相关，随帧投给模型。
     /// 冷门档案数（Day #、群系）不在这里，走感知的信息工具按需查。
     pub world_meta: WorldMeta,
 

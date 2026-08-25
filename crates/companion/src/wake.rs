@@ -109,7 +109,7 @@ impl WakeCursors {
             if !advance(&mut self.jobs, entry.seq) {
                 continue;
             }
-            // 进展不走这条通道：它是「还在走」，不是「出事了」，由轮末帧搭车呈现
+            // 进展不走这条通道：它是「还在走」，不是「出事了」，由帧搭车呈现
             // （组合根另有一个游标）。这里只管终局。
             if entry.fact.is_terminal() && wakes_on(&entry.fact) {
                 lines.push(render_job(entry));
