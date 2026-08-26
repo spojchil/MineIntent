@@ -8,6 +8,7 @@
 | 构建与运行 | [workspace 指南](./guides/rust-workspace.md) |
 | 检查、测试或验证 | [验证指南](./guides/validation.md) |
 | 理解当前实现 | [当前实现结构](./architecture.md)，再阅读其中链接的代码产生方 |
+| 理解寻路器的目标设计（设想） | [寻路器](./寻路器.md) |
 | 准备贡献 | [贡献流程](../CONTRIBUTING.md) |
 
 未决的设计问题在 GitHub Issue（`status:needs-decision` 标签）；历史材料靠 git 历史与
@@ -20,6 +21,7 @@
 | [`产品.md`](./产品.md) | 产品判断与由其导出的候选架构 | 以文件内每条文字的状态为准 |
 | 带“提案接受”标签的 GitHub Issue | 已接受提案入口 | 是否具有同等权威，以 `产品.md` 的 G03 状态为准 |
 | [`docs/architecture.md`](./architecture.md) | 绑定到指定分支的当前实现说明 | 无 |
+| [`docs/寻路器.md`](./寻路器.md) | 寻路器的目标设计（设想，非当前实现） | 无 |
 | [`docs/guides/validation.md`](./guides/validation.md) | 检查、测试和验证边界 | 无 |
 | [`docs/guides/rust-workspace.md`](./guides/rust-workspace.md) | 构建、运行、配置与已知越界 | 无 |
 | [`README.md`](../README.md) | 项目导航和最短启动 | 无 |
