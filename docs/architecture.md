@@ -1,7 +1,7 @@
 # 当前实现结构
 
-> 无产品权威。绑定 `feat/block-memory-tables` 当前工作树（基线 `9b4ae96`）与
-> Azalea fork `cce19dfa7b120eef090c48d96f5b25851cd89d9a`。
+> 无产品权威。绑定 `feat/integrated-pathfinder` 当前工作树（基线 `036327a`）与
+> Azalea fork `42cff2fb4fa4d9b72bc0245d491351128a8227a2`。
 >
 > 本仓只有一条线。此前并存的两套实现都已移出：
 > TypeScript 原型（`src/`、`agent-service/`、`mcserver/`）已随本线落 `main` 删除，
@@ -141,7 +141,9 @@ Direct(精确目标)
 - `BlockMemory` 同时保存三态和最后所见 `state_id`。`BlockSource` 对未知格返回
   `None`，fork 的 `missing_block_state` 将它解释为不可穿过、不可站立的哨兵；
   已知格从最后所见恢复碰撞语义，不回读离屏后的实时世界。这是 W02/W04c 在动作图
-  上的边界。所有严格观察图路径都关闭自动挖掘，避免挖掘成本分支读取 loaded world。
+  上的边界。fork 的采掘成本分支也只读同一 `BlockSource`：目标、上方落沙检查和四侧
+  液体检查都不会回退到 loaded world。未知格只能继承 source 声明的几何 fallback，
+  不能因为 loaded world 中恰有可挖方块而进入采掘计划。
 - 每条 A* 腿使用同一份冻结记忆；活视野继续写下一版，不会让一次搜索混入多个地图
   版本。计划判重键直接使用 `BlockMemory` 的内容 revision，以及冻结脚下本体支撑的
   坐标和原始 `state_id`，不再重扫、排序、哈希整张地图。revision 只在三态或完整
@@ -159,6 +161,11 @@ Direct(精确目标)
   `PathFoundEvent` 存进 `ExecutingPath`，执行器据此取 `can_mine`。此前执行器硬编码
   `can_mine: true` 且读真实加载世界，于是「未知格当空气」在规划期只是乐观假设，
   到执行期会变成真的把那格挖掉——一次没人授权、也没有任何事件报告的动作（W02/W03）。
+- fork 的每条 `MoveData` 另带相对起点的 `MovementSideEffects`。当前可采掘 movement
+  已声明精确 `blocks_to_break`，执行器的 `should_mine` / `mine` 会在发包前核对，计划
+  清单外的坐标不可被临场障碍处理顺手挖掉；`block_to_place` 契约已预留，但桥接、垫柱
+  等放置 movement 尚未实现。MineIntent 当前仍以 `allow_mining(false)` 执行严格观察图，
+  尚未把策略快照接入该契约。
 - 开放世界无法用有限证据证明“所有 frontier 已穷尽”。因此状态机不产生这种结论；
   同一位置/冻结图不重复同类计划，并给战争迷雾任务有限工作预算：每投递一段与身体
   每移动一格各扣一单位，额度为 `max(64, 初始曼哈顿距离 × 8)`。达到额度产生
