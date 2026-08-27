@@ -639,7 +639,13 @@ async fn main() -> Result<(), String> {
     // 合法寻路：寻路只按这本记忆里观察过的方块规划，不再读服务端推来的全量世界。
     // 必须是同一本——眼睛每 250ms 把看见的写进去，寻路要读的正是那一份。
     module.use_observed_pathfinding(block_memory.clone());
-    println!("[组合根] 合法寻路：只按观察过的方块规划路线");
+    // 装不上就不开跑：同伴会照读服务端推来的全量世界，看穿没去过的地方，
+    // 而这一行日志本身正是上次实盘里唯一「证明」战争迷雾开着的东西。
+    module
+        .wait_observed_pathfinding(Duration::from_secs(30))
+        .await
+        .map_err(|error| format!("合法寻路未能装上：{error}"))?;
+    println!("[组合根] 合法寻路已装上：只按观察过的方块规划路线");
     let read_mark = Arc::new(ChatReadMark::new());
     let memory_file = Arc::new(MemoryFile::new(memory_path));
     let snapshots: Arc<dyn SnapshotSource> = module.clone();

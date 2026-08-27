@@ -336,18 +336,51 @@ impl Module {
     ///
     /// 传进来的必须是**组合根那一份**记忆：眼睛每 250ms 往里推进增量，寻路要
     /// 看到的正是同一份，两份会各说各话。
+    /// 这只是**声明**，不是安装：真正装上要等 owner 线程的下一次 tick（那里世界句柄
+    /// 一定拿得到）。想要回执就接着 [`Module::wait_observed_pathfinding`]，别把
+    /// 「调用过」当成「装上了」。
     pub fn use_observed_pathfinding(
         &self,
         memory: std::sync::Arc<std::sync::Mutex<crate::BlockMemory>>,
     ) {
-        let world = self.inner.world_handle.lock().clone();
-        let Some(world) = world else {
-            // 世界还没就绪：装不上就如实什么都不做，调用方在 wait_ready 之后再叫一次。
-            return;
-        };
-        *self.inner.observed.lock() = Some(std::sync::Arc::new(
-            crate::machine::observed::ObservedBlocks::new(memory, world),
-        ));
+        *self.inner.observed_request.lock() = Some(memory);
+    }
+
+    /// 合法寻路的 `BlockSource` 组件此刻是否真的在 ECS 里。
+    pub fn observed_pathfinding_installed(&self) -> bool {
+        self.inner
+            .observed
+            .lock()
+            .as_ref()
+            .is_some_and(|source| source.is_installed())
+    }
+
+    /// 等到合法寻路真的装上；超时返回 Err。
+    ///
+    /// 没有这个回执，组合根只能凭「调用过」印一行成功——2026-08-25 那次 64 分钟
+    /// 长游玩正是这样：声明被启动时序吃掉，日志照样说开了，实际全程读的是服务端
+    /// 推来的全量世界。
+    pub async fn wait_observed_pathfinding(&self, timeout: Duration) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut ticked = self.inner.ticked_tx.subscribe();
+        loop {
+            if self.observed_pathfinding_installed() {
+                return Ok(());
+            }
+            if self.inner.is_stopping() {
+                return Err("连接正在停止".to_owned());
+            }
+            tokio::select! {
+                changed = ticked.changed() => {
+                    if changed.is_err() {
+                        return Err("接入机器已退出".to_owned());
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err("等待合法寻路装上超时".to_owned());
+                }
+            }
+        }
     }
 
     /// 诊断：同一目标，全量世界 vs 只按观察过的地图，各算一次路。

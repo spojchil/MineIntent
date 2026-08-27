@@ -62,6 +62,11 @@ impl ObservedBlocks {
         }
     }
 
+    /// 组件是否真的进了 ECS。这是安装回执的唯一依据：置位发生在 insert 返回之后。
+    pub(super) fn is_installed(&self) -> bool {
+        self.installed.load(Ordering::Acquire)
+    }
+
     /// 每 tick 由连接层推进：站着就是脚下那格，悬空就是 `None`。
     pub(super) fn set_floor(&self, floor: Option<BlockPos>) {
         *self.floor.lock() = floor;
@@ -240,20 +245,39 @@ impl fmt::Debug for PlanningSnapshot {
     }
 }
 
-/// 每 tick：首次装组件，之后只推进脚下那一格。
+/// 把组合根声明过的那本记忆兑现成观察源。已经兑现过就答 `None`，不重建。
+///
+/// 世界句柄由调用方现取：owner 线程走到这里时客户端一定活着，所以「拿不到世界」
+/// 这个失败模式在这一层不存在——它只存在于连接事件的时序里，而声明已经先落在
+/// [`Inner::observed_request`] 上等着，不会被时序吃掉。
+fn take_pending_install(
+    inner: &Inner,
+    world: impl FnOnce() -> Arc<RwLock<azalea::world::World>>,
+) -> Option<Arc<ObservedBlocks>> {
+    let memory = inner.observed_request.lock().take()?;
+    let source = Arc::new(ObservedBlocks::new(memory, world()));
+    *inner.observed.lock() = Some(source.clone());
+    Some(source)
+}
+
+/// 每 tick：兑现声明、首次装组件，之后只推进脚下那一格。
 ///
 /// 装组件放在 tick 里而不是连接时，是因为世界模型要就绪之后才拿得到句柄，
 /// 而 `Module::use_observed_pathfinding` 可能在任何时候被调用。
 pub(super) fn tick(inner: &Inner, bot: &azalea::Client) {
-    let Some(source) = inner.observed.lock().clone() else {
+    let installed = inner.observed.lock().clone();
+    let Some(source) = installed.or_else(|| take_pending_install(inner, || bot.world())) else {
         return;
     };
     source.set_floor(floor_under(bot));
-    if !source.installed.swap(true, Ordering::AcqRel) {
+    // 只有 owner 线程跑 tick，所以读改写不需要 swap；置位放在 insert **返回之后**，
+    // 让「已安装」这个回执的含义就是组件真的进了 ECS，而不是「我们打算装」。
+    if !source.installed.load(Ordering::Acquire) {
         bot.ecs
             .write()
             .entity_mut(bot.entity)
-            .insert(PathfinderBlockSource(source));
+            .insert(PathfinderBlockSource(source.clone()));
+        source.installed.store(true, Ordering::Release);
     }
 }
 
@@ -440,6 +464,38 @@ mod tests {
             state_id: u32::from(state.id()),
             properties: BTreeMap::new(),
         }
+    }
+
+    /// 声明早于世界句柄登记时，安装不能被时序吃掉。
+    ///
+    /// Ready 相由 `Event::Tick` 与 `Event::Spawn` 两处发布，Tick 先到时 `world_handle`
+    /// 还是 `None`；旧实现在那一刻直接静默返回，整场就再也没有观察源。
+    #[test]
+    fn a_declaration_made_before_the_world_handle_still_installs() {
+        let inner = Inner::new();
+        let memory = Arc::new(std::sync::Mutex::new(crate::BlockMemory::new()));
+
+        *inner.observed_request.lock() = Some(memory);
+        assert!(
+            inner.world_handle.lock().is_none(),
+            "前提：Spawn 还没登记世界句柄"
+        );
+        assert!(inner.observed.lock().is_none(), "声明本身不该直接建源");
+
+        let installed = take_pending_install(&inner, || {
+            Arc::new(RwLock::new(azalea::world::World::default()))
+        });
+        assert!(installed.is_some(), "第一次 tick 必须把声明兑现成观察源");
+        assert!(inner.observed.lock().is_some());
+        assert!(
+            !installed.expect("刚兑现").is_installed(),
+            "兑现不等于进了 ECS：回执要等 insert 返回后才置位"
+        );
+
+        assert!(
+            take_pending_install(&inner, || unreachable!("兑现过就不该再取世界")).is_none(),
+            "声明只兑现一次"
+        );
     }
 
     #[test]
