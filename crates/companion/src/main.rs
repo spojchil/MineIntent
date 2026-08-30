@@ -219,6 +219,12 @@ fn session_config() -> SessionConfig {
     // token 线等于不存在。
     config.budget.context.compact_above_bytes =
         env_number("MINEINTENT_COMPACT_ABOVE_BYTES", tokens * BYTES_PER_TOKEN) as usize;
+    // 两层超时必须一起抬。内核默认 120 秒、适配器默认 60 秒，而会思考的模型
+    // 在 effort=max 下实测最长 139 秒——不抬的话最慢那一档必然被判失败。
+    // 内核这层留得比适配器宽，让**适配器先报错**：它的错误话术带 HTTP 语义，
+    // 分得清「抖动」和「4xx」，重试判据要的就是这个。
+    let model_timeout = env_number("MODEL_TIMEOUT_SECONDS", 180);
+    config.model_timeout = Some(Duration::from_secs(model_timeout + 30));
     println!(
         "[组合根] 压缩线：输入 token 超过 {tokens} 时压缩（窗口 {window} 的 95%）；\
          首次请求前按字节兜底 {} MiB。压缩当前是空实现，越线只是观察点。",
@@ -528,11 +534,7 @@ static CONSECUTIVE_MODEL_FAILURES: std::sync::atomic::AtomicU32 =
 ///
 /// 补的是一条给模型看的话，不是静默重放：它需要知道上一轮是断的，
 /// 否则会以为自己刚说过的话已经生效。
-async fn retry_after_failure(
-    session: &Arc<AgentSession>,
-    doorbell: &Doorbell,
-    summary: &str,
-) {
+async fn retry_after_failure(session: &Arc<AgentSession>, doorbell: &Doorbell, summary: &str) {
     use std::sync::atomic::Ordering;
     let attempt = CONSECUTIVE_MODEL_FAILURES.fetch_add(1, Ordering::SeqCst);
     if attempt >= MAX_CONSECUTIVE_MODEL_RETRIES {
@@ -619,10 +621,22 @@ async fn main() -> Result<(), String> {
             Ok(resources)
         })
         .transpose()?;
+    // 适配器默认 60 秒，对会思考的模型太紧：离线量到 effort=max 下 p95 35s、
+    // 最长 139s，fognav11 自己也见过 47s。超时算模型失败，而失败会打断这一轮，
+    // 所以宁可等。内核那层（session_config）配成比这里多 30 秒，让这一层先报错——
+    // 适配器的错误话术带 HTTP 语义，重试判据靠它分「抖动」还是「4xx」。
+    let model_timeout = Duration::from_secs(
+        std::env::var("MODEL_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(180),
+    );
+    println!("[组合根] 模型请求超时：{model_timeout:?}");
     let model = Arc::new(
-        HttpModel::new(HttpModelConfig::new(
-            endpoint, api_key, model_name, protocol,
-        ))
+        HttpModel::new(
+            HttpModelConfig::new(endpoint, api_key, model_name, protocol)
+                .with_timeout(model_timeout),
+        )
         .map_err(|error| format!("模型适配器构造失败：{error}"))?,
     );
 
