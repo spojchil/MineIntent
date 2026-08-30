@@ -493,6 +493,84 @@ impl agent::StreamObserver for RoundEndSignal {
     }
 }
 
+/// 一次失败的轮该不该再试一次。
+///
+/// 判据在 `summary` 上，因为 `AgentErrorKind` 不区分「网络抖了一下」和
+/// 「这把 key 没钱了」——两者都是 `Model`。传输层错误一律可重试；HTTP 4xx
+/// 是请求本身的问题，重试只会原样再错一次，唯二例外是 408（超时）与
+/// 429（限流），那两个正是「等一下再来」的意思。
+///
+/// 实盘依据：fognav10 死于 402（终局，重试无意义），fognav11 死于
+/// `transport_body_failed`（抖动，本该能接着跑）。两轮都是一次失败就永久空转。
+fn failure_is_worth_retrying(summary: &str) -> bool {
+    let Some(rest) = summary.strip_prefix("transport_http_") else {
+        // 其余传输层失败（连接断、响应体解不出、超时）都是抖动。
+        return summary.starts_with("transport_");
+    };
+    let code: u16 = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .unwrap_or("")
+        .parse()
+        .unwrap_or(0);
+    match code {
+        408 | 429 => true,
+        400..=499 => false,
+        _ => true,
+    }
+}
+
+/// 连续失败计数。成功一轮就清零，所以偶发抖动不会一路累加到上限。
+static CONSECUTIVE_MODEL_FAILURES: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// 抖动之后补一次唤醒，把停摆的会话重新推起来。
+///
+/// 补的是一条给模型看的话，不是静默重放：它需要知道上一轮是断的，
+/// 否则会以为自己刚说过的话已经生效。
+async fn retry_after_failure(
+    session: &Arc<AgentSession>,
+    doorbell: &Doorbell,
+    summary: &str,
+) {
+    use std::sync::atomic::Ordering;
+    let attempt = CONSECUTIVE_MODEL_FAILURES.fetch_add(1, Ordering::SeqCst);
+    if attempt >= MAX_CONSECUTIVE_MODEL_RETRIES {
+        eprintln!(
+            "[组合根] 连续第 {} 次失败（{summary}），不再自动重试",
+            attempt + 1
+        );
+        return;
+    }
+    let wait = retry_backoff(attempt);
+    println!(
+        "[组合根] 上一轮断在传输层（{summary}）；等 {:?} 后补一次唤醒（第 {}/{} 次）",
+        wait,
+        attempt + 1,
+        MAX_CONSECUTIVE_MODEL_RETRIES
+    );
+    tokio::time::sleep(wait).await;
+    let line = format!(
+        "（上一轮和模型的连接断了：{summary}。你上一条动作可能没发出去，也可能发出去了。先看处境和 jobs 确认现在是什么状态，再决定接着做什么。）"
+    );
+    let items = vec![InputMessage::text("user", line).into()];
+    if session
+        .enqueue(MailboxInput::next_model_request(items))
+        .await
+        .is_ok()
+    {
+        doorbell.ring();
+    }
+}
+
+/// 连续失败最多补几次唤醒。超过就不再自愈——那多半不是抖动。
+const MAX_CONSECUTIVE_MODEL_RETRIES: u32 = 3;
+
+/// 第 n 次重试前等多久：5s / 15s / 45s。
+fn retry_backoff(attempt: u32) -> Duration {
+    Duration::from_secs(5 * 3u64.pow(attempt.min(3)))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     // ---- 配置 ----
@@ -854,7 +932,24 @@ async fn main() -> Result<(), String> {
                     }
                     match enqueued {
                         Ok(agent::Enqueued::Started(handle)) => {
-                            println!("[组合根] 轮结束:{:?}", handle.join().await);
+                            let outcome = handle.join().await;
+                            println!("[组合根] 轮结束:{outcome:?}");
+                            if matches!(outcome, agent::TurnOutcome::Completed { .. }) {
+                                CONSECUTIVE_MODEL_FAILURES
+                                    .store(0, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            // 一次模型失败以前等于永久停摆：没有任务在跑就没有帧，
+                            // 也就没有下一次唤醒，除非有人在公屏说话。抖动要能自愈。
+                            if let agent::TurnOutcome::Failed { error, .. } = &outcome {
+                                if failure_is_worth_retrying(&error.summary) {
+                                    retry_after_failure(&session, &doorbell, &error.summary).await;
+                                } else {
+                                    eprintln!(
+                                        "[组合根] 这次失败不值得重试（{}）：同伴会停在这里，等人来说话",
+                                        error.summary
+                                    );
+                                }
+                            }
                         }
                         Ok(agent::Enqueued::Pending) => {
                             println!("[组合根] 已并入进行中的轮");
@@ -896,4 +991,59 @@ async fn main() -> Result<(), String> {
     }
     println!("[组合根] 已停机");
     Ok(())
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    /// 两条实盘死因各自落在哪一边——这是这段判据存在的全部理由。
+    #[test]
+    fn the_two_live_deaths_are_classified_apart() {
+        // fognav11：连接抖了一下，重试就能接着跑。
+        assert!(failure_is_worth_retrying(
+            "transport_body_failed: error decoding response body"
+        ));
+        // fognav10：余额没了，重试一万次也是同样的 402。
+        assert!(!failure_is_worth_retrying(
+            "transport_http_402:invalid_request_error"
+        ));
+    }
+
+    /// 4xx 里唯二该重试的是「等一下再来」那两个。
+    #[test]
+    fn only_the_wait_and_retry_client_errors_come_back() {
+        assert!(failure_is_worth_retrying("transport_http_408:timeout"));
+        assert!(failure_is_worth_retrying("transport_http_429:rate_limited"));
+        for terminal in [
+            "transport_http_400:invalid_request_error",
+            "transport_http_401:unauthorized",
+            "transport_http_404:model_not_found",
+        ] {
+            assert!(!failure_is_worth_retrying(terminal), "{terminal}");
+        }
+    }
+
+    /// 服务端自己出错、以及非 HTTP 的传输失败，都算抖动。
+    #[test]
+    fn server_side_and_connection_failures_are_transient() {
+        assert!(failure_is_worth_retrying("transport_http_500:internal"));
+        assert!(failure_is_worth_retrying("transport_http_503:overloaded"));
+        assert!(failure_is_worth_retrying("transport_connect_failed"));
+    }
+
+    /// 不是传输层的失败不在这条判据管辖内：模型吐了个解不出的响应，
+    /// 补一次唤醒也是同样解不出，交给上限兜着。
+    #[test]
+    fn non_transport_failures_are_not_retried_here() {
+        assert!(!failure_is_worth_retrying("invalid_tool_batch"));
+        assert!(!failure_is_worth_retrying("session_loop_closed"));
+    }
+
+    /// 退避要真的拉开，别三次挤在一起。
+    #[test]
+    fn backoff_grows() {
+        let waits: Vec<u64> = (0..3).map(|n| retry_backoff(n).as_secs()).collect();
+        assert_eq!(waits, vec![5, 15, 45]);
+    }
 }
