@@ -503,7 +503,16 @@ async fn main() -> Result<(), String> {
     let username = env_or("MINEINTENT_USERNAME", "companion");
     let client_jar = std::env::var_os("MINEINTENT_CLIENT_JAR");
     let protocol_name = env_or("MODEL_PROTOCOL", "chat");
-    let protocol = model_config::protocol(&protocol_name, client_jar.is_some())?;
+    // 推理档位是端点方言：给了才发，没给就不出现在请求体里（DeepSeek 不认这个字段）。
+    // 注意本地网关对非法取值回的是误导性的 upstream_error，不是参数错误。
+    let reasoning_effort = std::env::var("MODEL_REASONING_EFFORT")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let protocol = model_config::protocol(
+        &protocol_name,
+        client_jar.is_some(),
+        reasoning_effort.as_deref(),
+    )?;
     let endpoint = env_or("MODEL_ENDPOINT", model_config::default_endpoint(&protocol));
     let model_name = env_or(
         "MODEL_NAME",
@@ -513,6 +522,9 @@ async fn main() -> Result<(), String> {
             "deepseek-flash"
         },
     );
+    if let Some(effort) = &reasoning_effort {
+        println!("[组合根] 推理档位：{effort}");
+    }
     let memory_path = env_or("MINEINTENT_MEMORY_FILE", "companion-memory.md");
     let persona = match std::env::var("MINEINTENT_PERSONA_FILE") {
         Ok(path) => std::fs::read_to_string(&path)
