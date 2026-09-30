@@ -1,7 +1,7 @@
 # 当前实现结构
 
 > 无产品权威。绑定 `feat/keymouse-actions` 当前工作树与
-> Azalea fork `cce19dfa7b120eef090c48d96f5b25851cd89d9a`、midturn
+> Azalea fork `29cf8e3f0d57abf767e9ab42d52ff2f57b4ab704`、midturn
 > `bf8bc7a7126dc2943145b03a0b4a3481de8177e1`。
 >
 > 本仓只有一条线。此前并存的两套实现都已移出：
@@ -193,14 +193,6 @@ Direct(精确目标)
 模型挖掘是 `input` 按住左键：Azalea 的 `LeftClickMine` 每 tick 挖准星下的方块，
 `machine::input` 记下上一 tick 准星下的方块，它变成空气（客户端所见，与玩家屏幕一致）
 即算挖碎并提前松开全部按键。
-
-钉住的 Azalea fork 有两处与原版不符，影响键鼠输入：
-
-- `tick_controls` 的左右号相反（原版 `KeyboardInput` 左键给 `leftImpulse` +1）。
-  `machine::input` 在交给 Azalea 前镜像左右；fork 修复并升级 rev 后删除镜像。
-- `ServerboundAttack` 把实体 id 编成定长 i32，原版读 VarInt，服务端以
-  「3 bytes extra」踢出。**左键攻击实体在升级 rev 前不可用**（此前的坐标式
-  `attack` 同样受影响）。
 
 - fork 的 `Client::start_mining` 在同一 ECS 写锁内直接写入 `MiningQueued`；MineIntent
   每 tick 再用同一读锁核对 `Mining`、`MiningQueued`、`MineBlockPos`、`MineProgress`

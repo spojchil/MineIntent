@@ -186,8 +186,8 @@ fn press(inner: &Inner, bot: &Client, held: &mut HeldInput, now: u64) {
 fn press_keys(bot: &Client, keys: HeldKeys) {
     let direction = walk_direction(keys);
     match sprint_direction(keys, direction) {
-        Some(sprint) => bot.sprint(mirror_sprint(sprint)),
-        None => bot.walk(mirror_walk(direction)),
+        Some(sprint) => bot.sprint(sprint),
+        None => bot.walk(direction),
     }
     bot.set_jumping(keys.jump);
     bot.set_crouching(keys.sneak);
@@ -271,31 +271,6 @@ fn walk_direction(keys: HeldKeys) -> WalkDirection {
         (0, 1) => WalkDirection::Left,
         (0, -1) => WalkDirection::Right,
         _ => WalkDirection::None,
-    }
-}
-
-/// Azalea（fork `cce19df`）`tick_controls` 的左右号是反的：`Right` 给 `left_impulse`
-/// 加 1，原版 `KeyboardInput` 是**左**键加 1。实服验证过：按 A 身体向右平移。
-/// 应当修在 fork 源头；修好并升级 rev 之前，在交给 Azalea 的这一处镜像左右，
-/// 本层其余地方的「左/右」都按原版语义。
-fn mirror_walk(direction: WalkDirection) -> WalkDirection {
-    match direction {
-        WalkDirection::Left => WalkDirection::Right,
-        WalkDirection::Right => WalkDirection::Left,
-        WalkDirection::ForwardLeft => WalkDirection::ForwardRight,
-        WalkDirection::ForwardRight => WalkDirection::ForwardLeft,
-        WalkDirection::BackwardLeft => WalkDirection::BackwardRight,
-        WalkDirection::BackwardRight => WalkDirection::BackwardLeft,
-        other => other,
-    }
-}
-
-/// 同 [`mirror_walk`]：疾跑的走向经同一个 `tick_controls` 落地。
-fn mirror_sprint(direction: SprintDirection) -> SprintDirection {
-    match direction {
-        SprintDirection::ForwardLeft => SprintDirection::ForwardRight,
-        SprintDirection::ForwardRight => SprintDirection::ForwardLeft,
-        SprintDirection::Forward => SprintDirection::Forward,
     }
 }
 
