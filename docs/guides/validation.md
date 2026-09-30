@@ -72,7 +72,8 @@ cargo run --release -p world --features azalea --example fog_goto_probe -- \
 一条真实终局。终局后探针继续逐 tick 观察 5 秒，必须 `in_flight=0` 且身体格不再移动；
 这是实服交叉证据，Azalea goal/计算/执行组件的严格 retirement 由 fork 生命周期单测
 直接证明。自然地形上“保持同 y 的相对坐标”可能本来就没有可站 stance，不能拿它单独
-充当到达验收。`go_to` 当前是精确身体格；near/reach 仍是 Issue #139 的待决产品语义。
+充当到达验收。`go_to` 已从模型面撤下，只剩探针与 `forward` 经由这条寻路；Issue #139 的
+near/reach 语义随之搁置。
 
 > 内核（依赖键 `agent`，本体是 [midturn](https://github.com/spojchil/midturn)）
 > 自 2026-08-16 起是 git 依赖，**不再是工作区成员**：`cargo test -p agent` 与
@@ -430,7 +431,7 @@ user 消息（帧、唤醒、job 终局）一个字都不记**。job 进展行�
 视锥体积按 r³ 长、暴露面只按 r² 长，多花的全在遍历看不见的空气。160 格 2.6 秒一次，
 模型一轮才 2 秒——连主动 `scan` 都用不了，更不用说每 250ms 的眼睛。
 
-**结论：眼睛用 32 格 + 不限方块数**，模型要看更远走 `scan` 的角度换距离预算。
+**结论：眼睛用 32 格 + 不限方块数**。（`scan` 工具与这个探针已删，见 git 历史。）
 
 ### 已知的下一档优化（未做）
 
@@ -460,10 +461,7 @@ Minecraft 自己的 section 级 cave culling 我们已经有对应物（section 
 
 ### 实测
 
-```
-# 静止基线（需要 --features azalea，需服务端）
-cargo run --release -p world --features azalea --example scan_bench_probe -- 127.0.0.1 25565 bench 30
-```
+`scan_bench_probe` 与 `scan_changes` 已删，下表是当时的记录，复现需回到 git 历史。
 
 | 场景 | 构建 | 最快 | 中位/均值 | 最慢 |
 | --- | --- | --- | --- | --- |

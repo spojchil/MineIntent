@@ -38,7 +38,7 @@ pub enum ToolClass {
 /// 口径对齐原版（26.1.2 客户端字节码考证）：死亡屏不暂停游戏
 /// （`DeathScreen.isPauseScreen()` 恒 false；多人下 `Minecraft.pause`
 /// 的第一道闸 `hasSingleplayerServer()` 本就为 false），所以死人**看得见
-/// 世界、听得见声音、看得见聊天**——`Free` 类（scan/remember）照常放行。
+/// 世界、听得见声音、看得见聊天**——`Free` 类（view/remember）照常放行。
 /// 但 `handleKeybinds()` 只在 `screen == null` 时调用，死亡屏是非空 screen，
 /// 所以死人**开不了口**——chat_box 连同其余 `Body` 类一起拦。
 pub trait LifeGate: Send + Sync {

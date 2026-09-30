@@ -216,41 +216,6 @@ impl Module {
         self.execute(DoorCommand::Chat(line.to_owned())).await
     }
 
-    /// 全景视口投影：用最新快照的姿态与实体，方块走世界模型读锁
-    /// （非 ECS，可在任意线程调用；计算量大，调用方自行放阻塞池）。
-    pub fn scan(
-        &self,
-        options: &crate::ViewportOptions,
-    ) -> Result<crate::ViewportProjection, String> {
-        let snapshot = self.latest();
-        if !matches!(snapshot.phase, ConnectionPhase::Ready) {
-            return Err("尚未连接到世界，无法观察".to_owned());
-        }
-        let world = self
-            .inner
-            .world_handle
-            .lock()
-            .clone()
-            .ok_or_else(|| "世界模型尚未就绪".to_owned())?;
-        let world = world.read();
-        let pose = crate::viewport::Pose {
-            position: snapshot.self_state.position,
-            yaw: snapshot.self_state.yaw,
-            pitch: snapshot.self_state.pitch,
-        };
-        crate::viewport::project_with_reader(
-            &pose,
-            &snapshot.entities,
-            crate::viewport::WorldReader::new(
-                |position| probe_block_from_world(&world, position),
-                |position| read_block_from_world(&world, position),
-            ),
-            options,
-            || Ok(()),
-        )
-        .map_err(|error| error.to_string())
-    }
-
     /// Copy a bounded region for on-demand rendering, then release the world
     /// lock before parsing assets or rendering pixels. Call on a blocking worker.
     pub fn capture_blocks(&self, radius: u32) -> Result<crate::BlockRegion, String> {
@@ -317,11 +282,10 @@ impl Module {
         })
     }
 
-    /// 同 [`Module::scan`]，另把射线走过的空格记进 [`crate::ObservedSpace`]。
+    /// 全景视口投影，另把射线走过的空格记进 [`crate::ObservedSpace`]。
     ///
-    /// 单独一个入口而不是给 `scan` 加参数：`scan` 服务的是**工具回执**（模型问
-    /// 「我看见什么」），一次性；本入口服务的是**眼睛**，每帧都跑，是三态记忆
-    /// 里「确认为空」那一位的唯一产生方。
+    /// 服务的是**眼睛**：每帧都跑，是三态记忆里「确认为空」那一位的唯一产生方。
+    /// 投影是纯 CPU 重活，调用方自行放阻塞池。
     fn scan_observing(
         &self,
         options: &crate::ViewportOptions,
@@ -357,45 +321,6 @@ impl Module {
         .map_err(|error| error.to_string())
     }
 
-    /// 定向视口投影：约束同 [`Module::scan`]。
-    pub fn scan_directed(
-        &self,
-        positions: &[[i32; 3]],
-        options: &crate::ViewportOptions,
-    ) -> Result<crate::DirectedProjection, String> {
-        let snapshot = self.latest();
-        if !matches!(snapshot.phase, ConnectionPhase::Ready) {
-            return Err("尚未连接到世界，无法观察".to_owned());
-        }
-        let world = self
-            .inner
-            .world_handle
-            .lock()
-            .clone()
-            .ok_or_else(|| "世界模型尚未就绪".to_owned())?;
-        let world = world.read();
-        let bounds = crate::WorldHeightBounds::new(world.chunks.min_y(), world.chunks.height());
-        let pose = crate::viewport::Pose {
-            position: snapshot.self_state.position,
-            yaw: snapshot.self_state.yaw,
-            pitch: snapshot.self_state.pitch,
-        };
-        crate::viewport::project_directed_with_reader(
-            &pose,
-            positions,
-            crate::viewport::WorldReader::new(
-                |position| probe_block_from_world(&world, position),
-                |position| read_block_from_world(&world, position),
-            ),
-            options,
-            bounds,
-            || Ok(()),
-        )
-        .map_err(|error| error.to_string())
-    }
-
-    /// 增量视口投影：对比方块记忆只报变化，并当场推进记忆（回执走内核
-    /// settled 通道必达模型，产出即送达）。约束同 [`Module::scan`]。
     /// 开启**合法寻路**：寻路只按 `memory` 里观察过的方块规划路线
     /// （不调用就是原样——azalea 读服务端推来的全部已加载区块，包括同伴从没看过的
     /// 地方，那会泄露未见地形；理由详见 `machine::observed` 模块文档）。
@@ -488,12 +413,7 @@ impl Module {
 
     /// 睁眼一次：把合法可见的方块整份写进记忆，返回吸收了多少格。
     ///
-    /// 眼睛走这条路而不是 [`Self::scan_changes`]：**差异没有消费者了**。方块不进
-    /// 会话区之后，记忆只需要「把看见的收进来」，不需要知道哪些是新的。
-    /// 实测差异那一层是 +3.7ms / 35%（8.8ms → 13.3ms），省下来是白赚的。
-    ///
-    /// 差异那套代码**保留不动**：将来做订阅（「盯着这个熔炉」）时，它就是原料；
-    /// 而且 `scan` 工具的 `changes` 模式现在仍然在用它。
+    /// 记忆只需要「把看见的收进来」，不需要知道哪些是新的。
     pub fn absorb(
         &self,
         memory: &std::sync::Mutex<crate::BlockMemory>,
@@ -517,42 +437,6 @@ impl Module {
             memory.absorb_visible(std::slice::from_ref(block), at_tick);
         }
         Ok(projection.visible_blocks.blocks.len())
-    }
-
-    pub fn scan_changes(
-        &self,
-        memory: &std::sync::Mutex<crate::BlockMemory>,
-        options: &crate::ViewportOptions,
-    ) -> Result<Vec<crate::BlockChange>, String> {
-        let snapshot = self.latest();
-        if !matches!(snapshot.phase, ConnectionPhase::Ready) {
-            return Err("尚未连接到世界，无法观察".to_owned());
-        }
-        let world = self
-            .inner
-            .world_handle
-            .lock()
-            .clone()
-            .ok_or_else(|| "世界模型尚未就绪".to_owned())?;
-        let world = world.read();
-        let bounds = crate::WorldHeightBounds::new(world.chunks.min_y(), world.chunks.height());
-        let pose = crate::viewport::Pose {
-            position: snapshot.self_state.position,
-            yaw: snapshot.self_state.yaw,
-            pitch: snapshot.self_state.pitch,
-        };
-        // 对比与推进在同一次持锁内完成：与并行吸收（其他 scan 回执）互斥，
-        // 不会对着推进到一半的记忆做 diff。
-        let mut memory = memory.lock().expect("方块记忆锁不应中毒");
-        let changes = crate::viewport::project_changes(
-            &pose,
-            &memory,
-            |position| read_block_from_world(&world, position),
-            options,
-            bounds,
-        )?;
-        memory.apply(&changes, snapshot.tick);
-        Ok(changes)
     }
 
     /// 全部在途任务。空 = 什么都没在跑。

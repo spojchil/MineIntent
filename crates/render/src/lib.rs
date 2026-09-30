@@ -2,7 +2,7 @@
 //!
 //! 呈现选择政策归此处（给多少、怎么说）；事实归快照（world），本层不添不删事实，
 //! 只挑选与措辞。处境厚度为"中版"：环境 + 体征 + 位置朝向 + 周围实体概览
-//! + 聊天未读数；方块级细节走感知的 scan，不进每轮开场。
+//! + 聊天未读数；方块级细节看画面（view），不进每轮开场。
 //!
 //! 同类实体聚合呈现（数量 + 最近距离方位）——压缩方向是同质聚合，不是截断。
 
@@ -115,8 +115,8 @@ pub fn render_environment(snap: &TickSnapshot) -> String {
 
 /// 准星一行：此刻对着什么。
 ///
-/// 对应原版 F3 的 `LOOKING_AT_*`。它值钱不在多一条信息，而在**免费**：模型此前要
-/// 花轮次 `scan` / `look` 才知道自己对着什么，实盘感知占比曾达 59%。
+/// 对应原版 F3 的 `LOOKING_AT_*`。它值钱不在多一条信息，而在**免费**：不用专门
+/// 花一轮去看，就知道自己对着什么。
 ///
 /// 数据直接取 azalea 每 tick 维护的 `HitResultComponent`——我们不自己发射线，
 /// 也就不会和它算出两套结果。够不着任何东西时这一行不出现（原版此时也不显示），
@@ -603,202 +603,11 @@ pub fn render_container_menu(snap: &TickSnapshot, kind: &str) -> String {
     }
 }
 
-/// 视口全景的呈现：同名方块聚合（数量+最近位置），实体逐个列出。
-/// 近距截断是临时政策（⑥），聚合是其非临时方向的第一步。
-pub fn render_viewport(projection: &world::ViewportProjection) -> String {
-    let mut lines = Vec::new();
-    let pose = &projection.pose;
-    lines.push(format!(
-        "视角：位于 ({:.1}, {:.1}, {:.1})，面朝 {}°（俯仰 {}°）。",
-        pose.position[0], pose.position[1], pose.position[2], pose.yaw_degrees, pose.pitch_degrees
-    ));
-    if let Some(block) = &projection.looked_at_block {
-        // 准星几乎总有落点：非空气=第一个撞上的方块；空气=视线尽头那格
-        // （看天/一路空到扫描边界/撞到未加载区），如实说穿。
-        if world::is_air_name(&block.name) {
-            lines.push(format!(
-                "准星方向一路是空气，视线尽头 ({}, {}, {})。",
-                block.position[0], block.position[1], block.position[2]
-            ));
-        } else {
-            lines.push(format!(
-                "准星对着：{} ({}, {}, {})。",
-                world::visible_block_label(&block.name, &block.properties),
-                block.position[0],
-                block.position[1],
-                block.position[2]
-            ));
-        }
-    }
-    if let Some(block) = &projection.standing_on_block {
-        lines.push(format!(
-            "脚下踩着：{}。",
-            world::visible_block_label(&block.name, &block.properties)
-        ));
-    }
-
-    if projection.visible_entities.items.is_empty() {
-        lines.push("视野里没有实体。".to_owned());
-    } else {
-        let entities: Vec<String> = projection
-            .visible_entities
-            .items
-            .iter()
-            .map(|entity| {
-                let label = match &entity.player {
-                    Some(player) => format!("玩家 {player}"),
-                    None => entity.entity_type.clone(),
-                };
-                format!(
-                    "{label}（{:.0}, {:.0}, {:.0}）",
-                    entity.position[0], entity.position[1], entity.position[2]
-                )
-            })
-            .collect();
-        let mut line = format!("视野里的实体：{}", entities.join("；"));
-        if projection.visible_entities.truncated {
-            line.push_str("；更远处还有");
-        }
-        line.push('。');
-        lines.push(line);
-    }
-
-    if projection.visible_blocks.blocks.is_empty() {
-        lines.push("视野里没有可见方块（可能都被挡住或未加载）。".to_owned());
-    } else {
-        // 同标签聚合：数量 + 最近一处坐标（列表本身按距离从近到远）。
-        // 标签=名称+白名单视觉属性——燃着与熄着的熔炉是两组，远处可辨。
-        let mut groups: Vec<(String, usize, [i32; 3])> = Vec::new();
-        for block in &projection.visible_blocks.blocks {
-            let label = world::visible_block_label(&block.name, &block.properties);
-            match groups.iter_mut().find(|(seen, ..)| *seen == label) {
-                Some((_, count, _)) => *count += 1,
-                None => groups.push((label, 1, block.position)),
-            }
-        }
-        let described: Vec<String> = groups
-            .into_iter()
-            .map(|(label, count, [x, y, z])| {
-                if count > 1 {
-                    format!("{label} ×{count}（最近 {x},{y},{z}）")
-                } else {
-                    format!("{label}（{x},{y},{z}）")
-                }
-            })
-            .collect();
-        let mut line = format!("可见方块：{}", described.join("；"));
-        if projection.visible_blocks.truncated {
-            line.push_str("；更远处已截断");
-        }
-        line.push('。');
-        lines.push(line);
-    }
-    lines.join("\n")
-}
-
-/// 增量查看结果的呈现：git 式 diff——只说变了什么，不说没变的。
-///
-/// 基线是记忆整体，不是「上一次报告」——比较不带时间性。每行是一个
-/// 五元组 (±, x, y, z, 方块状态)：第四元不止名称，是名称+白名单视觉属性
-/// （`furnace[facing=north,lit=true]`）——远处即可分辨熔炉燃灭，状态变化
-/// 也能一撤一立显出来；`+` 该事实进入所见，`-` 该事实不再成立，与 git 同法。
-/// 末注保住「缺席≠没有」语义。
-pub fn render_block_changes(changes: &[world::BlockChange]) -> String {
-    let quad = |at: &[i32; 3], fact: &world::BlockFact| {
-        format!(
-            "({}, {}, {}, {})",
-            at[0],
-            at[1],
-            at[2],
-            world::visible_block_label(&fact.name, &fact.properties)
-        )
-    };
-    let mut lines = Vec::new();
-    for change in changes {
-        match change {
-            world::BlockChange::Appeared { at, fact } => {
-                lines.push(format!("+ {}", quad(at, fact)));
-            }
-            world::BlockChange::Changed { at, was, now } => {
-                lines.push(format!("- {}", quad(at, was)));
-                lines.push(format!("+ {}", quad(at, now)));
-            }
-            world::BlockChange::Vanished { at, was } => {
-                lines.push(format!("- {}", quad(at, was)));
-            }
-        }
-    }
-    if lines.is_empty() {
-        lines.push("（与记忆一致；未列出≠没有，确认用 at）".to_owned());
-    } else {
-        lines.push("（相对你已见过的；未列出≠没有，确认用 at）".to_owned());
-    }
-    lines.join("\n")
-}
-
-/// 定向查看结果的呈现：逐坐标报可见/不可见与原因。
-pub fn render_directed(projection: &world::DirectedProjection) -> String {
-    let mut lines = Vec::new();
-    for seen in &projection.seen {
-        // 空气格照实报「空」：亲眼可证的空位是一等观察结果（消失确认靠它），
-        // 不说「是 air」这种半生不熟的话。
-        if world::is_air_name(&seen.name) {
-            lines.push(format!(
-                "({}, {}, {})：看得见，那里是空的。",
-                seen.at[0], seen.at[1], seen.at[2]
-            ));
-        } else {
-            lines.push(format!(
-                "({}, {}, {})：看得见，是 {}。",
-                seen.at[0],
-                seen.at[1],
-                seen.at[2],
-                world::visible_block_label(&seen.name, &seen.properties)
-            ));
-        }
-    }
-    for unseen in &projection.unseen {
-        let mut reasons = Vec::new();
-        for why in &unseen.why {
-            reasons.push(match why {
-                world::DirectedWhy::OutsideFov => "在视野外".to_owned(),
-                world::DirectedWhy::TooFar => match (unseen.distance, unseen.max) {
-                    (Some(distance), Some(max)) => {
-                        format!("太远（{distance:.0} 格，上限 {max:.0}）")
-                    }
-                    _ => "太远".to_owned(),
-                },
-                world::DirectedWhy::Occluded => match &unseen.by {
-                    Some(occluder) => format!(
-                        "被 {}（{}, {}, {}）挡住",
-                        occluder.name, occluder.at[0], occluder.at[1], occluder.at[2]
-                    ),
-                    None => "被挡住".to_owned(),
-                },
-                world::DirectedWhy::ChunkNotLoaded => "那片区域尚未加载".to_owned(),
-                world::DirectedWhy::OutOfWorld => "超出世界高度".to_owned(),
-            });
-        }
-        lines.push(format!(
-            "({}, {}, {})：看不见——{}。",
-            unseen.at[0],
-            unseen.at[1],
-            unseen.at[2],
-            reasons.join("，")
-        ));
-    }
-    if lines.is_empty() {
-        "（没有要查看的目标。）".to_owned()
-    } else {
-        lines.join("\n")
-    }
-}
-
 /// 进行中的进展措辞。
 ///
 /// 一趟远路是多段的——按自己观察到的地图规划，只能先走到知识边界，到了看到更多
 /// 再往前。每段开始说一句这一程走到哪，模型才知道自己为什么走走停停；不说，它
-/// 看到的就是「走了一段莫名其妙停下」，然后去 scan 找补。
+/// 看到的就是「走了一段莫名其妙停下」。
 ///
 /// **不解释为什么到此为止**：路径是被知识边界截断还是被超时截断，`is_partial`
 /// 分不出，说了就是把未知讲成已知。

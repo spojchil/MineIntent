@@ -35,7 +35,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use world::{ConnectionConfig, DoorCommand, Module, SnapshotSource, ViewportOptions};
+use world::{ConnectionConfig, DoorCommand, Module, SnapshotSource};
 
 /// 站立时脚下那格的整数坐标——垫柱要放的就是这一格。
 fn feet_block(module: &Module) -> [i32; 3] {
@@ -50,18 +50,6 @@ fn feet_block(module: &Module) -> [i32; 3] {
 
 fn on_ground(module: &Module) -> bool {
     module.latest().self_state.on_ground
-}
-
-/// 脚下那格现在是什么。定向观察只对**看得见**的格位有答案，所以这只是旁证；
-/// 主判据是人有没有站上去（`feet_block` 的 y 抬高一格）——那个不依赖视线。
-fn block_name(module: &Arc<Module>, at: [i32; 3]) -> String {
-    match module.scan_directed(&[at], &ViewportOptions::default()) {
-        Ok(view) => match view.seen.first() {
-            Some(block) => block.name.clone(),
-            None => "看不见".to_owned(),
-        },
-        Err(reason) => format!("读不到（{reason}）"),
-    }
 }
 
 #[tokio::main]
@@ -127,7 +115,7 @@ async fn main() -> Result<(), String> {
         let lifted = after[1] == before[1] + 1;
 
         println!(
-            "[探针] 间隔 {gap_ms:>3}ms｜发出时{}｜门层：{}｜脚下 {before:?} 现在是 {}｜人{}",
+            "[探针] 间隔 {gap_ms:>3}ms｜发出时{}｜门层：{}｜脚下 {before:?}｜人{}",
             if airborne {
                 "已离地"
             } else {
@@ -137,7 +125,6 @@ async fn main() -> Result<(), String> {
                 Ok(()) => "受理".to_owned(),
                 Err(reason) => format!("拒绝——{reason}"),
             },
-            block_name(&module, before),
             if lifted {
                 format!("升到 {after:?} ✓")
             } else {

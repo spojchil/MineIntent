@@ -1,6 +1,6 @@
 # 当前实现结构
 
-> 无产品权威。绑定 `fix/observed-pathfinding-install` 当前工作树（基线 `d11d347`）与
+> 无产品权威。绑定 `feat/picture-keymouse` 当前工作树与
 > Azalea fork `cce19dfa7b120eef090c48d96f5b25851cd89d9a`、midturn
 > `bf8bc7a7126dc2943145b03a0b4a3481de8177e1`。
 >
@@ -44,7 +44,7 @@ context perception screens   motion   hand    jobs   presence   memory  wait
 | `world` | 接入 azalea、tick 快照、视口内核 | **直译无损、政策外置**：不过滤、不判重要性、不做丢弃决策 |
 | `render` | 快照 → 模型可读文字 | **全部纯函数**；呈现选择归此处，事实归快照 |
 | `vision` | 已有方块状态 + 本地客户端资源 → PNG 图片原型 | CPU 三角形光栅化、视锥裁剪、深度缓冲与透明合成，按需成像；无窗口或游戏模拟；配置资源后供 `view` 工具调用，限制见 [vision](../crates/vision/README.md) |
-| `perception` | 主动看（`scan`）、查记忆（`blocks`，含 SQL 面）、按需图片（`view`） | 文字视口几何在 world；SQL 查询期不持锁；图片通过 `PictureDoor` 获取，保留为原生图片回执 |
+| `perception` | 按需图片（`view`） | 图片通过 `PictureDoor` 获取，保留为原生图片回执；文字视口已从模型面撤下 |
 | `screens` | 界面互斥域（`chat_box`/`inventory`/`container`） | 屏的状态转换在此，占用账本在 dispatch；容器屏真相在服务端，组合根随屏事实翻转 |
 | `motion` / `hand` | 位移朝向 / 攻挖用 | 工具只表达意图立刻返回，合法性由原版物理自我仲裁 |
 | `jobs` | 任务表（`list`） | 只读、`ToolClass::Free`；槽位是唯一真相源，不另建镜像 |
@@ -85,8 +85,8 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
                                   agent → 模型
 ```
 
-方块**不在快照里**——最深最重的嵌套留在 azalea 世界模型原地，
-`perception::scan` 按需拉（`world::machine::blocks`）。
+方块**不在快照里**——最深最重的嵌套留在 azalea 世界模型原地。模型看方块只经画面
+（`view`）；视口内核只服务「眼睛」，把合法可见的方块写进方块记忆，供寻路读。
 
 图片原型另有 `Module::capture_blocks`：在一个世界读锁下复制有界区域中的非空气
 方块，返回 `BlockRegion` 及未加载格数，随后释放锁。姿态取最新 tick 快照，与
@@ -141,14 +141,14 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
 **写口只有 `observe(at, Option<fact>, tick)` 一个**，删除这个操作在 API 上不存在：
 「亲眼见空」是一条载荷为空的观察，不是把记录删掉。
 
-模型面是两张虚表（`crates/perception/src/vtab.rs`），底下就是这本记忆，
-一行都不产生；「没看过」只能以两表反连接的形式出现，因为补集无界。
+这本记忆不再有模型面：写它的只有眼睛（`Module::absorb`），读它的只有寻路。
 
 ## 4b. 战争迷雾 `go_to`
 
-外部 `go_to` 当前仍是**精确身体格**目标；是否另提供 near/reach 语义仍在
-[Issue #139](https://github.com/spojchil/MineIntent/issues/139) 等待产品决定，当前实现
-不静默改写。已观察地图寻路按下面的有限状态循环：
+`go_to` 已从模型面撤下（`motion` 不再提供），底层 `DoorCommand::GoTo` 与下述状态机
+保留，模型可达的只剩 `forward`（化归为寻路目标），并将随画面与键鼠输入逐步退役。
+[Issue #139](https://github.com/spojchil/MineIntent/issues/139) 的 near/reach 语义随之搁置。
+已观察地图寻路按下面的有限状态循环：
 
 ```text
 Direct(精确目标)

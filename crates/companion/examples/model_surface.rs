@@ -133,127 +133,6 @@ impl wait::Interruptions for NoDoor {
     }
 }
 
-impl perception::ViewportDoor for NoDoor {
-    fn scan<'a>(
-        &'a self,
-        _options: world::ViewportOptions,
-    ) -> PortFuture<'a, Result<world::ViewportProjection, String>> {
-        Box::pin(async {
-            Ok(world::ViewportProjection {
-                pose: world::ViewportPose {
-                    position: [10.5, 72.0, 3.5],
-                    yaw_degrees: 90.0,
-                    pitch_degrees: 10.0,
-                },
-                standing_on_block: Some(world::ViewportBlock {
-                    name: "grass_block".to_owned(),
-                    state_id: 1,
-                    properties: Default::default(),
-                    position: [10, 71, 3],
-                }),
-                looked_at_block: Some(world::ViewportBlock {
-                    name: "oak_log".to_owned(),
-                    state_id: 1,
-                    properties: Default::default(),
-                    position: [6, 72, 3],
-                }),
-                visible_entities: world::VisibleEntitiesResult {
-                    items: vec![world::VisibleEntity {
-                        entity_type: "sheep".to_owned(),
-                        player: None,
-                        position: [7.0, 72.0, 5.0],
-                    }],
-                    truncated: false,
-                },
-                visible_blocks: world::VisibleBlocksResult {
-                    blocks: vec![
-                        world::ViewportBlock {
-                            name: "oak_log".to_owned(),
-                            state_id: 1,
-                            properties: Default::default(),
-                            position: [6, 72, 3],
-                        },
-                        world::ViewportBlock {
-                            name: "oak_log".to_owned(),
-                            state_id: 1,
-                            properties: Default::default(),
-                            position: [6, 73, 3],
-                        },
-                    ],
-                    truncated: true,
-                },
-            })
-        })
-    }
-    fn scan_directed<'a>(
-        &'a self,
-        _p: Vec<[i32; 3]>,
-    ) -> PortFuture<'a, Result<world::DirectedProjection, String>> {
-        Box::pin(async {
-            Ok(world::DirectedProjection {
-                seen: vec![world::DirectedSeenBlock {
-                    at: [6, 72, 3],
-                    name: "oak_log".to_owned(),
-                    state_id: 1,
-                    properties: Default::default(),
-                }],
-                unseen: vec![world::DirectedUnseenBlock {
-                    at: [0, 60, 0],
-                    why: vec![world::DirectedWhy::Occluded],
-                    by: Some(world::DirectedOccluder {
-                        name: "stone".to_owned(),
-                        properties: Default::default(),
-                        at: [3, 65, 1],
-                    }),
-                    distance: None,
-                    max: None,
-                }],
-            })
-        })
-    }
-    fn scan_changes<'a>(&'a self) -> PortFuture<'a, Result<Vec<world::BlockChange>, String>> {
-        Box::pin(async {
-            Ok(vec![
-                world::BlockChange::Appeared {
-                    at: [8, 72, 4],
-                    fact: world::BlockFact {
-                        name: "chest".to_owned(),
-                        state_id: 1,
-                        properties: Default::default(),
-                    },
-                },
-                world::BlockChange::Changed {
-                    at: [6, 72, 3],
-                    was: world::BlockFact {
-                        name: "furnace".to_owned(),
-                        state_id: 1,
-                        properties: std::collections::BTreeMap::from([
-                            ("facing".to_owned(), "north".to_owned()),
-                            ("lit".to_owned(), "false".to_owned()),
-                        ]),
-                    },
-                    now: world::BlockFact {
-                        name: "furnace".to_owned(),
-                        state_id: 1,
-                        properties: std::collections::BTreeMap::from([
-                            ("facing".to_owned(), "north".to_owned()),
-                            ("lit".to_owned(), "true".to_owned()),
-                        ]),
-                    },
-                },
-                world::BlockChange::Vanished {
-                    at: [6, 73, 3],
-                    was: world::BlockFact {
-                        name: "oak_log".to_owned(),
-                        state_id: 1,
-                        properties: Default::default(),
-                    },
-                },
-            ])
-        })
-    }
-}
-
 /// 样例快照：白天主世界、半血、身边有玩家与两只僵尸、背包有几样东西、
 /// 聊天窗两条未读。
 fn sample_snapshot() -> world::TickSnapshot {
@@ -529,14 +408,6 @@ async fn main() {
             Box::new(motion::MotionTools::new(door.clone())),
         ),
         ("hand", Box::new(hand::HandTools::new(door.clone()))),
-        (
-            "scan",
-            Box::new(perception::PerceptionTools::new(
-                door.clone(),
-                Arc::new(std::sync::Mutex::new(world::BlockMemory::new())),
-                snapshots.clone(),
-            )),
-        ),
         ("wait", Box::new(wait::WaitTools::new(door.clone()))),
         (
             "view（配置本地资源后启用）",
@@ -654,20 +525,6 @@ async fn main() {
         )
         .await
     );
-    let scan = &providers[6].1;
-    println!(
-        "\nscan 环视（呈现样例）：\n\n```text\n{}\n```\n",
-        call(scan.as_ref(), "scan", json!({})).await
-    );
-    println!(
-        "scan 定向（呈现样例）：\n\n```text\n{}\n```\n",
-        call(scan.as_ref(), "scan", json!({"at":[[6,72,3],[0,60,0]]})).await
-    );
-    println!(
-        "scan 增量（呈现样例；与已见过的对比，git 式差异行）：\n\n```text\n{}\n```\n",
-        call(scan.as_ref(), "scan", json!({"changes": true})).await
-    );
-
     // ---- 四、拒绝与报错话术 ----
     println!("## 四、拒绝与报错话术（真实调用产出）\n");
     let _ = call(inventory.as_ref(), "inventory", json!({"action":"open"})).await; // 占屏
@@ -720,15 +577,11 @@ async fn main() {
         "- hand use_on 参数二选一：`{}`",
         call(hand_tools.as_ref(), "hand", json!({"action":"use_on"})).await
     );
-    println!(
-        "- scan at 越界：`{}`",
-        call(scan.as_ref(), "scan", json!({"at":[[1,2]]})).await
-    );
     println!("\n编排层拒绝（dispatch，字面常量）：\n");
     println!("- 屏压制其他身体域：`有界面开着，无法移动或与世界交互；先关闭界面再行动`");
     println!("- 未知工具名：`没有名为 xx 的工具；请改用工具列表中的名字`\n");
     println!("接入机器的如实拒绝（字面常量，经门原文转达）：\n");
-    println!("- `尚未连接到世界，无法行动` / `尚未连接到世界，无法观察` / `连接已结束`");
+    println!("- `尚未连接到世界，无法行动` / `连接已结束`");
     println!("- `附近没有 {{entity_key}} 这个实体`（attack/use_on 实体找不到时）");
     println!("- `格号 {{slot}} 超出当前界面范围（0-{{max}}）` / `两个格号相同，没有可交换的`");
     println!("- `没有开着的容器界面`（没有容器时 container close）\n");

@@ -18,7 +18,6 @@ use hand::{HandDoor, HandTools};
 use jobs::{JobsDoor, JobsTools};
 use memory::{MemoryFile, MemoryTools};
 use motion::{MotionDoor, MotionTools};
-use perception::{PerceptionTools, ViewportDoor};
 use presence::{PresenceDoor, PresenceTools};
 use screens::{
     ChatBox, ChatDoor, ChatHistory, ChatReadMark, ContainerScreen, InventoryDoor, InventoryScreen,
@@ -217,55 +216,6 @@ impl InventoryDoor for ModuleInventoryDoor {
     }
     fn close_container<'a>(&'a self) -> agent::PortFuture<'a, Result<(), String>> {
         Box::pin(async move { self.0.execute(DoorCommand::CloseContainer).await })
-    }
-}
-
-/// 视口门：投影是纯 CPU 重活，放阻塞池，不占用异步线程。
-struct ModuleViewportDoor {
-    module: Arc<Module>,
-    /// 增量模式的对比基线：与 perception 吸收共用同一本方块记忆。
-    block_memory: Arc<std::sync::Mutex<world::BlockMemory>>,
-}
-
-impl ViewportDoor for ModuleViewportDoor {
-    fn scan<'a>(
-        &'a self,
-        options: world::ViewportOptions,
-    ) -> agent::PortFuture<'a, Result<world::ViewportProjection, String>> {
-        let module = self.module.clone();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || module.scan(&options))
-                .await
-                .map_err(|error| format!("视口投影任务失败：{error}"))?
-        })
-    }
-
-    fn scan_directed<'a>(
-        &'a self,
-        positions: Vec<[i32; 3]>,
-    ) -> agent::PortFuture<'a, Result<world::DirectedProjection, String>> {
-        let module = self.module.clone();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                module.scan_directed(&positions, &world::ViewportOptions::default())
-            })
-            .await
-            .map_err(|error| format!("视口投影任务失败：{error}"))?
-        })
-    }
-
-    fn scan_changes<'a>(
-        &'a self,
-    ) -> agent::PortFuture<'a, Result<Vec<world::BlockChange>, String>> {
-        let module = self.module.clone();
-        let memory = self.block_memory.clone();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                module.scan_changes(&memory, &world::ViewportOptions::default())
-            })
-            .await
-            .map_err(|error| format!("视口投影任务失败：{error}"))?
-        })
     }
 }
 
@@ -701,14 +651,6 @@ async fn main() -> Result<(), String> {
         Arc::new(MotionTools::new(Arc::new(ModuleMotionDoor(module.clone())))),
         Arc::new(HandTools::new(Arc::new(ModuleHandDoor(module.clone())))),
         Arc::new(JobsTools::new(Arc::new(ModuleJobsDoor(module.clone())))),
-        Arc::new(PerceptionTools::new(
-            Arc::new(ModuleViewportDoor {
-                module: module.clone(),
-                block_memory: block_memory.clone(),
-            }),
-            block_memory.clone(),
-            snapshots.clone(),
-        )),
         Arc::new(PresenceTools::new(Arc::new(ModulePresenceDoor(
             module.clone(),
         )))),
@@ -810,15 +752,13 @@ async fn main() -> Result<(), String> {
                 // 分开后实测排队开销 ≈0ms（1000 次采样，两者均值同为 26ms）；两个数
                 // 留着，是因为阻塞池一旦真忙起来它们会分开，而节律要跟着退。
 
-                // **方块信息不进会话区**：diff 照常算、照常
-                // 推进记忆——那是给机器用的（寻路读它，`blocks` 工具查它）——但一格
-                // 都不推给模型。
+                // **方块信息不进会话区**：眼睛把看见的吸进记忆——那是给机器用的
+                // （寻路读它）——但一格都不推给模型。
                 //
                 // 逐格推送在数学上走不通：站着转两分钟就能攒几千格，按 10.5 token/格
                 // 折算，半个 1M 窗口只装得下约 4.8 万格。不是优化得好不好的问题。
                 //
-                // 模型要方块就自己 `scan`（睁眼，填记忆）再查记忆库——就像改代码时
-                // 从不加载整个仓库，而是 grep 到行号再读那几行。
+                // 模型要看世界就看画面（`view`）。
                 let dispatched = std::time::Instant::now();
                 let outcome = tokio::task::spawn_blocking(move || {
                     let at = std::time::Instant::now();

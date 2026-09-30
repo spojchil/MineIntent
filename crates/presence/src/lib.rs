@@ -15,7 +15,7 @@
 //! - **看得见世界、听得见声音**：死亡屏不暂停游戏。`DeathScreen.isPauseScreen()`
 //!   恒为 false；而多人下 `Minecraft` 里 `pause` 的第一道闸就是
 //!   `hasSingleplayerServer()`，本就为 false，`soundManager.pauseAllExcept`
-//!   永远走不到。所以 `scan` 这类 `Free` 工具照常放行。
+//!   永远走不到。所以 `view` 这类 `Free` 工具照常放行。
 //! - **开不了口**：`handleKeybinds()`（聊天键在内）只在 `screen == null`
 //!   时调用，死亡屏是非空 screen。所以 `chat_box` 连同其余身体类一起拦。
 //! - **收得到别人说话**：聊天 HUD 归 `Gui` 渲染，不经 screen。所以唤醒判据

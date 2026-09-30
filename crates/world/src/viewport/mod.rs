@@ -14,7 +14,7 @@ mod geometry;
 mod incremental;
 mod observed_space;
 
-pub use incremental::{diff, BlockChange, BlockFact, BlockMemory, Known};
+pub use incremental::{BlockFact, BlockMemory, Known};
 pub use observed_space::ObservedSpace;
 
 use geometry::{
@@ -61,8 +61,6 @@ const RAY_STEP: f64 = 0.25;
 const FACE_EPSILON: f64 = 0.01;
 const DEFAULT_VERTICAL_HALF_ANGLE: f64 = 35.0 * PI / 180.0;
 const DEFAULT_ASPECT_RATIO: f64 = 16.0 / 9.0;
-const DIRECTED_MAX_DISTANCE: f64 = 32.0;
-pub const MAX_DIRECTED_VIEW_POSITIONS: usize = 16;
 
 /// 视口失败：参数非法或检查点（取消/超时）触发。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,25 +85,6 @@ impl std::fmt::Display for ViewportError {
 }
 
 impl std::error::Error for ViewportError {}
-
-/// 世界高度边界。定向几何在读取世界前用它分类出界目标；
-/// 上界用 `i64` 计算，任意 `i32` 查询坐标都安全。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct WorldHeightBounds {
-    pub min_y: i32,
-    pub height: u32,
-}
-
-impl WorldHeightBounds {
-    pub const fn new(min_y: i32, height: u32) -> Self {
-        Self { min_y, height }
-    }
-
-    fn contains_y(self, y: i32) -> bool {
-        let y = i64::from(y);
-        y >= i64::from(self.min_y) && y < i64::from(self.min_y) + i64::from(self.height)
-    }
-}
 
 /// 可见方块候选的几何谓词。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -134,8 +113,8 @@ impl ViewportOptions {
     /// 给**记忆**用的参数：判据不变，预算放开。
     ///
     /// `block_limit` 是**呈现**预算——模型读不了一万行，所以默认只留最近的 256 格。
-    /// 记忆没有这个问题：它是给机器读的（寻路）与按需查的（`blocks`），一次吸多少
-    /// 只影响内存与 CPU，不影响可读性。此前眼睛走的是默认参数，于是**远处看得见的
+    /// 记忆没有这个问题：它是给机器读的（寻路），一次吸多少只影响内存与 CPU，
+    /// 不影响可读性。此前眼睛走的是默认参数，于是**远处看得见的
     /// 方块从来没被记住过**——那是纯粹的损失。
     ///
     /// 视锥角度与遮挡判据**照旧不动**：那是合法性本身，放开它就等于让同伴看见它没
@@ -165,54 +144,6 @@ impl Default for ViewportOptions {
 }
 
 impl ViewportOptions {
-    /// 视口变焦：长宽角度与距离都是参数，耦合走
-    /// **等预算线**——工作量 ∝ tan(横半角)·tan(纵半角)·距离³，预算常数取
-    /// 默认组合（约 102°×70°、32 格）的工作量，不发明数字。收窄视锥即可
-    /// 换更远距离；超预算如实拒绝并告知该角度下的距离上限。
-    /// 硬天花板是服务器发来的已加载区块（射线遇 Unloaded 如实呈现），
-    /// 不设自己的人工帽。
-    pub fn zoomed(
-        width_degrees: f64,
-        height_degrees: f64,
-        range_blocks: f64,
-    ) -> Result<Self, String> {
-        for (name, value) in [("width", width_degrees), ("height", height_degrees)] {
-            if !value.is_finite() || !(10.0..=150.0).contains(&value) {
-                return Err(format!("{name} 需要在 10-150 度之间"));
-            }
-        }
-        if !range_blocks.is_finite() || !(2.0..=256.0).contains(&range_blocks) {
-            return Err("range 需要在 2-256 格之间".to_owned());
-        }
-        let horizontal_half = (width_degrees / 2.0).to_radians();
-        let vertical_half = (height_degrees / 2.0).to_radians();
-        let defaults = Self::default();
-        let budget = defaults.horizontal_half_angle.tan()
-            * defaults.vertical_half_angle.tan()
-            * defaults.max_distance.powi(3);
-        let cost = horizontal_half.tan() * vertical_half.tan() * range_blocks.powi(3);
-        if cost > budget * 1.001 {
-            let max_range = (budget / (horizontal_half.tan() * vertical_half.tan()))
-                .cbrt()
-                .floor();
-            return Err(format!(
-                "超出观察预算：{width_degrees:.0}°×{height_degrees:.0}° 视野下距离上限约 \
-{max_range:.0} 格；想看更远就收窄角度"
-            ));
-        }
-        let range = range_blocks.ceil() as i32;
-        // 竖向盒半径按默认比例（20/32）随距离缩放，行为在默认组合下不变。
-        let vertical_radius = ((range * 20 + 31) / 32).max(4);
-        Ok(Self {
-            horizontal_radius: range,
-            vertical_radius,
-            max_distance: range_blocks,
-            vertical_half_angle: vertical_half,
-            horizontal_half_angle: horizontal_half,
-            ..defaults
-        })
-    }
-
     /// 检查投影参数，避免无界扫描或无效三角函数。
     pub fn validate(&self) -> Result<(), String> {
         if !(0..=256).contains(&self.horizontal_radius) {
@@ -233,8 +164,7 @@ impl ViewportOptions {
         if self.vertical_half_angle >= PI / 2.0 || self.horizontal_half_angle >= PI / 2.0 {
             return Err("viewport 视锥半角必须小于 90 度".to_owned());
         }
-        // 上限是防**模型**乱传的护栏（它的 scan 参数里根本没有这一项，所以实际
-        // 只挡内部误用）。记忆那条路要把整个可见集收进来，4 096 挡得住它——
+        // 上限是防误用的护栏（模型不直接传视口参数，所以只挡内部误用）。记忆那条路要把整个可见集收进来，4 096 挡得住它——
         // 抬到 64 Ki，够一次 160 格视野的量级，同时仍然拦得住离谱值。
         if self.block_limit > 65_536 || self.entity_limit > 256 {
             return Err("viewport 结果上限过大".to_owned());
@@ -305,13 +235,6 @@ enum BlockCell {
     Unloaded,
 }
 
-#[derive(Clone, Debug)]
-struct BlockHit {
-    voxel: BlockPosition,
-    name: String,
-    properties: std::collections::BTreeMap<String, String>,
-}
-
 #[derive(Clone, Copy, Debug)]
 enum RayProperty {
     Occludes,
@@ -323,140 +246,6 @@ enum RayOutcome {
     Hit(BlockPosition),
     Clear,
     Unloaded,
-}
-
-// ---- 定向投影结果 ----
-
-/// 目标不可见的原因，报告固定按此规范顺序排列。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DirectedWhy {
-    OutsideFov,
-    TooFar,
-    Occluded,
-    ChunkNotLoaded,
-    OutOfWorld,
-}
-
-impl DirectedWhy {
-    fn rank(self) -> u8 {
-        match self {
-            Self::OutsideFov => 0,
-            Self::TooFar => 1,
-            Self::Occluded => 2,
-            Self::ChunkNotLoaded => 3,
-            Self::OutOfWorld => 4,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct DirectedOccluder {
-    pub at: [i32; 3],
-    pub name: String,
-    pub properties: std::collections::BTreeMap<String, String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct DirectedSeenBlock {
-    pub at: [i32; 3],
-    pub name: String,
-    pub state_id: u32,
-    pub properties: std::collections::BTreeMap<String, String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct DirectedUnseenBlock {
-    pub at: [i32; 3],
-    pub why: Vec<DirectedWhy>,
-    /// 仅与 TooFar 同现。
-    pub distance: Option<f64>,
-    pub max: Option<f64>,
-    /// 仅与 Occluded 同现；OutOfWorld 行必无。
-    pub by: Option<DirectedOccluder>,
-}
-
-impl DirectedUnseenBlock {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.why.is_empty() {
-            return Err("directed unseen why 不得为空".to_owned());
-        }
-        for pair in self.why.windows(2) {
-            if pair[0].rank() >= pair[1].rank() {
-                return Err("directed unseen why 必须去重并按规范顺序".to_owned());
-            }
-        }
-        let has_too_far = self.why.contains(&DirectedWhy::TooFar);
-        match (has_too_far, self.distance, self.max) {
-            (true, Some(distance), Some(max)) if distance.is_finite() && max.is_finite() => {
-                if max <= 0.0 || distance <= max {
-                    return Err("too_far 要求有限 distance 大于 max".to_owned());
-                }
-            }
-            (true, _, _) => {
-                return Err("too_far 要求同时给出 distance 与 max".to_owned());
-            }
-            (false, None, None) => {}
-            (false, _, _) => {
-                return Err("distance 与 max 只在 too_far 时有效".to_owned());
-            }
-        }
-        if !self.why.contains(&DirectedWhy::Occluded) && self.by.is_some() {
-            return Err("by 只在 occluded 时有效".to_owned());
-        }
-        if self.why.contains(&DirectedWhy::OutOfWorld) && self.by.is_some() {
-            return Err("out_of_world 行不得携带 by".to_owned());
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct DirectedProjection {
-    pub seen: Vec<DirectedSeenBlock>,
-    pub unseen: Vec<DirectedUnseenBlock>,
-}
-
-impl DirectedProjection {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.seen.len().saturating_add(self.unseen.len()) > MAX_DIRECTED_VIEW_POSITIONS {
-            return Err(format!("定向结果最多 {MAX_DIRECTED_VIEW_POSITIONS} 个位置"));
-        }
-        let mut coordinates = std::collections::HashSet::new();
-        for item in &self.seen {
-            if !coordinates.insert(item.at) {
-                return Err("定向结果含重复坐标".to_owned());
-            }
-        }
-        for item in &self.unseen {
-            item.validate()?;
-            if !coordinates.insert(item.at) {
-                return Err("定向结果含重复坐标".to_owned());
-            }
-        }
-        Ok(())
-    }
-}
-
-/// 定向输入边界：非空、至多 16 个、无重复。
-pub fn validate_directed_positions(positions: &[[i32; 3]]) -> Result<(), String> {
-    if positions.is_empty() {
-        return Err("定向观察至少需要一个位置".to_owned());
-    }
-    if positions.len() > MAX_DIRECTED_VIEW_POSITIONS {
-        return Err(format!(
-            "定向观察最多接受 {MAX_DIRECTED_VIEW_POSITIONS} 个位置"
-        ));
-    }
-    let mut unique = std::collections::HashSet::with_capacity(positions.len());
-    if positions
-        .iter()
-        .copied()
-        .all(|position| unique.insert(position))
-    {
-        Ok(())
-    } else {
-        Err("定向观察位置不得重复".to_owned())
-    }
 }
 
 /// 单读取器便捷入口：探针由完整 DTO 折出。
@@ -595,363 +384,6 @@ where
         visible_entities,
         visible_blocks,
     })
-}
-
-/// 定向投影便捷入口，约束同 [`project`]。
-pub fn project_directed<F, C>(
-    pose: &Pose,
-    positions: &[[i32; 3]],
-    read_block: F,
-    options: &ViewportOptions,
-    world_bounds: WorldHeightBounds,
-    checkpoint: C,
-) -> Result<DirectedProjection, ViewportError>
-where
-    F: Fn(BlockPosition) -> BlockReadResult,
-    C: FnMut() -> Result<(), ViewportError>,
-{
-    project_directed_with_reader(
-        pose,
-        positions,
-        WorldReader::new(
-            |position| BlockProbe::from_read(&read_block(position)),
-            &read_block,
-        ),
-        options,
-        world_bounds,
-        checkpoint,
-    )
-}
-
-/// 定向投影：与全量投影同一台内核。捕获的高度边界让出界目标零读取分类；
-/// 目标读取独立返回 `OutOfWorld` 时成为模型可见原因。
-pub fn project_directed_with_reader<P, F, C>(
-    pose: &Pose,
-    positions: &[[i32; 3]],
-    reader: WorldReader<P, F>,
-    options: &ViewportOptions,
-    world_bounds: WorldHeightBounds,
-    mut checkpoint: C,
-) -> Result<DirectedProjection, ViewportError>
-where
-    P: FnMut(BlockPosition) -> BlockProbe,
-    F: FnMut(BlockPosition) -> BlockReadResult,
-    C: FnMut() -> Result<(), ViewportError>,
-{
-    validate_directed_positions(positions)
-        .map_err(|message| ViewportError::new("positions", message))?;
-    options
-        .validate()
-        .map_err(|message| ViewportError::new("viewport", message))?;
-    checkpoint()?;
-
-    let eye = Point3 {
-        x: pose.position.x,
-        y: pose.position.y + EYE_HEIGHT,
-        z: pose.position.z,
-    };
-    let axes = view_axes(pose.yaw, pose.pitch);
-    // 缓存探针而非完整 DTO，理由同全量投影。
-    let mut probe_cache = HashMap::<(i32, i32, i32), BlockProbe>::new();
-    let WorldReader { probe, full } = reader;
-    let mut probe = probe;
-    let mut reader = WorldReader::new(
-        move |position: BlockPosition| {
-            let key = (position.x, position.y, position.z);
-            if let Some(probe) = probe_cache.get(&key) {
-                return *probe;
-            }
-            let result = probe(position);
-            probe_cache.insert(key, result);
-            result
-        },
-        full,
-    );
-    let directed_max_distance = options.max_distance.min(DIRECTED_MAX_DISTANCE);
-    let mut seen = Vec::new();
-    let mut unseen = Vec::new();
-
-    for [x, y, z] in positions.iter().copied() {
-        checkpoint()?;
-        let target = BlockPosition { x, y, z };
-        let center = Point3 {
-            x: f64::from(x) + 0.5,
-            y: f64::from(y) + 0.5,
-            z: f64::from(z) + 0.5,
-        };
-        let delta = subtract(center, eye);
-        let distance = length(delta);
-        let outside_fov = !inside_frustum(axes, delta, options);
-        let too_far = distance > directed_max_distance;
-        let out_of_world = !world_bounds.contains_y(y);
-
-        // 几何是硬的隐私与工作量边界：视锥外或超距的目标不读世界、不追射线
-        // 就分类完毕，任意 i32 坐标都是 O(1) 工作量。
-        if outside_fov || too_far || out_of_world {
-            let mut why = Vec::new();
-            if outside_fov {
-                why.push(DirectedWhy::OutsideFov);
-            }
-            if too_far {
-                why.push(DirectedWhy::TooFar);
-            }
-            if out_of_world {
-                why.push(DirectedWhy::OutOfWorld);
-            }
-            unseen.push(DirectedUnseenBlock {
-                at: [x, y, z],
-                why,
-                distance: too_far.then_some(distance),
-                max: too_far.then_some(directed_max_distance),
-                by: None,
-            });
-            continue;
-        }
-
-        // 定向投影每个目标都要报出方块身份，所以这里必须走完整 DTO；
-        // 目标个数已由 `validate_directed_positions` 限住，不是热路径。
-        let target_result = reader.full(target.clone());
-        // 一次 match 同时定出「这块方块的身份」与「看不看得见」，
-        // 使「同一个不可变值在两次 match 之间不变」的不变量无需被相信。
-        let (target_identity, target_visible) = match &target_result {
-            BlockReadResult::Loaded { block } => {
-                let identity = (block.name.clone(), block.state_id, block.properties.clone());
-                let visible = is_visible_candidate(
-                    &mut reader,
-                    eye,
-                    &target,
-                    distance,
-                    options.predicate,
-                    &mut checkpoint,
-                )?;
-                (Some(identity), visible)
-            }
-            BlockReadResult::Unloaded => (None, false),
-            BlockReadResult::OutOfWorld => {
-                unseen.push(DirectedUnseenBlock {
-                    at: [x, y, z],
-                    why: vec![DirectedWhy::OutOfWorld],
-                    distance: None,
-                    max: None,
-                    by: None,
-                });
-                continue;
-            }
-        };
-
-        if target_visible {
-            let (name, state_id, properties) = target_identity.expect("已加载目标必有方块身份");
-            seen.push(DirectedSeenBlock {
-                at: [x, y, z],
-                name,
-                state_id,
-                properties,
-            });
-            continue;
-        }
-
-        let ray = first_occluder_before_target(&mut reader, eye, center, &target, &mut checkpoint)?;
-        // 几何闸门已经 continue 掉三种原因；到这里它们必为 false。
-        let mut why = Vec::new();
-        let mut by = None;
-        match ray {
-            DirectedRayOutcome::Hit(hit) => {
-                why.push(DirectedWhy::Occluded);
-                by = Some(DirectedOccluder {
-                    at: [hit.voxel.x, hit.voxel.y, hit.voxel.z],
-                    name: hit.name,
-                    properties: hit.properties,
-                });
-            }
-            DirectedRayOutcome::Unloaded => why.push(DirectedWhy::ChunkNotLoaded),
-            DirectedRayOutcome::Clear if target_identity.is_some() => {
-                why.push(DirectedWhy::Occluded)
-            }
-            DirectedRayOutcome::Clear => {}
-        }
-        if target_identity.is_none() && !why.contains(&DirectedWhy::ChunkNotLoaded) {
-            why.push(DirectedWhy::ChunkNotLoaded);
-        }
-
-        if why.is_empty() {
-            let (name, state_id, properties) = target_identity.expect("已加载目标必有方块身份");
-            seen.push(DirectedSeenBlock {
-                at: [x, y, z],
-                name,
-                state_id,
-                properties,
-            });
-        } else {
-            unseen.push(DirectedUnseenBlock {
-                at: [x, y, z],
-                why,
-                distance: None,
-                max: None,
-                by,
-            });
-        }
-    }
-
-    let projection = DirectedProjection { seen, unseen };
-    projection
-        .validate()
-        .map_err(|message| ViewportError::new("directed", message))?;
-    Ok(projection)
-}
-
-/// 增量投影：视口的第三种模式（与全量、定向同一台内核）。
-///
-/// 把当前视野与方块记忆对比，只产出变化（判定表见 [`incremental`] 模块头）。
-/// 消费方不止 scan 工具——增量呈现、寻路合法域后续都调这同一个函数。
-/// 只读不写：推进记忆由调用方在变化确实送达之后 [`BlockMemory::apply`]。
-pub fn project_changes<F>(
-    pose: &Pose,
-    memory: &BlockMemory,
-    read_block: F,
-    options: &ViewportOptions,
-    world_bounds: WorldHeightBounds,
-) -> Result<Vec<BlockChange>, String>
-where
-    F: Fn(BlockPosition) -> BlockReadResult,
-{
-    // 第一遍：全量内核拿当前可见集（实体不参与增量，传空）。
-    let projection = project_with_reader(
-        pose,
-        &[],
-        WorldReader::new(
-            |position| BlockProbe::from_read(&read_block(position)),
-            &read_block,
-        ),
-        options,
-        || Ok(()),
-    )
-    .map_err(|error| error.message)?;
-
-    let eye = Point3 {
-        x: pose.position.x,
-        y: pose.position.y + EYE_HEIGHT,
-        z: pose.position.z,
-    };
-    let axes = view_axes(pose.yaw, pose.pitch);
-    // 探针距离与定向模式同帽：范围外的记忆连问都不问（剪枝=工作量边界）。
-    let probe_max_distance = options.max_distance.min(DIRECTED_MAX_DISTANCE);
-    let scope = |at: [i32; 3]| -> bool {
-        if !world_bounds.contains_y(at[1]) {
-            return false;
-        }
-        let center = Point3 {
-            x: f64::from(at[0]) + 0.5,
-            y: f64::from(at[1]) + 0.5,
-            z: f64::from(at[2]) + 0.5,
-        };
-        let delta = subtract(center, eye);
-        length(delta) <= probe_max_distance && inside_frustum(axes, delta, options)
-    };
-
-    let mut vanish_reader = WorldReader::new(
-        |position| BlockProbe::from_read(&read_block(position)),
-        &read_block,
-    );
-    let mut checkpoint = || Ok(());
-    let visibly_empty = |at: [i32; 3]| -> bool {
-        let voxel = BlockPosition {
-            x: at[0],
-            y: at[1],
-            z: at[2],
-        };
-        // 亲眼可证的空 = 该格已加载为空气，且到格心的射线通达。
-        let is_air = matches!(
-            vanish_reader.full(voxel.clone()),
-            BlockReadResult::Loaded { ref block } if crate::block::is_air_name(&block.name)
-        );
-        if !is_air {
-            return false;
-        }
-        let center = Point3 {
-            x: f64::from(at[0]) + 0.5,
-            y: f64::from(at[1]) + 0.5,
-            z: f64::from(at[2]) + 0.5,
-        };
-        matches!(
-            first_occluder_before_target(&mut vanish_reader, eye, center, &voxel, &mut checkpoint),
-            Ok(DirectedRayOutcome::Clear)
-        )
-    };
-
-    Ok(incremental::diff(
-        memory,
-        &projection.visible_blocks.blocks,
-        scope,
-        visibly_empty,
-    ))
-}
-
-enum DirectedRayOutcome {
-    Hit(BlockHit),
-    Clear,
-    Unloaded,
-}
-
-fn first_occluder_before_target<P, F, C>(
-    reader: &mut WorldReader<P, F>,
-    origin: Point3,
-    target: Point3,
-    target_voxel: &BlockPosition,
-    checkpoint: &mut C,
-) -> Result<DirectedRayOutcome, ViewportError>
-where
-    P: FnMut(BlockPosition) -> BlockProbe,
-    F: FnMut(BlockPosition) -> BlockReadResult,
-    C: FnMut() -> Result<(), ViewportError>,
-{
-    checkpoint()?;
-    let delta = subtract(target, origin);
-    let distance = length(delta);
-    if distance == 0.0 {
-        return Ok(DirectedRayOutcome::Clear);
-    }
-    let direction = normalize(delta, distance);
-    let steps = (distance / RAY_STEP).ceil() as i32;
-    for step in 1..=steps {
-        checkpoint()?;
-        let travelled = f64::from(step) * RAY_STEP;
-        if travelled >= distance {
-            break;
-        }
-        let voxel = BlockPosition {
-            x: (origin.x + direction.x * travelled).floor() as i32,
-            y: (origin.y + direction.y * travelled).floor() as i32,
-            z: (origin.z + direction.z * travelled).floor() as i32,
-        };
-        if same_voxel(&voxel, target_voxel) {
-            break;
-        }
-        match reader.probe(voxel.clone()) {
-            BlockProbe::Loaded {
-                visible: true,
-                transparent_hint: false,
-            } => {
-                // 射线每一步都要问「挡不挡」，但只有命中的那一步会被报出去。
-                // 所以只在这里才付完整 DTO 的钱。
-                let BlockReadResult::Loaded { block } = reader.full(voxel.clone()) else {
-                    // 探针说这里有不透光方块，完整读却拿不到——只可能是两次读
-                    // 之间世界变了。按"没挡住"继续，宁可少报遮挡也不报一个读不
-                    // 出来的方块。
-                    continue;
-                };
-                return Ok(DirectedRayOutcome::Hit(BlockHit {
-                    voxel,
-                    name: block.name,
-                    properties: block.properties,
-                }));
-            }
-            BlockProbe::Loaded { .. } => {}
-            BlockProbe::Unloaded => return Ok(DirectedRayOutcome::Unloaded),
-            // 与全量内核一致的保守射线边界：出界邻居不是被查目标的证据，跳过。
-            BlockProbe::OutOfWorld => {}
-        }
-    }
-    Ok(DirectedRayOutcome::Clear)
 }
 
 fn standing_on_block<P, F, C>(

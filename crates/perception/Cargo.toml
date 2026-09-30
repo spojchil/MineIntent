@@ -1,6 +1,6 @@
 [package]
 name = "perception"
-description = "感知：视口扫描工具（Free 类薄壳），几何在接入模块的视口内核"
+description = "感知：按需看画面的 view 工具（Free 类薄壳），成像在组合根注入的门后"
 version = "0.0.1"
 edition = "2021"
 license = "MIT"
@@ -10,15 +10,7 @@ publish = false
 agent = { workspace = true }
 base64 = "0.22"
 dispatch = { path = "../dispatch" }
-render = { path = "../render" }
-rusqlite = { version = "0.40.2", features = [
-    "bundled",
-    "functions",
-    "hooks",
-    "vtab",
-] }
 serde_json = "1"
-world = { path = "../world" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }

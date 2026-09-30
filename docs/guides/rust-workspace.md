@@ -7,7 +7,8 @@ MineIntent 的全 Rust 单进程实现。目标服务端 **Paper 26.1.2 / 协议
 |---|---|
 | [`crates/world`](../../crates/world) | 接入 azalea、tick 快照、视口内核、方块读取 |
 | [`crates/render`](../../crates/render) | 快照 → 模型可读文字（全纯函数） |
-| [`crates/perception`](../../crates/perception) | 主动看：`scan` |
+| [`crates/perception`](../../crates/perception) | 按需看画面：`view` |
+| [`crates/vision`](../../crates/vision) | 方块状态 + 本地客户端资源 → PNG（原型） |
 | [`crates/screens`](../../crates/screens) | 界面互斥域：`chat_box` / `inventory` / `container` |
 | [`crates/motion`](../../crates/motion) / [`hand`](../../crates/hand) | 位移朝向 / 攻挖用 |
 | [`crates/memory`](../../crates/memory) | 单文件长期记忆：`remember` |
@@ -123,8 +124,9 @@ git 依赖、不再是工作区成员，那个示例**跑不到本仓**（`cargo
 
 ## 视口
 
-`scan` 不带参数是环视当前朝向的整个视野（视锥 + 遮挡）；带 `at` 是定向确认
-指定坐标，最多 16 个唯一坐标，逐坐标返回可见或闭合的不可见原因。
+视口内核（视锥 + 遮挡 + 暴露面）只服务「眼睛」：组合根周期性调用
+`Module::absorb`，把合法可见的方块与射线穿过的空格写进方块记忆，供寻路读。
+模型不直接调用它，看世界走画面（`view`）。
 
 未加载方块让相关可见性射线**保守失败**，不会被当作空气。
 
@@ -132,7 +134,7 @@ git 依赖、不再是工作区成员，那个示例**跑不到本仓**（`cargo
 
 ## 寻路观察边界
 
-`go_to` / `forward` 的 A\* 只使用最后观察到的三态地图：Known Block 恢复最后所见
+`forward`（以及已从模型面撤下的 `go_to`）的 A\* 只使用最后观察到的三态地图：Known Block 恢复最后所见
 `state_id`，Known Empty 是空气，Unseen 是规划专用屏障。单次 A\* 使用冻结快照；路径
 交给腿以后，局部障碍/卡住修补可以读取更新后的最后所见，但不回读离屏实时世界。
 Azalea fork 的 partial continuation 已关闭，完整重规划由 Direct/Survey/Frontier 接管；
