@@ -80,6 +80,29 @@ cargo run --release -p world --features azalea --example fog_goto_probe -- \
 > not a member of the workspace」）。内核的测试与协议冒烟随上游仓跑；本仓验收
 > 的是「钉住的那个 rev 能把下游编过、测过」。
 
+## 按需图片原型
+
+`cargo test -p vision --all-targets` 使用自制资源验证模型解析、几何、相机、透明
+遮挡和资源版本拒绝；`cargo clippy -p vision -p world --features vision/live
+--all-targets -- -D warnings` 检查实际连接探针。运行命令与画面限制见
+[vision README](../../crates/vision/README.md)。合成场景图片只能证明资源到像素
+链路；连接测试服务端运行 `capture` 才提供真实协议状态到图片的证据，两者均不
+证明与官方画面一致或已经具备完整实体视觉。
+启动测试服、连接采图、画面检查、计时范围和关服步骤见
+[协议采图探针](../../crates/vision/README.md#协议采图探针)。
+完整交互验证需启动 `companion`、配置视觉模型，让假玩家聊天触发 `view`，再问 bot
+图像观察和工具反馈；步骤见 [完整交互测试](../../crates/vision/README.md#bot-与假玩家的完整交互测试)。
+`capture` 成功或渲染基准通过不等于这条模型链路已验证。
+
+`cargo test -p perception --lib` 检查图片工具参数、失败边界和二进制图片回执；
+`cargo test -p companion --bin companion` 检查世界姿态转换、协议配置拒绝，以及
+本地 HTTP 请求中的图片块与 call ID。HTTP 测试不调用付费模型，也不证明模型理解图片。
+
+光栅化正确性另外用测试专用射线实现交叉检查：相机变换、近面/侧面裁剪、透视
+贴图、径向远距离、透明深度顺序与共享边。`cargo run --release -p vision
+--example benchmark -- <client.jar>` 分别输出 JAR 打开、资源冷/热缓存成像和 PNG
+编码耗时；两组均为固定合成场景，不能拿这个数声称实服端到端或官方帧率。
+
 ## 纵向验收
 
 `scripts/gate-b-vertical.sh` 跑 Paper 实服 + `companion` 全栈 + 假人作说话方。

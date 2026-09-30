@@ -1,7 +1,8 @@
 # 当前实现结构
 
-> 无产品权威。绑定 `feat/block-memory-tables` 当前工作树（基线 `9b4ae96`）与
-> Azalea fork `cce19dfa7b120eef090c48d96f5b25851cd89d9a`。
+> 无产品权威。绑定 `fix/observed-pathfinding-install` 当前工作树（基线 `d11d347`）与
+> Azalea fork `cce19dfa7b120eef090c48d96f5b25851cd89d9a`、midturn
+> `bf8bc7a7126dc2943145b03a0b4a3481de8177e1`。
 >
 > 本仓只有一条线。此前并存的两套实现都已移出：
 > TypeScript 原型（`src/`、`agent-service/`、`mcserver/`）已随本线落 `main` 删除，
@@ -42,7 +43,8 @@ context perception screens   motion   hand    jobs   presence   memory  wait
 |---|---|---|
 | `world` | 接入 azalea、tick 快照、视口内核 | **直译无损、政策外置**：不过滤、不判重要性、不做丢弃决策 |
 | `render` | 快照 → 模型可读文字 | **全部纯函数**；呈现选择归此处，事实归快照 |
-| `perception` | 主动看（`scan`）、查记忆（`blocks`，含 SQL 面） | 薄壳：几何全在 world 的视口内核；SQL 面读记忆的快照，查询期不持锁 |
+| `vision` | 已有方块状态 + 本地客户端资源 → PNG 图片原型 | CPU 三角形光栅化、视锥裁剪、深度缓冲与透明合成，按需成像；无窗口或游戏模拟；配置资源后供 `view` 工具调用，限制见 [vision](../crates/vision/README.md) |
+| `perception` | 主动看（`scan`）、查记忆（`blocks`，含 SQL 面）、按需图片（`view`） | 文字视口几何在 world；SQL 查询期不持锁；图片通过 `PictureDoor` 获取，保留为原生图片回执 |
 | `screens` | 界面互斥域（`chat_box`/`inventory`/`container`） | 屏的状态转换在此，占用账本在 dispatch；容器屏真相在服务端，组合根随屏事实翻转 |
 | `motion` / `hand` | 位移朝向 / 攻挖用 | 工具只表达意图立刻返回，合法性由原版物理自我仲裁 |
 | `jobs` | 任务表（`list`） | 只读、`ToolClass::Free`；槽位是唯一真相源，不另建镜像 |
@@ -85,6 +87,23 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
 
 方块**不在快照里**——最深最重的嵌套留在 azalea 世界模型原地，
 `perception::scan` 按需拉（`world::machine::blocks`）。
+
+图片原型另有 `Module::capture_blocks`：在一个世界读锁下复制有界区域中的非空气
+方块，返回 `BlockRegion` 及未加载格数，随后释放锁。姿态取最新 tick 快照，与
+方块复制不是原子化的同一服务端 tick。`vision` 的可选 `live` feature 只供连接
+探针使用；纯渲染默认不依赖 world/Azalea。当前输出是方块图像，不含实体模型，
+尚未替换现有文字视口与观察记忆。
+
+配置 `MINEINTENT_CLIENT_JAR` 后，组合根注册 `perception::PictureTools` 的 `view {}`
+工具（Free 类）。`companion::picture::ModulePictureDoor` 在阻塞池里采集半径 16 格
+区域、检查全部已加载、调用 `vision` 渲染并编码 PNG；资源在进程内复用。图片回执
+只含图片及通用限制，不发送原始方块清单或包含被遮挡方块名称的渲染报告，也不据此
+把整个采集区域写入观察记忆。现有 `look` 工具负责朝向，`view` 不接受任意相机坐标。
+
+`MODEL_PROTOCOL` 选择 Chat Completions / Responses / Anthropic（默认仍是 Chat）。
+`view` 需要后两者的原生图片工具回执；不兼容的配置在连接服务器前报错。
+`ContentPart::Image` 在框架内保留结构化图片，经 HTTP adapter 编码；诊断轨迹仅记
+`[图片]`，不展开 Base64。图片随框架会话历史保留，当前上下文压缩仍是空实现。
 
 时间窗不是队列：条目自带 `tick` 与单调 `seq`，「取某 seq 之后的条目」
 是读方一行过滤。逐出用原版常量（聊天 100 行、声音 60 tick）。

@@ -1,0 +1,25 @@
+[package]
+name = "vision"
+description = "按需将已有世界状态与本地客户端资源渲染为图片"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+live = ["dep:world", "world/azalea", "dep:tokio"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+world = { path = "../world", optional = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"], optional = true }
+
+[[example]]
+name = "capture"
+required-features = ["live"]
+
+[lints]
+workspace = true

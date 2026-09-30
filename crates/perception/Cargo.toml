@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 agent = { workspace = true }
+base64 = "0.22"
 dispatch = { path = "../dispatch" }
 render = { path = "../render" }
 rusqlite = { version = "0.40.2", features = [

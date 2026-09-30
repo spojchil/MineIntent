@@ -251,6 +251,72 @@ impl Module {
         .map_err(|error| error.to_string())
     }
 
+    /// Copy a bounded region for on-demand rendering, then release the world
+    /// lock before parsing assets or rendering pixels. Call on a blocking worker.
+    pub fn capture_blocks(&self, radius: u32) -> Result<crate::BlockRegion, String> {
+        if !(1..=32).contains(&radius) {
+            return Err("图片采集半径必须在 1–32 格之间".to_owned());
+        }
+        let snapshot = self.latest();
+        if !matches!(snapshot.phase, ConnectionPhase::Ready) {
+            return Err("尚未连接到世界，无法采集图片".to_owned());
+        }
+        let handle = self
+            .inner
+            .world_handle
+            .lock()
+            .clone()
+            .ok_or_else(|| "世界模型尚未就绪".to_owned())?;
+        let loaded = handle.read();
+        let position = &snapshot.self_state.position;
+        let center = [position.x, position.y, position.z].map(|v| v.floor() as i32);
+        let radius = radius as i32;
+        if center
+            .iter()
+            .any(|v| v.checked_add(radius).is_none() || v.checked_sub(radius).is_none())
+        {
+            return Err("图片采集坐标越界".to_owned());
+        }
+        let mut states = Vec::new();
+        let mut unloaded = 0;
+        let min_y = i64::from(loaded.chunks.min_y());
+        let max_y = min_y + i64::from(loaded.chunks.height());
+        for y in center[1] - radius..=center[1] + radius {
+            if i64::from(y) < min_y || i64::from(y) >= max_y {
+                continue;
+            }
+            for z in center[2] - radius..=center[2] + radius {
+                for x in center[0] - radius..=center[0] + radius {
+                    let position = crate::BlockPosition { x, y, z };
+                    match loaded.get_block_state(azalea::BlockPos::new(x, y, z)) {
+                        Some(state) if !state.is_air() => states.push((position, state)),
+                        None => unloaded += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        drop(loaded);
+        // Decode each distinct state only once, outside the world read lock.
+        let mut palette = std::collections::HashMap::new();
+        let blocks = states
+            .into_iter()
+            .map(|(position, state)| {
+                let template = palette
+                    .entry(state.id())
+                    .or_insert_with(|| blocks::snapshot_from_state(state, position.clone()));
+                let mut block = template.clone();
+                block.position = position;
+                block
+            })
+            .collect();
+        Ok(crate::BlockRegion {
+            snapshot,
+            blocks,
+            unloaded,
+        })
+    }
+
     /// 同 [`Module::scan`]，另把射线走过的空格记进 [`crate::ObservedSpace`]。
     ///
     /// 单独一个入口而不是给 `scan` 加参数：`scan` 服务的是**工具回执**（模型问

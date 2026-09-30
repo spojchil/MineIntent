@@ -40,6 +40,17 @@ pub enum BlockReadResult {
     OutOfWorld,
 }
 
+/// A bounded copy of current loaded blocks for an image renderer. This is not
+/// observed-block memory, and does not itself decide which surfaces are visible.
+/// Pose is the latest tick snapshot; blocks are copied under one world read lock.
+/// The two are not an atomic server tick transaction.
+#[derive(Clone, Debug)]
+pub struct BlockRegion {
+    pub snapshot: std::sync::Arc<crate::TickSnapshot>,
+    pub blocks: Vec<BlockSnapshot>,
+    pub unloaded: usize,
+}
+
 /// 视口扫描热路径上唯一用得到的事实。
 ///
 /// 一次全量投影要问十几万次「这一格挡不挡视线」，而每次问的都只有两位：

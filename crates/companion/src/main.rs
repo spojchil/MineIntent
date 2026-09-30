@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent::adapters::http::{HttpModel, HttpModelConfig, Protocol};
+use agent::adapters::http::{HttpModel, HttpModelConfig};
 use agent::{AgentSession, InputMessage, MailboxInput, SessionConfig};
 use context::ContextStrategy;
 use dispatch::{Dispatcher, LifeGate, Occupancy, ToolProvider};
@@ -28,6 +28,10 @@ use world::{ConnectionConfig, DoorCommand, Module, SnapshotSource};
 
 mod doorbell;
 mod frame;
+mod model_config;
+mod picture;
+#[cfg(test)]
+mod picture_wire_tests;
 mod situation;
 mod wake;
 
@@ -464,6 +468,7 @@ impl agent::ContentObserver for TraceObserver {
                         .map(|part| match part {
                             agent::ContentPart::Text { text } => text.clone(),
                             agent::ContentPart::Json { value } => value.to_string(),
+                            agent::ContentPart::Image { .. } => "[图片]".to_owned(),
                             other => format!("{other:?}"),
                         })
                         .collect::<Vec<_>>()
@@ -601,11 +606,18 @@ async fn main() -> Result<(), String> {
         .parse()
         .map_err(|error| format!("MINEINTENT_PORT 无效：{error}"))?;
     let username = env_or("MINEINTENT_USERNAME", "companion");
-    let endpoint = env_or(
-        "MODEL_ENDPOINT",
-        "https://api.deepseek.com/chat/completions",
+    let client_jar = std::env::var_os("MINEINTENT_CLIENT_JAR");
+    let protocol_name = env_or("MODEL_PROTOCOL", "chat");
+    let protocol = model_config::protocol(&protocol_name, client_jar.is_some())?;
+    let endpoint = env_or("MODEL_ENDPOINT", model_config::default_endpoint(&protocol));
+    let model_name = env_or(
+        "MODEL_NAME",
+        if protocol_name == "chat" {
+            "deepseek-chat"
+        } else {
+            "deepseek-flash"
+        },
     );
-    let model_name = env_or("MODEL_NAME", "deepseek-chat");
     let memory_path = env_or("MINEINTENT_MEMORY_FILE", "companion-memory.md");
     let persona = match std::env::var("MINEINTENT_PERSONA_FILE") {
         Ok(path) => std::fs::read_to_string(&path)
@@ -613,6 +625,21 @@ async fn main() -> Result<(), String> {
         Err(_) => PLACEHOLDER_PERSONA.to_owned(),
     };
     let api_key = read_api_key()?;
+    let picture_resources = client_jar
+        .map(|path| {
+            let resources = vision::Resources::open(std::path::PathBuf::from(path))?;
+            if resources.version() != "26.1.2" {
+                return Err("图片资源必须是当前协议对应的 26.1.2 client.jar".to_owned());
+            }
+            Ok(resources)
+        })
+        .transpose()?;
+    let model = Arc::new(
+        HttpModel::new(HttpModelConfig::new(
+            endpoint, api_key, model_name, protocol,
+        ))
+        .map_err(|error| format!("模型适配器构造失败：{error}"))?,
+    );
 
     // ---- 接入世界 ----
     println!("[组合根] 连接 {host}:{port}，用户名 {username}");
@@ -652,7 +679,7 @@ async fn main() -> Result<(), String> {
 
     // 门铃同时是等待工具的打断源和内核的观察者，所以要早于两者建出来。
     let doorbell = Doorbell::new();
-    let providers: Vec<Arc<dyn ToolProvider>> = vec![
+    let mut providers: Vec<Arc<dyn ToolProvider>> = vec![
         Arc::new(ChatBox::new(
             occupancy.clone(),
             screen_state.clone(),
@@ -690,6 +717,11 @@ async fn main() -> Result<(), String> {
         )))),
         Arc::new(wait::WaitTools::new(doorbell.clone())),
     ];
+    if let Some(resources) = picture_resources {
+        providers.push(Arc::new(perception::PictureTools::new(Arc::new(
+            picture::ModulePictureDoor::new(module.clone(), resources),
+        ))));
+    }
     let life: Arc<dyn LifeGate> = Arc::new(SnapshotLifeGate(snapshots.clone()));
     let dispatcher = Arc::new(
         Dispatcher::new(providers, occupancy.clone(), life).map_err(|error| error.to_string())?,
@@ -703,16 +735,6 @@ async fn main() -> Result<(), String> {
             .collect();
         println!("[组合根] 工具表：{names:?}");
     }
-
-    let model = Arc::new(
-        HttpModel::new(HttpModelConfig::new(
-            endpoint,
-            api_key,
-            model_name,
-            Protocol::openai_chat(),
-        ))
-        .map_err(|error| format!("模型适配器构造失败：{error}"))?,
-    );
 
     // 前缀只有人设与记忆——两者都不逐轮变，吃满前缀缓存。处境不在这里：
     // 它每轮都变，随帧追加在对话末尾（见 `situation` 模块）。

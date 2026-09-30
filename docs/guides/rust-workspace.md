@@ -52,8 +52,10 @@ export PATH="$HOME/.rustup/toolchains/nightly-x86_64-apple-darwin/bin:$PATH"
 | `MINEINTENT_PERSONA_FILE` | 内置占位 | 人设全文；Q01 未裁前是占位文本 |
 | `MINEINTENT_MODEL_API_KEY_FILE` | 无 | **推荐**：密钥文件路径 |
 | `MODEL_API_KEY` | 无 | 退路：密钥本身（会进 shell 历史，不推荐） |
-| `MODEL_ENDPOINT` | DeepSeek chat/completions | 完整 endpoint，含协议路径 |
-| `MODEL_NAME` | `deepseek-chat` | 模型名 |
+| `MODEL_PROTOCOL` | `chat` | `chat` / `responses` / `anthropic`；图片工具要求后两者 |
+| `MODEL_ENDPOINT` | 对应协议的 DeepSeek endpoint | 完整 endpoint，含协议路径；Responses 默认 `https://api.deepseek.com/responses` |
+| `MODEL_NAME` | Chat 为 `deepseek-chat`，其余为 `deepseek-flash` | 模型必须支持所选协议；启用图片还需视觉能力 |
+| `MINEINTENT_CLIENT_JAR` | 未设置 | 本地 26.1.2 客户端 JAR；设置后加载资源并注册 `view` 图片工具，JAR 只读 |
 
 ```bash
 MINEINTENT_MODEL_API_KEY_FILE=/path/to/key cargo run -p companion

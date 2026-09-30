@@ -34,6 +34,14 @@ const PLACEHOLDER_PERSONA: &str = "\
 
 struct NoDoor;
 
+impl perception::PictureDoor for NoDoor {
+    fn capture<'a>(&'a self) -> PortFuture<'a, Result<perception::Picture, String>> {
+        Box::pin(async {
+            Err("文本导出不生成图片；实际图片由当前世界渲染".to_owned())
+        })
+    }
+}
+
 impl ChatDoor for NoDoor {
     fn send_chat<'a>(&'a self, _line: &'a str) -> PortFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
@@ -368,6 +376,7 @@ fn result_text(result: &ToolResult) -> String {
         .map(|part| match part {
             ContentPart::Text { text } => text.clone(),
             ContentPart::Json { value } => serde_json::to_string_pretty(value).unwrap_or_default(),
+            ContentPart::Image { .. } => "[图片]".to_owned(),
             other => format!("{other:?}"),
         })
         .collect::<Vec<_>>()
@@ -532,6 +541,10 @@ async fn main() {
             )),
         ),
         ("wait", Box::new(wait::WaitTools::new(door.clone()))),
+        (
+            "view（配置本地资源后启用）",
+            Box::new(perception::PictureTools::new(door.clone())),
+        ),
     ];
     for (label, provider) in &providers {
         for (definition, class) in provider.tools() {

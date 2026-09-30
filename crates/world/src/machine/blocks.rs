@@ -95,6 +95,16 @@ pub(super) fn read_block_from_world(
     let Some(state) = world.get_block_state(block_position) else {
         return BlockReadResult::Unloaded;
     };
+    BlockReadResult::Loaded {
+        block: snapshot_from_state(state, position),
+    }
+}
+
+/// Decode a copied registry state without holding a world lock.
+pub(super) fn snapshot_from_state(
+    state: azalea::block::BlockState,
+    position: BlockPosition,
+) -> crate::BlockSnapshot {
     let block: Box<dyn azalea::block::BlockTrait> = Box::from(state);
     let collision_shape = state.collision_shape();
     let collision_shapes: Vec<[f64; 6]> = collision_shape
@@ -116,15 +126,13 @@ pub(super) fn read_block_from_world(
     } else {
         crate::BlockBoundingBox::Block
     };
-    BlockReadResult::Loaded {
-        block: crate::BlockSnapshot {
-            position,
-            name: block.id().to_owned(),
-            state_id: u32::from(state.id()),
-            properties,
-            collision_shapes,
-            transparent_hint: transparent_hint(block.id(), state.outline_shape()),
-            bounding_box,
-        },
+    crate::BlockSnapshot {
+        position,
+        name: block.id().to_owned(),
+        state_id: u32::from(state.id()),
+        properties,
+        collision_shapes,
+        transparent_hint: transparent_hint(block.id(), state.outline_shape()),
+        bounding_box,
     }
 }

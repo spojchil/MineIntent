@@ -26,8 +26,11 @@ pub trait ViewportDoor: Send + Sync {
 }
 
 mod blocks;
+mod picture;
 mod sql;
 mod vtab;
+
+pub use picture::{Picture, PictureDoor, PictureTools};
 
 const TOOL_NAME: &str = "scan";
 
