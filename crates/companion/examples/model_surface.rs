@@ -175,6 +175,7 @@ fn sample_snapshot() -> world::TickSnapshot {
             on_ground: true,
             pose: None,
             held_item_name: None,
+            item_name: None,
             equipment: Vec::new(),
             valid: true,
         };

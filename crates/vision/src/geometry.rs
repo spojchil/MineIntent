@@ -106,6 +106,39 @@ pub(crate) fn build(
     triangles
 }
 
+/// 用方块自己的模型画一个缩小的方块（掉落在地上的方块物品）。`place` 把 0..1 的方块
+/// 空间换到世界坐标。方块状态取默认属性；需要属性才能选出模型的方块会返回 Err。
+pub(crate) fn block_item_triangles(
+    name: &str,
+    resources: &mut Resources,
+    report: &mut Report,
+    place: impl Fn(V3) -> V3,
+) -> Result<Vec<Triangle>, String> {
+    let block = Block {
+        position: [0; 3],
+        name: name.to_owned(),
+        properties: Default::default(),
+        opaque: false,
+    };
+    let faces = block_faces(&block, resources, report)?;
+    if faces.is_empty() {
+        return Err(format!("{name}: empty block model"));
+    }
+    let mut triangles = Vec::new();
+    for face in faces {
+        for indices in [[0, 1, 2], [0, 2, 3]] {
+            triangles.push(Triangle {
+                vertices: indices.map(|i| place(face.vertices[i])),
+                uv: indices.map(|i| face.uv[i]),
+                texture: face.texture.clone(),
+                color: face.color,
+                alpha: face.alpha,
+            });
+        }
+    }
+    Ok(triangles)
+}
+
 fn block_faces(
     block: &Block,
     resources: &mut Resources,
@@ -420,5 +453,6 @@ pub fn fixture() -> Scene {
             vertical_fov: 60.0,
         },
         blocks,
+        entities: Vec::new(),
     }
 }

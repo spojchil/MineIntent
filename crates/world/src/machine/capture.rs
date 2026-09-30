@@ -380,6 +380,7 @@ fn capture_entities(bot: &Client) -> Vec<EntitySnapshot> {
         Option<&LocalEntity>,
         Option<&EntityDimensions>,
         Option<&PoseComponent>,
+        Option<&azalea::entity::metadata::ItemItem>,
     )>();
     let mut entities: Vec<_> = query
         .iter(&ecs)
@@ -399,6 +400,7 @@ fn capture_entities(bot: &Client) -> Vec<EntitySnapshot> {
                 local,
                 dimensions,
                 pose,
+                item,
             )| {
                 if local.is_some() || !loaded_by.contains(&bot.entity) || world_name != &owner_world
                 {
@@ -432,6 +434,9 @@ fn capture_entities(bot: &Client) -> Vec<EntitySnapshot> {
                     on_ground: physics.on_ground(),
                     pose: pose.map(|value| format!("{value:?}").to_ascii_lowercase()),
                     held_item_name: None,
+                    item_name: item
+                        .filter(|item| !item.0.is_empty())
+                        .map(|item| canonical_registry_name(&item.0.kind().to_string())),
                     equipment: Vec::new(),
                     valid: dead.is_none(),
                 })

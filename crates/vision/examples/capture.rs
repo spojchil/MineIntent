@@ -72,6 +72,23 @@ async fn capture(
                 opaque: !b.transparent_hint,
             })
             .collect(),
+        entities: region
+            .snapshot
+            .entities
+            .iter()
+            .filter(|entity| entity.valid)
+            .map(|entity| vision::Entity {
+                kind: entity.entity_type.clone(),
+                position: [entity.position.x, entity.position.y, entity.position.z],
+                body_yaw: entity.yaw,
+                head_yaw: entity.head_yaw,
+                pitch: entity.pitch,
+                width: entity.width,
+                height: entity.height,
+                uuid: entity.uuid.clone(),
+                item: entity.item_name.clone(),
+            })
+            .collect(),
     };
     let started = Instant::now();
     let mut frame = vision::render(

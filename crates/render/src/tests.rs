@@ -89,6 +89,7 @@ fn entity(key: &str, entity_type: &str, x: f64, z: f64) -> EntitySnapshot {
         on_ground: true,
         pose: None,
         held_item_name: None,
+        item_name: None,
         equipment: Vec::new(),
         valid: true,
     }

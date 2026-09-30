@@ -39,9 +39,10 @@ impl PictureDoor for ModulePictureDoor {
                     png: frame.png()?,
                     // Reports describe the entire captured region and can name occluded
                     // blocks. Do not send that inventory or raw scene to the model.
-                    description: "当前朝向的第一人称方块地形图，范围 16 格，640×360。\
-图片不含玩家、生物、掉落物、手持物、界面、天气和粒子；亮度固定，植物颜色和水面简化。\
-紫黑格表示模型或资源未支持；未绘制及范围外内容不代表不存在。\
+                    description: "当前朝向的第一人称画面，范围 16 格，640×360，正中是准星。\
+画出方块、玩家、掉落物和常见生物（猪、牛、羊、鸡、苦力怕、蜘蛛、僵尸、骷髅）；\
+生物是静止姿态、默认花色，不画装备、手持物、界面、天气和粒子；亮度固定，植物颜色和水面简化。\
+紫黑块表示模型或资源尚未支持的方块或实体（大小即其碰撞箱）；未绘制及范围外内容不代表不存在。\
 视点采用站姿眼高 1.62 格，姿态与方块采集并非同一服务端 tick 的原子快照。"
                         .to_owned(),
                 })
@@ -77,6 +78,23 @@ fn scene_from_region(region: world::BlockRegion) -> Result<vision::Scene, String
                 name: block.name,
                 properties: block.properties,
                 opaque: !block.transparent_hint,
+            })
+            .collect(),
+        entities: region
+            .snapshot
+            .entities
+            .iter()
+            .filter(|entity| entity.valid)
+            .map(|entity| vision::Entity {
+                kind: entity.entity_type.clone(),
+                position: [entity.position.x, entity.position.y, entity.position.z],
+                body_yaw: entity.yaw,
+                head_yaw: entity.head_yaw,
+                pitch: entity.pitch,
+                width: entity.width,
+                height: entity.height,
+                uuid: entity.uuid.clone(),
+                item: entity.item_name.clone(),
             })
             .collect(),
     })

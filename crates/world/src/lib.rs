@@ -649,6 +649,8 @@ pub struct EntitySnapshot {
     pub on_ground: bool,
     pub pose: Option<String>,
     pub held_item_name: Option<String>,
+    /// 掉落物实体（`item`）上的物品注册名；其他实体为 None。元数据没到也是 None。
+    pub item_name: Option<String>,
     pub equipment: Vec<EntityEquipment>,
     pub valid: bool,
 }

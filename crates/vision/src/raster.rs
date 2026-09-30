@@ -409,11 +409,19 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
         blocks: scene.blocks.len(),
         ..Report::default()
     };
-    report.warnings.insert("prototype: fixed daylight/background, no server lighting, entities, block-entity contents, weather or HUD".to_owned());
+    report.warnings.insert("prototype: fixed daylight/background, no server lighting, block-entity contents, weather; HUD is only the crosshair".to_owned());
     report
         .warnings
         .insert("transparency is composited through at most 16 surfaces".to_owned());
-    let triangles = build(scene, resources, &mut report);
+    let mut triangles = build(scene, resources, &mut report);
+    if !scene.entities.is_empty() {
+        triangles.extend(crate::entity::build(
+            &scene.entities,
+            scene.camera.eye,
+            resources,
+            &mut report,
+        ));
+    }
     report.triangles = triangles.len();
     let mut image = draw(&triangles, &scene.camera, options);
     if options.crosshair {

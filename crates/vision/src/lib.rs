@@ -3,6 +3,7 @@
 //! assets are not embedded. See README for the deliberately incomplete effects.
 
 mod assets;
+mod entity;
 mod geometry;
 mod raster;
 #[cfg(test)]
@@ -15,6 +16,7 @@ use image::{DynamicImage, ImageFormat, RgbaImage};
 use serde::{Deserialize, Serialize};
 
 pub use assets::Resources;
+pub use entity::Entity;
 pub use geometry::fixture;
 pub use raster::render;
 
@@ -43,6 +45,9 @@ pub struct Scene {
     pub game_version: String,
     pub camera: Camera,
     pub blocks: Vec<Block>,
+    /// 视野里的实体（不含观察者自己）。
+    #[serde(default)]
+    pub entities: Vec<Entity>,
 }
 
 #[derive(Clone, Copy, Debug)]

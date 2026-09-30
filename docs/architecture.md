@@ -92,8 +92,9 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
 图片原型另有 `Module::capture_blocks`：在一个世界读锁下复制有界区域中的非空气
 方块，返回 `BlockRegion` 及未加载格数，随后释放锁。姿态取最新 tick 快照，与
 方块复制不是原子化的同一服务端 tick。`vision` 的可选 `live` feature 只供连接
-探针使用；纯渲染默认不依赖 world/Azalea。当前输出是方块图像，不含实体模型，
-尚未替换现有文字视口与观察记忆。
+探针使用；纯渲染默认不依赖 world/Azalea。画面含方块、准星与实体：组合根把同一份
+快照里的实体（种类、脚底位置、朝向、玩家 UUID、掉落物的物品名）交给 `vision`，
+几何按 26.1.2 客户端模型类转录，深度缓冲决定遮挡——墙后的实体不会出现在画面里。
 
 配置 `MINEINTENT_CLIENT_JAR` 后，组合根注册 `perception::PictureTools` 的 `view {}`
 工具（Free 类）。`companion::picture::ModulePictureDoor` 在阻塞池里采集半径 16 格

@@ -88,6 +88,7 @@ fn scene(blocks: Vec<Block>) -> Scene {
             vertical_fov: 60.0,
         },
         blocks,
+        entities: Vec::new(),
     }
 }
 fn small() -> Options {
