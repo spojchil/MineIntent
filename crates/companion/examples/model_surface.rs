@@ -72,9 +72,6 @@ impl InventoryDoor for NoDoor {
     }
 }
 impl motion::MotionDoor for NoDoor {
-    fn go_to<'a>(&'a self, _t: [f64; 3]) -> PortFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
     fn forward<'a>(&'a self, _b: f64) -> PortFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
@@ -649,11 +646,11 @@ async fn main() {
     );
     let motion_tools = &providers[4].1;
     println!(
-        "motion go_to：`{}`",
+        "motion forward：`{}`",
         call(
             motion_tools.as_ref(),
             "motion",
-            json!({"action":"go_to","target":[35.0,72.0,3.0]})
+            json!({"action":"forward","blocks":3})
         )
         .await
     );

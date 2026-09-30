@@ -4,8 +4,8 @@
 //! 合法性检查都在模块一的写口后面——能不能跑由原版物理自我仲裁
 //! （饱食度、前进冲量、被物品减速），我们不复刻这些规则，门拒绝就如实转达。
 //!
-//! go_to/forward 的可执行图只使用同伴最后观察到的三态地图；未知格不会被当成空气。
-//! 路段走到知识边界后，连接机器主动环视，再在新冻结图上直达或选择观察 frontier。
+//! forward 的可执行图只使用同伴最后观察到的三态地图；未知格不会被当成空气。
+//! 按坐标寻路的 go_to 已从模型面撤下：画面成为主要信息源后，坐标不再是模型手里的东西。
 //!
 //! 单意图槽：新意图顶替旧意图（门的语义）；屏开着时被编排压制（Body 类）。
 //! 屏压制掐掉的移动意图作废，关屏后不续走——模型想走再说一次。
@@ -18,7 +18,6 @@ use serde_json::{json, Value};
 
 /// 模块一写口的窄化：意图写入即返回，Err 是机器的如实拒绝（未连接、已死亡等）。
 pub trait MotionDoor: Send + Sync {
-    fn go_to<'a>(&'a self, target: [f64; 3]) -> PortFuture<'a, Result<(), String>>;
     fn forward<'a>(&'a self, blocks: f64) -> PortFuture<'a, Result<(), String>>;
     fn stop<'a>(&'a self) -> PortFuture<'a, Result<(), String>>;
     fn jump<'a>(&'a self) -> PortFuture<'a, Result<(), String>>;
@@ -46,10 +45,6 @@ impl MotionTools {
             return ToolResult::failure(call_id, "参数必须是 JSON 对象；请改写调用");
         };
         let outcome = match arguments.get("action").and_then(Value::as_str) {
-            Some("go_to") => match read_vec3(arguments.get("target")) {
-                Ok(target) => self.door.go_to(target).await,
-                Err(reason) => return ToolResult::failure(call_id, reason),
-            },
             Some("forward") => {
                 let Some(blocks) = arguments
                     .get("blocks")
@@ -73,7 +68,7 @@ impl MotionTools {
             _ => {
                 return ToolResult::failure(
                     call_id,
-                    "action 必须是 go_to/forward/stop/jump/sneak/sprint 之一；请改写调用",
+                    "action 必须是 forward/stop/jump/sneak/sprint 之一；请改写调用",
                 )
             }
         };
@@ -154,12 +149,8 @@ impl ToolProvider for MotionTools {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["go_to", "forward", "stop", "jump", "sneak", "sprint"],
-                        "description": "go_to=寻路前往；forward=朝面前直走；stop=停下；jump=跳一下；sneak/sprint=开关潜行/疾跑"
-                    },
-                    "target": {
-                        "type": "array", "items": {"type": "number"},
-                        "description": "go_to 用：[x, y, z]——你要**站进去**的那一格，不是脚下踩的那块方块"
+                        "enum": ["forward", "stop", "jump", "sneak", "sprint"],
+                        "description": "forward=朝面前直走；stop=停下；jump=跳一下；sneak/sprint=开关潜行/疾跑"
                     },
                     "blocks": { "type": "number", "description": "forward 用：走几格" },
                     "on": { "type": "boolean", "description": "sneak/sprint 用：开或关" }
@@ -170,11 +161,7 @@ impl ToolProvider for MotionTools {
         );
         motion.description = Some(
             "移动。发出意图立刻返回，行走在后台继续；新意图顶替旧意图。\
-能不能跑动由世界决定（饱食度、被阻挡等）；到达、走不到或途中卡住会收到通知。\
-\n\n**go_to 的目标是你身体要站进去的那一格，不是你看到的地面方块。**\
-你看见 (12,164,10) 是 grass_block、想走过去，目标要写 (12,165,10)——\
-人站在方块**上面**，不是站在方块里面。写成方块本身那一格，身体挤不进去，\
-到不了。"
+能不能跑动由世界决定（饱食度、被阻挡等）；到达、走不到或途中卡住会收到通知。"
                 .to_owned(),
         );
 
@@ -257,9 +244,6 @@ mod tests {
     }
 
     impl MotionDoor for RecordingDoor {
-        fn go_to<'a>(&'a self, target: [f64; 3]) -> PortFuture<'a, Result<(), String>> {
-            self.log(format!("go_to{target:?}"))
-        }
         fn forward<'a>(&'a self, blocks: f64) -> PortFuture<'a, Result<(), String>> {
             self.log(format!("forward({blocks})"))
         }
@@ -299,10 +283,6 @@ mod tests {
     async fn every_action_reaches_the_door_with_its_arguments() {
         let (tools, door) = tools(false);
         for (tool, arguments) in [
-            (
-                MOTION_TOOL,
-                json!({"action": "go_to", "target": [1.0, 64.0, -3.5]}),
-            ),
             (MOTION_TOOL, json!({"action": "forward", "blocks": 3})),
             (MOTION_TOOL, json!({"action": "stop"})),
             (MOTION_TOOL, json!({"action": "jump"})),
@@ -323,7 +303,6 @@ mod tests {
         assert_eq!(
             *door.calls.lock().unwrap(),
             vec![
-                "go_to[1.0, 64.0, -3.5]",
                 "forward(3)",
                 "stop",
                 "jump",
@@ -339,10 +318,10 @@ mod tests {
     async fn bad_arguments_are_rejected_before_the_door() {
         let (tools, door) = tools(false);
         for (tool, arguments) in [
-            (MOTION_TOOL, json!({"action": "go_to", "target": [1, 2]})),
+            // go_to 已从模型面撤下：按一个不存在的动作拒绝。
             (
                 MOTION_TOOL,
-                json!({"action": "go_to", "target": [1, "bad", 64, -3]}),
+                json!({"action": "go_to", "target": [1.0, 64.0, -3.5]}),
             ),
             (
                 LOOK_TOOL,

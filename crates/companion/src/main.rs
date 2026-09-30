@@ -90,9 +90,6 @@ impl ChatHistory for ModuleChatHistory {
 struct ModuleMotionDoor(Arc<Module>);
 
 impl MotionDoor for ModuleMotionDoor {
-    fn go_to<'a>(&'a self, target: [f64; 3]) -> agent::PortFuture<'a, Result<(), String>> {
-        Box::pin(async move { self.0.execute(DoorCommand::GoTo(target)).await })
-    }
     fn forward<'a>(&'a self, blocks: f64) -> agent::PortFuture<'a, Result<(), String>> {
         Box::pin(async move { self.0.execute(DoorCommand::Forward(blocks)).await })
     }
