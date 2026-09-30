@@ -50,6 +50,8 @@ pub struct Options {
     pub width: u32,
     pub height: u32,
     pub far: f64,
+    /// 画准星（画面正中、对底色取反）。几何对照测试关掉它，以免中心像素被覆盖。
+    pub crosshair: bool,
 }
 
 impl Default for Options {
@@ -58,6 +60,7 @@ impl Default for Options {
             width: 640,
             height: 360,
             far: 48.0,
+            crosshair: true,
         }
     }
 }

@@ -415,8 +415,50 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
         .insert("transparency is composited through at most 16 surfaces".to_owned());
     let triangles = build(scene, resources, &mut report);
     report.triangles = triangles.len();
-    Ok(Frame {
-        image: draw(&triangles, &scene.camera, options),
-        report,
-    })
+    let mut image = draw(&triangles, &scene.camera, options);
+    if options.crosshair {
+        draw_crosshair(&mut image, resources, &mut report);
+    }
+    Ok(Frame { image, report })
+}
+
+/// 准星：原版 `hud/crosshair` 精灵，按原版混合（`ONE_MINUS_DST_COLOR`，即对底色取反）
+/// 画在画面正中。640×360 下原版自动 GUI 缩放为 1（高 360 < 2×240），精灵 1:1。
+/// 资源里没有这张精灵时退回一个 9 像素的取反十字，并在报告里说明。
+fn draw_crosshair(image: &mut RgbaImage, resources: &mut Resources, report: &mut Report) {
+    let sprite = resources
+        .texture("minecraft:gui/sprites/hud/crosshair")
+        .ok();
+    if sprite.is_none() {
+        report
+            .warnings
+            .insert("crosshair sprite missing; drew a plain inverted cross".to_owned());
+    }
+    let (width, height) = sprite
+        .as_ref()
+        .map_or((9, 9), |sprite| (sprite.width(), sprite.height()));
+    // 原版：(屏宽 - 15) / 2，整数除。
+    let left = (image.width().saturating_sub(width) / 2) as i64;
+    let top = (image.height().saturating_sub(height) / 2) as i64;
+    for y in 0..height {
+        for x in 0..width {
+            let coverage = match &sprite {
+                Some(sprite) => f64::from(sprite.get_pixel(x, y).0[3]) / 255.0,
+                None => f64::from(u8::from(x == width / 2 || y == height / 2)),
+            };
+            if coverage <= 0.0 {
+                continue;
+            }
+            let (px, py) = (left + i64::from(x), top + i64::from(y));
+            if px < 0 || py < 0 || px >= i64::from(image.width()) || py >= i64::from(image.height())
+            {
+                continue;
+            }
+            let pixel = image.get_pixel_mut(px as u32, py as u32);
+            for channel in 0..3 {
+                let dst = f64::from(pixel.0[channel]);
+                pixel.0[channel] = (dst + coverage * (255.0 - 2.0 * dst)).round() as u8;
+            }
+        }
+    }
 }

@@ -95,6 +95,7 @@ fn small() -> Options {
         width: 9,
         height: 9,
         far: 12.0,
+        crosshair: false,
     }
 }
 
@@ -141,6 +142,38 @@ fn alpha_holes_do_not_hide_geometry_behind_them() {
     .unwrap();
     let p = frame.image.get_pixel(4, 4).0;
     assert!(p[1] > 150 && p[0] == 0, "{p:?}");
+}
+
+#[test]
+fn crosshair_inverts_the_centre_and_leaves_the_rest() {
+    let (_jar, mut resources) = resources();
+    let scene = scene(vec![block("red", [0, 0, 2])]);
+    let plain = render(&scene, &mut resources, small()).unwrap();
+    let marked = render(
+        &scene,
+        &mut resources,
+        Options {
+            crosshair: true,
+            ..small()
+        },
+    )
+    .unwrap();
+    // 自制资源里没有准星精灵：退回 9 像素取反十字，并在报告里说明。
+    assert!(marked
+        .report
+        .warnings
+        .iter()
+        .any(|w| w.contains("crosshair sprite missing")));
+    for (x, y) in [(4, 4), (0, 4), (4, 8)] {
+        let before = plain.image.get_pixel(x, y).0;
+        let after = marked.image.get_pixel(x, y).0;
+        assert_eq!(
+            [after[0], after[1], after[2]],
+            [255 - before[0], 255 - before[1], 255 - before[2]],
+            "({x},{y}) 在十字上，应取反"
+        );
+    }
+    assert_eq!(plain.image.get_pixel(0, 0), marked.image.get_pixel(0, 0));
 }
 
 #[test]
@@ -351,6 +384,7 @@ fn raster_clipping_perspective_uv_cutouts_and_far_distance_match_ray_reference()
         width: 87,
         height: 61,
         far: 4.2,
+        crosshair: false,
     };
     let camera = Camera {
         eye: [0.0; 3],
