@@ -251,7 +251,7 @@ fn capture_inventory(inner: &Inner, bot: &Client) -> Inventory {
 /// 我们只是读——不自己发射线，也就不会和它算出两套结果。
 ///
 /// `miss`（够不着任何东西）返回 None：原版此时也什么都不显示。
-fn capture_looking_at(bot: &Client) -> Option<crate::LookingAt> {
+pub(super) fn capture_looking_at(bot: &Client) -> Option<crate::LookingAt> {
     use azalea::core::hit_result::HitResult;
     let hit = bot
         .get_component::<azalea::interact::pick::HitResultComponent>()

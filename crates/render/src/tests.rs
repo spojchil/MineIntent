@@ -7,6 +7,51 @@ use world::{
 
 use super::*;
 
+fn input_outcome(ended: world::InputEnd, ticks: u32) -> world::InputOutcome {
+    world::InputOutcome {
+        ticks,
+        ended,
+        from: [0.5, 64.0, 0.5],
+        to: [0.5, 64.0, 0.5],
+        yaw: 90.0,
+        pitch: 0.0,
+        pressed_on: None,
+        broken: Vec::new(),
+    }
+}
+
+#[test]
+fn input_receipt_says_why_it_let_go_and_what_changed() {
+    let mut outcome = input_outcome(world::InputEnd::BlockBroken, 19);
+    outcome.pressed_on = Some(world::LookingAt::Block {
+        name: "grass_block".to_owned(),
+        position: [0, 63, 0],
+        face: "up".to_owned(),
+    });
+    outcome.broken = vec!["grass_block".to_owned()];
+    outcome.to = [0.5, 63.0, 0.5];
+    let text = render_input_outcome(&outcome);
+    assert!(
+        text.starts_with("准星下的方块碎了，按住 0.9 秒时松手。"),
+        "{text}"
+    );
+    assert!(
+        text.contains("按下时准星对着 grass_block（0, 63, 0），命中上面。"),
+        "{text}"
+    );
+    assert!(text.contains("挖碎了：grass_block。"), "{text}");
+    assert!(text.contains("下降了 1.0 格。"), "{text}");
+}
+
+#[test]
+fn input_receipt_for_a_tap_that_moved_nothing() {
+    let text = render_input_outcome(&input_outcome(world::InputEnd::Elapsed, 1));
+    assert_eq!(
+        text,
+        "点按了一下，已松开。\n位置没有变。\n现在面朝西（yaw 90°，pitch 0°）。"
+    );
+}
+
 fn snapshot() -> TickSnapshot {
     let mut snap = TickSnapshot::empty(Epoch(1), 100, ConnectionPhase::Ready);
     snap.world_meta.dimension = "minecraft:overworld".to_owned();

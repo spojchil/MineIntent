@@ -29,6 +29,8 @@ use super::state::Inner;
 pub enum DoorCommand {
     /// 一行聊天；`/` 开头由 azalea 按原版语义路由为命令。
     Chat(String),
+    /// 一次键鼠输入：按住若干 tick 后全部松开，松开时经回执通道报告结果。
+    Input(crate::InputSpec, super::input::InputCompletion),
     GoTo([f64; 3]),
     /// 朝当前面向直走 N 格（化归为寻路目标，机械终止交给寻路器）。
     Forward(f64),
@@ -95,6 +97,7 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             bot.chat(&line);
             Ok(())
         }
+        DoorCommand::Input(spec, completion) => super::input::begin(inner, bot, spec, completion),
         DoorCommand::GoTo(target) => {
             let destination = block_destination(target)?;
             // 目标是**身体要站进去的那一格**，不是脚下踩的那块方块。
@@ -667,7 +670,10 @@ fn world_handle(
 }
 
 /// 读目标格的（方块名，有无碰撞体）。未加载/超高度如实拒绝。
-fn read_target_block(inner: &Inner, [x, y, z]: [i32; 3]) -> Result<(String, bool), String> {
+pub(super) fn read_target_block(
+    inner: &Inner,
+    [x, y, z]: [i32; 3],
+) -> Result<(String, bool), String> {
     let world = world_handle(inner)?;
     let world = world.read();
     let y64 = i64::from(y);

@@ -19,6 +19,7 @@ mod blocks;
 mod capture;
 mod connect;
 mod door;
+mod input;
 mod job;
 mod mining;
 mod movement;
@@ -27,6 +28,7 @@ pub mod observed;
 mod state;
 
 pub use door::DoorCommand;
+pub use input::InputCompletion;
 
 use self::blocks::{probe_block_from_world, read_block_from_world};
 use self::connect::run_swarm;
@@ -209,6 +211,27 @@ impl Module {
         receiver
             .await
             .unwrap_or_else(|_| Err("连接已结束".to_owned()))
+    }
+
+    /// 按一次键鼠：入队，下一 tick 按下，按满时长（或提前结束）后松开，回执松开时的结果。
+    ///
+    /// 两段等待：先等机器接受（未连接、死亡等如实拒绝），再等松开。
+    pub async fn input(&self, spec: crate::InputSpec) -> Result<crate::InputOutcome, String> {
+        if !(1..=crate::MAX_INPUT_TICKS).contains(&spec.ticks) {
+            return Err(format!(
+                "按住时长要在 1..={} tick 之间",
+                crate::MAX_INPUT_TICKS
+            ));
+        }
+        if spec
+            .turn
+            .is_some_and(|turn| !turn.yaw.is_finite() || !turn.pitch.is_finite())
+        {
+            return Err("转动角度要是有限数".to_owned());
+        }
+        let (completion, released) = InputCompletion::new();
+        self.execute(DoorCommand::Input(spec, completion)).await?;
+        released.await.map_err(|_| "按键期间连接结束了".to_owned())
     }
 
     /// 聊天出站：一行 = 一次原版输入循环，`/` 开头由 azalea 按原版语义路由为命令。

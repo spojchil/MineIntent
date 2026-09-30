@@ -72,7 +72,7 @@ cargo run --release -p world --features azalea --example fog_goto_probe -- \
 一条真实终局。终局后探针继续逐 tick 观察 5 秒，必须 `in_flight=0` 且身体格不再移动；
 这是实服交叉证据，Azalea goal/计算/执行组件的严格 retirement 由 fork 生命周期单测
 直接证明。自然地形上“保持同 y 的相对坐标”可能本来就没有可站 stance，不能拿它单独
-充当到达验收。`go_to` 已从模型面撤下，只剩探针与 `forward` 经由这条寻路；Issue #139 的
+充当到达验收。`go_to` 与 `forward` 都已从模型面撤下，只剩探针经由这条寻路；Issue #139 的
 near/reach 语义随之搁置。
 
 > 内核（依赖键 `agent`，本体是 [midturn](https://github.com/spojchil/midturn)）

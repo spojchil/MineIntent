@@ -1,6 +1,6 @@
 # 当前实现结构
 
-> 无产品权威。绑定 `feat/picture-keymouse` 当前工作树与
+> 无产品权威。绑定 `feat/keymouse-actions` 当前工作树与
 > Azalea fork `cce19dfa7b120eef090c48d96f5b25851cd89d9a`、midturn
 > `bf8bc7a7126dc2943145b03a0b4a3481de8177e1`。
 >
@@ -22,7 +22,7 @@
                           │
    ┌────────┬─────────┬───┴────┬────────┬───────┬────────┬─────────┬──────┐
    ▼        ▼         ▼        ▼        ▼       ▼        ▼         ▼      ▼
-context perception screens   motion   hand    jobs   presence   memory  wait
+context perception screens   input    hand    jobs   presence   memory  wait
    │        │  │      │  │      │  │    │  │    │  │     │  │      │      │
    │        │  └───┐  │  │      │  │    │  │    │  │     │  │      │      │
    ▼        ▼      ▼  ▼  ▼      ▼  ▼    ▼  ▼    ▼  ▼     ▼  ▼      ▼      ▼
@@ -46,7 +46,8 @@ context perception screens   motion   hand    jobs   presence   memory  wait
 | `vision` | 已有方块状态 + 本地客户端资源 → PNG 图片原型 | CPU 三角形光栅化、视锥裁剪、深度缓冲与透明合成，按需成像；无窗口或游戏模拟；配置资源后供 `view` 工具调用，限制见 [vision](../crates/vision/README.md) |
 | `perception` | 按需图片（`view`） | 图片通过 `PictureDoor` 获取，保留为原生图片回执；文字视口已从模型面撤下 |
 | `screens` | 界面互斥域（`chat_box`/`inventory`/`container`） | 屏的状态转换在此，占用账本在 dispatch；容器屏真相在服务端，组合根随屏事实翻转 |
-| `motion` / `hand` | 位移朝向 / 攻挖用 | 工具只表达意图立刻返回，合法性由原版物理自我仲裁 |
+| `input` | 键鼠（`input`）：WASD/空格/Shift/Ctrl、左右键、鼠标相对转动 | 一次调用按住若干秒后全部松开，松开后才返回回执；左右键作用于准星所指，**不收坐标**；合法性由原版物理与服务端自我仲裁 |
+| `hand` | 瞬时键（`hand`）：快捷栏、丢弃、主副手对调 | 发出即完，结果由物品栏变化证实 |
 | `jobs` | 任务表（`list`） | 只读、`ToolClass::Free`；槽位是唯一真相源，不另建镜像 |
 | `presence` | 生死去留（`respawn`） | 死亡时唯一还放行的一类（`ToolClass::Vital`）；自动重生已关，起不起来是模型自己的事 |
 | `memory` | 单文件长期记忆 | 一个文件、两张脸（工具面 `remember` 与策略面落盘）、一个出口 |
@@ -98,7 +99,8 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
 工具（Free 类）。`companion::picture::ModulePictureDoor` 在阻塞池里采集半径 16 格
 区域、检查全部已加载、调用 `vision` 渲染并编码 PNG；资源在进程内复用。图片回执
 只含图片及通用限制，不发送原始方块清单或包含被遮挡方块名称的渲染报告，也不据此
-把整个采集区域写入观察记忆。现有 `look` 工具负责朝向，`view` 不接受任意相机坐标。
+把整个采集区域写入观察记忆。朝向由 `input` 的 `turn` 改变，`view` 不接受任意相机坐标；
+准星即画面正中央。
 
 `MODEL_PROTOCOL` 选择 Chat Completions / Responses / Anthropic（默认仍是 Chat）。
 `view` 需要后两者的原生图片工具回执；不兼容的配置在连接服务器前报错。
@@ -118,7 +120,8 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
 | `state.rs` | `Inner`：共享状态、时间窗、写口队列——**可脱离 azalea 单测** |
 | `capture.rs` | ECS → `TickSnapshot` 直译 |
 | `job.rs` | `JobSlot`：后台任务的形状，**每个任务恰好一条终局** |
-| `movement.rs` / `mining.rs` | 两个动词各自的判定表与轮询；移动含战争迷雾高层状态机 |
+| `input.rs` | 键鼠输入的时序：起手转向、下一 tick 按键、按满或提前结束后全部松开，回执经一次性通道送回 `Module::input` |
+| `movement.rs` / `mining.rs` | 坐标式移动与挖掘的判定表与轮询；移动含战争迷雾高层状态机（已无模型面，见 §4b） |
 | `navigation.rs` | 观察 frontier 的稳定身份、目标谓词与朝最终目标的引导 |
 | `observed.rs` | 最后所见的方块记忆 → 冻结碰撞快照与 `BlockSource` |
 | `connect.rs` | azalea 接入、客户端回调、停机 |
@@ -145,8 +148,8 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
 
 ## 4b. 战争迷雾 `go_to`
 
-`go_to` 已从模型面撤下（`motion` 不再提供），底层 `DoorCommand::GoTo` 与下述状态机
-保留，模型可达的只剩 `forward`（化归为寻路目标），并将随画面与键鼠输入逐步退役。
+`go_to` 与 `forward` 都已从模型面撤下，模型移动只经 `input` 的按键。底层
+`DoorCommand::GoTo`/`Forward` 与下述状态机只剩探针在用，待退役。
 [Issue #139](https://github.com/spojchil/MineIntent/issues/139) 的 near/reach 语义随之搁置。
 已观察地图寻路按下面的有限状态循环：
 
@@ -184,6 +187,19 @@ Direct(精确目标)
   `NavigationLimitReached`，明确只表示机器主动收束、**不证明目标不可达**（W07/W07a）。
 
 ## 4c. 挖掘请求与结果
+
+本节描述坐标式挖掘队列（`DoorCommand::Mine`），已无模型面，只剩探针在用。
+模型挖掘是 `input` 按住左键：Azalea 的 `LeftClickMine` 每 tick 挖准星下的方块，
+`machine::input` 记下上一 tick 准星下的方块，它变成空气（客户端所见，与玩家屏幕一致）
+即算挖碎并提前松开全部按键。
+
+钉住的 Azalea fork 有两处与原版不符，影响键鼠输入：
+
+- `tick_controls` 的左右号相反（原版 `KeyboardInput` 左键给 `leftImpulse` +1）。
+  `machine::input` 在交给 Azalea 前镜像左右；fork 修复并升级 rev 后删除镜像。
+- `ServerboundAttack` 把实体 id 编成定长 i32，原版读 VarInt，服务端以
+  「3 bytes extra」踢出。**左键攻击实体在升级 rev 前不可用**（此前的坐标式
+  `attack` 同样受影响）。
 
 - fork 的 `Client::start_mining` 在同一 ECS 写锁内直接写入 `MiningQueued`；MineIntent
   每 tick 再用同一读锁核对 `Mining`、`MiningQueued`、`MineBlockPos`、`MineProgress`

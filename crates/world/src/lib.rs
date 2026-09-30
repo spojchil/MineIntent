@@ -12,11 +12,13 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 mod block;
+mod input;
 #[cfg(feature = "azalea")]
 mod machine;
 mod viewport;
 
 pub use block::*;
+pub use input::*;
 // 纯数据（协议号 ↔ 地址的映射），不碰 azalea。`Inventory` 带着它，
 // 所以不能跟着接入层一起进特性门——否则关掉 azalea 时快照类型就散了。
 pub mod slots;

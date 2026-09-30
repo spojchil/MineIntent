@@ -301,7 +301,7 @@ fn observe_runtime_state(bot: &Client, target: BlockPos) -> (MiningRequestState,
 }
 
 /// 收掉 Azalea 的活跃/排队挖掘状态。终局不能只清 MineIntent 的 job、让身体继续挖。
-fn retire_mining(bot: &Client) {
+pub(super) fn retire_mining(bot: &Client) {
     let mut ecs = bot.ecs.write();
     let is_active = ecs.get::<Mining>(bot.entity).is_some();
     ecs.entity_mut(bot.entity).remove::<MiningQueued>();

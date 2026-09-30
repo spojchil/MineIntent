@@ -55,13 +55,12 @@ impl LifeGate for AlwaysAlive {
     }
 }
 
-/// 身体互斥域。手（攻击/挖掘/使用三态彼此互斥）
-/// 独立成域，与移动正交；朝向独立于移动（寻路与挖掘期间由各自任务牵引）。
+/// 身体互斥域。键鼠（移动、转向、左右键）是一个域；快捷栏、丢弃、换手这些
+/// 瞬时键是另一个域。
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Domain {
     Screen,
     Movement,
-    Facing,
     Hand,
 }
 

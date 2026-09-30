@@ -10,7 +10,7 @@ MineIntent 的全 Rust 单进程实现。目标服务端 **Paper 26.1.2 / 协议
 | [`crates/perception`](../../crates/perception) | 按需看画面：`view` |
 | [`crates/vision`](../../crates/vision) | 方块状态 + 本地客户端资源 → PNG（原型） |
 | [`crates/screens`](../../crates/screens) | 界面互斥域：`chat_box` / `inventory` / `container` |
-| [`crates/motion`](../../crates/motion) / [`hand`](../../crates/hand) | 位移朝向 / 攻挖用 |
+| [`crates/input`](../../crates/input) / [`hand`](../../crates/hand) | 键鼠（按住若干秒后松开，左右键作用于准星） / 瞬时键（快捷栏、丢弃、换手） |
 | [`crates/memory`](../../crates/memory) | 单文件长期记忆：`remember` |
 | [`crates/presence`](../../crates/presence) | 生死去留：`presence`（当前只有 `respawn`） |
 | [`crates/context`](../../crates/context) | 提示装配与压缩策略 |
@@ -134,7 +134,7 @@ git 依赖、不再是工作区成员，那个示例**跑不到本仓**（`cargo
 
 ## 寻路观察边界
 
-`forward`（以及已从模型面撤下的 `go_to`）的 A\* 只使用最后观察到的三态地图：Known Block 恢复最后所见
+`forward` 与 `go_to`（都已从模型面撤下，只剩探针在用）的 A\* 只使用最后观察到的三态地图：Known Block 恢复最后所见
 `state_id`，Known Empty 是空气，Unseen 是规划专用屏障。单次 A\* 使用冻结快照；路径
 交给腿以后，局部障碍/卡住修补可以读取更新后的最后所见，但不回读离屏实时世界。
 Azalea fork 的 partial continuation 已关闭，完整重规划由 Direct/Survey/Frontier 接管；

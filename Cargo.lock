@@ -941,10 +941,10 @@ dependencies = [
  "context",
  "dispatch",
  "hand",
+ "input",
  "jobs",
  "memory",
  "midturn",
- "motion",
  "perception",
  "presence",
  "render",
@@ -1952,6 +1952,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "input"
+version = "0.0.1"
+dependencies = [
+ "dispatch",
+ "midturn",
+ "render",
+ "serde_json",
+ "tokio",
+ "world",
+]
+
+[[package]]
 name = "ipconfig"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2191,16 +2203,6 @@ dependencies = [
  "smallvec",
  "tagptr",
  "uuid",
-]
-
-[[package]]
-name = "motion"
-version = "0.0.1"
-dependencies = [
- "dispatch",
- "midturn",
- "serde_json",
- "tokio",
 ]
 
 [[package]]

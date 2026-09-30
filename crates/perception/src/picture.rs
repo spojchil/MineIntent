@@ -35,7 +35,7 @@ impl ToolProvider for PictureTools {
             }),
         );
         definition.description = Some(
-            "看一张当前朝向的第一人称图片。无需参数；想转头先调用 look 的 face 或 look_at 动作。\
+            "看一张当前朝向的第一人称图片。无需参数；想换个方向看，先用 input 的 turn 转过去。准星在画面正中央，input 的鼠标键作用于它所指。\
 当前只画 16 格内的方块地形，不画玩家、生物、掉落物或界面；亮度固定，不能据此判断天黑或照明。\
 未绘制的内容不代表不存在。"
                 .to_owned(),

@@ -71,51 +71,31 @@ impl InventoryDoor for NoDoor {
         Box::pin(async { Ok(()) })
     }
 }
-impl motion::MotionDoor for NoDoor {
-    fn forward<'a>(&'a self, _b: f64) -> PortFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
-    fn stop<'a>(&'a self) -> PortFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
-    fn jump<'a>(&'a self) -> PortFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
-    fn sneak<'a>(&'a self, _on: bool) -> PortFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
-    fn sprint<'a>(&'a self, _on: bool) -> PortFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
-    fn look_at<'a>(&'a self, _t: [f64; 3]) -> PortFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
-    fn face<'a>(&'a self, _y: f64, _p: f64) -> PortFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
+/// 样例回执：按住 W 与左键 1.2 秒，挖碎了准星下的石头。
+impl input::InputDoor for NoDoor {
+    fn input<'a>(
+        &'a self,
+        spec: world::InputSpec,
+    ) -> PortFuture<'a, Result<world::InputOutcome, String>> {
+        Box::pin(async move {
+            Ok(world::InputOutcome {
+                ticks: spec.ticks.min(24),
+                ended: world::InputEnd::BlockBroken,
+                from: [10.5, 72.0, 3.5],
+                to: [11.7, 72.0, 3.5],
+                yaw: -90.0,
+                pitch: 20.0,
+                pressed_on: Some(world::LookingAt::Block {
+                    name: "stone".to_owned(),
+                    position: [12, 72, 3],
+                    face: "west".to_owned(),
+                }),
+                broken: vec!["stone".to_owned()],
+            })
+        })
     }
 }
 impl hand::HandDoor for NoDoor {
-    fn attack<'a>(&'a self, _k: &'a str) -> PortFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
-    fn mine<'a>(&'a self, _b: Vec<[i32; 3]>) -> PortFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
-    fn place<'a>(&'a self, _b: [i32; 3]) -> PortFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
-    fn use_on_block<'a>(&'a self, _b: [i32; 3]) -> PortFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
-    fn use_on_entity<'a>(&'a self, _k: &'a str) -> PortFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
-    fn use_item<'a>(&'a self) -> PortFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
-    fn release<'a>(&'a self) -> PortFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
     fn drop_item<'a>(&'a self, _w: bool) -> PortFuture<'a, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
@@ -403,10 +383,7 @@ async fn main() {
             )),
         ),
         ("remember", Box::new(MemoryTools::new(memory_file.clone()))),
-        (
-            "motion/look",
-            Box::new(motion::MotionTools::new(door.clone())),
-        ),
+        ("input", Box::new(input::InputTools::new(door.clone()))),
         ("hand", Box::new(hand::HandTools::new(door.clone()))),
         ("wait", Box::new(wait::WaitTools::new(door.clone()))),
         (
@@ -515,13 +492,13 @@ async fn main() {
         "container close：`{}`\n",
         call(container.as_ref(), "container", json!({"action":"close"})).await
     );
-    let motion_tools = &providers[4].1;
+    let input_tools = &providers[4].1;
     println!(
-        "motion forward：`{}`",
+        "input（按住 W 与左键）：\n\n```text\n{}\n```\n",
         call(
-            motion_tools.as_ref(),
-            "motion",
-            json!({"action":"forward","blocks":3})
+            input_tools.as_ref(),
+            "input",
+            json!({"keys":["w"],"mouse":"left","turn":{"pitch":20},"seconds":2})
         )
         .await
     );
@@ -560,29 +537,28 @@ async fn main() {
         call(chat_box.as_ref(), "chat_box", json!({"action":"dance"})).await
     );
     println!(
-        "- motion 缺参数：`{}`",
-        call(motion_tools.as_ref(), "motion", json!({"action":"forward"})).await
+        "- input 什么都没按：`{}`",
+        call(input_tools.as_ref(), "input", json!({})).await
     );
     println!(
-        "- look 越界俯仰：`{}`",
+        "- input 按太久：`{}`",
         call(
-            motion_tools.as_ref(),
-            "look",
-            json!({"action":"face","yaw":0.0,"pitch":120.0})
+            input_tools.as_ref(),
+            "input",
+            json!({"keys":["w"],"seconds":60})
         )
         .await
     );
     let hand_tools = &providers[5].1;
     println!(
-        "- hand use_on 参数二选一：`{}`",
-        call(hand_tools.as_ref(), "hand", json!({"action":"use_on"})).await
+        "- hand 旧的鼠标动作：`{}`",
+        call(hand_tools.as_ref(), "hand", json!({"action":"mine"})).await
     );
     println!("\n编排层拒绝（dispatch，字面常量）：\n");
     println!("- 屏压制其他身体域：`有界面开着，无法移动或与世界交互；先关闭界面再行动`");
     println!("- 未知工具名：`没有名为 xx 的工具；请改用工具列表中的名字`\n");
     println!("接入机器的如实拒绝（字面常量，经门原文转达）：\n");
     println!("- `尚未连接到世界，无法行动` / `连接已结束`");
-    println!("- `附近没有 {{entity_key}} 这个实体`（attack/use_on 实体找不到时）");
     println!("- `格号 {{slot}} 超出当前界面范围（0-{{max}}）` / `两个格号相同，没有可交换的`");
     println!("- `没有开着的容器界面`（没有容器时 container close）\n");
 

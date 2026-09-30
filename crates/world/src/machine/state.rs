@@ -70,6 +70,8 @@ pub(crate) struct Inner {
     /// 预期关屏（我们刚下过 close）：失效 tick。时限内的 Closed 算回声。
     pub(super) expected_close: Mutex<Option<u64>>,
     pub(super) pending: Mutex<Vec<PendingCommand>>,
+    /// 在按的键鼠输入（同一时刻至多一次）。
+    pub(super) held_input: Mutex<Option<super::input::HeldInput>>,
     /// 一次性跳跃的复位标记：跳跃布尔保持一整 tick 后放开。
     pub(super) jump_reset: AtomicBool,
     /// azalea 世界模型句柄（Spawn 登记）。方块读取走它的读锁，
@@ -129,6 +131,7 @@ impl Inner {
             sounds_window: Mutex::new(VecDeque::new()),
             expected_close: Mutex::new(None),
             pending: Mutex::new(Vec::new()),
+            held_input: Mutex::new(None),
             jump_reset: AtomicBool::new(false),
             world_handle: Mutex::new(None),
             observed: Mutex::new(None),
@@ -183,6 +186,7 @@ impl Inner {
     /// 连接生命周期结束后不会再有 tick，两个持续任务必须在这个边界同步落终局。
     /// client、swarm 与线程退出都可能报告同一次断线；槽位 take 语义保证只落一次。
     pub(super) fn end_running_jobs(&self) -> bool {
+        super::input::connection_ended(self);
         let movement = self.movement_job.connection_ended(self);
         let mining = self.mining_job.connection_ended(self);
         movement || mining

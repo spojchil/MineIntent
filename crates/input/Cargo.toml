@@ -1,6 +1,6 @@
 [package]
-name = "motion"
-description = "运动：位移与朝向的意图工具，经模块一写口执行，机械终止在世界侧"
+name = "input"
+description = "键鼠输入：按住一组键与鼠标若干时长后松开，左右键作用于准星所指，经模块一写口执行"
 version = "0.0.1"
 edition = "2021"
 license = "MIT"
@@ -9,7 +9,9 @@ publish = false
 [dependencies]
 agent = { workspace = true }
 dispatch = { path = "../dispatch" }
+render = { path = "../render" }
 serde_json = "1"
+world = { path = "../world" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }

@@ -124,19 +124,75 @@ pub fn render_environment(snap: &TickSnapshot) -> String {
 pub fn render_looking_at(snap: &TickSnapshot) -> String {
     match &snap.self_state.looking_at {
         None => String::new(),
-        Some(world::LookingAt::Block {
+        Some(target) => format!("准星对着 {}。", looking_at_words(target)),
+    }
+}
+
+fn looking_at_words(target: &world::LookingAt) -> String {
+    match target {
+        world::LookingAt::Block {
             name,
             position: [x, y, z],
             face,
-        }) => format!(
-            "准星对着 {name}（{x}, {y}, {z}），命中{}面。",
-            face_word(face)
-        ),
-        Some(world::LookingAt::Entity { kind, name }) => match name {
-            Some(name) => format!("准星对着 {name}（{kind}）。"),
-            None => format!("准星对着 {kind}。"),
+        } => format!("{name}（{x}, {y}, {z}），命中{}面", face_word(face)),
+        world::LookingAt::Entity { kind, name } => match name {
+            Some(name) => format!("{name}（{kind}）"),
+            None => kind.clone(),
         },
     }
+}
+
+/// 一次键鼠输入松开后的回执：按了多久、为什么松开、按下时准星指着什么、
+/// 挖碎了什么、身体挪了多少、现在朝哪。
+///
+/// 位移只说相对量：画面是主要信息源，这里只替它补上「按住期间看不见」的那一段。
+pub fn render_input_outcome(outcome: &world::InputOutcome) -> String {
+    let seconds = f64::from(outcome.ticks) / 20.0;
+    let mut lines = vec![match outcome.ended {
+        world::InputEnd::Elapsed if outcome.ticks <= 1 => "点按了一下，已松开。".to_owned(),
+        world::InputEnd::Elapsed => format!("按住 {} 秒后松开。", trim_number(seconds)),
+        world::InputEnd::BlockBroken => {
+            format!("准星下的方块碎了，按住 {} 秒时松手。", trim_number(seconds))
+        }
+        world::InputEnd::ScreenOpened => format!(
+            "按住 {} 秒时界面打开了，按键全部松开。",
+            trim_number(seconds)
+        ),
+        world::InputEnd::Died => format!("按住 {} 秒时你死了。", trim_number(seconds)),
+        world::InputEnd::Replaced => "这次输入被新的输入顶替，已松开。".to_owned(),
+    }];
+    if let Some(target) = &outcome.pressed_on {
+        lines.push(format!("按下时准星对着 {}。", looking_at_words(target)));
+    }
+    if !outcome.broken.is_empty() {
+        lines.push(format!("挖碎了：{}。", outcome.broken.join("、")));
+    }
+    let [fx, fy, fz] = outcome.from;
+    let [tx, ty, tz] = outcome.to;
+    let horizontal = (tx - fx).hypot(tz - fz);
+    let rise = ty - fy;
+    // 0.05 格以下是物理抖动，不算挪动。
+    let mut moved = Vec::new();
+    if horizontal >= 0.05 {
+        moved.push(format!("水平移动了 {:.1} 格", horizontal));
+    }
+    if rise >= 0.05 {
+        moved.push(format!("上升了 {:.1} 格", rise));
+    } else if rise <= -0.05 {
+        moved.push(format!("下降了 {:.1} 格", -rise));
+    }
+    lines.push(if moved.is_empty() {
+        "位置没有变。".to_owned()
+    } else {
+        format!("{}。", moved.join("，"))
+    });
+    lines.push(format!(
+        "现在面朝{}（yaw {:.0}°，pitch {:.0}°）。",
+        compass_word(f64::from(outcome.yaw)),
+        outcome.yaw,
+        outcome.pitch
+    ));
+    lines.join("\n")
 }
 
 /// 命中面的中文。放置要贴在这一面上，所以说清楚。
