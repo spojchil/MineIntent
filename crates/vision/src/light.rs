@@ -97,26 +97,27 @@ impl Cells {
         } else {
             Sections::Sparse(PositionMap::default())
         };
+        // 先给每个有格的段分槽号，再一次分配好全部段的数据，免得逐段扩容搬运。
         let mut count = 0u32;
-        let mut data = Vec::new();
         for cell in cells {
             let section = section_of(cell);
-            let mut slot = sections.slot(section);
-            if slot == NO_SLOT {
-                slot = count;
-                count += 1;
-                match &mut sections {
-                    Sections::Grid { first, span, slots } => {
-                        let local: [i32; 3] = std::array::from_fn(|i| section[i] - first[i]);
-                        slots[((local[1] * span[2] + local[2]) * span[0] + local[0]) as usize] =
-                            slot;
-                    }
-                    Sections::Sparse(map) => {
-                        map.insert(section, slot);
-                    }
-                }
-                data.resize(data.len() + 4096, Stored::default());
+            if sections.slot(section) != NO_SLOT {
+                continue;
             }
+            match &mut sections {
+                Sections::Grid { first, span, slots } => {
+                    let local: [i32; 3] = std::array::from_fn(|i| section[i] - first[i]);
+                    slots[((local[1] * span[2] + local[2]) * span[0] + local[0]) as usize] = count;
+                }
+                Sections::Sparse(map) => {
+                    map.insert(section, count);
+                }
+            }
+            count += 1;
+        }
+        let mut data = vec![Stored::default(); count as usize * 4096];
+        for cell in cells {
+            let slot = sections.slot(section_of(cell));
             let flags = PRESENT
                 | if cell.view_blocking { VIEW_BLOCKING } else { 0 }
                 | if cell.solid_render { SOLID_RENDER } else { 0 }
