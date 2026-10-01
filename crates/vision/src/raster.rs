@@ -21,6 +21,18 @@ pub(crate) struct Frustum {
 }
 
 impl Frustum {
+    /// 这些点是否全在同一个视锥平面外侧。是的话，它们围成的凸多边形里每一点也都在
+    /// 那一侧，裁剪后为空、画不出任何像素。留一点余量：这里在世界坐标里算，裁剪在
+    /// 相机坐标里算，贴着平面的点两边舍入可能不同，宁可留下交给裁剪。
+    pub(crate) fn excludes(&self, points: &[V3]) -> bool {
+        const MARGIN: f64 = 1e-6;
+        self.planes.iter().any(|(normal, offset)| {
+            points
+                .iter()
+                .all(|point| dot(*normal, sub(*point, self.eye)) + offset < -MARGIN)
+        })
+    }
+
     /// 区块段（16³）是否可能落在视锥里。外扩 1 格，容纳伸出格子的模型元素；
     /// 对每个平面取最靠内的角（原版 `FrustumIntersection.testAab` 的做法），保守不漏。
     pub(crate) fn section_visible(&self, section: [i32; 3]) -> bool {

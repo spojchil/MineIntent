@@ -23,6 +23,7 @@ counters! {
     FacesConsidered => "geometry: model faces considered",
     FacesCovered => "geometry: faces hidden by neighbours",
     FacesBackfacing => "geometry: faces facing away",
+    FacesOutside => "geometry: faces outside the view frustum",
     FacesEmitted => "geometry: faces emitted",
     TintLookups => "tint: lookups",
     TintBlends => "tint: 5x5 blends computed (cache misses)",

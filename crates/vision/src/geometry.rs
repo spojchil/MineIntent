@@ -231,6 +231,7 @@ pub(crate) fn build_lit(
                         emit_block(
                             block,
                             eye,
+                            frustum,
                             &faces_by_state[*state],
                             neighbours,
                             cells,
@@ -264,11 +265,12 @@ fn is_air(name: &str) -> bool {
     )
 }
 
-/// 一个方块的模型面：剔掉被遮挡的面与背向眼睛的面，染色、算光，写成三角形。
+/// 一个方块的模型面：剔掉被遮挡的面、背向眼睛的面与视锥外的面，染色、算光，写成三角形。
 #[allow(clippy::too_many_arguments)]
 fn emit_block(
     block: &Block,
     eye: Option<V3>,
+    frustum: Option<&crate::raster::Frustum>,
     faces: &[Face],
     neighbours: &PositionMap<&Block>,
     cells: Option<&Cells>,
@@ -277,7 +279,7 @@ fn emit_block(
     triangles: &mut Vec<Triangle>,
 ) {
     let fluid = is_fluid(&block.name);
-    let [mut covered, mut backfacing, mut emitted] = [0u64; 3];
+    let [mut covered, mut backfacing, mut outside, mut emitted] = [0u64; 4];
     for face in faces {
         if let Some(direction) = face.cull {
             let hidden = match block.covered {
@@ -300,6 +302,11 @@ fn emit_block(
         // 背面剔除：原版方块的渲染管线都开着面剔除（流体除外，FluidRenderer 自己补反面）。
         if !face.fluid && eye.is_some_and(|eye| !face.faces(sub(eye, offset))) {
             backfacing += 1;
+            continue;
+        }
+        // 整个落在视锥外的面会被裁剪整个丢掉：不必再染色、算光、出三角形。
+        if frustum.is_some_and(|frustum| frustum.excludes(&face.vertices.map(|v| add(v, offset)))) {
+            outside += 1;
             continue;
         }
         emitted += 1;
@@ -327,6 +334,7 @@ fn emit_block(
     crate::counters::add(Counter::FacesConsidered, faces.len() as u64);
     crate::counters::add(Counter::FacesCovered, covered);
     crate::counters::add(Counter::FacesBackfacing, backfacing);
+    crate::counters::add(Counter::FacesOutside, outside);
     crate::counters::add(Counter::FacesEmitted, emitted);
 }
 
