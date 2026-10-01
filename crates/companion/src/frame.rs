@@ -97,8 +97,25 @@ impl FrameComposer {
         snapshot: &TickSnapshot,
         chat_read: (u64, u64),
     ) -> Option<Vec<String>> {
+        let jobs = self.unseen_jobs(snapshot);
+        self.compose_lines(snapshot, chat_read, jobs)
+    }
+
+    /// 外接代理在工具回执里拉取：没有进展也返回变化的处境，不触发额外模型请求。
+    pub fn compose_on_pull(
+        &mut self,
+        snapshot: &TickSnapshot,
+        chat_read: (u64, u64),
+    ) -> Vec<String> {
+        let jobs = self.unseen_jobs(snapshot);
+        self.collect_pickups(snapshot);
+        let progress = self.take_progress(jobs);
+        self.assemble(snapshot, chat_read, progress)
+    }
+
+    fn unseen_jobs(&self, snapshot: &TickSnapshot) -> Vec<JobLine> {
         // 只给游标之后的条目写句子；游标在下面推进。
-        let jobs = snapshot
+        snapshot
             .jobs
             .entries
             .iter()
@@ -108,8 +125,7 @@ impl FrameComposer {
                 stage: entry.fact.stage,
                 text: render::render_job_entry(entry),
             })
-            .collect();
-        self.compose_lines(snapshot, chat_read, jobs)
+            .collect()
     }
 
     fn compose_lines(
@@ -120,6 +136,14 @@ impl FrameComposer {
     ) -> Option<Vec<String>> {
         self.collect_pickups(snapshot);
 
+        let progress = self.take_progress(jobs);
+        if progress.is_empty() {
+            return None;
+        }
+        Some(self.assemble(snapshot, chat_read, progress))
+    }
+
+    fn take_progress(&mut self, jobs: Vec<JobLine>) -> Vec<String> {
         let mut progress = Vec::new();
         for line in jobs {
             if self.progress_seq.is_some_and(|seen| line.seq <= seen) {
@@ -130,16 +154,21 @@ impl FrameComposer {
                 progress.push(line.text);
             }
         }
-        if progress.is_empty() {
-            return None;
-        }
+        progress
+    }
 
+    fn assemble(
+        &mut self,
+        snapshot: &TickSnapshot,
+        chat_read: (u64, u64),
+        progress: Vec<String>,
+    ) -> Vec<String> {
         let mut sections = self
             .situation
             .take(render::render_situation_lines(snapshot, chat_read));
         sections.append(&mut self.pickup_lines);
         sections.extend(progress);
-        Some(sections)
+        sections
     }
 
     /// 拾取：世界事件，不受开屏与否管。
@@ -210,6 +239,22 @@ mod tests {
     fn without_progress_there_is_no_frame() {
         let mut frames = FrameComposer::new();
         assert!(frames.compose(&snap(1, 0.5), READ).is_none());
+    }
+
+    #[test]
+    fn pulling_needs_no_progress_and_returns_only_changed_situation() {
+        let mut frames = FrameComposer::new();
+        let mut first = snap(1, 0.5);
+        first.pickups.entries.push(pickup(1, "minecraft:coal"));
+        let opening = frames.compose_on_pull(&first, READ);
+        assert!(opening.iter().any(|line| line.contains("位置 (0, 64, 0)")));
+        assert!(opening.iter().any(|line| line.contains("coal")));
+        assert!(frames.compose_on_pull(&first, READ).is_empty());
+
+        let moved = frames.compose_on_pull(&snap(2, 9.5), READ);
+        assert!(moved.iter().any(|line| line.contains("位置 (9, 64, 0)")));
+        frames.resend_situation();
+        assert!(frames.compose_on_pull(&snap(2, 9.5), READ).len() > moved.len());
     }
 
     /// 任务反复重发，每次把上一个顶替掉。`Replaced` 是终局，

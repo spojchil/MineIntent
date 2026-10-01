@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/bridge",
     "crates/companion",
     "crates/context",
     "crates/dispatch",

@@ -1,6 +1,7 @@
 # 验证当前实现
 
 > 本页说明每项检查能提供什么证据，以及**它不能证明什么**。验证结果不产生产品权威。
+> MCP 部分适用 `feat/mcp-compatible` 当前工作树，基线提交 `8ae31a3`。
 >
 > TypeScript 原型的验证方式（pnpm / Paper 集成工作流）随那条线留在 `main`，
 > 说明见[历史](../history/run-typescript.md)。
@@ -31,6 +32,78 @@ cargo test -p render -p context -p dispatch          # 纯函数与策略层
 `world` 的 `azalea` feature 关掉时不拖 bevy 编译；`Inner` 的状态转换测试
 （`machine/state.rs`）与移动判定表（`machine/movement.rs`）都能脱离 azalea 跑。
 这不是可选项——它是「纯状态转换可单测」这条设计的验收方式。
+
+## 外接代理（MCP）
+
+MCP 检查分三层；下列命令是检查入口，不是通过记录。实现以
+[`bridge`](../../crates/bridge/src) 与
+[`companion::mcp_entry`](../../crates/companion/src/mcp_entry.rs) 为准。
+
+### 无 Minecraft、无真实模型的检查
+
+```sh
+cargo test -p bridge --all-targets --locked
+cargo test -p companion --bin companion --test mcp_startup --locked
+cargo clippy -p bridge -p companion --all-targets --locked -- -D warnings
+```
+
+桥接测试使用本机 TCP 和测试身体；组合根测试使用构造快照、信箱和测试工具。
+`mcp_startup` 子进程测试核对非法入口与端口占用在进入世界之前报错，以及 MCP
+入口不读取无效的内置模型配置。
+它们不连接 Minecraft 或模型服务。Cargo 初次取得依赖和工具链仍可能需要联网，
+`companion` 的构建仍包含 Azalea，不能把“不接实服”理解为轻量编译。
+
+核对结果时分别记录标准握手与工具载荷、取消与 EOF 清理、等待期间其他调用的响应、
+连接占用与重新接手、事件留存与重送、超过 100 条后的丢失提示；仅测试信箱不能
+证明真实 stdio 子进程的退出路径。
+图片回执的 JSON 形状通过，也不能代替有效 PNG 的解码与客户端显示检查。
+
+### 独立标准客户端互操作
+
+先用[官方 Inspector](https://modelcontextprotocol.io/docs/2026-07-28/tools/inspector)
+或官方 SDK 客户端连接 stdio 转接器；协议选择 legacy `2025-11-25`，不启用供应商
+扩展。下面的 CLI 命令每次建立新会话，适合单次检查；取消、并发与连续调用需使用
+Inspector Web/TUI 或保持连接的 SDK 测试客户端。
+
+```sh
+npx @modelcontextprotocol/inspector --cli /abs/path/to/mineintent-mcp \
+  --method initialize --format json
+npx @modelcontextprotocol/inspector --cli /abs/path/to/mineintent-mcp \
+  --method tools/list --format json
+npx @modelcontextprotocol/inspector --cli /abs/path/to/mineintent-mcp \
+  --method tools/call --tool-name wait --tool-args-json '{"seconds":1}' --format json
+```
+
+`initialize` 不依赖世界；工具表和调用需要身体在线或专用测试身体。Inspector 自身
+不需要模型，但连接真实身体并执行动作工具会改变世界，测试时使用独立测试服。
+
+最小互操作判据：
+
+- 协商版本、工具 schema、请求 ID 与错误形状正确；stdout 不混入日志。
+- 文字、执行失败和有效 PNG 图片回执能被客户端解码。
+- 取消、超时、EOF 后未完成调用得到清理；下一调用或下一控制者能继续操作。
+- 取消等待不消费事件；回执重送和重接历史可按 `seq` 识别，历史重送不使下一次
+  `wait` 反复立返。历史与序号仅属当前身体进程，此项不验证跨进程恢复、宿主确认
+  或 exactly-once 投递。
+- 身体不在线、迟启动和重启时，客户端获得明确失败并能主动重试；不声称客户端会
+  自动重连或自动重新发现工具。
+- 不加载 channel 时，调用回执仍能带回事件，已有 `wait` 能提前返回；宿主完全空闲
+  时不要求模型自行开始新一轮。
+
+[官方 Conformance](https://github.com/modelcontextprotocol/conformance) 的公开服务器
+检查入口使用 HTTP `--url`，不能直接指向本仓私有 TCP 端口。可先采用 Inspector、
+官方 SDK 与所声明版本的 schema 做互操作检查；不为运行全套 SDK 一致性场景扩展
+产品接口。resources、Tasks 和现代 `2026-07-28` 分代不在本入口的兼容承诺内。
+
+### 真实世界与模型边界
+
+真实 MCP 身体还需在隔离测试服核对：进入世界、`input` 按键及松开、屏状态、`view`、
+死亡与复活、Minecraft 断线、取消/重连后的身体状态和进程停机。用 Inspector 驱动
+即可验证世界效果，不必调用模型；宿主是否正确向模型提供图片、模型是否理解回执、
+空闲调度与长期记忆则需要额外宿主验证。协议单测不提供这些证据。
+
+`scripts/gate-b-vertical.sh` 是内置模型入口的实服验收，会请求真实模型并写入测试世界，
+不能用作上述无模型检查或 MCP 兼容性的证据。
 
 ## 按需图片原型
 

@@ -1,8 +1,9 @@
-//! 组合根：第一次真实对话的纵切装配。
+//! 组合根：同一具身体的内置模型与外接 MCP 入口。
 //!
 //! 接线：接入模块（azalea）→ 门适配器 → screens/memory 注册进 dispatch →
 //! ContextStrategy 填内核提示与压缩端口 → openai 兼容适配器连模型 →
-//! 最小唤醒脚手架（聊天→件投递）。脚手架不是己：唤醒判据（AttentionSpec）
+//! 最小唤醒脚手架（聊天→件投递）。MCP入口复用身体工具与唤醒收集，
+//! 通过工具回执把事件和处境交给外部宿主。脚手架不是己：唤醒判据（AttentionSpec）
 //! 未裁前，这里只做"别人对我说话就醒"这一条最朴素的规则。
 //!
 //! 配置全走环境变量；API key 只从文件读，不进命令行与日志。
@@ -27,6 +28,7 @@ use world::{ConnectionConfig, DoorCommand, Module, SnapshotSource};
 
 mod doorbell;
 mod frame;
+mod mcp_entry;
 mod model_config;
 mod picture;
 #[cfg(test)]
@@ -483,36 +485,16 @@ async fn main() -> Result<(), String> {
         .map_err(|error| format!("MINEINTENT_PORT 无效：{error}"))?;
     let username = env_or("MINEINTENT_USERNAME", "companion");
     let client_jar = std::env::var_os("MINEINTENT_CLIENT_JAR");
-    let protocol_name = env_or("MODEL_PROTOCOL", "chat");
-    // 推理档位是端点方言：给了才发，没给就不出现在请求体里（DeepSeek 不认这个字段）。
-    // 注意本地网关对非法取值回的是误导性的 upstream_error，不是参数错误。
-    let reasoning_effort = std::env::var("MODEL_REASONING_EFFORT")
-        .ok()
-        .filter(|value| !value.is_empty());
-    let protocol = model_config::protocol(
-        &protocol_name,
-        client_jar.is_some(),
-        reasoning_effort.as_deref(),
-    )?;
-    let endpoint = env_or("MODEL_ENDPOINT", model_config::default_endpoint(&protocol));
-    let model_name = env_or(
-        "MODEL_NAME",
-        if protocol_name == "chat" {
-            "deepseek-chat"
-        } else {
-            "deepseek-flash"
-        },
-    );
-    if let Some(effort) = &reasoning_effort {
-        println!("[组合根] 推理档位：{effort}");
-    }
-    let memory_path = env_or("MINEINTENT_MEMORY_FILE", "companion-memory.md");
-    let persona = match std::env::var("MINEINTENT_PERSONA_FILE") {
-        Ok(path) => std::fs::read_to_string(&path)
-            .map_err(|error| format!("读取人设文件失败（{path}）：{error}"))?,
-        Err(_) => PLACEHOLDER_PERSONA.to_owned(),
+    let entry = env_or("MINEINTENT_ENTRY", "model");
+    let brain = match entry.as_str() {
+        "model" => Some(Brain::from_env(client_jar.is_some())?),
+        "mcp" => None,
+        other => {
+            return Err(format!(
+                "MINEINTENT_ENTRY 只能是 model 或 mcp，收到 {other}"
+            ))
+        }
     };
-    let api_key = read_api_key()?;
     let screen = picture::parse_screen(&env_or("MINEINTENT_VIEW_SIZE", "1920x1080"))?;
     let picture_resources = client_jar
         .map(|path| {
@@ -523,24 +505,20 @@ async fn main() -> Result<(), String> {
             Ok(resources)
         })
         .transpose()?;
-    // 适配器默认 60 秒，对会思考的模型太紧：离线量到 effort=max 下 p95 35s、
-    // 最长 139s，fognav11 自己也见过 47s。超时算模型失败，而失败会打断这一轮，
-    // 所以宁可等。内核那层（session_config）配成比这里多 30 秒，让这一层先报错——
-    // 适配器的错误话术带 HTTP 语义，重试判据靠它分「抖动」还是「4xx」。
-    let model_timeout = Duration::from_secs(
-        std::env::var("MODEL_TIMEOUT_SECONDS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(180),
-    );
-    println!("[组合根] 模型请求超时：{model_timeout:?}");
-    let model = Arc::new(
-        HttpModel::new(
-            HttpModelConfig::new(endpoint, api_key, model_name, protocol)
-                .with_timeout(model_timeout),
-        )
-        .map_err(|error| format!("模型适配器构造失败：{error}"))?,
-    );
+    // 本机端口必须先绑定成功，才进入游戏；配置错误不留下多余身体。
+    let body_listener = if brain.is_none() {
+        let addr = bridge::protocol::parse_addr(&env_or(
+            "MINEINTENT_BODY_ADDR",
+            bridge::protocol::DEFAULT_ADDR,
+        ))?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|error| format!("外接入口监听 {addr} 失败：{error}"))?;
+        println!("[组合根] 外接入口：在 {addr} 等待 mineintent-mcp 接入");
+        Some(listener)
+    } else {
+        None
+    };
 
     // ---- 接入世界 ----
     println!("[组合根] 连接 {host}:{port}，用户名 {username}");
@@ -562,11 +540,11 @@ async fn main() -> Result<(), String> {
     let occupancy = Arc::new(Occupancy::new());
     let screen_state = Arc::new(ScreenState::new());
     let read_mark = Arc::new(ChatReadMark::new());
-    let memory_file = Arc::new(MemoryFile::new(memory_path));
     let snapshots: Arc<dyn SnapshotSource> = module.clone();
 
     // 门铃同时是等待工具的打断源和内核的观察者，所以要早于两者建出来。
     let doorbell = Doorbell::new();
+    let inbox = mcp_entry::Inbox::new();
     let mut providers: Vec<Arc<dyn ToolProvider>> = vec![
         Arc::new(ChatBox::new(
             occupancy.clone(),
@@ -588,15 +566,24 @@ async fn main() -> Result<(), String> {
             Arc::new(ModuleInventoryDoor(module.clone())),
             snapshots.clone(),
         )),
-        Arc::new(MemoryTools::new(memory_file.clone())),
         Arc::new(InputTools::new(Arc::new(ModuleInputDoor(module.clone())))),
         Arc::new(HandTools::new(Arc::new(ModuleHandDoor(module.clone())))),
         Arc::new(JobsTools::new(Arc::new(ModuleJobsDoor(module.clone())))),
         Arc::new(PresenceTools::new(Arc::new(ModulePresenceDoor(
             module.clone(),
         )))),
-        Arc::new(wait::WaitTools::new(doorbell.clone())),
     ];
+    let memory_file = brain
+        .as_ref()
+        .map(|brain| Arc::new(MemoryFile::new(brain.memory_path.clone())));
+    match &memory_file {
+        Some(memory_file) => {
+            // 保留内置模型入口的工具顺序。
+            providers.insert(3, Arc::new(MemoryTools::new(memory_file.clone())));
+            providers.push(Arc::new(wait::WaitTools::new(doorbell.clone())));
+        }
+        None => providers.push(Arc::new(wait::WaitTools::new(inbox.clone()))),
+    }
     if let Some(resources) = picture_resources {
         providers.push(Arc::new(perception::PictureTools::new(Arc::new(
             picture::ModulePictureDoor::new(module.clone(), resources, screen),
@@ -616,9 +603,25 @@ async fn main() -> Result<(), String> {
         println!("[组合根] 工具表：{names:?}");
     }
 
+    let (Some(brain), Some(memory_file)) = (brain, memory_file) else {
+        return mcp_entry::run(mcp_entry::Parts {
+            listener: body_listener.expect("mcp入口已绑定监听端口"),
+            module,
+            dispatcher,
+            inbox,
+            snapshots,
+            read_mark,
+            screen_state,
+            occupancy,
+            username,
+        })
+        .await;
+    };
+    let model = brain.model;
+
     // 前缀只有人设与记忆——两者都不逐轮变，吃满前缀缓存。处境不在这里：
     // 它每轮都变，随帧追加在对话末尾（见 `situation` 模块）。
-    let strategy = Arc::new(ContextStrategy::new(persona, memory_file));
+    let strategy = Arc::new(ContextStrategy::new(brain.persona, memory_file));
     // 帧：把处境变了的那几行、攒下的拾取和在途 job 的进展投给模型。
     // 它们便宜，且只在真有进展时才发（判据见 `frame`）。
     let (round_end_tx, mut round_end_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -702,46 +705,13 @@ async fn main() -> Result<(), String> {
     loop {
         tokio::select! {
             _ = module.ticked() => {
-                let snapshot = snapshots.latest();
-                let wake = cursors.collect(
-                    &snapshot,
+                let lines = wake_lines(
+                    &mut cursors,
+                    &snapshots.latest(),
                     SelfIdentity { entity_key: &own_key, username: &username },
-                    // 格位变化只在**物品栏屏**开着时投递：关着屏时格号对模型
-                    // 无意义（它看不见界面）。容器屏不再走推送——那条通道恒定
-                    // 晚一个动作且无法自我定位，改由 `container list` 拉取。
-                    screen_state.current() == Some(ScreenKind::Inventory),
+                    &screen_state,
+                    &occupancy,
                 );
-                if wake.is_empty() {
-                    continue;
-                }
-                let mut lines = wake.lines;
-                // 屏事实的副作用：状态翻转 + 占域随服务端真相走。
-                // 所有服务端容器共用一件 container 工具；种类差异只在
-                // 通知携带的清单段表与用法补充（数据，不是分支）。
-                for directive in wake.screens {
-                    match directive {
-                        ScreenDirective::Opened { kind } => {
-                            let displaced = screen_state.server_open(ScreenKind::Container);
-                            occupancy.occupy(dispatch::Domain::Screen);
-                            // 措辞装配归 render（与 model_surface 导出共用一份）；
-                            // 这里只做副作用：占域与屏状态翻转。
-                            lines.push(render::render_container_opened(
-                                &snapshot,
-                                &kind,
-                                displaced == Some(ScreenKind::Chat),
-                            ));
-                        }
-                        ScreenDirective::Closed { kind, commanded } => {
-                            screen_state.server_close(ScreenKind::Container);
-                            if screen_state.current().is_none() {
-                                occupancy.release(dispatch::Domain::Screen);
-                            }
-                            if !commanded {
-                                lines.push(format!("容器界面被关闭了（{kind}）。"));
-                            }
-                        }
-                    }
-                }
                 if lines.is_empty() {
                     // 只有副作用（如 close 回声）没有要说的话：不吵模型。
                     continue;
@@ -828,6 +798,10 @@ async fn main() -> Result<(), String> {
     {
         eprintln!("[组合根] 会话 30 秒内未收尾，继续停机");
     }
+    stop_world(&module).await
+}
+
+async fn stop_world(module: &Module) -> Result<(), String> {
     if let Err(reason) = module.stop("维护者停机").await {
         // 已知上游隐患：azalea 停机路径可能卡死机器线程；进程退出由
         // 操作系统回收，不把它当成组合根自己的失败。
@@ -835,6 +809,121 @@ async fn main() -> Result<(), String> {
     }
     println!("[组合根] 已停机");
     Ok(())
+}
+
+/// 一个 tick 的唤醒：要说的话，外加屏事实的副作用。两个入口共用。
+///
+/// 判据本身是纯函数，在 `wake` 里，带单测；这里只负责取快照与屏状态翻转。
+fn wake_lines(
+    cursors: &mut WakeCursors,
+    snapshot: &world::TickSnapshot,
+    identity: SelfIdentity<'_>,
+    screen_state: &ScreenState,
+    occupancy: &Occupancy,
+) -> Vec<String> {
+    let wake = cursors.collect(
+        snapshot,
+        identity,
+        // 格位变化只在**物品栏屏**开着时投递：关着屏时格号对模型
+        // 无意义（它看不见界面）。容器屏不再走推送——那条通道恒定
+        // 晚一个动作且无法自我定位，改由 `container list` 拉取。
+        screen_state.current() == Some(ScreenKind::Inventory),
+    );
+    if wake.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = wake.lines;
+    // 屏事实的副作用：状态翻转 + 占域随服务端真相走。
+    // 所有服务端容器共用一件 container 工具；种类差异只在
+    // 通知携带的清单段表与用法补充（数据，不是分支）。
+    for directive in wake.screens {
+        match directive {
+            ScreenDirective::Opened { kind } => {
+                let displaced = screen_state.server_open(ScreenKind::Container);
+                occupancy.occupy(dispatch::Domain::Screen);
+                // 措辞装配归 render（与 model_surface 导出共用一份）；
+                // 这里只做副作用：占域与屏状态翻转。
+                lines.push(render::render_container_opened(
+                    snapshot,
+                    &kind,
+                    displaced == Some(ScreenKind::Chat),
+                ));
+            }
+            ScreenDirective::Closed { kind, commanded } => {
+                screen_state.server_close(ScreenKind::Container);
+                if screen_state.current().is_none() {
+                    occupancy.release(dispatch::Domain::Screen);
+                }
+                if !commanded {
+                    lines.push(format!("容器界面被关闭了（{kind}）。"));
+                }
+            }
+        }
+    }
+    lines
+}
+
+/// 内置模型入口独有配置；MCP入口不会读取模型密钥、人设或记忆文件。
+struct Brain {
+    model: Arc<HttpModel>,
+    memory_path: String,
+    persona: String,
+}
+
+impl Brain {
+    fn from_env(pictures: bool) -> Result<Self, String> {
+        let protocol_name = env_or("MODEL_PROTOCOL", "chat");
+        // 推理档位是端点方言：给了才发，没给就不出现在请求体里（DeepSeek 不认这个字段）。
+        // 注意本地网关对非法取值回的是误导性的 upstream_error，不是参数错误。
+        let reasoning_effort = std::env::var("MODEL_REASONING_EFFORT")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let protocol =
+            model_config::protocol(&protocol_name, pictures, reasoning_effort.as_deref())?;
+        let endpoint = env_or("MODEL_ENDPOINT", model_config::default_endpoint(&protocol));
+        let model_name = env_or(
+            "MODEL_NAME",
+            if protocol_name == "chat" {
+                "deepseek-chat"
+            } else {
+                "deepseek-flash"
+            },
+        );
+        if let Some(effort) = &reasoning_effort {
+            println!("[组合根] 推理档位：{effort}");
+        }
+        let memory_path = env_or("MINEINTENT_MEMORY_FILE", "companion-memory.md");
+        let persona = match std::env::var("MINEINTENT_PERSONA_FILE") {
+            Ok(path) => std::fs::read_to_string(&path)
+                .map_err(|error| format!("读取人设文件失败（{path}）：{error}"))?,
+            Err(_) => PLACEHOLDER_PERSONA.to_owned(),
+        };
+        let api_key = read_api_key()?;
+        // 适配器默认 60 秒，对会思考的模型太紧：离线量到 effort=max 下 p95 35s、
+        // 最长 139s，fognav11 自己也见过 47s。超时算模型失败，而失败会打断这一轮，
+        // 所以宁可等。内核那层（session_config）配成比这里多 30 秒，让这一层先报错——
+        // 适配器的错误话术带 HTTP 语义，重试判据靠它分「抖动」还是「4xx」。
+        let model_timeout = Duration::from_secs(
+            std::env::var("MODEL_TIMEOUT_SECONDS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(180),
+        );
+        println!("[组合根] 模型请求超时：{model_timeout:?}");
+        let model = Arc::new(
+            HttpModel::new(
+                HttpModelConfig::new(endpoint, api_key, model_name, protocol)
+                    .with_timeout(model_timeout),
+            )
+            .map_err(|error| format!("模型适配器构造失败：{error}"))?,
+        );
+
+        Ok(Self {
+            model,
+            memory_path,
+            persona,
+        })
+    }
 }
 
 #[cfg(test)]

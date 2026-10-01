@@ -12,8 +12,9 @@
 
 ## 0. 一句话
 
-`companion` 是唯一组合根、唯一可执行。它把**接入世界**、**工具编排**、
-**上下文策略**、**模型内核**四件事接在一起，其余 crate 各自只做一件事。
+`companion` 是身体的组合根。`MINEINTENT_ENTRY=model` 装配内置模型会话，
+`MINEINTENT_ENTRY=mcp` 把同一份工具编排开放给外部代理；后者另有
+`bridge` 的 stdio 可执行 `mineintent-mcp`，见 §8。
 
 ## 1. 依赖图
 
@@ -37,6 +38,9 @@ context perception screens   input    hand    jobs   presence   memory  wait
   本体是独立仓库 midturn 的 git 依赖（见 §5）。
 - **`world` 不认识模型。** 它只做「原版连接与感知」，出口是 tick 快照。
 
+外接路径另外经过 `mineintent-mcp → bridge::body → companion`；`bridge` 复用
+`agent` 的工具载荷类型与 `rmcp` 的 MCP 边界，不直接依赖 `world`。
+
 ## 2. 各 crate 一句话
 
 | crate | 职责 | 关键约束 |
@@ -51,13 +55,14 @@ context perception screens   input    hand    jobs   presence   memory  wait
 | `jobs` | 任务表（`list`） | 只读、`ToolClass::Free`；槽位是唯一真相源，不另建镜像 |
 | `presence` | 生死去留（`respawn`） | 死亡时唯一还放行的一类（`ToolClass::Vital`）；自动重生已关，起不起来是模型自己的事 |
 | `memory` | 单文件长期记忆 | 一个文件、两张脸（工具面 `remember` 与策略面落盘）、一个出口 |
-| `wait` | 让时间过去（`wait`） | `ToolClass::Free`；**永远可打断**，判据由组合根的门铃给（见下） |
+| `wait` | 让时间过去（`wait`） | `ToolClass::Free`；**永远可打断**；内置入口用门铃，外接入口用未读信箱（见 §8） |
 | `context` | 提示装配与压缩 | 受保护**两段**（人设、记忆）每轮现拉、永不参与压缩；处境不在前缀里，随帧追加 |
 | `dispatch` | 工具编排 | 互斥域账本归此层；工具模块只做状态转换 |
 | `agent` | 模型—工具循环内核 | 零项目依赖；见 §5 |
-| `companion` | 组合根 | 唯一 `main`；唤醒脚手架也在这里 |
+| `bridge` | 外接代理入口 | `mineintent-mcp` 用官方 `rmcp` SDK 提供 stdio MCP；经本机私有 TCP 转给常驻身体 |
+| `companion` | 身体组合根 | 世界、工具与唤醒在这里装配；选择内置模型或外接代理入口 |
 
-`wait` 的打断判据不在 `wait` 里：组合根的 `doorbell.rs` 同时是 `agent::Observer` 和
+内置入口的 `wait` 打断判据不在 `wait` 里：组合根的 `doorbell.rs` 同时是 `agent::Observer` 和
 `wait::Interruptions`。判据是两个计数的差——唤醒每投递一批敲一次铃，每次模型请求开始
 拍一张快照，**计数比快照大 = 有模型还没看见的唤醒**，那就一秒都不等。这补上了「模型
 决定要等」到「等真的开始」之间那次推理（实测 3–4 秒）的窗口。
@@ -128,7 +133,7 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
 把整个采集区域写入观察记忆。朝向由 `input` 的 `turn` 改变，`view` 不接受任意相机坐标；
 准星即画面正中央。
 
-`MODEL_PROTOCOL` 选择 Chat Completions / Responses / Anthropic（默认仍是 Chat）。
+内置模型入口中，`MODEL_PROTOCOL` 选择 Chat Completions / Responses / Anthropic（默认仍是 Chat）。
 `view` 需要后两者的原生图片工具回执；不兼容的配置在连接服务器前报错。
 `ContentPart::Image` 在框架内保留结构化图片，经 HTTP adapter 编码；诊断轨迹仅记
 `[图片]`，不展开 Base64。图片随框架会话历史保留，当前上下文压缩仍是空实现。
@@ -202,4 +207,51 @@ cargo test --workspace --all-targets --no-fail-fast
 ```
 
 无整体放行的 lint。`[workspace.lints]` 的 `unsafe_code = "deny"` 与
-`str_to_string = "warn"` 由 11 个 crate 全部接上。
+`str_to_string = "warn"` 由所有工作区 crate 接上，包括 `bridge`。
+
+## 8. 外接代理入口
+
+```text
+通用 MCP 客户端 ──stdio MCP──→ mineintent-mcp ──本机私有 TCP──→ companion
+                              bridge + rmcp                MINEINTENT_ENTRY=mcp
+                                                               │
+                                                       Dispatcher → world
+```
+
+`bridge` 的 `rmcp` SDK 负责标准 MCP 握手、消息与 stdio 生命周期。私有 TCP 只在
+转接器和身体之间复用工具定义、调用与回执；它不是 Streamable HTTP MCP 地址。
+身体同一时刻只接受一个控制连接，客户端关闭 stdio 转接器不会使身体退出 Minecraft。
+两个进程分别由各自的启动者管理。转接器在 stdio 会话建立后探测身体连接，恢复后
+发送标准 `tools/list_changed` 通知；失败的动作调用不会自动重发。客户端是否据此
+重新发现工具，由客户端决定。
+
+外接入口复用当前键鼠工具 `input`、瞬时键 `hand`、屏工具、`presence`、`jobs` 和
+`wait`；设置本地客户端资源后还有 `view`。`input` 仍通过原版键鼠与准星作用于世界，
+不接受坐标寻路指令。外接入口不创建内置模型会话、提示策略、
+模型适配器或 `remember`，不读取内置入口的模型密钥、人设与记忆配置；这条入口没有
+实现外部代理的长期记忆契约，不能据此把[产品](./产品.md) M01、M03、M04a、M11
+视为已经兑现。
+
+世界事件仍由组合根的唤醒判据收集，`mcp_entry::Inbox` 保留最近 100 条带 `seq`
+的事件，不在读取时删除；历史与序号只在当前身体进程内有效，身体重启后重置。
+每次工具回执附本次新事件与上一回执的新事件，重接则重送
+有限历史并报告逐出条数；重送显式标明可能重复。没有宿主确认协议，不能保证
+exactly-once，也不能恢复超出容量的历史。事件与 `FrameComposer::compose_on_pull`
+生成的处境变化放在回执的「——期间——」段。帧也重送上一回执新装配的处境、拾取
+与进展，并标明这是当时的记录；重接时重新生成完整处境。Inbox 留存只覆盖唤醒判据
+已收集的事件，不能弥补上游快照窗口已逐出的记录；拾取与进展仍在调用返回时才拉取。
+
+工具执行期间取消不会推进取信位置，连接拥有的调用任务由 `bridge` 回收，持锁
+future 被丢弃时释放动作锁。`wait` 只以新事件的
+`seq` 判断提前返回，不因历史重送反复立返；它不占用其他工具共用的串行锁。
+其他工具仍串行执行。取消或连接关闭不会撤回已提交到世界的动作，`input` 的松开
+继续由世界线程负责，最长 200 个游戏 tick。已经开始的 `view` 阻塞渲染也不会因
+请求 future 被取消而立即中止。
+
+宿主完全空闲时，事件留待下一次工具调用读取；MCP 核心不保证宿主因此开始新一轮
+推理。本入口不把 Claude channel、resources 订阅或 Tasks 当作必需能力。
+
+兼容与验证范围固定为 legacy `2025-11-25` 的 stdio 工具调用。当前 MCP
+`2026-07-28` 使用不同的生命周期和逐请求元数据，不能仅增加版本号宣称支持。
+新旧分代与回退规则见[官方兼容说明](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning)；
+本仓的检查入口和证据边界见[验证指南](./guides/validation.md#外接代理mcp)。

@@ -1,0 +1,27 @@
+[package]
+name = "bridge"
+description = "外接入口：常驻身体开本机端口，stdio MCP 转接器把通用代理接上来"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+agent = { workspace = true }
+rmcp = { version = "=3.5.0", default-features = false, features = ["server", "transport-io"] }
+serde = { workspace = true }
+serde_json = "1"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+base64 = "0.22"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+rmcp = { version = "=3.5.0", default-features = false, features = ["client"] }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "mineintent-mcp"
+path = "src/bin/mineintent-mcp.rs"
