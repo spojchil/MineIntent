@@ -149,6 +149,18 @@ pub struct Report {
     pub blocks: usize,
     pub triangles: usize,
     pub warnings: BTreeSet<String>,
+    /// 各阶段耗时（毫秒，按发生顺序），供性能测量；不进模型可见的说明。
+    pub stage_ms: Vec<(&'static str, f64)>,
+}
+
+impl Report {
+    /// 记下从 `since` 到现在的耗时，并把 `since` 推到现在。
+    pub(crate) fn stage(&mut self, name: &'static str, since: &mut std::time::Instant) {
+        let now = std::time::Instant::now();
+        self.stage_ms
+            .push((name, (now - *since).as_secs_f64() * 1000.0));
+        *since = now;
+    }
 }
 
 pub struct Frame {

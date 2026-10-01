@@ -6,7 +6,6 @@
 //! 每格的生物群系经模糊缩放从相邻 quart 里挑，染色取同一 y 上 5×5 格的整数平均
 //! （`biomeBlendRadius` 默认 2）。
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -115,6 +114,8 @@ fn colormap(map: &RgbaImage, temperature: f32, downfall: f32) -> u32 {
 
 /// 混色缓存的键：方块位置与取色方式。
 type TintKey = ([i32; 3], Resolver);
+/// 混合染色的缓存，每个出几何的线程一份（原版 `ClientLevel.tintCaches` 也按线程分）。
+pub(crate) type TintCache = HashMap<TintKey, [u8; 3]>;
 
 pub(crate) struct Biomes {
     definitions: Vec<Definition>,
@@ -124,7 +125,6 @@ pub(crate) struct Biomes {
     seed: i64,
     maps: ColorMaps,
     swamp: SimplexNoise,
-    blended: RefCell<HashMap<TintKey, [u8; 3]>>,
 }
 
 impl Biomes {
@@ -191,7 +191,6 @@ impl Biomes {
             maps,
             // 原版 `Biome.BIOME_INFO_NOISE`：种子 2345、只有第 0 八度的 PerlinSimplexNoise。
             swamp: SimplexNoise::new(&mut JavaRandom::new(2345)),
-            blended: RefCell::new(HashMap::new()),
         })
     }
 
@@ -260,8 +259,13 @@ impl Biomes {
     }
 
     /// `ClientLevel.calculateBlockTint`：同一 y 上 5×5 格逐通道整数平均。
-    pub(crate) fn blended(&self, position: [i32; 3], resolver: Resolver) -> V3 {
-        if let Some(rgb) = self.blended.borrow().get(&(position, resolver)) {
+    pub(crate) fn blended(
+        &self,
+        position: [i32; 3],
+        resolver: Resolver,
+        cache: &mut TintCache,
+    ) -> V3 {
+        if let Some(rgb) = cache.get(&(position, resolver)) {
             return rgb.map(|c| f64::from(c) / 255.0);
         }
         let [x, y, z] = position;
@@ -277,7 +281,7 @@ impl Biomes {
         }
         let count = ((BLEND_RADIUS * 2 + 1) * (BLEND_RADIUS * 2 + 1)) as u32;
         let rgb = total.map(|c| (c / count) as u8);
-        self.blended.borrow_mut().insert((position, resolver), rgb);
+        cache.insert((position, resolver), rgb);
         rgb.map(|c| f64::from(c) / 255.0)
     }
 
@@ -288,16 +292,17 @@ impl Biomes {
         properties: &std::collections::BTreeMap<String, String>,
         index: usize,
         position: [i32; 3],
+        cache: &mut TintCache,
     ) -> V3 {
         match source(name, index) {
-            Source::Biome(resolver) => self.blended(position, resolver),
+            Source::Biome(resolver) => self.blended(position, resolver, cache),
             Source::UpperHalfBelow => {
                 let below = if properties.get("half").map(String::as_str) == Some("upper") {
                     [position[0], position[1] - 1, position[2]]
                 } else {
                     position
                 };
-                self.blended(below, Resolver::Grass)
+                self.blended(below, Resolver::Grass, cache)
             }
             Source::Fixed(color) => rgb(color),
             Source::InHandOnly { world, .. } => rgb(world),

@@ -65,9 +65,11 @@ async fn capture(
 ) -> Result<(), String> {
     module.wait_ready(Duration::from_secs(45)).await?;
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut capture_started;
     let region = loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let source = module.clone();
+        capture_started = Instant::now();
         let region = tokio::task::spawn_blocking(move || source.capture_view())
             .await
             .map_err(|e| e.to_string())?;
@@ -84,6 +86,8 @@ async fn capture(
             return Err(pending);
         }
     };
+    let capture_ms = capture_started.elapsed().as_secs_f64() * 1000.0;
+    let scene_started = Instant::now();
     let pose = &region.snapshot.self_state;
     let scene = vision::Scene {
         game_version: "26.1.2".to_owned(),
@@ -157,6 +161,15 @@ async fn capture(
             biome_zoom_seed: region.biome_zoom_seed,
         }),
     };
+    let scene_ms = scene_started.elapsed().as_secs_f64() * 1000.0;
+    // 设了 CAPTURE_SCENE 时另存场景，供 render_scene 离线重放（改渲染器前后逐像素比对）。
+    if std::env::var_os("CAPTURE_SCENE").is_some() {
+        std::fs::write(
+            PathBuf::from(output).with_extension("scene.json"),
+            serde_json::to_vec(&scene).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     let started = Instant::now();
     let mut options = vision::Options::default();
     if let Some([width, height]) = size {
@@ -164,8 +177,21 @@ async fn capture(
         options.height = height;
     }
     let mut frame = vision::render(&scene, resources, options)?;
+    let render_s = started.elapsed().as_secs_f64();
     frame.report.warnings.insert("capture uses latest tick pose and current block-region copy, not an atomic server tick; standing eye height 1.62".to_owned());
-    std::fs::write(output, frame.png()?).map_err(|e| e.to_string())?;
+    let png_started = Instant::now();
+    let png = frame.png()?;
+    let png_ms = png_started.elapsed().as_secs_f64() * 1000.0;
+    frame
+        .report
+        .stage_ms
+        .insert(0, ("capture_view", capture_ms));
+    frame
+        .report
+        .stage_ms
+        .insert(1, ("scene from region", scene_ms));
+    frame.report.stage_ms.push(("png encode", png_ms));
+    std::fs::write(output, png).map_err(|e| e.to_string())?;
     std::fs::write(
         PathBuf::from(output).with_extension("report.json"),
         serde_json::to_vec_pretty(&frame.report).map_err(|e| e.to_string())?,
@@ -173,9 +199,10 @@ async fn capture(
     .map_err(|e| e.to_string())?;
     println!(
         "captured {} loaded blocks, rendered {} triangles in {:.2}s; limitations in report",
-        frame.report.blocks,
-        frame.report.triangles,
-        started.elapsed().as_secs_f64()
+        frame.report.blocks, frame.report.triangles, render_s
     );
+    for (stage, ms) in &frame.report.stage_ms {
+        println!("  {stage}: {ms:.0} ms");
+    }
     Ok(())
 }

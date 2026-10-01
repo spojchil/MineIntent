@@ -12,6 +12,26 @@ const NEAR: f64 = 1e-4;
 const SKY: [f64; 3] = [150.0, 185.0, 215.0];
 const MAX_LAYERS: usize = 16;
 
+pub(crate) struct Frustum {
+    eye: V3,
+    /// 世界坐标法线与偏移：点 p 在内侧当且仅当 `normal · (p - eye) + offset ≥ 0`。
+    planes: [(V3, f64); 6],
+}
+
+impl Frustum {
+    /// 区块段（16³）是否可能落在视锥里。外扩 1 格，容纳伸出格子的模型元素；
+    /// 对每个平面取最靠内的角（原版 `FrustumIntersection.testAab` 的做法），保守不漏。
+    pub(crate) fn section_visible(&self, section: [i32; 3]) -> bool {
+        let min = section.map(|c| f64::from(c * 16 - 1));
+        let max = section.map(|c| f64::from(c * 16 + 17));
+        self.planes.iter().all(|(normal, offset)| {
+            let corner: V3 =
+                std::array::from_fn(|k| if normal[k] >= 0.0 { max[k] } else { min[k] });
+            dot(*normal, sub(corner, self.eye)) + offset >= 0.0
+        })
+    }
+}
+
 pub(crate) struct Projection {
     axes: [V3; 3], // right, up, forward
     scale: [f64; 2],
@@ -64,6 +84,18 @@ impl Projection {
             ([0.0, 1.0, sy], 0.0),
             ([0.0, -1.0, sy], 0.0),
         ]
+    }
+
+    /// 世界坐标里的视锥（与 [`Self::planes`] 同一组平面，原版 `Frustum`）。
+    pub(crate) fn frustum(&self, eye: V3, far: f64) -> Frustum {
+        Frustum {
+            eye,
+            planes: self.planes(far).map(|(normal, offset)| {
+                let world =
+                    std::array::from_fn(|k| (0..3).map(|i| normal[i] * self.axes[i][k]).sum());
+                (world, offset)
+            }),
+        }
     }
 
     fn project(&self, vertex: Vertex) -> ScreenVertex {
@@ -141,7 +173,40 @@ fn top_left(a: [f64; 2], b: [f64; 2]) -> bool {
     b[1] < a[1] || (b[1] == a[1] && b[0] > a[0])
 }
 
+/// 投影、裁剪所有三角形，按块并行，按原顺序拼回后从近到远排序。
 fn project<'a>(
+    triangles: &'a [Triangle],
+    camera: &Camera,
+    projection: &Projection,
+    far: f64,
+) -> Vec<Projected<'a>> {
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(8);
+    let chunk = triangles.len().div_ceil(workers).max(1);
+    let parts: Vec<Vec<Projected<'a>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = triangles
+            .chunks(chunk)
+            .map(|part| scope.spawn(move || project_part(part, camera, projection, far)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("投影线程不 panic"))
+            .collect()
+    });
+    let mut result = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+    for mut part in parts {
+        result.append(&mut part);
+    }
+    // Front-to-back improves early depth rejection; correctness does not require sorting.
+    result.sort_unstable_by(|a, b| {
+        let nearest = |t: &Projected<'_>| t.vertices.iter().map(|v| v.inv_z).fold(0.0, f64::max);
+        nearest(b).total_cmp(&nearest(a))
+    });
+    result
+}
+
+fn project_part<'a>(
     triangles: &'a [Triangle],
     camera: &Camera,
     projection: &Projection,
@@ -214,11 +279,6 @@ fn project<'a>(
             }
         }
     }
-    // Front-to-back improves early depth rejection; correctness does not require sorting.
-    result.sort_unstable_by(|a, b| {
-        let nearest = |t: &Projected<'_>| t.vertices.iter().map(|v| v.inv_z).fold(0.0, f64::max);
-        nearest(b).total_cmp(&nearest(a))
-    });
     result
 }
 
@@ -558,6 +618,7 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
     report
         .warnings
         .insert("transparency is composited through at most 16 surfaces".to_owned());
+    let mut clock = std::time::Instant::now();
     // 有环境才有光照与昼夜；没有时（模型夹具、测试）满亮度、固定背景。
     let biomes = match Biomes::new(scene, resources, &mut report) {
         Ok(biomes) => Some(biomes),
@@ -590,8 +651,18 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
         }
         None => None,
     };
+    report.stage("biomes, daylight, sky, light cells", &mut clock);
     let cells = lighting.as_ref().map(|(cells, _, _)| cells);
-    let mut triangles = build_lit(scene, cells, biomes.as_ref(), resources, &mut report);
+    let frustum = Projection::new(&scene.camera, options).frustum(scene.camera.eye, options.far);
+    let mut triangles = build_lit(
+        scene,
+        cells,
+        biomes.as_ref(),
+        Some(&frustum),
+        resources,
+        &mut report,
+    );
+    report.stage("block geometry", &mut clock);
     if !scene.entities.is_empty() {
         triangles.extend(crate::entity::build(
             &scene.entities,
@@ -610,15 +681,18 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
             }
         }
     }
+    report.stage("entities, lightmap", &mut clock);
     report.triangles = triangles.len();
     let sky = lighting.as_ref().map(|(_, _, sky)| sky);
     let mut image = draw(&triangles, &scene.camera, options, sky);
+    report.stage("raster", &mut clock);
     if options.crosshair {
         draw_crosshair(&mut image, resources, &mut report);
     }
     if let Some([x, y, width, height]) = options.crop {
         image = image::imageops::crop_imm(&image, x, y, width, height).to_image();
     }
+    report.stage("crosshair, crop", &mut clock);
     Ok(Frame { image, report })
 }
 

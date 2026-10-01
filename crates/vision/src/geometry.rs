@@ -99,41 +99,47 @@ pub(crate) fn build(
     report: &mut Report,
 ) -> Vec<Triangle> {
     let biomes = Biomes::new(scene, resources, report).ok();
-    build_lit(scene, None, biomes.as_ref(), resources, report)
+    build_lit(scene, None, biomes.as_ref(), None, resources, report)
 }
 
 /// `cells` 为 `Some` 时按原版平滑光照与光照坐标逐顶点算光；`biomes` 给模型面染色
-/// （没有时染色面按白）。
+/// （没有时染色面按白）；`frustum` 为 `Some` 时整段跳过视锥外的区块段。
+///
+/// 分三步（参照原版 `SectionRenderDispatcher` 与 Sodium 的分段编译）：视锥按段筛方块；
+/// 串行解析每种方块状态的面与方块实体（要读资源）；再按方块并行出三角形，每个线程一份
+/// 染色缓存（原版 `ClientLevel` 的 `tintCaches` 也是每线程一份），按方块原顺序拼回。
 pub(crate) fn build_lit(
     scene: &Scene,
     cells: Option<&Cells>,
     biomes: Option<&Biomes>,
+    frustum: Option<&crate::raster::Frustum>,
     resources: &mut Resources,
     report: &mut Report,
 ) -> Vec<Triangle> {
-    let neighbours: HashMap<_, _> = scene.blocks.iter().map(|b| (b.position, b)).collect();
-    let mut cache: HashMap<String, Vec<Face>> = HashMap::new();
-    let mut triangles = Vec::new();
-    for block in &scene.blocks {
-        if matches!(
-            block.name.as_str(),
-            "air"
-                | "cave_air"
-                | "void_air"
-                | "minecraft:air"
-                | "minecraft:cave_air"
-                | "minecraft:void_air"
-        ) {
-            continue;
-        }
-        triangles.extend(crate::block_entity::triangles(
-            block, cells, resources, report,
-        ));
-        let key = format!("{}{:?}", block.name, block.properties);
-        let faces =
-            cache
-                .entry(key)
-                .or_insert_with(|| match block_faces(block, resources, report) {
+    let mut sections: HashMap<[i32; 3], bool> = HashMap::new();
+    let visible: Vec<&Block> = scene
+        .blocks
+        .iter()
+        .filter(|block| !is_air(&block.name))
+        .filter(|block| {
+            frustum.is_none_or(|frustum| {
+                *sections
+                    .entry(block.position.map(|c| c >> 4))
+                    .or_insert_with_key(|section| frustum.section_visible(*section))
+            })
+        })
+        .collect();
+
+    let mut states: HashMap<(&str, &std::collections::BTreeMap<String, String>), usize> =
+        HashMap::new();
+    let mut faces_by_state: Vec<Vec<Face>> = Vec::new();
+    let mut prepared: Vec<(usize, Vec<Triangle>)> = Vec::with_capacity(visible.len());
+    for block in &visible {
+        let entity = crate::block_entity::triangles(block, cells, resources, report);
+        let state = *states
+            .entry((block.name.as_str(), &block.properties))
+            .or_insert_with(|| {
+                faces_by_state.push(match block_faces(block, resources, report) {
                     Ok(faces) if !faces.is_empty() => faces,
                     // 箱子、潜影盒等没有资源定义的几何，整个外形由方块实体画。
                     _ if crate::block_entity::has(&block.name) => Vec::new(),
@@ -148,49 +154,110 @@ pub(crate) fn build_lit(
                         cube_faces(missing_texture(), [1.0; 3], 1.0, 1.0)
                     }
                 });
-        let fluid = is_fluid(&block.name);
-        for face in faces.iter() {
-            if let Some(direction) = face.cull {
-                let hidden = match block.covered {
-                    Some(mask) => {
-                        direction_bit(direction).is_some_and(|bit| mask & (1 << bit) != 0)
+                faces_by_state.len() - 1
+            });
+        prepared.push((state, entity));
+    }
+
+    let neighbours: HashMap<_, _> = scene.blocks.iter().map(|b| (b.position, b)).collect();
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(8);
+    let chunk = visible.len().div_ceil(workers).max(1);
+    let faces_by_state = &faces_by_state;
+    let neighbours = &neighbours;
+    let parts: Vec<Vec<Triangle>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = visible
+            .chunks(chunk)
+            .zip(prepared.chunks_mut(chunk))
+            .map(|(blocks, prepared)| {
+                scope.spawn(move || {
+                    let mut tints = crate::biome::TintCache::new();
+                    let mut triangles = Vec::new();
+                    for (block, (state, entity)) in blocks.iter().zip(prepared) {
+                        triangles.append(entity);
+                        emit_block(
+                            block,
+                            &faces_by_state[*state],
+                            neighbours,
+                            cells,
+                            biomes,
+                            &mut tints,
+                            &mut triangles,
+                        );
                     }
-                    None => {
-                        let pos =
-                            std::array::from_fn(|i| block.position[i].saturating_add(direction[i]));
-                        // 原版 FluidRenderer：同种流体相邻的面不画。
-                        neighbours
-                            .get(&pos)
-                            .is_some_and(|b| b.opaque || (fluid && b.name == block.name))
-                    }
-                };
-                if hidden {
-                    continue;
-                }
-            }
-            let offset = block.position.map(f64::from);
-            let tint = match (face.tint_index, biomes) {
-                (Some(index), Some(biomes)) => {
-                    let color =
-                        biomes.block_tint(&block.name, &block.properties, index, block.position);
-                    std::array::from_fn(|i| face.tint[i] * color[i])
-                }
-                _ => face.tint,
-            };
-            let lit = face.lighting(block.position, tint, cells);
-            for indices in [[0, 1, 2], [0, 2, 3]] {
-                triangles.push(Triangle {
-                    vertices: indices.map(|i| add(face.vertices[i], offset)),
-                    uv: indices.map(|i| face.uv[i]),
-                    texture: face.texture.clone(),
-                    color: indices.map(|i| lit[i].0),
-                    light: indices.map(|i| lit[i].1),
-                    alpha: face.alpha,
-                });
-            }
-        }
+                    triangles
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("几何线程不 panic"))
+            .collect()
+    });
+    let mut triangles = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+    for mut part in parts {
+        triangles.append(&mut part);
     }
     triangles
+}
+
+fn is_air(name: &str) -> bool {
+    matches!(
+        name.strip_prefix("minecraft:").unwrap_or(name),
+        "air" | "cave_air" | "void_air"
+    )
+}
+
+/// 一个方块的模型面：剔掉被遮挡的面，染色、算光，写成三角形。
+fn emit_block(
+    block: &Block,
+    faces: &[Face],
+    neighbours: &HashMap<[i32; 3], &Block>,
+    cells: Option<&Cells>,
+    biomes: Option<&Biomes>,
+    tints: &mut crate::biome::TintCache,
+    triangles: &mut Vec<Triangle>,
+) {
+    let fluid = is_fluid(&block.name);
+    for face in faces {
+        if let Some(direction) = face.cull {
+            let hidden = match block.covered {
+                Some(mask) => direction_bit(direction).is_some_and(|bit| mask & (1 << bit) != 0),
+                None => {
+                    let pos =
+                        std::array::from_fn(|i| block.position[i].saturating_add(direction[i]));
+                    // 原版 FluidRenderer：同种流体相邻的面不画。
+                    neighbours
+                        .get(&pos)
+                        .is_some_and(|b| b.opaque || (fluid && b.name == block.name))
+                }
+            };
+            if hidden {
+                continue;
+            }
+        }
+        let offset = block.position.map(f64::from);
+        let tint = match (face.tint_index, biomes) {
+            (Some(index), Some(biomes)) => {
+                let color =
+                    biomes.block_tint(&block.name, &block.properties, index, block.position, tints);
+                std::array::from_fn(|i| face.tint[i] * color[i])
+            }
+            _ => face.tint,
+        };
+        let lit = face.lighting(block.position, tint, cells);
+        for indices in [[0, 1, 2], [0, 2, 3]] {
+            triangles.push(Triangle {
+                vertices: indices.map(|i| add(face.vertices[i], offset)),
+                uv: indices.map(|i| face.uv[i]),
+                texture: face.texture.clone(),
+                color: indices.map(|i| lit[i].0),
+                light: indices.map(|i| lit[i].1),
+                alpha: face.alpha,
+            });
+        }
+    }
 }
 
 fn is_fluid(name: &str) -> bool {
