@@ -98,7 +98,10 @@ impl Sky {
     /// `fog.glsl` 的 `total_fog_value`：球面距离走环境雾，柱面距离走视距雾，取大。
     fn fog(&self, relative: V3) -> f64 {
         let spherical = dot(relative, relative).sqrt();
-        let cylindrical = relative[0].hypot(relative[2]).max(relative[1].abs());
+        // 不用 hypot：它为防溢出多做缩放，这里的距离离溢出很远（着色器里也是直接开方）。
+        let cylindrical = (relative[0] * relative[0] + relative[2] * relative[2])
+            .sqrt()
+            .max(relative[1].abs());
         linear_fog(spherical, 0.0, ENVIRONMENTAL_FOG_END).max(linear_fog(
             cylindrical,
             self.render_start,
@@ -126,7 +129,7 @@ impl Sky {
             return None;
         }
         let hit = direction.map(|v| v * plane / direction[1]);
-        let radius = hit[0].hypot(hit[2]);
+        let radius = (hit[0] * hit[0] + hit[2] * hit[2]).sqrt();
         if radius > SKY_DISC_RADIUS {
             return None;
         }
