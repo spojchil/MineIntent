@@ -281,21 +281,26 @@ impl Module {
         let origin_x = (feet[0].div_euclid(16) - view_distance as i32) * 16;
         let origin_z = (feet[2].div_euclid(16) - view_distance as i32) * 16;
 
-        // 第一遍：整块拷出状态号，未加载记 `UNLOADED`。世界读锁里只取各区块的句柄，
-        // 逐格拷贝在锁外、每个区块各自短暂加锁——长时间持有世界读锁会饿住客户端循环，
-        // 心跳超时被服务端踢掉（实测：视距 6 时整段持锁即掉线）。
+        // 第一遍：冻结。世界读锁里把视距内各区块的分段原样克隆出来（只复制调色板数据），
+        // 随即放锁；逐格解码、分类与成像都在锁外。方块因此是同一时刻的副本，与位姿快照
+        // 相差不超过一个 tick；逐格解码若在锁内做，长时间持锁会饿住客户端循环、心跳超时被踢。
         const UNLOADED: u16 = u16::MAX;
         let loaded = handle.read();
         let min_y = loaded.chunks.min_y();
         let height = loaded.chunks.height() as i32;
         let chunks_per_side = view_distance as i32 * 2 + 1;
-        let columns: Vec<_> = (0..chunks_per_side * chunks_per_side)
+        let columns: Vec<Option<Vec<azalea::world::Section>>> = (0..chunks_per_side
+            * chunks_per_side)
             .map(|i| {
                 let pos = azalea::core::position::ChunkPos::new(
                     origin_x.div_euclid(16) + i % chunks_per_side,
                     origin_z.div_euclid(16) + i / chunks_per_side,
                 );
-                loaded.chunks.0.get(&pos)
+                loaded
+                    .chunks
+                    .0
+                    .get(&pos)
+                    .map(|chunk| chunk.read().sections.to_vec())
             })
             .collect();
         drop(loaded);
@@ -309,8 +314,7 @@ impl Module {
             };
             let base_x = origin_x + (i as i32 % chunks_per_side) * 16;
             let base_z = origin_z + (i as i32 / chunks_per_side) * 16;
-            let column = column.read();
-            for (section_index, section) in column.sections.iter().enumerate() {
+            for (section_index, section) in column.iter().enumerate() {
                 let base_y = min_y + section_index as i32 * 16;
                 if base_y >= min_y + height {
                     break;
