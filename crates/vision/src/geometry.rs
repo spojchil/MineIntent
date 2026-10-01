@@ -142,6 +142,9 @@ pub(crate) fn build(
 ) -> Vec<Triangle> {
     let biomes = Biomes::new(scene, resources, report).ok();
     build_lit(scene, None, biomes.as_ref(), None, None, resources, report)
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// `cells` 为 `Some` 时按原版平滑光照与光照坐标逐顶点算光；`biomes` 给模型面染色
@@ -150,7 +153,8 @@ pub(crate) fn build(
 ///
 /// 分三步（参照原版 `SectionRenderDispatcher` 与 Sodium 的分段编译）：视锥按段筛方块；
 /// 串行解析每种方块状态的面与方块实体（要读资源）；再按方块并行出三角形，每个线程一份
-/// 染色缓存（原版 `ClientLevel` 的 `tintCaches` 也是每线程一份），按方块原顺序拼回。
+/// 染色缓存（原版 `ClientLevel` 的 `tintCaches` 也是每线程一份）。返回各线程的分段，
+/// 按顺序接起来就是方块原顺序；不拼成一个大数组，省一次整体搬运。
 pub(crate) fn build_lit(
     scene: &Scene,
     cells: Option<&Cells>,
@@ -159,7 +163,7 @@ pub(crate) fn build_lit(
     eye: Option<V3>,
     resources: &mut Resources,
     report: &mut Report,
-) -> Vec<Triangle> {
+) -> Vec<Vec<Triangle>> {
     let mut clock = std::time::Instant::now();
     let mut sections: PositionMap<bool> = PositionMap::default();
     let visible: Vec<&Block> = scene
@@ -225,7 +229,8 @@ pub(crate) fn build_lit(
             .map(|(blocks, prepared)| {
                 scope.spawn(move || {
                     let mut tints = crate::biome::TintCache::new();
-                    let mut triangles = Vec::new();
+                    // 大多数方块露出一个面、两个三角形；先留够，免得边推边扩容搬运。
+                    let mut triangles = Vec::with_capacity(blocks.len() * 2);
                     for (block, (state, entity)) in blocks.iter().zip(prepared) {
                         triangles.append(entity);
                         emit_block(
@@ -250,12 +255,8 @@ pub(crate) fn build_lit(
             .map(|handle| handle.join().expect("几何线程不 panic"))
             .collect()
     });
-    let mut triangles = Vec::with_capacity(parts.iter().map(Vec::len).sum());
-    for mut part in parts {
-        triangles.append(&mut part);
-    }
     report.stage("geometry: emit", &mut clock);
-    triangles
+    parts
 }
 
 fn is_air(name: &str) -> bool {

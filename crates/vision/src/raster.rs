@@ -252,20 +252,16 @@ fn row_span(
     [from, to.max(from)]
 }
 
-/// 投影、裁剪所有三角形，按块并行，按原顺序拼回后从近到远排序。
+/// 投影、裁剪所有三角形，每个分段一个线程，按原顺序拼回后从近到远排序。
 fn project<'a>(
-    triangles: &'a [Triangle],
+    parts: &'a [Vec<Triangle>],
     camera: &Camera,
     projection: &Projection,
     far: f64,
 ) -> Vec<Projected<'a>> {
-    let workers = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .min(8);
-    let chunk = triangles.len().div_ceil(workers).max(1);
     let parts: Vec<Vec<Projected<'a>>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = triangles
-            .chunks(chunk)
+        let handles: Vec<_> = parts
+            .iter()
             .map(|part| {
                 scope.spawn(move || {
                     let projected = project_part(part, camera, projection, far);
@@ -294,7 +290,8 @@ fn project_part<'a>(
     projection: &Projection,
     far: f64,
 ) -> Vec<Projected<'a>> {
-    let mut result = Vec::new();
+    // 多数三角形投影出一个，被裁的出零个；先留够。
+    let mut result = Vec::with_capacity(triangles.len());
     let mut polygon = Vec::with_capacity(12);
     let mut scratch = Vec::with_capacity(12);
     let planes = projection.planes(far);
@@ -649,8 +646,9 @@ fn draw_band(
     }
 }
 
+/// `parts` 按顺序接起来是全部三角形（几何各线程的分段与实体）。
 pub(crate) fn draw(
-    triangles: &[Triangle],
+    parts: &[Vec<Triangle>],
     camera: &Camera,
     options: Options,
     sky: Option<&Sky>,
@@ -658,7 +656,7 @@ pub(crate) fn draw(
 ) -> RgbaImage {
     let mut clock = std::time::Instant::now();
     let projection = Projection::new(camera, options);
-    let projected = project(triangles, camera, &projection, options.far);
+    let projected = project(parts, camera, &projection, options.far);
     report.stage("project, clip, sort", &mut clock);
     // 分箱：每个三角形按（已排好的）顺序登记到它覆盖的每个 16 行条带，条带只扫自己的箱。
     let band_count = (options.height as usize).div_ceil(BAND);
@@ -815,7 +813,7 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
     report.stage("biomes, daylight, sky, light cells", &mut clock);
     let cells = lighting.as_ref().map(|(cells, _, _)| cells);
     let frustum = Projection::new(&scene.camera, options).frustum(scene.camera.eye, options.far);
-    let mut triangles = build_lit(
+    let mut parts = build_lit(
         scene,
         cells,
         biomes.as_ref(),
@@ -826,7 +824,7 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
     );
     clock = std::time::Instant::now();
     if !scene.entities.is_empty() {
-        triangles.extend(crate::entity::build(
+        parts.push(crate::entity::build(
             &scene.entities,
             scene.camera.eye,
             cells,
@@ -834,19 +832,26 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
             &mut report,
         ));
     }
-    // 原版逐顶点乘光照贴图（`vertexColor = Color * sample_lightmap(UV2)`）。
+    // 原版逐顶点乘光照贴图（`vertexColor = Color * sample_lightmap(UV2)`）；各分段并行。
     if let Some((_, lightmap, _)) = &lighting {
-        for triangle in &mut triangles {
-            for i in 0..3 {
-                let light = lightmap.sample(triangle.light[i]);
-                triangle.color[i] = std::array::from_fn(|k| triangle.color[i][k] * light[k]);
+        std::thread::scope(|scope| {
+            for part in &mut parts {
+                scope.spawn(move || {
+                    for triangle in part {
+                        for i in 0..3 {
+                            let light = lightmap.sample(triangle.light[i]);
+                            triangle.color[i] =
+                                std::array::from_fn(|k| triangle.color[i][k] * light[k]);
+                        }
+                    }
+                });
             }
-        }
+        });
     }
     report.stage("entities, lightmap", &mut clock);
-    report.triangles = triangles.len();
+    report.triangles = parts.iter().map(Vec::len).sum();
     let sky = lighting.as_ref().map(|(_, _, sky)| sky);
-    let mut image = draw(&triangles, &scene.camera, options, sky, &mut report);
+    let mut image = draw(&parts, &scene.camera, options, sky, &mut report);
     clock = std::time::Instant::now();
     if options.crosshair {
         draw_crosshair(&mut image, resources, &mut report);
