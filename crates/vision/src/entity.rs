@@ -637,7 +637,7 @@ const SHADE: [(V3, f64); 6] = [
 ];
 
 /// 按世界朝向给面上固定明暗（与方块同一套近似，不是原版实体光照）。
-fn shade(normal: V3) -> f64 {
+pub(crate) fn shade(normal: V3) -> f64 {
     SHADE
         .iter()
         .map(|(axis, value)| {

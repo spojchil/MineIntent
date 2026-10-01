@@ -4,6 +4,7 @@
 
 mod assets;
 mod biome;
+mod block_entity;
 mod daylight;
 mod entity;
 mod geometry;

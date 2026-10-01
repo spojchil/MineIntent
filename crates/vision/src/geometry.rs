@@ -126,12 +126,17 @@ pub(crate) fn build_lit(
         ) {
             continue;
         }
+        triangles.extend(crate::block_entity::triangles(
+            block, cells, resources, report,
+        ));
         let key = format!("{}{:?}", block.name, block.properties);
         let faces =
             cache
                 .entry(key)
                 .or_insert_with(|| match block_faces(block, resources, report) {
                     Ok(faces) if !faces.is_empty() => faces,
+                    // 箱子、潜影盒等没有资源定义的几何，整个外形由方块实体画。
+                    _ if crate::block_entity::has(&block.name) => Vec::new(),
                     result => {
                         let reason = result
                             .err()
