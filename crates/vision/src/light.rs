@@ -33,12 +33,9 @@ enum Sections {
 const MAX_GRID_SLOTS: i64 = 1 << 22;
 const NO_SLOT: u32 = u32::MAX;
 
-/// 一格压缩后的样子：`[天空光, 方块光, 发光, 透光]` 与标志位（下面四个属性 + 是否有数据）。
-#[derive(Clone, Copy, Default)]
-struct Stored {
-    light: [u8; 4],
-    flags: u8,
-}
+/// 一格压缩后的样子：`[天空光, 方块光, 发光, 透光, 标志位]`，标志位是下面四个属性加
+/// 是否有数据。全零就是「没有数据」，整块数据可以直接按零分配。
+type Stored = [u8; 5];
 
 const VIEW_BLOCKING: u8 = 1;
 const SOLID_RENDER: u8 = 2;
@@ -76,16 +73,23 @@ const OPEN_AIR: Cell = Cell {
 impl Cells {
     pub(crate) fn new(cells: &[Cell]) -> Self {
         let section_of = |cell: &Cell| cell.position.map(|c| c >> 4);
-        let (min, max) =
-            cells
-                .iter()
-                .map(section_of)
-                .fold(([i32::MAX; 3], [i32::MIN; 3]), |(min, max), s| {
-                    (
-                        std::array::from_fn(|i| min[i].min(s[i])),
-                        std::array::from_fn(|i| max[i].max(s[i])),
-                    )
-                });
+        // 采集按区块段成批给格：先切成同段的连续段落，每个段落只查一次段。
+        let mut runs: Vec<([i32; 3], std::ops::Range<usize>)> = Vec::new();
+        let mut start = 0;
+        for i in 1..=cells.len() {
+            if i == cells.len() || section_of(&cells[i]) != section_of(&cells[start]) {
+                runs.push((section_of(&cells[start]), start..i));
+                start = i;
+            }
+        }
+        let (min, max) = runs
+            .iter()
+            .fold(([i32::MAX; 3], [i32::MIN; 3]), |(min, max), (s, _)| {
+                (
+                    std::array::from_fn(|i| min[i].min(s[i])),
+                    std::array::from_fn(|i| max[i].max(s[i])),
+                )
+            });
         let span: [i64; 3] = std::array::from_fn(|i| i64::from(max[i]) - i64::from(min[i]) + 1);
         let grid = !cells.is_empty() && span.iter().product::<i64>() <= MAX_GRID_SLOTS;
         let mut sections = if grid {
@@ -97,46 +101,46 @@ impl Cells {
         } else {
             Sections::Sparse(PositionMap::default())
         };
-        // 先给每个有格的段分槽号，再一次分配好全部段的数据，免得逐段扩容搬运。
-        let mut count = 0u32;
-        for cell in cells {
-            let section = section_of(cell);
-            if sections.slot(section) != NO_SLOT {
-                continue;
-            }
-            match &mut sections {
-                Sections::Grid { first, span, slots } => {
-                    let local: [i32; 3] = std::array::from_fn(|i| section[i] - first[i]);
-                    slots[((local[1] * span[2] + local[2]) * span[0] + local[0]) as usize] = count;
+        // 给每个有格的段分槽号，记下各槽的段落（同一段分散在几处时按原顺序，后写的覆盖先写的）。
+        let mut by_slot: Vec<Vec<std::ops::Range<usize>>> = Vec::new();
+        for (section, run) in runs {
+            let mut slot = sections.slot(section);
+            if slot == NO_SLOT {
+                slot = by_slot.len() as u32;
+                by_slot.push(Vec::new());
+                match &mut sections {
+                    Sections::Grid { first, span, slots } => {
+                        let local: [i32; 3] = std::array::from_fn(|i| section[i] - first[i]);
+                        slots[((local[1] * span[2] + local[2]) * span[0] + local[0]) as usize] =
+                            slot;
+                    }
+                    Sections::Sparse(map) => {
+                        map.insert(section, slot);
+                    }
                 }
-                Sections::Sparse(map) => {
-                    map.insert(section, count);
-                }
             }
-            count += 1;
+            by_slot[slot as usize].push(run);
         }
-        let mut data = vec![Stored::default(); count as usize * 4096];
-        for cell in cells {
-            let slot = sections.slot(section_of(cell));
-            let flags = PRESENT
-                | if cell.view_blocking { VIEW_BLOCKING } else { 0 }
-                | if cell.solid_render { SOLID_RENDER } else { 0 }
-                | if cell.emissive { EMISSIVE } else { 0 }
-                | if cell.full_collision {
-                    FULL_COLLISION
-                } else {
-                    0
-                };
-            data[slot as usize * 4096 + local_index(cell.position)] = Stored {
-                light: [
-                    cell.sky_light,
-                    cell.block_light,
-                    cell.emission,
-                    cell.dampening,
-                ],
-                flags,
-            };
-        }
+        // 一次按零分配好全部段，再按槽分给多个线程填：每个槽只归一个线程，互不重叠。
+        let mut data: Vec<Stored> = vec![[0; 5]; by_slot.len() * 4096];
+        let workers = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(8);
+        let per_worker = by_slot.len().div_ceil(workers).max(1);
+        std::thread::scope(|scope| {
+            for (data, by_slot) in data
+                .chunks_mut(per_worker * 4096)
+                .zip(by_slot.chunks(per_worker))
+            {
+                scope.spawn(move || {
+                    for (section, runs) in data.chunks_mut(4096).zip(by_slot) {
+                        for cell in runs.iter().flat_map(|run| &cells[run.clone()]) {
+                            section[local_index(cell.position)] = stored(cell);
+                        }
+                    }
+                });
+            }
+        });
         Self { sections, data }
     }
 
@@ -146,21 +150,21 @@ impl Cells {
         if slot == NO_SLOT {
             return OPEN_AIR;
         }
-        let stored = self.data[slot as usize * 4096 + local_index(position)];
-        if stored.flags & PRESENT == 0 {
+        let [sky_light, block_light, emission, dampening, flags] =
+            self.data[slot as usize * 4096 + local_index(position)];
+        if flags & PRESENT == 0 {
             return OPEN_AIR;
         }
-        let [sky_light, block_light, emission, dampening] = stored.light;
         Cell {
             position,
             sky_light,
             block_light,
             emission,
             dampening,
-            view_blocking: stored.flags & VIEW_BLOCKING != 0,
-            solid_render: stored.flags & SOLID_RENDER != 0,
-            emissive: stored.flags & EMISSIVE != 0,
-            full_collision: stored.flags & FULL_COLLISION != 0,
+            view_blocking: flags & VIEW_BLOCKING != 0,
+            solid_render: flags & SOLID_RENDER != 0,
+            emissive: flags & EMISSIVE != 0,
+            full_collision: flags & FULL_COLLISION != 0,
         }
     }
 
@@ -184,6 +188,25 @@ impl Cells {
             1.0
         }
     }
+}
+
+fn stored(cell: &Cell) -> Stored {
+    let flags = PRESENT
+        | if cell.view_blocking { VIEW_BLOCKING } else { 0 }
+        | if cell.solid_render { SOLID_RENDER } else { 0 }
+        | if cell.emissive { EMISSIVE } else { 0 }
+        | if cell.full_collision {
+            FULL_COLLISION
+        } else {
+            0
+        };
+    [
+        cell.sky_light,
+        cell.block_light,
+        cell.emission,
+        cell.dampening,
+        flags,
+    ]
 }
 
 /// 段内下标，(y, z, x) 序。
