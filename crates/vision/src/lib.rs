@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 pub use assets::Resources;
 pub use entity::Entity;
 pub use geometry::fixture;
-pub use raster::render;
+pub use raster::{render, section_filter};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Block {

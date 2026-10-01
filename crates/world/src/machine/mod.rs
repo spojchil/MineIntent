@@ -226,12 +226,21 @@ impl Module {
         self.execute(DoorCommand::Chat(line.to_owned())).await
     }
 
-    /// 拷贝视距内的表面方块供按需成像，随即放开世界读锁；解析资源与出像素都在锁外。
+    /// 拷贝视野里的表面方块供按需成像，随即放开世界读锁；解析资源与出像素都在锁外。
     /// 在阻塞线程上调用。
     ///
     /// 范围与原版一致：以所在区块为中心、视距内的区块，全世界高度。视距取客户端
     /// 默认视距与服务端视距的较小者。
-    pub fn capture_view(&self) -> Result<crate::BlockRegion, String> {
+    ///
+    /// 和原版只建视锥里的区块段一样，只交 `visible` 认可的区块段里的表面方块：调用方
+    /// 拿同一份位姿快照与视距造出区块段判据（区块段坐标 = 方块坐标 >> 4），世界层不知道
+    /// 相机与视锥。判据外只再解码贴着它的一圈区块段（表面判定与平滑光照要查邻格）和
+    /// 脚边一圈（未加载计数）。恒真判据即整个视距。
+    pub fn capture_view<F, V>(&self, visible: F) -> Result<crate::BlockRegion, String>
+    where
+        F: FnOnce(&TickSnapshot, u32) -> V,
+        V: Fn([i32; 3]) -> bool + Sync,
+    {
         use self::blocks::{render_class, RenderClass};
 
         let snapshot = self.latest();
@@ -264,14 +273,13 @@ impl Module {
         {
             return Err("图片采集坐标越界".to_owned());
         }
-        let span = (view_distance as i32 * 2 + 1) * 16;
+        let visible = visible(&snapshot, view_distance);
         let origin_x = (feet[0].div_euclid(16) - view_distance as i32) * 16;
         let origin_z = (feet[2].div_euclid(16) - view_distance as i32) * 16;
 
         // 第一遍：冻结。世界读锁里把视距内各区块的分段原样克隆出来（只复制调色板数据），
         // 随即放锁；逐格解码、分类与成像都在锁外。方块因此是同一时刻的副本，与位姿快照
         // 相差不超过一个 tick；逐格解码若在锁内做，长时间持锁会饿住客户端循环、心跳超时被踢。
-        const UNLOADED: u16 = u16::MAX;
         let loaded = handle.read();
         let min_y = loaded.chunks.min_y();
         let height = loaded.chunks.height() as i32;
@@ -324,85 +332,124 @@ impl Module {
             .inner
             .day_time
             .load(std::sync::atomic::Ordering::Acquire);
-        let index = |x: i32, y: i32, z: i32| -> usize {
-            (((y - min_y) * span + (z - origin_z)) * span + (x - origin_x)) as usize
+
+        // 第二遍：挑区块段。区块段网格按 (y, z, x) 编号，坐标相对视距窗口的西北角与世界底。
+        let (side, layers) = (chunks_per_side, height / 16);
+        let grid = |[sx, sy, sz]: [i32; 3]| ((sy * side + sz) * side + sx) as usize;
+        let in_grid = |[sx, sy, sz]: [i32; 3]| {
+            (0..side).contains(&sx) && (0..layers).contains(&sy) && (0..side).contains(&sz)
         };
-        let mut states = vec![UNLOADED; (span * span * height) as usize];
-        // 生物群系按 4×4×4 格存（原版 quart 坐标）。
-        let (quart_x0, quart_z0, quart_y0) = (origin_x >> 2, origin_z >> 2, min_y >> 2);
-        let (quart_span, quart_height) = (span / 4, height / 4);
-        let quart_index = |qx: i32, qy: i32, qz: i32| -> Option<usize> {
-            ((quart_x0..quart_x0 + quart_span).contains(&qx)
-                && (quart_y0..quart_y0 + quart_height).contains(&qy)
-                && (quart_z0..quart_z0 + quart_span).contains(&qz))
-            .then(|| {
-                (((qy - quart_y0) * quart_span + (qz - quart_z0)) * quart_span + (qx - quart_x0))
-                    as usize
-            })
+        let present = |[sx, sy, sz]: [i32; 3]| {
+            columns[(sz * side + sx) as usize]
+                .as_ref()
+                .is_some_and(|sections| (sy as usize) < sections.len())
         };
-        let mut quarts = vec![u32::MAX; (quart_span * quart_span * quart_height) as usize];
-        for (i, column) in columns.into_iter().enumerate() {
-            let Some(column) = column else {
-                continue;
-            };
-            let base_x = origin_x + (i as i32 % chunks_per_side) * 16;
-            let base_z = origin_z + (i as i32 / chunks_per_side) * 16;
-            for (section_index, section) in column.iter().enumerate() {
-                let base_y = min_y + section_index as i32 * 16;
-                if base_y >= min_y + height {
-                    break;
-                }
-                for y in 0..4u8 {
-                    for z in 0..4u8 {
-                        for x in 0..4u8 {
-                            let biome =
-                                section.get_biome(azalea::core::position::ChunkSectionBiomePos {
-                                    x,
-                                    y,
-                                    z,
-                                });
-                            if let Some(i) = quart_index(
-                                (base_x >> 2) + i32::from(x),
-                                (base_y >> 2) + i32::from(y),
-                                (base_z >> 2) + i32::from(z),
-                            ) {
-                                use azalea::registry::DataRegistry;
-                                quarts[i] = biome.protocol_id();
-                            }
-                        }
+        let first = [origin_x >> 4, min_y >> 4, origin_z >> 4];
+        let mut shown = vec![false; (side * side * layers) as usize];
+        let mut wanted_sections = vec![false; shown.len()];
+        for sy in 0..layers {
+            for sz in 0..side {
+                for sx in 0..side {
+                    let local = [sx, sy, sz];
+                    if !present(local) || !visible([first[0] + sx, first[1] + sy, first[2] + sz]) {
+                        continue;
                     }
-                }
-                for y in 0..16u8 {
-                    for z in 0..16u8 {
-                        for x in 0..16u8 {
-                            let state = section.get_block_state(
-                                azalea::core::position::ChunkSectionBlockPos::new(x, y, z),
-                            );
-                            states[index(
-                                base_x + i32::from(x),
-                                base_y + i32::from(y),
-                                base_z + i32::from(z),
-                            )] = state.id();
+                    shown[grid(local)] = true;
+                    for dy in -1..=1 {
+                        for dz in -1..=1 {
+                            for dx in -1..=1 {
+                                let near = [sx + dx, sy + dy, sz + dz];
+                                if in_grid(near) {
+                                    wanted_sections[grid(near)] = true;
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+        // 未加载计数查的是脚边 NEAR_LOADED_RADIUS 的立方体。
+        let near = |axis: usize, origin: i32| {
+            (feet[axis] - crate::NEAR_LOADED_RADIUS - origin) >> 4
+                ..=(feet[axis] + crate::NEAR_LOADED_RADIUS - origin) >> 4
+        };
+        for sy in near(1, min_y) {
+            for sz in near(2, origin_z) {
+                for sx in near(0, origin_x) {
+                    if in_grid([sx, sy, sz]) {
+                        wanted_sections[grid([sx, sy, sz])] = true;
+                    }
+                }
+            }
+        }
+        // 要解码的区块段按网格序排进槽位，每槽 16³ 个状态、4³ 个生物群系格，(y, z, x) 序。
+        const UNDECODED: u32 = u32::MAX;
+        let mut slot = vec![UNDECODED; shown.len()];
+        let mut decoded: Vec<[i32; 3]> = Vec::new();
+        for (g, wanted) in wanted_sections.iter().enumerate() {
+            let g = g as i32;
+            let local = [g % side, g / (side * side), g / side % side];
+            if *wanted && present(local) {
+                slot[g as usize] = decoded.len() as u32;
+                decoded.push(local);
+            }
+        }
+        drop(wanted_sections);
 
+        // 第三遍：多线程解码选中的区块段。
+        let mut states = vec![0u16; decoded.len() * 4096];
+        let mut quarts = vec![0u32; decoded.len() * 64];
+        let per = decoded.len().div_ceil(workers()).max(1);
+        std::thread::scope(|scope| {
+            let columns = &columns;
+            for ((sections, states), quarts) in decoded
+                .chunks(per)
+                .zip(states.chunks_mut(per * 4096))
+                .zip(quarts.chunks_mut(per * 64))
+            {
+                scope.spawn(move || {
+                    use azalea::core::position::{ChunkSectionBiomePos, ChunkSectionBlockPos};
+                    use azalea::registry::DataRegistry;
+                    for (k, &[sx, sy, sz]) in sections.iter().enumerate() {
+                        let section = &columns[(sz * side + sx) as usize]
+                            .as_ref()
+                            .expect("只解码已加载的区块柱")[sy as usize];
+                        for (i, state) in states[k * 4096..(k + 1) * 4096].iter_mut().enumerate() {
+                            let [x, y, z] = [i & 15, i >> 8, (i >> 4) & 15].map(|v| v as u8);
+                            *state = section
+                                .get_block_state(ChunkSectionBlockPos::new(x, y, z))
+                                .id();
+                        }
+                        for (i, quart) in quarts[k * 64..(k + 1) * 64].iter_mut().enumerate() {
+                            let [x, y, z] = [i & 3, i >> 4, (i >> 2) & 3].map(|v| v as u8);
+                            *quart = section
+                                .get_biome(ChunkSectionBiomePos { x, y, z })
+                                .protocol_id();
+                        }
+                    }
+                });
+            }
+        });
+
+        // 方块坐标 → 状态数组下标；视距窗口外、没加载或没解码的格子为 `None`。
+        let index = |x: i32, y: i32, z: i32| -> Option<usize> {
+            let local = [x - origin_x, y - min_y, z - origin_z];
+            if !in_grid(local.map(|v| v >> 4)) {
+                return None;
+            }
+            match slot[grid(local.map(|v| v >> 4))] {
+                UNDECODED => None,
+                s => {
+                    let [lx, ly, lz] = local.map(|v| (v & 15) as usize);
+                    Some(s as usize * 4096 + (ly * 16 + lz) * 16 + lx)
+                }
+            }
+        };
         let class_at = |x: i32, y: i32, z: i32| -> Option<RenderClass> {
             if y >= min_y + height {
                 return Some(RenderClass::Air);
             }
-            if y < min_y
-                || !(origin_x..origin_x + span).contains(&x)
-                || !(origin_z..origin_z + span).contains(&z)
-            {
-                return None;
-            }
-            match states[index(x, y, z)] {
-                UNLOADED => None,
-                id => Some(render_class(id)),
-            }
+            index(x, y, z).map(|i| render_class(states[i]))
         };
 
         let mut unloaded = 0;
@@ -419,8 +466,8 @@ impl Module {
             }
         }
 
-        // 第二遍：只留至少一面没被挡住的方块。没加载的邻格按挡住算，否则视距边缘
-        // 和未加载区块的边上会立起一整面墙。
+        // 第四遍：视野里的区块段只留至少一面没被挡住的方块。没加载的邻格按挡住算，否则
+        // 视距边缘和未加载区块的边上会立起一整面墙。分段并行，再按 (y, z, x) 排回整体扫描序。
         const DIRECTIONS: [[i32; 3]; 6] = [
             [0, -1, 0],
             [0, 1, 0],
@@ -429,16 +476,23 @@ impl Module {
             [-1, 0, 0],
             [1, 0, 0],
         ];
-        let mut surface = Vec::new();
-        for y in min_y..min_y + height {
-            for z in origin_z..origin_z + span {
-                for x in origin_x..origin_x + span {
-                    let Some(class) = class_at(x, y, z) else {
-                        continue;
-                    };
+        let shown_slots: Vec<usize> = (0..decoded.len())
+            .filter(|&s| shown[grid(decoded[s])])
+            .collect();
+        let mut surface = parallel(&shown_slots, |slots, _, surface| {
+            for &s in slots {
+                let [sx, sy, sz] = decoded[s];
+                let base = [origin_x + sx * 16, min_y + sy * 16, origin_z + sz * 16];
+                for (i, &id) in states[s * 4096..(s + 1) * 4096].iter().enumerate() {
+                    let class = render_class(id);
                     if class == RenderClass::Air {
                         continue;
                     }
+                    let [x, y, z] = [
+                        base[0] + (i & 15) as i32,
+                        base[1] + (i >> 8) as i32,
+                        base[2] + ((i >> 4) & 15) as i32,
+                    ];
                     let mut covered = 0u8;
                     for (bit, [dx, dy, dz]) in DIRECTIONS.into_iter().enumerate() {
                         let hidden = match class_at(x + dx, y + dy, z + dz) {
@@ -453,22 +507,20 @@ impl Module {
                         }
                     }
                     if covered != 0b11_1111 {
-                        surface.push((x, y, z, states[index(x, y, z)], covered));
+                        surface.push((x, y, z, id, covered));
                     }
                 }
             }
-        }
+        });
+        surface.sort_unstable_by_key(|&(x, y, z, _, _)| (y, z, x));
 
-        // 第三遍：原版平滑光照要查的格子。每个表面方块周围一圈 27 格；露出的面另加
+        // 第五遍：原版平滑光照要查的格子。每个表面方块周围一圈 27 格；露出的面另加
         // 面前第二层的四个侧格（`BlockModelLighter` 判断角格是否透光查的是那一层）。
         // 实体按眼睛所在格取光（原版 `getLightProbePosition`）。
         let mut needed = vec![false; states.len()];
         let mut mark = |x: i32, y: i32, z: i32| {
-            if (min_y..min_y + height).contains(&y)
-                && (origin_x..origin_x + span).contains(&x)
-                && (origin_z..origin_z + span).contains(&z)
-            {
-                needed[index(x, y, z)] = true;
+            if let Some(i) = index(x, y, z) {
+                needed[i] = true;
             }
         };
         for &(x, y, z, _, covered) in &surface {
@@ -502,27 +554,22 @@ impl Module {
                 entity.position.z.floor() as i32,
             );
         }
-        let mut cells = Vec::new();
-        for y in min_y..min_y + height {
-            for z in origin_z..origin_z + span {
-                for x in origin_x..origin_x + span {
-                    let i = index(x, y, z);
-                    if !needed[i] || states[i] == UNLOADED {
-                        continue;
-                    }
-                    let column =
-                        ((z - origin_z) / 16 * chunks_per_side + (x - origin_x) / 16) as usize;
+        let cells = parallel(&decoded, |sections, first_slot, cells| {
+            for (k, &[sx, sy, sz]) in sections.iter().enumerate() {
+                let s = first_slot + k;
+                let light = lights[(sz * side + sx) as usize].as_ref();
+                for i in (0..4096).filter(|i| needed[s * 4096 + i]) {
+                    let [lx, ly, lz] = [i & 15, i >> 8, (i >> 4) & 15];
+                    let y = min_y + sy * 16 + ly as i32;
                     let (sky_light, block_light) =
-                        lights[column].as_ref().map_or((0, 0), |light| {
-                            light.get(
-                                [(x - origin_x) as usize % 16, (z - origin_z) as usize % 16],
-                                y,
-                                min_y,
-                            )
-                        });
-                    let props = blocks::render_props(states[i]);
+                        light.map_or((0, 0), |light| light.get([lx, lz], y, min_y));
+                    let props = blocks::render_props(states[s * 4096 + i]);
                     cells.push(crate::LightCell {
-                        position: [x, y, z],
+                        position: [
+                            origin_x + sx * 16 + lx as i32,
+                            y,
+                            origin_z + sz * 16 + lz as i32,
+                        ],
                         sky_light,
                         block_light,
                         emission: props.emission,
@@ -534,18 +581,26 @@ impl Module {
                     });
                 }
             }
-        }
+        });
         drop(needed);
         drop(states);
 
-        // 第四遍：成像要查的生物群系格。原版染色在同一 y 上取 5×5 格的生物群系
+        // 第六遍：成像要查的生物群系格。原版染色在同一 y 上取 5×5 格的生物群系
         // （高草上半取下面一格），每格经 `BiomeManager.getBiome` 的模糊缩放落到相邻的
         // 8 个 quart 之一；天空等环境属性在相机处按 6³ quart 高斯加权。y 按原版夹进范围。
-        let quart_y_range = [quart_y0, quart_y0 + quart_height - 1];
+        let (quart_x0, quart_z0, quart_y0) = (origin_x >> 2, origin_z >> 2, min_y >> 2);
+        let quart_y_range = [quart_y0, quart_y0 + layers * 4 - 1];
         let mut wanted = vec![false; quarts.len()];
         let mut want = |qx: i32, qy: i32, qz: i32| {
-            if let Some(i) = quart_index(qx, qy.clamp(quart_y_range[0], quart_y_range[1]), qz) {
-                wanted[i] = true;
+            let qy = qy.clamp(quart_y_range[0], quart_y_range[1]);
+            let local = [qx - quart_x0, qy - quart_y0, qz - quart_z0];
+            if !in_grid(local.map(|v| v >> 2)) {
+                return;
+            }
+            let s = slot[grid(local.map(|v| v >> 2))];
+            if s != UNDECODED {
+                let [lx, ly, lz] = local.map(|v| (v & 3) as usize);
+                wanted[s as usize * 64 + (ly * 4 + lz) * 4 + lx] = true;
             }
         };
         for &(x, y, z, _, _) in &surface {
@@ -567,42 +622,40 @@ impl Module {
             }
         }
         let mut biomes = Vec::new();
-        for qy in quart_y0..quart_y0 + quart_height {
-            for qz in quart_z0..quart_z0 + quart_span {
-                for qx in quart_x0..quart_x0 + quart_span {
-                    let Some(i) = quart_index(qx, qy, qz) else {
-                        continue;
-                    };
-                    if !wanted[i] || quarts[i] == u32::MAX {
-                        continue;
-                    }
-                    let Ok(biome) = u16::try_from(quarts[i]) else {
-                        continue;
-                    };
-                    biomes.push(crate::BiomeCell {
-                        quart: [qx, qy, qz],
-                        biome,
-                    });
-                }
+        for (s, &[sx, sy, sz]) in decoded.iter().enumerate() {
+            for i in (0..64).filter(|i| wanted[s * 64 + i]) {
+                let Ok(biome) = u16::try_from(quarts[s * 64 + i]) else {
+                    continue;
+                };
+                let [lx, ly, lz] = [i & 3, i >> 4, (i >> 2) & 3].map(|v| v as i32);
+                biomes.push(crate::BiomeCell {
+                    quart: [
+                        quart_x0 + sx * 4 + lx,
+                        quart_y0 + sy * 4 + ly,
+                        quart_z0 + sz * 4 + lz,
+                    ],
+                    biome,
+                });
             }
         }
 
-        // 每种状态只解码一次。
-        let mut palette = std::collections::HashMap::new();
-        let mut blocks = Vec::with_capacity(surface.len());
-        for (x, y, z, id, covered) in surface {
-            let position = crate::BlockPosition { x, y, z };
-            let template = palette.entry(id).or_insert_with(|| {
-                azalea::block::BlockState::try_from(id)
-                    .map(|state| blocks::snapshot_from_state(state, position.clone()))
-            });
-            let Ok(template) = template else {
-                continue;
-            };
-            let mut block = template.clone();
-            block.position = position;
-            blocks.push(crate::RegionBlock { block, covered });
-        }
+        // 每种状态只解码一次（每个线程各自一份）。
+        let blocks = parallel(&surface, |surface, _, blocks| {
+            let mut palette = std::collections::HashMap::new();
+            for &(x, y, z, id, covered) in surface {
+                let position = crate::BlockPosition { x, y, z };
+                let template = palette.entry(id).or_insert_with(|| {
+                    azalea::block::BlockState::try_from(id)
+                        .map(|state| blocks::snapshot_from_state(state, position.clone()))
+                });
+                let Ok(template) = template else {
+                    continue;
+                };
+                let mut block = template.clone();
+                block.position = position;
+                blocks.push(crate::RegionBlock { block, covered });
+            }
+        });
         Ok(crate::BlockRegion {
             snapshot,
             blocks,
@@ -646,6 +699,41 @@ impl Module {
             })
             .collect()
     }
+}
+
+/// 成像拷贝用的线程数：与成像一致，最多 8 个。
+fn workers() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(8)
+}
+
+/// 把 `items` 切成连续的几块并行处理，各块的输出按原顺序拼接。`work` 收到块、
+/// 块首在 `items` 里的下标和本块的输出。
+fn parallel<T: Sync, R: Send>(
+    items: &[T],
+    work: impl Fn(&[T], usize, &mut Vec<R>) + Sync,
+) -> Vec<R> {
+    let per = items.len().div_ceil(workers()).max(1);
+    let work = &work;
+    let parts: Vec<Vec<R>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = items
+            .chunks(per)
+            .enumerate()
+            .map(|(n, chunk)| {
+                scope.spawn(move || {
+                    let mut output = Vec::new();
+                    work(chunk, n * per, &mut output);
+                    output
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("成像拷贝线程不 panic"))
+            .collect()
+    });
+    parts.into_iter().flatten().collect()
 }
 
 impl SnapshotSource for Module {

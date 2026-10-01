@@ -579,11 +579,26 @@ pub(crate) fn draw(
     RgbaImage::from_raw(options.width, options.height, pixels).expect("validated pixel dimensions")
 }
 
+/// 有环境时的远平面：视距雾按柱面距离算，最远的角落在斜上方；放宽到能覆盖整个视距立方体。
+fn view_far(view_distance: u32) -> f64 {
+    (f64::from(view_distance) * 16.0 * 1.8).max(1.0)
+}
+
+/// 成像会画的区块段（区块段坐标 = 方块坐标 >> 4）：与 [`render`] 剔除区块段是同一个视锥
+/// （带环境、视距 `view_distance` 的场景）。采集方据此只拷贝视野里的方块，判据外的区块段交了也不画。
+pub fn section_filter(
+    camera: &Camera,
+    options: Options,
+    view_distance: u32,
+) -> impl Fn([i32; 3]) -> bool + Send + Sync {
+    let frustum = Projection::new(camera, options).frustum(camera.eye, view_far(view_distance));
+    move |section| frustum.section_visible(section)
+}
+
 pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Result<Frame, String> {
     let mut options = options;
     if let Some(environment) = &scene.environment {
-        // 视距雾按柱面距离算，最远的角落在斜上方；放宽到能覆盖整个视距立方体。
-        options.far = (f64::from(environment.view_distance) * 16.0 * 1.8).max(1.0);
+        options.far = view_far(environment.view_distance);
     }
     if scene.game_version != resources.version() {
         return Err(format!(

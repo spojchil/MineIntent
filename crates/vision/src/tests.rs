@@ -604,3 +604,20 @@ fn benchmark_ray_and_raster_with_local_resources() {
         );
     }
 }
+
+#[test]
+fn section_filter_keeps_sections_ahead_and_drops_those_behind_or_beyond_view() {
+    // yaw 0 朝南（+z）。
+    let camera = Camera {
+        eye: [8.0, 70.0, 8.0],
+        yaw: 0.0,
+        pitch: 0.0,
+        vertical_fov: 70.0,
+    };
+    let visible = crate::section_filter(&camera, Options::default(), 4);
+    assert!(visible([0, 4, 0]), "眼睛所在区块段");
+    assert!(visible([0, 4, 2]), "正前方");
+    assert!(!visible([0, 4, -2]), "正后方");
+    assert!(!visible([0, 4, 8]), "远平面（视距 ×1.8）之外");
+    assert!(!visible([0, 12, 2]), "视锥上方");
+}

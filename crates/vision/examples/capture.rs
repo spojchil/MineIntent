@@ -1,7 +1,8 @@
 //! Live protocol-client image probe. No model/provider, commands or world writes.
 //!
-//! 输出路径给 `-` 时常驻在线：从标准输入逐行读 `输出路径 [宽x高]`，每行按当前位姿出一张图
-//! （不给尺寸用默认 1920x1080），便于让人旁观同一个视点做对照。
+//! 输出路径给 `-` 时常驻在线：从标准输入逐行读 `输出路径 [宽x高] [all]`，每行按当前位姿出一张图
+//! （不给尺寸用默认 1920x1080），便于让人旁观同一个视点做对照。`all` 让采集不按视锥挑
+//! 区块段、拷贝整个视距，用来和默认采集逐像素比对。
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,7 +28,7 @@ async fn main() -> Result<(), String> {
     let result = if args[4] == "-" {
         resident(module.clone(), &mut resources).await
     } else {
-        capture(module.clone(), &mut resources, &args[4], None).await
+        capture(module.clone(), &mut resources, &args[4], None, false).await
     };
     let _ = module.stop("图片采集完成").await;
     result
@@ -45,11 +46,20 @@ async fn resident(
         let Some(output) = words.next() else {
             continue;
         };
-        let size = words.next().and_then(|size| {
-            let (width, height) = size.split_once('x')?;
-            Some([width.parse().ok()?, height.parse().ok()?])
-        });
-        match capture(module.clone(), resources, output, size).await {
+        let mut size = None;
+        let mut all = false;
+        for word in words {
+            if word == "all" {
+                all = true;
+            } else if let Some((width, height)) = word.split_once('x') {
+                size = width
+                    .parse()
+                    .ok()
+                    .zip(height.parse().ok())
+                    .map(|(w, h)| [w, h]);
+            }
+        }
+        match capture(module.clone(), resources, output, size, all).await {
             Ok(()) => println!("done {output}"),
             Err(error) => println!("failed {output}: {error}"),
         }
@@ -62,7 +72,13 @@ async fn capture(
     resources: &mut vision::Resources,
     output: &str,
     size: Option<[u32; 2]>,
+    all: bool,
 ) -> Result<(), String> {
+    let mut options = vision::Options::default();
+    if let Some([width, height]) = size {
+        options.width = width;
+        options.height = height;
+    }
     module.wait_ready(Duration::from_secs(45)).await?;
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut capture_started;
@@ -70,9 +86,17 @@ async fn capture(
         tokio::time::sleep(Duration::from_millis(500)).await;
         let source = module.clone();
         capture_started = Instant::now();
-        let region = tokio::task::spawn_blocking(move || source.capture_view())
-            .await
-            .map_err(|e| e.to_string())?;
+        let region = tokio::task::spawn_blocking(move || {
+            if all {
+                source.capture_view(|_, _| |_: [i32; 3]| true)
+            } else {
+                source.capture_view(|snapshot, view_distance| {
+                    vision::section_filter(&camera(snapshot), options, view_distance)
+                })
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?;
         // Ready 可能先于出生事件发布，那一刻世界句柄还没装上；截止前一律重试。
         let pending = match region {
             Ok(region) if region.unloaded == 0 => break region,
@@ -88,19 +112,9 @@ async fn capture(
     };
     let capture_ms = capture_started.elapsed().as_secs_f64() * 1000.0;
     let scene_started = Instant::now();
-    let pose = &region.snapshot.self_state;
     let scene = vision::Scene {
         game_version: "26.1.2".to_owned(),
-        camera: vision::Camera {
-            eye: [
-                pose.position.x,
-                pose.position.y + world::EYE_HEIGHT,
-                pose.position.z,
-            ],
-            yaw: pose.yaw,
-            pitch: pose.pitch,
-            vertical_fov: 70.0,
-        },
+        camera: camera(&region.snapshot),
         blocks: region
             .blocks
             .into_iter()
@@ -171,11 +185,6 @@ async fn capture(
         .map_err(|e| e.to_string())?;
     }
     let started = Instant::now();
-    let mut options = vision::Options::default();
-    if let Some([width, height]) = size {
-        options.width = width;
-        options.height = height;
-    }
     let mut frame = vision::render(&scene, resources, options)?;
     let render_s = started.elapsed().as_secs_f64();
     frame.report.warnings.insert("capture uses latest tick pose and current block-region copy, not an atomic server tick; standing eye height 1.62".to_owned());
@@ -205,4 +214,18 @@ async fn capture(
         println!("  {stage}: {ms:.0} ms");
     }
     Ok(())
+}
+
+fn camera(snapshot: &world::TickSnapshot) -> vision::Camera {
+    let pose = &snapshot.self_state;
+    vision::Camera {
+        eye: [
+            pose.position.x,
+            pose.position.y + world::EYE_HEIGHT,
+            pose.position.z,
+        ],
+        yaw: pose.yaw,
+        pitch: pose.pitch,
+        vertical_fov: 70.0,
+    }
 }

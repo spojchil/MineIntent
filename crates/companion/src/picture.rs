@@ -61,16 +61,18 @@ impl PictureDoor for ModulePictureDoor {
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
                 let mut resources = resources.lock().map_err(|_| "图片资源暂不可用")?;
-                // One bounded copy, no polling: let the caller choose when to retry.
-                let region = module.capture_view()?;
-                let view_distance = region.view_distance;
-                let scene = scene_from_region(region)?;
                 let options = vision::Options {
                     width,
                     height,
                     crop,
                     ..vision::Options::default()
                 };
+                // One bounded copy, no polling: let the caller choose when to retry.
+                let region = module.capture_view(|snapshot, view_distance| {
+                    vision::section_filter(&camera(snapshot), options, view_distance)
+                })?;
+                let view_distance = region.view_distance;
+                let scene = scene_from_region(region)?;
                 let frame = vision::render(&scene, &mut resources, options)?;
                 let framing = match crop {
                     None => format!("整个屏幕 {width}×{height}，正中是准星"),
@@ -101,23 +103,28 @@ impl PictureDoor for ModulePictureDoor {
     }
 }
 
+/// 身体位姿下的第一人称相机：采集挑区块段与出图用同一个。
+fn camera(snapshot: &world::TickSnapshot) -> vision::Camera {
+    let pose = &snapshot.self_state;
+    vision::Camera {
+        eye: [
+            pose.position.x,
+            pose.position.y + world::EYE_HEIGHT,
+            pose.position.z,
+        ],
+        yaw: pose.yaw,
+        pitch: pose.pitch,
+        vertical_fov: 70.0,
+    }
+}
+
 fn scene_from_region(region: world::BlockRegion) -> Result<vision::Scene, String> {
     if region.unloaded != 0 {
         return Err("周围区块尚未加载完整，暂时无法生成可靠图片，请稍后再看".to_owned());
     }
-    let pose = &region.snapshot.self_state;
     Ok(vision::Scene {
         game_version: "26.1.2".to_owned(),
-        camera: vision::Camera {
-            eye: [
-                pose.position.x,
-                pose.position.y + world::EYE_HEIGHT,
-                pose.position.z,
-            ],
-            yaw: pose.yaw,
-            pitch: pose.pitch,
-            vertical_fov: 70.0,
-        },
+        camera: camera(&region.snapshot),
         blocks: region
             .blocks
             .into_iter()
