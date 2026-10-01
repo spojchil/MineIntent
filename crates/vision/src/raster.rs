@@ -5,7 +5,7 @@ use crate::biome::Biomes;
 use crate::daylight::Daylight;
 use crate::geometry::{build_lit, dot, sub, Triangle, V3};
 use crate::light::{Cells, Lightmap, LightmapInputs};
-use crate::sky::Sky;
+use crate::sky::{Sky, SkyPlan};
 use crate::{Camera, Frame, Options, Report, Resources, Scene};
 
 const NEAR: f64 = 1e-4;
@@ -397,6 +397,8 @@ struct Pixel {
 struct BandScratch {
     pixels: Vec<Pixel>,
     depths: Vec<f64>,
+    /// 这个条带的天空（没有地形挡住时的颜色）。
+    background: Vec<V3>,
 }
 
 impl Pixel {
@@ -456,13 +458,9 @@ impl Pixel {
     }
 }
 
-/// 天空用的整幅光栅化：一个凸多边形（相对眼睛的世界坐标、uv、颜色），逐个覆盖到的像素
-/// 回调（行优先像素下标, 透视校正的 uv, 颜色）。不做深度测试，画的先后就是遮挡关系。
-pub(crate) fn rasterize(
-    projection: &Projection,
-    corners: &[(V3, [f64; 2], V3)],
-    mut paint: impl FnMut(usize, [f64; 2], V3),
-) {
+/// 天空用的光栅化，先做一次的部分：一个凸多边形（相对眼睛的世界坐标、uv、颜色）裁剪、
+/// 投影成屏幕三角形；各条带再用 [`Flat::fill`] 只画自己的几行。
+pub(crate) fn flatten(projection: &Projection, corners: &[(V3, [f64; 2], V3)]) -> Vec<Flat> {
     let mut polygon: Vec<Vertex> = corners
         .iter()
         .map(|&(position, uv, color)| projection.vertex(position, uv, color, [0.0; 3]))
@@ -472,10 +470,10 @@ pub(crate) fn rasterize(
         clip(&polygon, &mut scratch, normal, offset);
         std::mem::swap(&mut polygon, &mut scratch);
         if polygon.is_empty() {
-            return;
+            return Vec::new();
         }
     }
-    let width = projection.size[0] as usize;
+    let mut result = Vec::new();
     for i in 1..polygon.len().saturating_sub(1) {
         let mut v = [polygon[0], polygon[i], polygon[i + 1]].map(|v| projection.project(v));
         let mut area = edge(v[0].xy, v[1].xy, v[2].xy);
@@ -492,15 +490,41 @@ pub(crate) fn rasterize(
         let y0 = (min[1] - 0.5).ceil().max(0.0) as usize;
         let x1 = ((max[0] - 0.5).floor() + 1.0).clamp(0.0, projection.size[0]) as usize;
         let y1 = ((max[1] - 0.5).floor() + 1.0).clamp(0.0, projection.size[1]) as usize;
+        result.push(Flat {
+            vertices: v,
+            area,
+            bounds: [x0, y0, x1, y1],
+        });
+    }
+    result
+}
+
+/// 投影好的天空三角形。不做深度测试，画的先后就是遮挡关系。
+pub(crate) struct Flat {
+    vertices: [ScreenVertex; 3],
+    area: f64,
+    bounds: [usize; 4], // x0, y0, x1, y1 (exclusive)
+}
+
+impl Flat {
+    /// 只画 `rows` 里的行：逐个覆盖到的像素回调（行优先像素下标, 透视校正的 uv, 颜色）。
+    /// 每行只走 [`row_span`] 给出的区间，像素集合与逐个测试相同。
+    pub(crate) fn fill(
+        &self,
+        width: usize,
+        rows: std::ops::Range<usize>,
+        mut paint: impl FnMut(usize, [f64; 2], V3),
+    ) {
+        let (v, area) = (&self.vertices, self.area);
+        let [x0, y0, x1, y1] = self.bounds;
         let pairs = [(v[1].xy, v[2].xy), (v[2].xy, v[0].xy), (v[0].xy, v[1].xy)];
         let inclusive = pairs.map(|(a, b)| top_left(a, b));
-        for y in y0..y1 {
-            for x in x0..x1 {
+        let mut probes = 0;
+        for y in y0.max(rows.start)..y1.min(rows.end) {
+            let [from, to] = row_span(&pairs, inclusive, y, [x0, x1], &mut probes);
+            for x in from..to {
                 let p = [x as f64 + 0.5, y as f64 + 0.5];
                 let e = pairs.map(|(a, b)| edge(a, b, p));
-                if (0..3).any(|k| e[k] < 0.0 || (e[k] == 0.0 && !inclusive[k])) {
-                    continue;
-                }
                 let w = e.map(|value| value / area);
                 let z = 1.0 / (w[0] * v[0].inv_z + w[1] * v[1].inv_z + w[2] * v[2].inv_z);
                 let uv = std::array::from_fn(|k| {
@@ -544,15 +568,26 @@ fn draw_band(
     bin: &[&Projected<'_>],
     projection: &Projection,
     options: Options,
-    sky: Option<&Sky>,
-    background: Option<&[V3]>,
+    sky: Option<&SkyPlan<'_>>,
     y0: usize,
     output: &mut [u8],
 ) {
     let width = options.width as usize;
     let rows = output.len() / (width * 4);
-    let background_at = |i: usize| background.map_or(SKY, |image| image[y0 * width + i]);
-    let BandScratch { pixels, depths } = scratch;
+    let BandScratch {
+        pixels,
+        depths,
+        background,
+    } = scratch;
+    match sky {
+        Some(plan) => plan.paint(projection, y0, rows, background),
+        None => {
+            background.clear();
+            background.resize(width * rows, SKY);
+        }
+    }
+    let sky = sky.map(SkyPlan::sky);
+    let background_at = |i: usize| background[i];
     pixels.truncate(width * rows);
     for (i, pixel) in pixels.iter_mut().enumerate() {
         pixel.color = background_at(i);
@@ -675,8 +710,9 @@ pub(crate) fn draw(
         }
     }
     report.stage("bin", &mut clock);
-    let background = sky.map(|sky| sky.paint(&projection));
-    report.stage("sky", &mut clock);
+    // 天空各层多边形先裁好；天空本身由各条带只画自己的几行。
+    let sky = sky.map(|sky| sky.plan(&projection));
+    report.stage("sky plan", &mut clock);
     let mut pixels = vec![0; options.width as usize * options.height as usize * 4];
     let workers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
@@ -690,8 +726,7 @@ pub(crate) fn draw(
     );
     std::thread::scope(|scope| {
         for _ in 0..workers {
-            let (projection, bins, bands) = (&projection, &bins, &bands);
-            let background = background.as_deref();
+            let (projection, bins, bands, sky) = (&projection, &bins, &bands, sky.as_ref());
             scope.spawn(move || {
                 let mut scratch = BandScratch::default();
                 loop {
@@ -705,7 +740,6 @@ pub(crate) fn draw(
                         projection,
                         options,
                         sky,
-                        background,
                         band * BAND,
                         output,
                     );

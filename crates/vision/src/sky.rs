@@ -1,9 +1,10 @@
 //! 原版的视距雾与天空：`FogRenderer.computeFogColor`、`AtmosphericFogEnvironment`、
 //! `SkyRenderer` 与 `fog.glsl`（26.1.2 客户端）。颜色与天体角度来自 [`Daylight`]。
 //!
-//! 天空按原版绘制顺序在整幅画面上先画好一张背景：清屏为雾色 → 天空盘 → 日出日落扇面
+//! 天空按原版绘制顺序画成地形底下的背景：清屏为雾色 → 天空盘 → 日出日落扇面
 //! （半透明混合）→ 太阳、月亮、星星（叠加混合）→ 眼睛低于地平线时的黑盘。这些天空管线
-//! 都不做深度测试，后画的盖住先画的。天气（雨、雷）与云尚未接入。
+//! 都不做深度测试，后画的盖住先画的。各层多边形每次成像裁剪、投影一次，背景由光栅器的
+//! 各条带只画自己的几行。天气（雨、雷）与云尚未接入。
 
 use std::sync::Arc;
 
@@ -12,7 +13,7 @@ use image::RgbaImage;
 use crate::daylight::Daylight;
 use crate::geometry::{dot, V3};
 use crate::random::JavaRandom;
-use crate::raster::{rasterize, Projection};
+use crate::raster::{flatten, Flat, Projection};
 use crate::{Camera, Environment, Report, Resources};
 
 /// `EnvironmentAttributes` 默认值：环境雾 0–1024 格、天空雾止于 512 格。
@@ -145,19 +146,31 @@ impl Sky {
         }))
     }
 
-    /// 没有地形挡住时整幅画面的颜色（0..255），行优先。
-    pub(crate) fn paint(&self, projection: &Projection) -> Vec<V3> {
-        let [width, height] = projection.size.map(|v| v as usize);
-        let mut image: Vec<V3> = vec![[0.0; 3]; width * height];
-        for_each_pixel(projection, &mut image, |pixel, direction| {
-            *pixel = self
-                .disc(direction, SKY_DISC_HEIGHT, self.sky_color)
-                .unwrap_or(self.fog_color);
-        });
+    /// 这次成像的天空：日出日落扇面、日月、星星先裁剪、投影好，各条带再只画自己的几行。
+    pub(crate) fn plan(&self, projection: &Projection) -> SkyPlan<'_> {
         let daylight = &self.daylight;
-        self.sunrise(projection, &mut image);
+        let mut sunrise = Vec::new();
+        // `renderSunriseAndSunset`：太阳一侧的半透明扇面，中心不透明、边缘全透明。
+        let alpha = daylight.sunrise_alpha;
+        if alpha > 0.001 {
+            let turn = if daylight.sun_angle.to_radians().sin() < 0.0 {
+                180.0
+            } else {
+                0.0
+            };
+            let place = |v: V3| rotate_x(90.0, rotate_z(turn + 90.0, [v[0], v[1], v[2] * alpha]));
+            let center = (place([0.0, 100.0, 0.0]), [0.0; 2], [1.0; 3]);
+            let rim = |i: usize| {
+                let (s, c) = (i as f64 * std::f64::consts::TAU / 16.0).sin_cos();
+                (place([s * 120.0, c * 120.0, -c * 40.0]), [0.0; 2], [0.0; 3])
+            };
+            for i in 0..16 {
+                sunrise.extend(flatten(projection, &[center, rim(i), rim(i + 1)]));
+            }
+        }
         // renderSunMoonAndStars：整体先绕 Y 转 -90°，各自再绕 X 转自己的角度。
         let celestial = |angle: f64, v: V3| rotate_y(-90.0, rotate_x(angle, v));
+        let mut bodies = Vec::new();
         for (texture, angle, half_size) in [
             (&self.sun, daylight.sun_angle, 30.0),
             (&self.moon, daylight.moon_angle, 20.0),
@@ -173,94 +186,98 @@ impl Sky {
                 let local = [v[0] * half_size, 100.0, v[2] * half_size];
                 (celestial(angle, local), uv, [1.0; 3])
             });
-            // CELESTIAL 管线：`position_tex` 采样，透明处丢弃，`OVERLAY` 混合（源 × 源 alpha 加到底色上）。
-            rasterize(projection, &corners, |index, uv, _| {
-                let c = nearest(texture, uv);
-                if c[3] > 0.0 {
-                    for channel in 0..3 {
-                        image[index][channel] += c[channel] * c[3];
-                    }
-                }
-            });
+            bodies.push((&**texture, flatten(projection, &corners)));
         }
+        let mut stars = Vec::new();
         if daylight.star_brightness > 0.0 {
-            // STARS 管线：颜色与 alpha 都是星光亮度，`OVERLAY` 混合。
-            let added = daylight.star_brightness * daylight.star_brightness * 255.0;
-            for star in stars() {
+            for star in self::stars() {
                 let corners = star.map(|v| (celestial(daylight.star_angle, v), [0.0; 2], [1.0; 3]));
-                rasterize(projection, &corners, |index, _, _| {
-                    for channel in &mut image[index] {
-                        *channel += added;
-                    }
-                });
+                stars.extend(flatten(projection, &corners));
             }
         }
-        for_each_pixel(projection, &mut image, |pixel, direction| {
-            if self.dark_disc {
-                if let Some(color) = self.disc(direction, -DARK_DISC_DEPTH, [0.0; 3]) {
-                    *pixel = color;
-                }
-            }
-            *pixel = pixel.map(|c| c.min(255.0));
-        });
-        image
-    }
-
-    /// `renderSunriseAndSunset`：太阳一侧的半透明扇面，中心不透明、边缘全透明。
-    fn sunrise(&self, projection: &Projection, image: &mut [V3]) {
-        let daylight = &self.daylight;
-        let alpha = daylight.sunrise_alpha;
-        if alpha <= 0.001 {
-            return;
-        }
-        let turn = if daylight.sun_angle.to_radians().sin() < 0.0 {
-            180.0
-        } else {
-            0.0
-        };
-        let place = |v: V3| rotate_x(90.0, rotate_z(turn + 90.0, [v[0], v[1], v[2] * alpha]));
-        let color = daylight.sunrise_color.map(|c| c * 255.0);
-        let center = (place([0.0, 100.0, 0.0]), [0.0; 2], [1.0; 3]);
-        let rim = |i: usize| {
-            let (s, c) = (i as f64 * std::f64::consts::TAU / 16.0).sin_cos();
-            (place([s * 120.0, c * 120.0, -c * 40.0]), [0.0; 2], [0.0; 3])
-        };
-        // 顶点颜色是白色乘调制色：rgb 为日出日落色，alpha 为顶点 alpha × 其 alpha；`TRANSLUCENT` 混合。
-        for i in 0..16 {
-            rasterize(
-                projection,
-                &[center, rim(i), rim(i + 1)],
-                |index, _, vertex| {
-                    let a = vertex[0] * alpha;
-                    for channel in 0..3 {
-                        image[index][channel] += a * (color[channel] - image[index][channel]);
-                    }
-                },
-            );
+        SkyPlan {
+            sky: self,
+            sunrise,
+            bodies,
+            stars,
         }
     }
 }
 
-/// 按行分给多个线程，逐像素以该像素的视线方向调用 `f`（逐像素独立的天空计算）。
-fn for_each_pixel(projection: &Projection, image: &mut [V3], f: impl Fn(&mut V3, V3) + Sync) {
-    let width = projection.size[0] as usize;
-    let workers = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .min(8);
-    let rows = (projection.size[1] as usize).div_ceil(workers).max(1);
-    let f = &f;
-    std::thread::scope(|scope| {
-        for (chunk, pixels) in image.chunks_mut(rows * width).enumerate() {
-            scope.spawn(move || {
-                for (offset, pixel) in pixels.iter_mut().enumerate() {
-                    let index = chunk * rows * width + offset;
-                    f(pixel, projection.direction(index % width, index / width));
+/// 一次成像的天空，见 [`Sky::plan`]。
+pub(crate) struct SkyPlan<'s> {
+    sky: &'s Sky,
+    sunrise: Vec<Flat>,
+    /// 太阳、月亮：贴图与多边形。
+    bodies: Vec<(&'s RgbaImage, Vec<Flat>)>,
+    stars: Vec<Flat>,
+}
+
+impl SkyPlan<'_> {
+    pub(crate) fn sky(&self) -> &Sky {
+        self.sky
+    }
+
+    /// 从第 `y0` 行起 `rows` 行在没有地形挡住时的颜色（0..255），行优先，写进 `out`。
+    /// 逐像素的先后与原版一致：天空盘、日出日落、日月、星星，最后黑盘与截断。
+    pub(crate) fn paint(&self, projection: &Projection, y0: usize, rows: usize, out: &mut Vec<V3>) {
+        let sky = self.sky;
+        let daylight = &sky.daylight;
+        let width = projection.size[0] as usize;
+        let lines = y0..y0 + rows;
+        let base = y0 * width;
+        out.clear();
+        out.extend((0..width * rows).map(|i| {
+            let direction = projection.direction(i % width, y0 + i / width);
+            sky.disc(direction, SKY_DISC_HEIGHT, sky.sky_color)
+                .unwrap_or(sky.fog_color)
+        }));
+        // 顶点颜色是白色乘调制色：rgb 为日出日落色，alpha 为顶点 alpha × 其 alpha；`TRANSLUCENT` 混合。
+        let alpha = daylight.sunrise_alpha;
+        let color = daylight.sunrise_color.map(|c| c * 255.0);
+        for flat in &self.sunrise {
+            flat.fill(width, lines.clone(), |index, _, vertex| {
+                let pixel = &mut out[index - base];
+                let a = vertex[0] * alpha;
+                for channel in 0..3 {
+                    pixel[channel] += a * (color[channel] - pixel[channel]);
                 }
-                crate::counters::add(crate::counters::Counter::SkyPixels, pixels.len() as u64);
-                crate::counters::flush();
             });
         }
-    });
+        // CELESTIAL 管线：`position_tex` 采样，透明处丢弃，`OVERLAY` 混合（源 × 源 alpha 加到底色上）。
+        for (texture, flats) in &self.bodies {
+            for flat in flats {
+                flat.fill(width, lines.clone(), |index, uv, _| {
+                    let c = nearest(texture, uv);
+                    if c[3] > 0.0 {
+                        for channel in 0..3 {
+                            out[index - base][channel] += c[channel] * c[3];
+                        }
+                    }
+                });
+            }
+        }
+        // STARS 管线：颜色与 alpha 都是星光亮度，`OVERLAY` 混合。
+        let added = daylight.star_brightness * daylight.star_brightness * 255.0;
+        for flat in &self.stars {
+            flat.fill(width, lines.clone(), |index, _, _| {
+                for channel in &mut out[index - base] {
+                    *channel += added;
+                }
+            });
+        }
+        for (i, pixel) in out.iter_mut().enumerate() {
+            if sky.dark_disc {
+                let direction = projection.direction(i % width, y0 + i / width);
+                if let Some(color) = sky.disc(direction, -DARK_DISC_DEPTH, [0.0; 3]) {
+                    *pixel = color;
+                }
+            }
+            *pixel = pixel.map(|c| c.min(255.0));
+        }
+        // 两遍逐像素（天空盘、黑盘与截断）。
+        crate::counters::add(crate::counters::Counter::SkyPixels, 2 * out.len() as u64);
+    }
 }
 
 /// 原版 `ARGB.srgbLerp`：逐通道整数插值（`Mth.lerpInt` 向下取整）。
