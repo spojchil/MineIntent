@@ -11,6 +11,8 @@ use crate::{Camera, Frame, Options, Report, Resources, Scene};
 const NEAR: f64 = 1e-4;
 const SKY: [f64; 3] = [150.0, 185.0, 215.0];
 const MAX_LAYERS: usize = 16;
+/// 光栅化的条带高度（行）：限制透明层的临时内存，也是分箱的单位。
+const BAND: usize = 16;
 
 pub(crate) struct Frustum {
     eye: V3,
@@ -157,6 +159,8 @@ struct ScreenVertex {
 }
 
 struct Projected<'a> {
+    /// 最近顶点的 1/z，排序键（大的在前）。
+    nearest: f64,
     vertices: [ScreenVertex; 3],
     area: f64,
     bounds: [usize; 4], // x0, y0, x1, y1 (exclusive)
@@ -199,10 +203,7 @@ fn project<'a>(
         result.append(&mut part);
     }
     // Front-to-back improves early depth rejection; correctness does not require sorting.
-    result.sort_unstable_by(|a, b| {
-        let nearest = |t: &Projected<'_>| t.vertices.iter().map(|v| v.inv_z).fold(0.0, f64::max);
-        nearest(b).total_cmp(&nearest(a))
-    });
+    result.sort_unstable_by(|a, b| b.nearest.total_cmp(&a.nearest));
     result
 }
 
@@ -271,6 +272,7 @@ fn project_part<'a>(
             ];
             if bounds[0] < bounds[2] && bounds[1] < bounds[3] {
                 result.push(Projected {
+                    nearest: vertices.iter().map(|v| v.inv_z).fold(0.0, f64::max),
                     vertices,
                     area,
                     bounds,
@@ -432,7 +434,7 @@ fn sample(triangle: &Triangle, uv: [f64; 2], tint: V3) -> [f64; 4] {
 }
 
 fn draw_band(
-    projected: &[Projected<'_>],
+    bin: &[&Projected<'_>],
     projection: &Projection,
     options: Options,
     sky: Option<&Sky>,
@@ -467,7 +469,7 @@ fn draw_band(
             ((1.0 - 2.0 * (y as f64 + 0.5) / projection.size[1]) * projection.scale[1]).powi(2)
         })
         .collect();
-    for t in projected {
+    for t in bin {
         let [x0, ty0, x1, ty1] = t.bounds;
         let first_y = ty0.max(y0);
         let last_y = ty1.min(y0 + rows);
@@ -531,33 +533,42 @@ pub(crate) fn draw(
 ) -> RgbaImage {
     let projection = Projection::new(camera, options);
     let projected = project(triangles, camera, &projection, options.far);
+    // 分箱：每个三角形按（已排好的）顺序登记到它覆盖的每个 16 行条带，条带只扫自己的箱。
+    let band_count = (options.height as usize).div_ceil(BAND);
+    let mut bins: Vec<Vec<&Projected<'_>>> = vec![Vec::new(); band_count];
+    for t in &projected {
+        for bin in &mut bins[t.bounds[1] / BAND..t.bounds[3].div_ceil(BAND)] {
+            bin.push(t);
+        }
+    }
     let background = sky.map(|sky| sky.paint(&projection));
     let mut pixels = vec![0; options.width as usize * options.height as usize * 4];
     let workers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(8);
-    let rows = (options.height as usize).div_ceil(workers);
+    // 每个线程整数个条带，箱与条带一一对应。
+    let rows = (options.height as usize).div_ceil(workers).div_ceil(BAND) * BAND;
     std::thread::scope(|scope| {
         for (i, output) in pixels
             .chunks_mut(rows * options.width as usize * 4)
             .enumerate()
         {
             let projection = &projection;
-            let projected = &projected;
+            let bins = &bins;
             let background = background.as_deref();
             scope.spawn(move || {
                 // Limit transparency scratch memory even for large images.
                 for (band, output) in output
-                    .chunks_mut(16 * options.width as usize * 4)
+                    .chunks_mut(BAND * options.width as usize * 4)
                     .enumerate()
                 {
                     draw_band(
-                        projected,
+                        &bins[i * rows / BAND + band],
                         projection,
                         options,
                         sky,
                         background,
-                        i * rows + band * 16,
+                        i * rows + band * BAND,
                         output,
                     );
                 }

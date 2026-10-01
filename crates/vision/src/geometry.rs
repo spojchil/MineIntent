@@ -10,6 +10,36 @@ use crate::light::{self, Cells, Coords, Direction, FULL_BRIGHT};
 use crate::{Block, Report, Resources, Scene};
 
 pub(crate) type V3 = [f64; 3];
+
+/// 以方块坐标为键的哈希表。哈希用 FxHash（rustc 的 `FxHasher` 同一算法）：每帧要建、查上百万次，
+/// 默认的 SipHash 慢一个量级；键是场景里的坐标，不需要抗碰撞攻击。
+pub(crate) type PositionMap<V> =
+    HashMap<[i32; 3], V, std::hash::BuildHasherDefault<PositionHasher>>;
+
+#[derive(Default, Clone, Copy)]
+pub(crate) struct PositionHasher(u64);
+
+impl PositionHasher {
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl std::hash::Hasher for PositionHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.add(u64::from_le_bytes(word));
+        }
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.add(n as u64);
+    }
+}
 pub(crate) fn add(a: V3, b: V3) -> V3 {
     std::array::from_fn(|i| a[i] + b[i])
 }
@@ -116,7 +146,7 @@ pub(crate) fn build_lit(
     resources: &mut Resources,
     report: &mut Report,
 ) -> Vec<Triangle> {
-    let mut sections: HashMap<[i32; 3], bool> = HashMap::new();
+    let mut sections: PositionMap<bool> = PositionMap::default();
     let visible: Vec<&Block> = scene
         .blocks
         .iter()
@@ -159,7 +189,12 @@ pub(crate) fn build_lit(
         prepared.push((state, entity));
     }
 
-    let neighbours: HashMap<_, _> = scene.blocks.iter().map(|b| (b.position, b)).collect();
+    // 只有缺遮挡位的方块（测试夹具）才要查邻居。
+    let neighbours: PositionMap<&Block> = if visible.iter().any(|b| b.covered.is_none()) {
+        scene.blocks.iter().map(|b| (b.position, b)).collect()
+    } else {
+        PositionMap::default()
+    };
     let workers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(8);
@@ -213,7 +248,7 @@ fn is_air(name: &str) -> bool {
 fn emit_block(
     block: &Block,
     faces: &[Face],
-    neighbours: &HashMap<[i32; 3], &Block>,
+    neighbours: &PositionMap<&Block>,
     cells: Option<&Cells>,
     biomes: Option<&Biomes>,
     tints: &mut crate::biome::TintCache,

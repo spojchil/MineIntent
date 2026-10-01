@@ -2,9 +2,7 @@
 //! 光照坐标（`LevelRenderer.getLightCoords`、`LightCoordsUtil`）与光照贴图（`lightmap.fsh`）。
 //! 全部按 26.1.2 客户端转录；光照坐标沿用原版单位：每级 16，0..=240。
 
-use std::collections::HashMap;
-
-use crate::geometry::V3;
+use crate::geometry::{PositionMap, V3};
 use crate::Cell;
 
 /// 光照坐标 `[方块光, 天空光]`，原版单位（每级 16）。
@@ -14,7 +12,7 @@ pub(crate) type Coords = [f64; 2];
 pub(crate) const FULL_BRIGHT: Coords = [240.0, 240.0];
 
 /// 场景里的光照格。查不到的格按露天空气（天空光 15、方块光 0）。
-pub(crate) struct Cells(HashMap<[i32; 3], Cell>);
+pub(crate) struct Cells(PositionMap<Cell>);
 
 const OPEN_AIR: Cell = Cell {
     position: [0; 3],
@@ -30,7 +28,11 @@ const OPEN_AIR: Cell = Cell {
 
 impl Cells {
     pub(crate) fn new(cells: &[Cell]) -> Self {
-        Self(cells.iter().map(|cell| (cell.position, *cell)).collect())
+        let mut map = PositionMap::with_capacity_and_hasher(cells.len(), Default::default());
+        for cell in cells {
+            map.insert(cell.position, *cell);
+        }
+        Self(map)
     }
 
     pub(crate) fn get(&self, position: [i32; 3]) -> &Cell {

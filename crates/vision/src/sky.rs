@@ -145,16 +145,12 @@ impl Sky {
     /// 没有地形挡住时整幅画面的颜色（0..255），行优先。
     pub(crate) fn paint(&self, projection: &Projection) -> Vec<V3> {
         let [width, height] = projection.size.map(|v| v as usize);
-        let directions: Vec<V3> = (0..width * height)
-            .map(|i| projection.direction(i % width, i / width))
-            .collect();
-        let mut image: Vec<V3> = directions
-            .iter()
-            .map(|&d| {
-                self.disc(d, SKY_DISC_HEIGHT, self.sky_color)
-                    .unwrap_or(self.fog_color)
-            })
-            .collect();
+        let mut image: Vec<V3> = vec![[0.0; 3]; width * height];
+        for_each_pixel(projection, &mut image, |pixel, direction| {
+            *pixel = self
+                .disc(direction, SKY_DISC_HEIGHT, self.sky_color)
+                .unwrap_or(self.fog_color);
+        });
         let daylight = &self.daylight;
         self.sunrise(projection, &mut image);
         // renderSunMoonAndStars：整体先绕 Y 转 -90°，各自再绕 X 转自己的角度。
@@ -196,16 +192,14 @@ impl Sky {
                 });
             }
         }
-        if self.dark_disc {
-            for (pixel, &d) in image.iter_mut().zip(&directions) {
-                if let Some(color) = self.disc(d, -DARK_DISC_DEPTH, [0.0; 3]) {
+        for_each_pixel(projection, &mut image, |pixel, direction| {
+            if self.dark_disc {
+                if let Some(color) = self.disc(direction, -DARK_DISC_DEPTH, [0.0; 3]) {
                     *pixel = color;
                 }
             }
-        }
-        for pixel in &mut image {
             *pixel = pixel.map(|c| c.min(255.0));
-        }
+        });
         image
     }
 
@@ -242,6 +236,26 @@ impl Sky {
             );
         }
     }
+}
+
+/// 按行分给多个线程，逐像素以该像素的视线方向调用 `f`（逐像素独立的天空计算）。
+fn for_each_pixel(projection: &Projection, image: &mut [V3], f: impl Fn(&mut V3, V3) + Sync) {
+    let width = projection.size[0] as usize;
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(8);
+    let rows = (projection.size[1] as usize).div_ceil(workers).max(1);
+    let f = &f;
+    std::thread::scope(|scope| {
+        for (chunk, pixels) in image.chunks_mut(rows * width).enumerate() {
+            scope.spawn(move || {
+                for (offset, pixel) in pixels.iter_mut().enumerate() {
+                    let index = chunk * rows * width + offset;
+                    f(pixel, projection.direction(index % width, index / width));
+                }
+            });
+        }
+    });
 }
 
 /// 原版 `ARGB.srgbLerp`：逐通道整数插值（`Mth.lerpInt` 向下取整）。

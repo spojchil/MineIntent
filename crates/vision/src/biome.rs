@@ -120,7 +120,7 @@ pub(crate) type TintCache = HashMap<TintKey, [u8; 3]>;
 pub(crate) struct Biomes {
     definitions: Vec<Definition>,
     fallback: usize,
-    cells: HashMap<[i32; 3], usize>,
+    cells: crate::geometry::PositionMap<usize>,
     quart_y: [i32; 2],
     seed: i64,
     maps: ColorMaps,
