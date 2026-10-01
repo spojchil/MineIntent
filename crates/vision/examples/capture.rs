@@ -120,9 +120,25 @@ async fn capture(
                 item: entity.item_name.clone(),
             })
             .collect(),
+        cells: region
+            .cells
+            .iter()
+            .map(|cell| vision::Cell {
+                position: cell.position,
+                sky_light: cell.sky_light,
+                block_light: cell.block_light,
+                emission: cell.emission,
+                dampening: cell.dampening,
+                view_blocking: cell.view_blocking,
+                solid_render: cell.solid_render,
+                emissive: cell.emissive,
+                full_collision: cell.full_collision,
+            })
+            .collect(),
         environment: Some(vision::Environment {
             view_distance: region.view_distance,
             horizon_height: region.horizon_height,
+            clock_ticks: region.clock_ticks,
         }),
     };
     let started = Instant::now();

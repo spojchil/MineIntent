@@ -195,11 +195,28 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                     .server_view_distance
                     .store(login.chunk_radius, Ordering::Relaxed);
                 inner.is_flat.store(login.common.is_flat, Ordering::Relaxed);
+                inner.light.lock().clear();
             }
             ClientboundGamePacket::Respawn(respawn) => {
                 inner
                     .is_flat
                     .store(respawn.common.is_flat, Ordering::Relaxed);
+                inner.light.lock().clear();
+            }
+            ClientboundGamePacket::LevelChunkWithLight(chunk) => {
+                inner
+                    .light
+                    .lock()
+                    .apply(chunk.x, chunk.z, &chunk.light_data, true);
+            }
+            ClientboundGamePacket::LightUpdate(update) => {
+                inner
+                    .light
+                    .lock()
+                    .apply(update.x, update.z, &update.light_data, false);
+            }
+            ClientboundGamePacket::ForgetLevelChunk(forget) => {
+                inner.light.lock().forget(forget.pos.x, forget.pos.z);
             }
             ClientboundGamePacket::SetChunkCacheRadius(radius) => {
                 inner

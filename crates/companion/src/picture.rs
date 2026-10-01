@@ -38,7 +38,7 @@ impl PictureDoor for ModulePictureDoor {
                         "当前朝向的第一人称画面，视距 {view_distance} 区块，远处渐隐入雾，640×360，正中是准星。\
 画出方块、玩家、掉落物和常见生物（猪、牛、羊、鸡、苦力怕、蜘蛛、僵尸、骷髅）；\
 生物是静止姿态、默认花色，不画装备、手持物、界面、天气和粒子；\
-亮度与天空固定为白天，不能据此判断昼夜或照明；植物颜色和水面简化。\
+明暗按服务端光照与当前时刻，天空有昼夜与日月星辰；不画云，植物颜色和水面简化。\
 紫黑块表示模型或资源尚未支持的方块或实体（大小即其碰撞箱）；未绘制及视距外内容不代表不存在。\
 视点采用站姿眼高 1.62 格，姿态与方块采集并非同一服务端 tick 的原子快照。"
                     ),
@@ -99,9 +99,25 @@ fn scene_from_region(region: world::BlockRegion) -> Result<vision::Scene, String
                 item: entity.item_name.clone(),
             })
             .collect(),
+        cells: region
+            .cells
+            .iter()
+            .map(|cell| vision::Cell {
+                position: cell.position,
+                sky_light: cell.sky_light,
+                block_light: cell.block_light,
+                emission: cell.emission,
+                dampening: cell.dampening,
+                view_blocking: cell.view_blocking,
+                solid_render: cell.solid_render,
+                emissive: cell.emissive,
+                full_collision: cell.full_collision,
+            })
+            .collect(),
         environment: Some(vision::Environment {
             view_distance: region.view_distance,
             horizon_height: region.horizon_height,
+            clock_ticks: region.clock_ticks,
         }),
     })
 }
@@ -124,9 +140,11 @@ mod tests {
         let mut region = world::BlockRegion {
             snapshot: Arc::new(snapshot),
             blocks: vec![],
+            cells: vec![],
             unloaded: 1,
             view_distance: 6,
             horizon_height: 63.0,
+            clock_ticks: 0,
         };
         assert!(scene_from_region(region.clone()).is_err());
         region.unloaded = 0;

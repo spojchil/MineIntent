@@ -5,6 +5,7 @@ use image::RgbaImage;
 use serde_json::{json, Value};
 
 use crate::assets::{missing_texture, texture_id};
+use crate::light::{self, Cells, Coords, Direction, FULL_BRIGHT};
 use crate::{Block, Report, Resources, Scene};
 
 pub(crate) type V3 = [f64; 3];
@@ -31,24 +32,76 @@ pub(crate) fn cross(a: V3, b: V3) -> V3 {
 
 #[derive(Clone)]
 struct Face {
+    /// 方块内坐标（0..1）。
     vertices: [V3; 4],
     uv: [[f64; 2]; 4],
     texture: Arc<RgbaImage>,
-    color: V3,
+    /// 染色（植物色等）；不染色为白。
+    tint: V3,
     alpha: f64,
     cull: Option<[i32; 3]>,
+    /// 原版烘焙出的四边形朝向（法线最接近的轴）。
+    direction: Direction,
+    /// 模型元素的 `shade`：false 时不按朝向压暗。
+    shade: bool,
+    /// 模型的 `ambientocclusion`。
+    ambient_occlusion: bool,
+    fluid: bool,
 }
 
 pub(crate) struct Triangle {
     pub vertices: [V3; 3],
     pub uv: [[f64; 2]; 3],
     pub texture: Arc<RgbaImage>,
-    pub color: V3,
+    /// 逐顶点颜色：染色 × 朝向明暗 × 环境光遮蔽。光照贴图另由 `light` 取样后乘上。
+    pub color: [V3; 3],
+    /// 逐顶点光照坐标 `[方块光, 天空光]`，原版单位。
+    pub light: [Coords; 3],
     pub alpha: f64,
 }
 
+impl Face {
+    fn directional_shade(&self) -> f64 {
+        if self.shade {
+            self.direction.cardinal_shade()
+        } else {
+            Direction::Up.cardinal_shade()
+        }
+    }
+
+    /// 本面四个顶点的（颜色, 光照坐标）。`cells` 为 `None` 时不算光照：满亮度、无遮蔽。
+    fn lighting(&self, position: [i32; 3], cells: Option<&Cells>) -> [(V3, Coords); 4] {
+        let shade = self.directional_shade();
+        let plain = mul(self.tint, shade);
+        let Some(cells) = cells else {
+            return [(plain, FULL_BRIGHT); 4];
+        };
+        if self.fluid {
+            return [(plain, light::fluid(cells, position)); 4];
+        }
+        if self.ambient_occlusion && cells.get(position).emission == 0 {
+            let values = light::ambient_occlusion(cells, position, self.direction, &self.vertices);
+            return std::array::from_fn(|i| (mul(self.tint, shade * values[i].0), values[i].1));
+        }
+        let coords = light::flat(cells, position, self.direction, self.cull.is_some());
+        [(plain, coords); 4]
+    }
+}
+
+/// 不带光照的方块三角形（测试）：满亮度、只按朝向明暗。
+#[cfg(test)]
 pub(crate) fn build(
     scene: &Scene,
+    resources: &mut Resources,
+    report: &mut Report,
+) -> Vec<Triangle> {
+    build_lit(scene, None, resources, report)
+}
+
+/// `cells` 为 `Some` 时按原版平滑光照与光照坐标逐顶点算光。
+pub(crate) fn build_lit(
+    scene: &Scene,
+    cells: Option<&Cells>,
     resources: &mut Resources,
     report: &mut Report,
 ) -> Vec<Triangle> {
@@ -105,12 +158,14 @@ pub(crate) fn build(
                 }
             }
             let offset = block.position.map(f64::from);
+            let lit = face.lighting(block.position, cells);
             for indices in [[0, 1, 2], [0, 2, 3]] {
                 triangles.push(Triangle {
                     vertices: indices.map(|i| add(face.vertices[i], offset)),
                     uv: indices.map(|i| face.uv[i]),
                     texture: face.texture.clone(),
-                    color: face.color,
+                    color: indices.map(|i| lit[i].0),
+                    light: indices.map(|i| lit[i].1),
                     alpha: face.alpha,
                 });
             }
@@ -145,6 +200,7 @@ pub(crate) fn block_item_triangles(
     name: &str,
     resources: &mut Resources,
     report: &mut Report,
+    light: Coords,
     place: impl Fn(V3) -> V3,
 ) -> Result<Vec<Triangle>, String> {
     let block = Block {
@@ -160,12 +216,14 @@ pub(crate) fn block_item_triangles(
     }
     let mut triangles = Vec::new();
     for face in faces {
+        let color = mul(face.tint, face.directional_shade());
         for indices in [[0, 1, 2], [0, 2, 3]] {
             triangles.push(Triangle {
                 vertices: indices.map(|i| place(face.vertices[i])),
                 uv: indices.map(|i| face.uv[i]),
                 texture: face.texture.clone(),
-                color: face.color,
+                color: [color; 3],
+                light: [light; 3],
                 alpha: face.alpha,
             });
         }
@@ -195,7 +253,7 @@ fn block_faces(
             (8 - level) as f64 / 9.0
         };
         let texture = resources.texture(&format!("block/{name}_still"))?;
-        return Ok(cube_faces(
+        let mut faces = cube_faces(
             texture,
             if name == "water" {
                 [0.25, 0.45, 0.95]
@@ -204,7 +262,11 @@ fn block_faces(
             },
             if name == "water" { 0.65 } else { 1.0 },
             height,
-        ));
+        );
+        for face in &mut faces {
+            face.fluid = true;
+        }
+        return Ok(faces);
     }
     if block
         .properties
@@ -228,6 +290,7 @@ fn block_faces(
                 .warnings
                 .insert("uvlock is approximated: textures rotate with the model".to_owned());
         }
+        let ambient_occlusion = model["ambientocclusion"].as_bool() != Some(false);
         let elements = model["elements"]
             .as_array()
             .ok_or_else(|| format!("{id}: no resource-defined geometry"))?;
@@ -295,16 +358,14 @@ fn block_faces(
                     *vertex = mul(*vertex, 1.0 / 16.0);
                 }
                 let normal = rotate(rotate(normal, 0, -x), 1, -y);
-                let shade = if element["shade"].as_bool() == Some(false) {
-                    1.0
+                let tint = if definition["tintindex"].as_i64().is_some_and(|i| i >= 0) {
+                    report.warnings.insert(
+                        "tinted models use a fixed vegetation color; biome/redstone tints are not yet used"
+                            .to_owned(),
+                    );
+                    [0.55, 0.8, 0.32]
                 } else {
-                    0.6 + 0.25 * normal[1].max(0.0) + 0.1 * normal[2].abs()
-                };
-                let color = if definition["tintindex"].as_i64().is_some_and(|i| i >= 0) {
-                    report.warnings.insert("tinted models use a fixed vegetation color; biome/redstone tints and server light are not yet used".to_owned());
-                    mul([0.55, 0.8, 0.32], shade)
-                } else {
-                    [shade; 3]
+                    [1.0; 3]
                 };
                 let cull = definition["cullface"]
                     .as_str()
@@ -319,9 +380,13 @@ fn block_faces(
                     vertices,
                     uv,
                     texture,
-                    color,
+                    tint,
                     alpha: 1.0,
                     cull,
+                    direction: Direction::nearest(normal),
+                    shade: element["shade"].as_bool() != Some(false),
+                    ambient_occlusion,
+                    fluid: false,
                 });
             }
         }
@@ -329,7 +394,7 @@ fn block_faces(
     Ok(result)
 }
 
-fn cube_faces(texture: Arc<RgbaImage>, color: V3, alpha: f64, height: f64) -> Vec<Face> {
+fn cube_faces(texture: Arc<RgbaImage>, tint: V3, alpha: f64, height: f64) -> Vec<Face> {
     ["down", "up", "north", "south", "west", "east"]
         .into_iter()
         .map(|direction| {
@@ -339,9 +404,13 @@ fn cube_faces(texture: Arc<RgbaImage>, color: V3, alpha: f64, height: f64) -> Ve
                 vertices,
                 uv: [[0.0, 0.0], [16.0, 0.0], [16.0, 16.0], [0.0, 16.0]],
                 texture: texture.clone(),
-                color,
+                tint,
                 alpha,
                 cull: Some(normal.map(|v| v.round() as i32)),
+                direction: Direction::nearest(normal),
+                shade: true,
+                ambient_occlusion: true,
+                fluid: false,
             }
         })
         .collect()
@@ -490,5 +559,6 @@ pub fn fixture() -> Scene {
         blocks,
         entities: Vec::new(),
         environment: None,
+        cells: Vec::new(),
     }
 }

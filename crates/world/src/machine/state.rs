@@ -105,6 +105,8 @@ pub(crate) struct Inner {
     pub(super) server_view_distance: AtomicU32,
     /// 当前维度是不是超平坦（登录与重生包的 `is_flat`）。原版地平线高度由它定。
     pub(super) is_flat: AtomicBool,
+    /// 服务端下发的天空光与方块光（azalea 不存）。
+    pub(super) light: Mutex<super::light::LightStore>,
 }
 
 pub(super) const EPOCH: Epoch = Epoch(1);
@@ -140,6 +142,7 @@ impl Inner {
             world_handle: Mutex::new(None),
             server_view_distance: AtomicU32::new(0),
             is_flat: AtomicBool::new(false),
+            light: Mutex::new(super::light::LightStore::default()),
             observed: Mutex::new(None),
             observed_request: Mutex::new(None),
             stop_reason: OnceLock::new(),

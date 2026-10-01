@@ -21,6 +21,7 @@ mod connect;
 mod door;
 mod input;
 mod job;
+mod light;
 mod mining;
 mod movement;
 mod navigation;
@@ -303,7 +304,23 @@ impl Module {
                     .map(|chunk| chunk.read().sections.to_vec())
             })
             .collect();
+        // 光照与方块同一时刻冻结：光照段是 Arc，克隆只加引用计数。
+        let lights: Vec<Option<light::ColumnLight>> = {
+            let store = self.inner.light.lock();
+            (0..chunks_per_side * chunks_per_side)
+                .map(|i| {
+                    store.column(
+                        origin_x.div_euclid(16) + i % chunks_per_side,
+                        origin_z.div_euclid(16) + i / chunks_per_side,
+                    )
+                })
+                .collect()
+        };
         drop(loaded);
+        let clock_ticks = self
+            .inner
+            .day_time
+            .load(std::sync::atomic::Ordering::Acquire);
         let index = |x: i32, y: i32, z: i32| -> usize {
             (((y - min_y) * span + (z - origin_z)) * span + (x - origin_x)) as usize
         };
@@ -405,6 +422,84 @@ impl Module {
                 }
             }
         }
+
+        // 第三遍：原版平滑光照要查的格子。每个表面方块周围一圈 27 格；露出的面另加
+        // 面前第二层的四个侧格（`BlockModelLighter` 判断角格是否透光查的是那一层）。
+        // 实体按眼睛所在格取光（原版 `getLightProbePosition`）。
+        let mut needed = vec![false; states.len()];
+        let mut mark = |x: i32, y: i32, z: i32| {
+            if (min_y..min_y + height).contains(&y)
+                && (origin_x..origin_x + span).contains(&x)
+                && (origin_z..origin_z + span).contains(&z)
+            {
+                needed[index(x, y, z)] = true;
+            }
+        };
+        for &(x, y, z, _, covered) in &surface {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    for dx in -1..=1 {
+                        mark(x + dx, y + dy, z + dz);
+                    }
+                }
+            }
+            for (bit, direction) in DIRECTIONS.into_iter().enumerate() {
+                if covered & (1 << bit) != 0 {
+                    continue;
+                }
+                for side in DIRECTIONS {
+                    if side.iter().zip(direction).any(|(a, b)| *a != 0 && b != 0) {
+                        continue;
+                    }
+                    mark(
+                        x + 2 * direction[0] + side[0],
+                        y + 2 * direction[1] + side[1],
+                        z + 2 * direction[2] + side[2],
+                    );
+                }
+            }
+        }
+        for entity in snapshot.entities.iter().filter(|entity| entity.valid) {
+            mark(
+                entity.position.x.floor() as i32,
+                (entity.position.y + entity.height * 0.85).floor() as i32,
+                entity.position.z.floor() as i32,
+            );
+        }
+        let mut cells = Vec::new();
+        for y in min_y..min_y + height {
+            for z in origin_z..origin_z + span {
+                for x in origin_x..origin_x + span {
+                    let i = index(x, y, z);
+                    if !needed[i] || states[i] == UNLOADED {
+                        continue;
+                    }
+                    let column =
+                        ((z - origin_z) / 16 * chunks_per_side + (x - origin_x) / 16) as usize;
+                    let (sky_light, block_light) =
+                        lights[column].as_ref().map_or((0, 0), |light| {
+                            light.get(
+                                [(x - origin_x) as usize % 16, (z - origin_z) as usize % 16],
+                                y,
+                                min_y,
+                            )
+                        });
+                    let props = blocks::render_props(states[i]);
+                    cells.push(crate::LightCell {
+                        position: [x, y, z],
+                        sky_light,
+                        block_light,
+                        emission: props.emission,
+                        dampening: props.dampening,
+                        view_blocking: props.view_blocking,
+                        solid_render: props.solid_render,
+                        emissive: props.emissive,
+                        full_collision: props.full_collision,
+                    });
+                }
+            }
+        }
+        drop(needed);
         drop(states);
 
         // 每种状态只解码一次。
@@ -437,6 +532,8 @@ impl Module {
             } else {
                 63.0
             },
+            cells,
+            clock_ticks,
         })
     }
 

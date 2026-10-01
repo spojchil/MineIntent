@@ -156,10 +156,13 @@ fn sample(triangle: &Triangle, u: f64, v: f64) -> [f64; 4] {
         .texture
         .get_pixel(x.min(width - 1), y.min(height - 1))
         .0;
+    let tint: [f64; 3] = std::array::from_fn(|i| {
+        triangle.color[0][i] * (1.0 - u - v) + triangle.color[1][i] * u + triangle.color[2][i] * v
+    });
     [
-        f64::from(color[0]) * triangle.color[0],
-        f64::from(color[1]) * triangle.color[1],
-        f64::from(color[2]) * triangle.color[2],
+        f64::from(color[0]) * tint[0],
+        f64::from(color[1]) * tint[1],
+        f64::from(color[2]) * tint[2],
         f64::from(color[3]) / 255.0 * triangle.alpha,
     ]
 }

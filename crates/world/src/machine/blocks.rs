@@ -191,3 +191,68 @@ fn renders_through(name: &str) -> bool {
             | "vault"
     )
 }
+
+/// 原版方块渲染属性表（`data/BlockRenderDump.java` 从 26.1.2 服务端导出），每个状态 2 字节。
+static RENDER_TABLE: &[u8] = include_bytes!("../../data/block_render_26.1.2.bin");
+
+/// 一个方块状态在原版光照与环境光遮蔽里用到的属性。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct RenderProps {
+    pub emission: u8,
+    pub dampening: u8,
+    pub view_blocking: bool,
+    pub solid_render: bool,
+    pub emissive: bool,
+    pub full_collision: bool,
+}
+
+pub(super) fn render_props(state_id: u16) -> RenderProps {
+    let index = usize::from(state_id) * 2;
+    let (Some(&light), Some(&flags)) = (RENDER_TABLE.get(index), RENDER_TABLE.get(index + 1))
+    else {
+        return RenderProps::default();
+    };
+    RenderProps {
+        emission: light >> 4,
+        dampening: light & 0xF,
+        view_blocking: flags & 1 != 0,
+        solid_render: flags & 2 != 0,
+        emissive: flags & 4 != 0,
+        full_collision: flags & 8 != 0,
+    }
+}
+
+#[cfg(test)]
+mod render_table_tests {
+    use super::*;
+
+    fn props_of(name: &str) -> RenderProps {
+        (0..=azalea::block::BlockState::MAX_STATE)
+            .find(|&id| {
+                azalea::block::BlockState::try_from(id).is_ok_and(|state| {
+                    let block: Box<dyn azalea::block::BlockTrait> = Box::from(state);
+                    block.id() == name
+                })
+            })
+            .map(render_props)
+            .unwrap()
+    }
+
+    #[test]
+    fn table_lines_up_with_azalea_state_ids() {
+        assert_eq!(
+            RENDER_TABLE.len(),
+            (usize::from(azalea::block::BlockState::MAX_STATE) + 1) * 2
+        );
+        let glowstone = props_of("glowstone");
+        assert_eq!((glowstone.emission, glowstone.dampening), (15, 15));
+        let stone = props_of("stone");
+        assert!(stone.view_blocking && stone.solid_render && stone.full_collision);
+        assert_eq!((stone.emission, stone.dampening), (0, 15));
+        let glass = props_of("glass");
+        assert!(!glass.view_blocking && !glass.solid_render && glass.full_collision);
+        assert_eq!(glass.dampening, 0);
+        assert!(props_of("magma_block").emissive);
+        assert_eq!(props_of("torch").emission, 14);
+    }
+}

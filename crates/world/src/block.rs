@@ -58,6 +58,29 @@ pub struct BlockRegion {
     pub view_distance: u32,
     /// 原版地平线高度：超平坦是世界底，其余是 63。眼睛低于它时天空下半是黑的。
     pub horizon_height: f64,
+    /// 原版平滑光照要查的格子：每个表面方块周围一圈，加上露出面前方第二层的四个侧格。
+    /// 视距外、没加载的格不在里面。
+    pub cells: Vec<LightCell>,
+    /// 主世界时钟的累计 tick（服务端时间包）。原版各时间轴按各自周期取模：
+    /// 昼夜 `timeline/day` 24000，月相 `timeline/moon` 192000。
+    pub clock_ticks: u64,
+}
+
+/// 一格的服务端光照与原版方块渲染属性（光照与环境光遮蔽用）。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LightCell {
+    pub position: [i32; 3],
+    /// 天空光、方块光，0..=15。
+    pub sky_light: u8,
+    pub block_light: u8,
+    /// 方块自身发光值（`getLightEmission`）与透光度（`getLightDampening`），0..=15。
+    pub emission: u8,
+    pub dampening: u8,
+    /// `isViewBlocking`、`isSolidRender`、`emissiveRendering`、`isCollisionShapeFullBlock`。
+    pub view_blocking: bool,
+    pub solid_render: bool,
+    pub emissive: bool,
+    pub full_collision: bool,
 }
 
 /// 身边必须加载完整的半径（格）。

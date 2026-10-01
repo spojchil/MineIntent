@@ -1,121 +1,20 @@
 //! CPU rasterization into an image: no surface, window or graphics device.
 use image::RgbaImage;
 
-use crate::geometry::{build, dot, sub, Triangle, V3};
-use crate::{Camera, Environment, Frame, Options, Report, Resources, Scene};
+use crate::daylight::Daylight;
+use crate::geometry::{build_lit, dot, sub, Triangle, V3};
+use crate::light::{Cells, Lightmap, LightmapInputs};
+use crate::sky::Sky;
+use crate::{Camera, Frame, Options, Report, Resources, Scene};
 
 const NEAR: f64 = 1e-4;
 const SKY: [f64; 3] = [150.0, 185.0, 215.0];
 const MAX_LAYERS: usize = 16;
 
-/// 原版的视距雾与天空：`FogRenderer.setupFog`、`AtmosphericFogEnvironment`、`SkyRenderer`
-/// 与 `fog.glsl`（26.1.2 客户端）。颜色暂取主世界白天的值，见 [`Environment`]。
-pub(crate) struct Sky {
-    fog_color: [f64; 3],
-    sky_color: [f64; 3],
-    render_start: f64,
-    render_end: f64,
-    sky_end: f64,
-    /// 眼睛低于地平线：天空下半是黑盘（`SkyRenderer.shouldRenderDarkDisc`）。
-    dark_disc: bool,
-}
-
-/// `dimension_type/overworld` 的 `visual/sky_color` 与 `visual/fog_color`。
-const OVERWORLD_SKY: [f64; 3] = [120.0, 167.0, 255.0];
-const OVERWORLD_FOG: [f64; 3] = [192.0, 216.0, 255.0];
-/// `EnvironmentAttributes` 默认值：环境雾 0–1024 格、天空雾止于 512 格。
-const ENVIRONMENTAL_FOG_END: f64 = 1024.0;
-const SKY_FOG_END: f64 = 512.0;
-/// 天空盘半径（`SkyRenderer.SKY_DISC_RADIUS`）与高度；黑盘在眼下 16-12 格。
-const SKY_DISC_RADIUS: f64 = 512.0;
-const SKY_DISC_HEIGHT: f64 = 16.0;
-const DARK_DISC_DEPTH: f64 = 4.0;
-
-impl Sky {
-    pub(crate) fn new(environment: &Environment, eye_y: f64) -> Self {
-        let render_distance = f64::from(environment.view_distance) * 16.0;
-        // AtmosphericFogEnvironment.getBaseColor：雾色按视距朝天空色偏。
-        let sky_fog_end_chunks = (SKY_FOG_END / 16.0).min(f64::from(environment.view_distance));
-        let factor = 0.25 + 0.75 * (sky_fog_end_chunks / 32.0).clamp(0.0, 1.0);
-        let mix = 1.0 - factor.powf(0.25);
-        let fog_color = std::array::from_fn(|i| {
-            (OVERWORLD_FOG[i] + mix * (OVERWORLD_SKY[i] - OVERWORLD_FOG[i])).trunc()
-        });
-        let span = (render_distance / 10.0).clamp(4.0, 64.0);
-        Self {
-            fog_color,
-            sky_color: OVERWORLD_SKY,
-            render_start: render_distance - span,
-            render_end: render_distance,
-            sky_end: render_distance.min(SKY_FOG_END),
-            dark_disc: eye_y < environment.horizon_height,
-        }
-    }
-
-    /// `fog.glsl` 的 `total_fog_value`：球面距离走环境雾，柱面距离走视距雾，取大。
-    fn fog(&self, relative: V3) -> f64 {
-        let spherical = dot(relative, relative).sqrt();
-        let cylindrical = relative[0].hypot(relative[2]).max(relative[1].abs());
-        linear_fog(spherical, 0.0, ENVIRONMENTAL_FOG_END).max(linear_fog(
-            cylindrical,
-            self.render_start,
-            self.render_end,
-        ))
-    }
-
-    fn apply(&self, color: [f64; 4], relative: V3) -> [f64; 4] {
-        let fog = self.fog(relative);
-        if fog <= 0.0 {
-            return color;
-        }
-        [
-            color[0] + fog * (self.fog_color[0] - color[0]),
-            color[1] + fog * (self.fog_color[1] - color[1]),
-            color[2] + fog * (self.fog_color[2] - color[2]),
-            color[3],
-        ]
-    }
-
-    /// 没有地形挡住时看到的颜色：清屏色是雾色，上面画天空盘，眼低于地平线时下面画黑盘；
-    /// 两张盘都按 `sky.fsh` 的天空雾渐变到雾色。
-    fn background(&self, direction: V3) -> [f64; 3] {
-        let (plane, base) = if direction[1] > 0.0 {
-            (SKY_DISC_HEIGHT, self.sky_color)
-        } else if direction[1] < 0.0 && self.dark_disc {
-            (-DARK_DISC_DEPTH, [0.0; 3])
-        } else {
-            return self.fog_color;
-        };
-        let hit = direction.map(|v| v * plane / direction[1]);
-        let radius = hit[0].hypot(hit[2]);
-        if radius > SKY_DISC_RADIUS {
-            return self.fog_color;
-        }
-        let spherical = dot(hit, hit).sqrt();
-        let cylindrical = radius.max(plane.abs());
-        let fog = linear_fog(spherical, 0.0, self.sky_end).max(linear_fog(
-            cylindrical,
-            self.sky_end,
-            self.sky_end,
-        ));
-        std::array::from_fn(|i| base[i] + fog * (self.fog_color[i] - base[i]))
-    }
-}
-
-fn linear_fog(distance: f64, start: f64, end: f64) -> f64 {
-    if distance <= start {
-        0.0
-    } else if distance >= end {
-        1.0
-    } else {
-        (distance - start) / (end - start)
-    }
-}
-
-struct Projection {
+pub(crate) struct Projection {
     axes: [V3; 3], // right, up, forward
     scale: [f64; 2],
-    size: [f64; 2],
+    pub(crate) size: [f64; 2],
 }
 
 impl Projection {
@@ -137,12 +36,33 @@ impl Projection {
         }
     }
 
-    fn vertex(&self, position: V3, uv: [f64; 2], eye: V3) -> Vertex {
+    fn vertex(&self, position: V3, uv: [f64; 2], color: V3, eye: V3) -> Vertex {
         let relative = sub(position, eye);
         Vertex {
             position: self.axes.map(|axis| dot(relative, axis)),
             uv,
+            color,
         }
+    }
+
+    /// 像素中心的视线方向（世界坐标，前向分量为 1）：片元位置 = 深度 × 方向。
+    pub(crate) fn direction(&self, x: usize, y: usize) -> V3 {
+        let right = (2.0 * (x as f64 + 0.5) / self.size[0] - 1.0) * self.scale[0];
+        let up = (1.0 - 2.0 * (y as f64 + 0.5) / self.size[1]) * self.scale[1];
+        std::array::from_fn(|k| right * self.axes[0][k] + up * self.axes[1][k] + self.axes[2][k])
+    }
+
+    /// 近平面、远平面与四个侧面（相机坐标）。侧面裁剪避免穿过眼睛的三角形投影出巨大坐标。
+    fn planes(&self, far: f64) -> [(V3, f64); 6] {
+        let [sx, sy] = self.scale;
+        [
+            ([0.0, 0.0, 1.0], -NEAR),
+            ([0.0, 0.0, -1.0], far),
+            ([1.0, 0.0, sx], 0.0),
+            ([-1.0, 0.0, sx], 0.0),
+            ([0.0, 1.0, sy], 0.0),
+            ([0.0, -1.0, sy], 0.0),
+        ]
     }
 
     fn project(&self, vertex: Vertex) -> ScreenVertex {
@@ -154,6 +74,7 @@ impl Projection {
             ],
             inv_z,
             uv_over_z: vertex.uv.map(|v| v * inv_z),
+            color_over_z: vertex.color.map(|v| v * inv_z),
         }
     }
 }
@@ -162,6 +83,8 @@ impl Projection {
 struct Vertex {
     position: V3,
     uv: [f64; 2],
+    /// 逐顶点颜色（明暗、遮蔽与光照贴图已乘入），透视正确地插值。
+    color: V3,
 }
 
 /// Sutherland-Hodgman in camera space, interpolating UV before projection.
@@ -179,6 +102,9 @@ fn clip(input: &[Vertex], output: &mut Vec<Vertex>, normal: V3, offset: f64) {
                     previous.position[i] + t * (current.position[i] - previous.position[i])
                 }),
                 uv: std::array::from_fn(|i| previous.uv[i] + t * (current.uv[i] - previous.uv[i])),
+                color: std::array::from_fn(|i| {
+                    previous.color[i] + t * (current.color[i] - previous.color[i])
+                }),
             });
         }
         if b >= 0.0 {
@@ -194,6 +120,7 @@ struct ScreenVertex {
     xy: [f64; 2],
     inv_z: f64,
     uv_over_z: [f64; 2],
+    color_over_z: V3,
 }
 
 struct Projected<'a> {
@@ -222,21 +149,17 @@ fn project<'a>(
     let mut result = Vec::new();
     let mut polygon = Vec::with_capacity(12);
     let mut scratch = Vec::with_capacity(12);
-    let [sx, sy] = projection.scale;
-    // Side clipping avoids huge projected coordinates for triangles crossing the eye.
-    let planes = [
-        ([0.0, 0.0, 1.0], -NEAR),
-        ([0.0, 0.0, -1.0], far),
-        ([1.0, 0.0, sx], 0.0),
-        ([-1.0, 0.0, sx], 0.0),
-        ([0.0, 1.0, sy], 0.0),
-        ([0.0, -1.0, sy], 0.0),
-    ];
+    let planes = projection.planes(far);
     for triangle in triangles {
         polygon.clear();
-        polygon.extend(
-            (0..3).map(|i| projection.vertex(triangle.vertices[i], triangle.uv[i], camera.eye)),
-        );
+        polygon.extend((0..3).map(|i| {
+            projection.vertex(
+                triangle.vertices[i],
+                triangle.uv[i],
+                triangle.color[i],
+                camera.eye,
+            )
+        }));
         if polygon
             .iter()
             .any(|v| !v.position.iter().all(|n| n.is_finite()))
@@ -367,7 +290,70 @@ impl Pixel {
     }
 }
 
-fn sample(triangle: &Triangle, uv: [f64; 2]) -> [f64; 4] {
+/// 天空用的整幅光栅化：一个凸多边形（相对眼睛的世界坐标、uv、颜色），逐个覆盖到的像素
+/// 回调（行优先像素下标, 透视校正的 uv, 颜色）。不做深度测试，画的先后就是遮挡关系。
+pub(crate) fn rasterize(
+    projection: &Projection,
+    corners: &[(V3, [f64; 2], V3)],
+    mut paint: impl FnMut(usize, [f64; 2], V3),
+) {
+    let mut polygon: Vec<Vertex> = corners
+        .iter()
+        .map(|&(position, uv, color)| projection.vertex(position, uv, color, [0.0; 3]))
+        .collect();
+    let mut scratch = Vec::with_capacity(12);
+    for (normal, offset) in projection.planes(f64::MAX) {
+        clip(&polygon, &mut scratch, normal, offset);
+        std::mem::swap(&mut polygon, &mut scratch);
+        if polygon.is_empty() {
+            return;
+        }
+    }
+    let width = projection.size[0] as usize;
+    for i in 1..polygon.len().saturating_sub(1) {
+        let mut v = [polygon[0], polygon[i], polygon[i + 1]].map(|v| projection.project(v));
+        let mut area = edge(v[0].xy, v[1].xy, v[2].xy);
+        if area.abs() < 1e-12 {
+            continue;
+        }
+        if area < 0.0 {
+            v.swap(1, 2);
+            area = -area;
+        }
+        let min = [0, 1].map(|a| v.iter().map(|p| p.xy[a]).fold(f64::INFINITY, f64::min));
+        let max = [0, 1].map(|a| v.iter().map(|p| p.xy[a]).fold(f64::NEG_INFINITY, f64::max));
+        let x0 = (min[0] - 0.5).ceil().max(0.0) as usize;
+        let y0 = (min[1] - 0.5).ceil().max(0.0) as usize;
+        let x1 = ((max[0] - 0.5).floor() + 1.0).clamp(0.0, projection.size[0]) as usize;
+        let y1 = ((max[1] - 0.5).floor() + 1.0).clamp(0.0, projection.size[1]) as usize;
+        let pairs = [(v[1].xy, v[2].xy), (v[2].xy, v[0].xy), (v[0].xy, v[1].xy)];
+        let inclusive = pairs.map(|(a, b)| top_left(a, b));
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let p = [x as f64 + 0.5, y as f64 + 0.5];
+                let e = pairs.map(|(a, b)| edge(a, b, p));
+                if (0..3).any(|k| e[k] < 0.0 || (e[k] == 0.0 && !inclusive[k])) {
+                    continue;
+                }
+                let w = e.map(|value| value / area);
+                let z = 1.0 / (w[0] * v[0].inv_z + w[1] * v[1].inv_z + w[2] * v[2].inv_z);
+                let uv = std::array::from_fn(|k| {
+                    (w[0] * v[0].uv_over_z[k] + w[1] * v[1].uv_over_z[k] + w[2] * v[2].uv_over_z[k])
+                        * z
+                });
+                let color = std::array::from_fn(|k| {
+                    (w[0] * v[0].color_over_z[k]
+                        + w[1] * v[1].color_over_z[k]
+                        + w[2] * v[2].color_over_z[k])
+                        * z
+                });
+                paint(y * width + x, uv, color);
+            }
+        }
+    }
+}
+
+fn sample(triangle: &Triangle, uv: [f64; 2], tint: V3) -> [f64; 4] {
     let width = triangle.texture.width();
     let height = triangle.texture.height().min(width);
     let x = ((uv[0] / 16.0).clamp(0.0, 1.0) * f64::from(width)) as u32;
@@ -377,9 +363,9 @@ fn sample(triangle: &Triangle, uv: [f64; 2]) -> [f64; 4] {
         .get_pixel(x.min(width - 1), y.min(height - 1))
         .0;
     [
-        f64::from(c[0]) * triangle.color[0],
-        f64::from(c[1]) * triangle.color[1],
-        f64::from(c[2]) * triangle.color[2],
+        f64::from(c[0]) * tint[0],
+        f64::from(c[1]) * tint[1],
+        f64::from(c[2]) * tint[2],
         f64::from(c[3]) / 255.0 * triangle.alpha,
     ]
 }
@@ -389,26 +375,18 @@ fn draw_band(
     projection: &Projection,
     options: Options,
     sky: Option<&Sky>,
+    background: Option<&[V3]>,
     y0: usize,
     output: &mut [u8],
 ) {
     let width = options.width as usize;
     let rows = output.len() / (width * 4);
-    // 每个像素的视线方向（世界坐标，前向分量为 1）：片元位置 = 深度 × 方向。
     let directions: Vec<V3> = (0..width * rows)
-        .map(|i| {
-            let (x, y) = (i % width, y0 + i / width);
-            let right = (2.0 * (x as f64 + 0.5) / projection.size[0] - 1.0) * projection.scale[0];
-            let up = (1.0 - 2.0 * (y as f64 + 0.5) / projection.size[1]) * projection.scale[1];
-            std::array::from_fn(|k| {
-                right * projection.axes[0][k] + up * projection.axes[1][k] + projection.axes[2][k]
-            })
-        })
+        .map(|i| projection.direction(i % width, y0 + i / width))
         .collect();
-    let mut pixels: Vec<_> = directions
-        .iter()
-        .map(|&direction| {
-            let background = sky.map_or(SKY, |sky| sky.background(direction));
+    let mut pixels: Vec<_> = (0..width * rows)
+        .map(|i| {
+            let background = background.map_or(SKY, |image| image[y0 * width + i]);
             Pixel {
                 z: f64::INFINITY,
                 color: background,
@@ -462,7 +440,13 @@ fn draw_band(
                         + weights[2] * v[2].uv_over_z[i])
                         * z
                 });
-                let mut color = sample(t.triangle, uv);
+                let tint = std::array::from_fn(|i| {
+                    (weights[0] * v[0].color_over_z[i]
+                        + weights[1] * v[1].color_over_z[i]
+                        + weights[2] * v[2].color_over_z[i])
+                        * z
+                });
+                let mut color = sample(t.triangle, uv, tint);
                 if let Some(sky) = sky {
                     let direction = directions[(y - y0) * width + x];
                     color = sky.apply(color, direction.map(|v| v * z));
@@ -486,6 +470,7 @@ pub(crate) fn draw(
 ) -> RgbaImage {
     let projection = Projection::new(camera, options);
     let projected = project(triangles, camera, &projection, options.far);
+    let background = sky.map(|sky| sky.paint(&projection));
     let mut pixels = vec![0; options.width as usize * options.height as usize * 4];
     let workers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
@@ -498,6 +483,7 @@ pub(crate) fn draw(
         {
             let projection = &projection;
             let projected = &projected;
+            let background = background.as_deref();
             scope.spawn(move || {
                 // Limit transparency scratch memory even for large images.
                 for (band, output) in output
@@ -509,6 +495,7 @@ pub(crate) fn draw(
                         projection,
                         options,
                         sky,
+                        background,
                         i * rows + band * 16,
                         output,
                     );
@@ -521,10 +508,6 @@ pub(crate) fn draw(
 
 pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Result<Frame, String> {
     let mut options = options;
-    let sky = scene
-        .environment
-        .as_ref()
-        .map(|environment| Sky::new(environment, scene.camera.eye[1]));
     if let Some(environment) = &scene.environment {
         // 视距雾按柱面距离算，最远的角落在斜上方；放宽到能覆盖整个视距立方体。
         options.far = (f64::from(environment.view_distance) * 16.0 * 1.8).max(1.0);
@@ -558,24 +541,55 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
         ..Report::default()
     };
     report.warnings.insert(if scene.environment.is_some() {
-        "prototype: view-distance fog and sky use overworld daytime colours; no server lighting, sun/moon/stars/clouds, block-entity contents, weather; HUD is only the crosshair"
+        "prototype: overworld only, no biome colours, clouds, weather, block-entity contents or block-light flicker; HUD is only the crosshair"
     } else {
         "prototype: fixed daylight/background, no fog, no server lighting, block-entity contents, weather; HUD is only the crosshair"
     }.to_owned());
     report
         .warnings
         .insert("transparency is composited through at most 16 surfaces".to_owned());
-    let mut triangles = build(scene, resources, &mut report);
+    // 有环境才有光照与昼夜；没有时（模型夹具、测试）满亮度、固定背景。
+    let lighting = match &scene.environment {
+        Some(environment) => {
+            let daylight = Daylight::evaluate(resources, environment.clock_ticks)?;
+            let lightmap = Lightmap::new(&LightmapInputs {
+                sky_factor: daylight.sky_light_factor,
+                // LightmapRenderStateExtractor：1.4 加方块光闪烁（这里不模拟闪烁）。
+                block_factor: 1.4,
+                block_light_tint: daylight.block_light_tint,
+                sky_light_color: daylight.sky_light_color,
+                ambient_color: daylight.ambient_light_color,
+                // 亮度选项默认值（「亮度：中」）。
+                brightness: 0.5,
+            });
+            let sky = Sky::new(environment, &scene.camera, daylight, resources, &mut report);
+            Some((Cells::new(&scene.cells), lightmap, sky))
+        }
+        None => None,
+    };
+    let cells = lighting.as_ref().map(|(cells, _, _)| cells);
+    let mut triangles = build_lit(scene, cells, resources, &mut report);
     if !scene.entities.is_empty() {
         triangles.extend(crate::entity::build(
             &scene.entities,
             scene.camera.eye,
+            cells,
             resources,
             &mut report,
         ));
     }
+    // 原版逐顶点乘光照贴图（`vertexColor = Color * sample_lightmap(UV2)`）。
+    if let Some((_, lightmap, _)) = &lighting {
+        for triangle in &mut triangles {
+            for i in 0..3 {
+                let light = lightmap.sample(triangle.light[i]);
+                triangle.color[i] = std::array::from_fn(|k| triangle.color[i][k] * light[k]);
+            }
+        }
+    }
     report.triangles = triangles.len();
-    let mut image = draw(&triangles, &scene.camera, options, sky.as_ref());
+    let sky = lighting.as_ref().map(|(_, _, sky)| sky);
+    let mut image = draw(&triangles, &scene.camera, options, sky);
     if options.crosshair {
         draw_crosshair(&mut image, resources, &mut report);
     }

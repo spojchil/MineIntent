@@ -3,9 +3,12 @@
 //! assets are not embedded. See README for the deliberately incomplete effects.
 
 mod assets;
+mod daylight;
 mod entity;
 mod geometry;
+mod light;
 mod raster;
+mod sky;
 #[cfg(test)]
 mod trace;
 
@@ -52,19 +55,41 @@ pub struct Scene {
     /// 视野里的实体（不含观察者自己）。
     #[serde(default)]
     pub entities: Vec<Entity>,
-    /// 视距与天空。没有时按旧口径：固定背景色、只按 `Options::far` 截断、不加雾。
+    /// 视距与天空。没有时按旧口径：固定背景色、只按 `Options::far` 截断、不加雾、不算光照。
     #[serde(default)]
     pub environment: Option<Environment>,
+    /// 光照格：原版平滑光照与环境光遮蔽要查的格子。查不到的格按露天空气。
+    #[serde(default)]
+    pub cells: Vec<Cell>,
 }
 
-/// 原版的视距雾与天空所需的世界状态。颜色暂取主世界白天的值（`dimension_type/overworld`
-/// 的 `sky_color`/`fog_color`，日间时间轴乘子为白）；昼夜与生物群系随光照一起接入。
+/// 一格的服务端光照与原版方块渲染属性。
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Cell {
+    pub position: [i32; 3],
+    /// 天空光、方块光，0..=15。
+    pub sky_light: u8,
+    pub block_light: u8,
+    /// 本格方块的发光值与透光度，0..=15。
+    pub emission: u8,
+    pub dampening: u8,
+    /// 原版 `isViewBlocking`、`isSolidRender`、`emissiveRendering`、`isCollisionShapeFullBlock`。
+    pub view_blocking: bool,
+    pub solid_render: bool,
+    pub emissive: bool,
+    pub full_collision: bool,
+}
+
+/// 原版的视距雾、天空与光照所需的世界状态。颜色与光照参数按主世界维度属性
+/// （`dimension_type/overworld`）叠加日时间轴（`timeline/day`）求值；生物群系尚未接入。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Environment {
     /// 实际视距（区块）。
     pub view_distance: u32,
     /// 原版地平线高度：眼睛低于它时，天空下半画黑盘。
     pub horizon_height: f64,
+    /// 主世界时钟的累计 tick；各时间轴按自己的周期取模。
+    pub clock_ticks: u64,
 }
 
 #[derive(Clone, Copy, Debug)]

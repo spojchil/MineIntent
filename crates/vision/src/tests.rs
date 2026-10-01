@@ -99,6 +99,7 @@ fn scene(blocks: Vec<Block>) -> Scene {
         blocks,
         entities: Vec::new(),
         environment: None,
+        cells: Vec::new(),
     }
 }
 fn small() -> Options {
@@ -381,7 +382,8 @@ fn triangle(vertices: [[f64; 3]; 3], texture: Arc<RgbaImage>) -> geometry::Trian
         vertices,
         uv: [[0.0, 0.0], [16.0, 0.0], [0.0, 16.0]],
         texture,
-        color: [1.0; 3],
+        color: [[1.0; 3]; 3],
+        light: [crate::light::FULL_BRIGHT; 3],
         alpha: 1.0,
     }
 }

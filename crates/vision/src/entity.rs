@@ -715,7 +715,8 @@ fn emit_cube(
                 vertices: indices.map(|i| world[i]),
                 uv: indices.map(|i| uv[i]),
                 texture: texture.clone(),
-                color: [light; 3],
+                color: [[light; 3]; 3],
+                light: [crate::light::FULL_BRIGHT; 3],
                 alpha: 1.0,
             });
         }
@@ -763,65 +764,24 @@ fn wrap_degrees(angle: f64) -> f64 {
 pub(crate) fn build(
     entities: &[Entity],
     eye: V3,
+    cells: Option<&crate::light::Cells>,
     resources: &mut Resources,
     report: &mut Report,
 ) -> Vec<Triangle> {
     let mut triangles = Vec::new();
     for entity in entities {
-        let valid = entity.position.iter().all(|c| c.is_finite())
-            && entity.body_yaw.is_finite()
-            && entity.pitch.is_finite();
-        if !valid {
-            report
-                .warnings
-                .insert(format!("{}: non-finite pose, not drawn", entity.kind));
-            continue;
-        }
-        let kind = entity
-            .kind
-            .strip_prefix("minecraft:")
-            .unwrap_or(&entity.kind);
-        if kind == "item" {
-            if !dropped_item(entity, eye, resources, report, &mut triangles) {
-                placeholder(entity, &mut triangles);
-            }
-            continue;
-        }
-        let Some(layers) = layers(entity) else {
-            report.warnings.insert(format!(
-                "{}: no entity model yet, drawn as hitbox placeholder",
-                entity.kind
-            ));
-            placeholder(entity, &mut triangles);
-            continue;
-        };
-        // LivingEntityRenderer：平移到脚底 → 绕 Y 转 180-bodyYaw → scale(-1,-1,1) → 下移 1.501。
-        let root = Pose {
-            linear: rot_y((180.0 - entity.body_yaw).to_radians()),
-            translation: entity.position,
-        };
-        let flip = [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]];
-        let root = root
-            .then([0.0; 3], flip)
-            .then([0.0, -1.501, 0.0], rot_x(0.0));
-        let head_yaw = wrap_degrees(entity.head_yaw.unwrap_or(entity.body_yaw) - entity.body_yaw);
-        let head = (entity.pitch.to_radians(), head_yaw.to_radians());
-        for layer in layers {
-            let texture = resources.texture(&layer.texture).unwrap_or_else(|error| {
-                report
-                    .warnings
-                    .insert(format!("{}: texture unavailable ({error})", entity.kind));
-                missing_texture()
-            });
-            for part in &layer.parts {
-                emit_part(
-                    part,
-                    &root,
-                    head,
-                    &texture,
-                    layer.texture_size,
-                    &mut triangles,
-                );
+        let start = triangles.len();
+        emit_entity(entity, eye, resources, report, &mut triangles);
+        // 原版实体按眼睛所在格取光（`getLightProbePosition`），整只实体一个光照值。
+        if let Some(cells) = cells {
+            let probe = [
+                entity.position[0].floor() as i32,
+                (entity.position[1] + entity.height * 0.85).floor() as i32,
+                entity.position[2].floor() as i32,
+            ];
+            let coords = cells.coords(cells.get(probe), probe);
+            for triangle in &mut triangles[start..] {
+                triangle.light = [coords; 3];
             }
         }
     }
@@ -829,6 +789,64 @@ pub(crate) fn build(
         "entities: static pose (no walk/limb animation), adult model, default variant texture, no equipment or held items".to_owned(),
     );
     triangles
+}
+
+fn emit_entity(
+    entity: &Entity,
+    eye: V3,
+    resources: &mut Resources,
+    report: &mut Report,
+    triangles: &mut Vec<Triangle>,
+) {
+    let valid = entity.position.iter().all(|c| c.is_finite())
+        && entity.body_yaw.is_finite()
+        && entity.pitch.is_finite();
+    if !valid {
+        report
+            .warnings
+            .insert(format!("{}: non-finite pose, not drawn", entity.kind));
+        return;
+    }
+    let kind = entity
+        .kind
+        .strip_prefix("minecraft:")
+        .unwrap_or(&entity.kind);
+    if kind == "item" {
+        if !dropped_item(entity, eye, resources, report, triangles) {
+            placeholder(entity, triangles);
+        }
+        return;
+    }
+    let Some(layers) = layers(entity) else {
+        report.warnings.insert(format!(
+            "{}: no entity model yet, drawn as hitbox placeholder",
+            entity.kind
+        ));
+        placeholder(entity, triangles);
+        return;
+    };
+    // LivingEntityRenderer：平移到脚底 → 绕 Y 转 180-bodyYaw → scale(-1,-1,1) → 下移 1.501。
+    let root = Pose {
+        linear: rot_y((180.0 - entity.body_yaw).to_radians()),
+        translation: entity.position,
+    };
+    let flip = [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]];
+    let root = root
+        .then([0.0; 3], flip)
+        .then([0.0, -1.501, 0.0], rot_x(0.0));
+    let head_yaw = wrap_degrees(entity.head_yaw.unwrap_or(entity.body_yaw) - entity.body_yaw);
+    let head = (entity.pitch.to_radians(), head_yaw.to_radians());
+    for layer in layers {
+        let texture = resources.texture(&layer.texture).unwrap_or_else(|error| {
+            report
+                .warnings
+                .insert(format!("{}: texture unavailable ({error})", entity.kind));
+            missing_texture()
+        });
+        for part in &layer.parts {
+            emit_part(part, &root, head, &texture, layer.texture_size, triangles);
+        }
+    }
 }
 
 /// 掉落物。方块物品按方块自己的模型缩到 1/4（原版 ground 变换的尺度），平面物品画成
@@ -852,13 +870,19 @@ fn dropped_item(
     );
     let [x, y, z] = entity.position;
     let lift = 0.1;
-    let block = crate::geometry::block_item_triangles(name, resources, report, |p| {
-        [
-            x + (p[0] - 0.5) * 0.25,
-            y + lift + p[1] * 0.25,
-            z + (p[2] - 0.5) * 0.25,
-        ]
-    });
+    let block = crate::geometry::block_item_triangles(
+        name,
+        resources,
+        report,
+        crate::light::FULL_BRIGHT,
+        |p| {
+            [
+                x + (p[0] - 0.5) * 0.25,
+                y + lift + p[1] * 0.25,
+                z + (p[2] - 0.5) * 0.25,
+            ]
+        },
+    );
     if let Ok(block) = block {
         triangles.extend(block);
         return true;
@@ -890,7 +914,8 @@ fn dropped_item(
             vertices: indices.map(|i| vertices[i]),
             uv: indices.map(|i| uv[i]),
             texture: texture.clone(),
-            color: [1.0; 3],
+            color: [[1.0; 3]; 3],
+            light: [crate::light::FULL_BRIGHT; 3],
             alpha: 1.0,
         });
     }

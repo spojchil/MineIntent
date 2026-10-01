@@ -96,7 +96,16 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
 循环，心跳超时被踢。只交**表面**方块
 （`RegionBlock`：六面里至少一面没被完整不透明方块挡住；流体另算同种流体相邻），
 每块附六面遮挡位供成像剔面；身边 16 格内有未加载格时报出数量，更远处未加载的区块和
-原版一样不画。另附地平线高度（超平坦是世界底，其余 63）。姿态取最新 tick 快照，与
+原版一样不画。另附地平线高度（超平坦是世界底，其余 63）与主世界时钟累计 tick。
+
+光照：azalea 解析光照包但不存，`machine/light.rs` 的 `LightStore` 按原版
+`applyLightData` 口径自存每柱天空光与方块光（区块包整柱重来、光照更新包逐段覆盖），
+随区块卸载与换维度清掉。`capture_view` 同在世界读锁里克隆光照段（`Arc`，只加引用
+计数），锁外为表面方块周围 3×3×3、未遮挡面外两格的侧向格与实体眼睛所在格附上
+`LightCell`：存储的天空光/方块光加该格方块的原版渲染属性（发光、透光、
+`isViewBlocking`、`isSolidRender`、`emissiveRendering`、碰撞箱是否完整方块）。
+这些属性 azalea 不提供，由 `crates/world/data/BlockRenderDump.java` 对 26.1.2 服务端
+导出成按 `state_id` 排列的二进制表随源码入库。姿态取最新 tick 快照，与
 方块复制不是原子化的同一服务端 tick。`vision` 的可选 `live` feature 只供连接
 探针使用；纯渲染默认不依赖 world/Azalea。画面含方块、准星与实体：组合根把同一份
 快照里的实体（种类、脚底位置、朝向、玩家 UUID、掉落物的物品名）交给 `vision`，
