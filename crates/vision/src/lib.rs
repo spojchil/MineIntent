@@ -124,6 +124,9 @@ pub struct Options {
     pub far: f64,
     /// 画准星（画面正中、对底色取反）。几何对照测试关掉它，以免中心像素被覆盖。
     pub crosshair: bool,
+    /// 只交出整屏里的这一块（左上 x、y 与宽高，像素）。投影与准星仍按整屏，
+    /// 所以局部的每个像素和整屏图里同位置的像素相同。
+    pub crop: Option<[u32; 4]>,
 }
 
 impl Default for Options {
@@ -133,6 +136,7 @@ impl Default for Options {
             height: 360,
             far: 48.0,
             crosshair: true,
+            crop: None,
         }
     }
 }

@@ -5,4 +5,4 @@
 
 mod picture;
 
-pub use picture::{Picture, PictureDoor, PictureTools};
+pub use picture::{Picture, PictureDoor, PictureTools, Region};

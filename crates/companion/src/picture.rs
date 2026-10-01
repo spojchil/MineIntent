@@ -1,27 +1,63 @@
 //! Protocol world -> bounded scene -> PNG; expensive work stays off async workers.
 use std::sync::{Arc, Mutex};
 
-use perception::{Picture, PictureDoor};
+use perception::{Picture, PictureDoor, Region};
 use world::Module;
 
 pub struct ModulePictureDoor {
     module: Arc<Module>,
     resources: Arc<Mutex<vision::Resources>>,
+    /// 屏幕像素尺寸（宽, 高），即这具身体的「显示器」。
+    screen: [u32; 2],
 }
 
 impl ModulePictureDoor {
-    pub fn new(module: Arc<Module>, resources: vision::Resources) -> Self {
+    pub fn new(module: Arc<Module>, resources: vision::Resources, screen: [u32; 2]) -> Self {
         Self {
             module,
             resources: Arc::new(Mutex::new(resources)),
+            screen,
         }
     }
 }
 
+/// 屏幕比例换成像素矩形 `[x, y, 宽, 高]`：左上向下取整、右下向上取整，至少 1 像素。
+fn crop_pixels(region: Region, [width, height]: [u32; 2]) -> [u32; 4] {
+    let span = |start: f64, size: f64, total: u32| {
+        let total_f = f64::from(total);
+        let from = ((start * total_f).floor() as u32).min(total - 1);
+        let to = (((start + size) * total_f).ceil() as u32).clamp(from + 1, total);
+        (from, to - from)
+    };
+    let (x, w) = span(region.x, region.width, width);
+    let (y, h) = span(region.y, region.height, height);
+    [x, y, w, h]
+}
+
+/// 屏幕尺寸配置 `宽x高`（如 `1280x720`），每边 1–2048。
+pub fn parse_screen(text: &str) -> Result<[u32; 2], String> {
+    let invalid = || format!("屏幕尺寸要写成 宽x高（如 1280x720，每边 1–2048），收到 {text:?}");
+    let (width, height) = text.split_once(['x', 'X']).ok_or_else(invalid)?;
+    let side = |value: &str| {
+        value
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|n| (1..=2048).contains(n))
+            .ok_or_else(invalid)
+    };
+    Ok([side(width)?, side(height)?])
+}
+
 impl PictureDoor for ModulePictureDoor {
-    fn capture<'a>(&'a self) -> agent::PortFuture<'a, Result<Picture, String>> {
+    fn capture<'a>(
+        &'a self,
+        region: Option<Region>,
+    ) -> agent::PortFuture<'a, Result<Picture, String>> {
         let module = self.module.clone();
         let resources = self.resources.clone();
+        let [width, height] = self.screen;
+        let crop = region.map(|region| crop_pixels(region, self.screen));
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
                 let mut resources = resources.lock().map_err(|_| "图片资源暂不可用")?;
@@ -29,13 +65,28 @@ impl PictureDoor for ModulePictureDoor {
                 let region = module.capture_view()?;
                 let view_distance = region.view_distance;
                 let scene = scene_from_region(region)?;
-                let frame = vision::render(&scene, &mut resources, vision::Options::default())?;
+                let options = vision::Options {
+                    width,
+                    height,
+                    crop,
+                    ..vision::Options::default()
+                };
+                let frame = vision::render(&scene, &mut resources, options)?;
+                let framing = match crop {
+                    None => format!("整个屏幕 {width}×{height}，正中是准星"),
+                    Some([x, y, w, h]) => format!(
+                        "屏幕（{width}×{height}）上的一块：左上 ({x}, {y}) 起 {w}×{h} 像素；\
+准星在整屏正中 ({}, {})",
+                        width / 2,
+                        height / 2
+                    ),
+                };
                 Ok(Picture {
                     png: frame.png()?,
                     // Reports describe the entire captured region and can name occluded
                     // blocks. Do not send that inventory or raw scene to the model.
                     description: format!(
-                        "当前朝向的第一人称画面，视距 {view_distance} 区块，远处渐隐入雾，640×360，正中是准星。\
+                        "当前朝向的第一人称画面，{framing}。视距 {view_distance} 区块，远处渐隐入雾。\
 画出方块、玩家、掉落物和常见生物（猪、牛、羊、鸡、苦力怕、蜘蛛、僵尸、骷髅）；\
 生物是静止姿态、默认花色，不画装备、手持物、界面、天气和粒子；\
 明暗按服务端光照与当前时刻，天空有昼夜与日月星辰；不画云；植物与水按生物群系染色，水面是平的。\
@@ -167,5 +218,42 @@ mod tests {
         assert_eq!(scene.camera.eye, [12.5, 65.62, -3.0]);
         assert_eq!(scene.camera.yaw, 91.0);
         assert_eq!(scene.camera.pitch, -17.0);
+    }
+
+    #[test]
+    fn region_fractions_become_pixel_rectangles_that_cover_the_request() {
+        let screen = [1280, 720];
+        let region = |x, y, width, height| Region {
+            x,
+            y,
+            width,
+            height,
+        };
+        assert_eq!(
+            crop_pixels(region(0.0, 0.0, 1.0, 1.0), screen),
+            [0, 0, 1280, 720]
+        );
+        assert_eq!(
+            crop_pixels(region(0.0, 0.66, 1.0, 0.34), screen),
+            [0, 475, 1280, 245]
+        );
+        assert_eq!(
+            crop_pixels(region(0.5, 0.5, 1e-9, 1e-9), screen),
+            [640, 360, 1, 1]
+        );
+        // 容差内略超出屏幕的右下边缘截在屏幕边上。
+        assert_eq!(
+            crop_pixels(region(0.0, 0.66, 1.0, 0.340_000_5), screen),
+            [0, 475, 1280, 245]
+        );
+    }
+
+    #[test]
+    fn screen_size_parses_width_by_height() {
+        assert_eq!(parse_screen("1280x720"), Ok([1280, 720]));
+        assert_eq!(parse_screen("640X360"), Ok([640, 360]));
+        for bad in ["1280", "0x720", "4096x720", "ax720", ""] {
+            assert!(parse_screen(bad).is_err(), "{bad}");
+        }
     }
 }

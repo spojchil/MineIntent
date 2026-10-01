@@ -1,7 +1,7 @@
 //! Live protocol-client image probe. No model/provider, commands or world writes.
 //!
-//! 输出路径给 `-` 时常驻在线：从标准输入逐行读输出路径，每行按当前位姿出一张图，
-//! 便于让人旁观同一个视点做对照。
+//! 输出路径给 `-` 时常驻在线：从标准输入逐行读 `输出路径 [宽x高]`，每行按当前位姿出一张图
+//! （不给尺寸用默认 640x360），便于让人旁观同一个视点做对照。
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,7 +27,7 @@ async fn main() -> Result<(), String> {
     let result = if args[4] == "-" {
         resident(module.clone(), &mut resources).await
     } else {
-        capture(module.clone(), &mut resources, &args[4]).await
+        capture(module.clone(), &mut resources, &args[4], None).await
     };
     let _ = module.stop("图片采集完成").await;
     result
@@ -40,12 +40,16 @@ async fn resident(
     module.wait_ready(Duration::from_secs(45)).await?;
     println!("ready");
     for line in std::io::stdin().lines() {
-        let output = line.map_err(|e| e.to_string())?;
-        let output = output.trim();
-        if output.is_empty() {
+        let line = line.map_err(|e| e.to_string())?;
+        let mut words = line.split_whitespace();
+        let Some(output) = words.next() else {
             continue;
-        }
-        match capture(module.clone(), resources, output).await {
+        };
+        let size = words.next().and_then(|size| {
+            let (width, height) = size.split_once('x')?;
+            Some([width.parse().ok()?, height.parse().ok()?])
+        });
+        match capture(module.clone(), resources, output, size).await {
             Ok(()) => println!("done {output}"),
             Err(error) => println!("failed {output}: {error}"),
         }
@@ -57,6 +61,7 @@ async fn capture(
     module: Arc<world::Module>,
     resources: &mut vision::Resources,
     output: &str,
+    size: Option<[u32; 2]>,
 ) -> Result<(), String> {
     module.wait_ready(Duration::from_secs(45)).await?;
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -153,7 +158,12 @@ async fn capture(
         }),
     };
     let started = Instant::now();
-    let mut frame = vision::render(&scene, resources, vision::Options::default())?;
+    let mut options = vision::Options::default();
+    if let Some([width, height]) = size {
+        options.width = width;
+        options.height = height;
+    }
+    let mut frame = vision::render(&scene, resources, options)?;
     frame.report.warnings.insert("capture uses latest tick pose and current block-region copy, not an atomic server tick; standing eye height 1.62".to_owned());
     std::fs::write(output, frame.png()?).map_err(|e| e.to_string())?;
     std::fs::write(

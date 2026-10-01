@@ -513,6 +513,7 @@ async fn main() -> Result<(), String> {
         Err(_) => PLACEHOLDER_PERSONA.to_owned(),
     };
     let api_key = read_api_key()?;
+    let screen = picture::parse_screen(&env_or("MINEINTENT_VIEW_SIZE", "640x360"))?;
     let picture_resources = client_jar
         .map(|path| {
             let resources = vision::Resources::open(std::path::PathBuf::from(path))?;
@@ -598,7 +599,7 @@ async fn main() -> Result<(), String> {
     ];
     if let Some(resources) = picture_resources {
         providers.push(Arc::new(perception::PictureTools::new(Arc::new(
-            picture::ModulePictureDoor::new(module.clone(), resources),
+            picture::ModulePictureDoor::new(module.clone(), resources, screen),
         ))));
     }
     let life: Arc<dyn LifeGate> = Arc::new(SnapshotLifeGate(snapshots.clone()));

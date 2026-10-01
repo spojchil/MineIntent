@@ -35,7 +35,10 @@ const PLACEHOLDER_PERSONA: &str = "\
 struct NoDoor;
 
 impl perception::PictureDoor for NoDoor {
-    fn capture<'a>(&'a self) -> PortFuture<'a, Result<perception::Picture, String>> {
+    fn capture<'a>(
+        &'a self,
+        _region: Option<perception::Region>,
+    ) -> PortFuture<'a, Result<perception::Picture, String>> {
         Box::pin(async {
             Err("文本导出不生成图片；实际图片由当前世界渲染".to_owned())
         })

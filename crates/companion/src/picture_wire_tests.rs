@@ -16,7 +16,10 @@ use serde_json::{json, Value};
 
 struct TestPicture;
 impl PictureDoor for TestPicture {
-    fn capture<'a>(&'a self) -> agent::PortFuture<'a, Result<Picture, String>> {
+    fn capture<'a>(
+        &'a self,
+        _region: Option<perception::Region>,
+    ) -> agent::PortFuture<'a, Result<Picture, String>> {
         // Payload bytes are deliberately tiny: this tests transport, not PNG decoding.
         Box::pin(async {
             Ok(Picture {

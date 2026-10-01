@@ -110,6 +110,7 @@ fn small() -> Options {
         height: 9,
         far: 12.0,
         crosshair: false,
+        crop: None,
     }
 }
 
@@ -188,6 +189,54 @@ fn crosshair_inverts_the_centre_and_leaves_the_rest() {
         );
     }
     assert_eq!(plain.image.get_pixel(0, 0), marked.image.get_pixel(0, 0));
+}
+
+#[test]
+fn crop_returns_the_same_pixels_as_the_full_frame() {
+    let (_jar, mut resources) = resources();
+    let scene = scene(vec![block("red", [0, 0, 2]), block("green", [1, 1, 4])]);
+    let options = Options {
+        crosshair: true,
+        ..small()
+    };
+    let full = render(&scene, &mut resources, options).unwrap();
+    let part = render(
+        &scene,
+        &mut resources,
+        Options {
+            crop: Some([2, 3, 5, 4]),
+            ..options
+        },
+    )
+    .unwrap();
+    assert_eq!(part.image.dimensions(), (5, 4));
+    for (x, y) in (0..5).flat_map(|x| (0..4).map(move |y| (x, y))) {
+        assert_eq!(
+            part.image.get_pixel(x, y),
+            full.image.get_pixel(x + 2, y + 3)
+        );
+    }
+    for crop in [[0, 0, 0, 1], [5, 0, 5, 1], [0, 8, 1, 2]] {
+        let options = Options {
+            crop: Some(crop),
+            ..options
+        };
+        assert!(render(&scene, &mut resources, options).is_err(), "{crop:?}");
+    }
+}
+
+#[test]
+fn gui_scale_follows_vanilla_auto_scale() {
+    for (size, scale) in [
+        ((640, 360), 1),
+        ((854, 480), 2),
+        ((1280, 720), 3),
+        ((1920, 1080), 4),
+        ((2560, 1440), 6),
+        ((300, 200), 1),
+    ] {
+        assert_eq!(crate::raster::gui_scale(size.0, size.1), scale, "{size:?}");
+    }
 }
 
 #[test]
@@ -444,6 +493,7 @@ fn raster_clipping_perspective_uv_cutouts_and_far_distance_match_ray_reference()
         height: 61,
         far: 4.2,
         crosshair: false,
+        crop: None,
     };
     let camera = Camera {
         eye: [0.0; 3],

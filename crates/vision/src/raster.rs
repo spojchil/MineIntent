@@ -537,12 +537,21 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
                 .to_owned(),
         );
     }
+    if let Some([x, y, width, height]) = options.crop {
+        if width == 0
+            || height == 0
+            || u64::from(x) + u64::from(width) > u64::from(options.width)
+            || u64::from(y) + u64::from(height) > u64::from(options.height)
+        {
+            return Err("crop must be a non-empty rectangle inside the image".to_owned());
+        }
+    }
     let mut report = Report {
         blocks: scene.blocks.len(),
         ..Report::default()
     };
     report.warnings.insert(if scene.environment.is_some() {
-        "prototype: overworld only, no biome colours, clouds, weather, block-entity contents or block-light flicker; HUD is only the crosshair"
+        "prototype: overworld only, no clouds, weather, block-entity contents or block-light flicker; HUD is only the crosshair"
     } else {
         "prototype: fixed daylight/background, no fog, no server lighting, block-entity contents, weather; HUD is only the crosshair"
     }.to_owned());
@@ -607,11 +616,29 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
     if options.crosshair {
         draw_crosshair(&mut image, resources, &mut report);
     }
+    if let Some([x, y, width, height]) = options.crop {
+        image = image::imageops::crop_imm(&image, x, y, width, height).to_image();
+    }
     Ok(Frame { image, report })
 }
 
+/// 原版自动 GUI 缩放（`Window.calculateScale(0, false)`）：最大的整数倍，使屏幕除以它后
+/// 仍不小于 320×240。
+pub(crate) fn gui_scale(width: u32, height: u32) -> u32 {
+    let mut scale = 1;
+    while scale < width
+        && scale < height
+        && width / (scale + 1) >= 320
+        && height / (scale + 1) >= 240
+    {
+        scale += 1;
+    }
+    scale
+}
+
 /// 准星：原版 `hud/crosshair` 精灵，按原版混合（`ONE_MINUS_DST_COLOR`，即对底色取反）
-/// 画在画面正中。640×360 下原版自动 GUI 缩放为 1（高 360 < 2×240），精灵 1:1。
+/// 画在画面正中：GUI 坐标 `((guiWidth - 15) / 2, (guiHeight - 15) / 2)`，每个纹素放大成
+/// GUI 缩放倍数的方块（`Gui.extractCrosshair`）。
 /// 资源里没有这张精灵时退回一个 9 像素的取反十字，并在报告里说明。
 fn draw_crosshair(image: &mut RgbaImage, resources: &mut Resources, report: &mut Report) {
     let sprite = resources
@@ -625,9 +652,11 @@ fn draw_crosshair(image: &mut RgbaImage, resources: &mut Resources, report: &mut
     let (width, height) = sprite
         .as_ref()
         .map_or((9, 9), |sprite| (sprite.width(), sprite.height()));
-    // 原版：(屏宽 - 15) / 2，整数除。
-    let left = (image.width().saturating_sub(width) / 2) as i64;
-    let top = (image.height().saturating_sub(height) / 2) as i64;
+    let scale = gui_scale(image.width(), image.height());
+    // GUI 尺寸向上取整（`Window.setGuiScale`），位置是 GUI 坐标里的整数除再乘回像素。
+    let gui = |pixels: u32| pixels.div_ceil(scale);
+    let left = i64::from(gui(image.width()).saturating_sub(width) / 2 * scale);
+    let top = i64::from(gui(image.height()).saturating_sub(height) / 2 * scale);
     for y in 0..height {
         for x in 0..width {
             let coverage = match &sprite {
@@ -637,15 +666,21 @@ fn draw_crosshair(image: &mut RgbaImage, resources: &mut Resources, report: &mut
             if coverage <= 0.0 {
                 continue;
             }
-            let (px, py) = (left + i64::from(x), top + i64::from(y));
-            if px < 0 || py < 0 || px >= i64::from(image.width()) || py >= i64::from(image.height())
-            {
-                continue;
-            }
-            let pixel = image.get_pixel_mut(px as u32, py as u32);
-            for channel in 0..3 {
-                let dst = f64::from(pixel.0[channel]);
-                pixel.0[channel] = (dst + coverage * (255.0 - 2.0 * dst)).round() as u8;
+            for (dx, dy) in (0..scale).flat_map(|dx| (0..scale).map(move |dy| (dx, dy))) {
+                let px = left + i64::from(x * scale + dx);
+                let py = top + i64::from(y * scale + dy);
+                if px < 0
+                    || py < 0
+                    || px >= i64::from(image.width())
+                    || py >= i64::from(image.height())
+                {
+                    continue;
+                }
+                let pixel = image.get_pixel_mut(px as u32, py as u32);
+                for channel in 0..3 {
+                    let dst = f64::from(pixel.0[channel]);
+                    pixel.0[channel] = (dst + coverage * (255.0 - 2.0 * dst)).round() as u8;
+                }
             }
         }
     }
