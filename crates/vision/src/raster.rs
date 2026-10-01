@@ -382,10 +382,18 @@ struct Fragment {
 
 /// 一个像素除深度外的状态。最近不透明面的深度单独放在一个连续数组里：深度测试是
 /// 内层循环里最频繁的访存，只碰 8 字节比拉一整个 `Pixel` 省缓存。
+/// 背景（天空或雾色）不另存，收尾时从天空底图读。
 struct Pixel {
     color: [f64; 3],
-    background: [f64; 3],
     layers: Vec<Fragment>,
+}
+
+/// 条带的工作区：每个线程一份，在条带之间复用（透明层的 `Vec` 也保留容量），
+/// 不必每条带重新分配。
+#[derive(Default)]
+struct BandScratch {
+    pixels: Vec<Pixel>,
+    depths: Vec<f64>,
 }
 
 impl Pixel {
@@ -416,7 +424,7 @@ impl Pixel {
         }
     }
 
-    fn finish(&self, depth: f64) -> [u8; 4] {
+    fn finish(&self, depth: f64, background: [f64; 3]) -> [u8; 4] {
         let mut color = [0.0; 3];
         let mut remaining = 1.0;
         let mut count = 0;
@@ -434,7 +442,7 @@ impl Pixel {
         let background = if count < MAX_LAYERS && remaining >= 0.005 {
             self.color
         } else {
-            self.background
+            background
         };
         [
             (color[0] + remaining * background[0]).clamp(0.0, 255.0) as u8,
@@ -527,7 +535,9 @@ fn sample(triangle: &Triangle, uv: [f64; 2], tint: V3) -> [f64; 4] {
 
 // `x` 同时是像素横坐标与下标，迭代器写法反而难读。
 #[allow(clippy::needless_range_loop)]
+#[allow(clippy::too_many_arguments)]
 fn draw_band(
+    scratch: &mut BandScratch,
     bin: &[&Projected<'_>],
     projection: &Projection,
     options: Options,
@@ -538,20 +548,21 @@ fn draw_band(
 ) {
     let width = options.width as usize;
     let rows = output.len() / (width * 4);
-    let directions: Vec<V3> = (0..width * rows)
-        .map(|i| projection.direction(i % width, y0 + i / width))
-        .collect();
-    let mut pixels: Vec<_> = (0..width * rows)
-        .map(|i| {
-            let background = background.map_or(SKY, |image| image[y0 * width + i]);
-            Pixel {
-                color: background,
-                background,
-                layers: Vec::new(),
-            }
-        })
-        .collect();
-    let mut depths = vec![f64::INFINITY; width * rows];
+    let background_at = |i: usize| background.map_or(SKY, |image| image[y0 * width + i]);
+    let BandScratch { pixels, depths } = scratch;
+    pixels.truncate(width * rows);
+    for (i, pixel) in pixels.iter_mut().enumerate() {
+        pixel.color = background_at(i);
+        pixel.layers.clear();
+    }
+    for i in pixels.len()..width * rows {
+        pixels.push(Pixel {
+            color: background_at(i),
+            layers: Vec::new(),
+        });
+    }
+    depths.clear();
+    depths.resize(width * rows, f64::INFINITY);
     // Preserve radial far distance, not a camera-Z-only far plane.
     let x_squared: Vec<_> = (0..width)
         .map(|x| {
@@ -614,7 +625,8 @@ fn draw_band(
                 }
                 if let Some(sky) = sky {
                     fogged += 1;
-                    color = sky.apply(color, directions[index].map(|v| v * z));
+                    let direction = projection.direction(x, y);
+                    color = sky.apply(color, direction.map(|v| v * z));
                 }
                 pixels[index].insert(&mut depths[index], Fragment { z, color });
             }
@@ -627,12 +639,13 @@ fn draw_band(
     add(Counter::DepthPassed, passed);
     add(Counter::Transparent, transparent);
     add(Counter::FogApplied, fogged);
-    for ((pixel, depth), out) in pixels
+    for (i, ((pixel, depth), out)) in pixels
         .iter()
-        .zip(&depths)
+        .zip(depths.iter())
         .zip(output.as_chunks_mut::<4>().0)
+        .enumerate()
     {
-        *out = pixel.finish(*depth);
+        *out = pixel.finish(*depth, background_at(i));
     }
 }
 
@@ -674,12 +687,14 @@ pub(crate) fn draw(
             let (projection, bins, bands) = (&projection, &bins, &bands);
             let background = background.as_deref();
             scope.spawn(move || {
+                let mut scratch = BandScratch::default();
                 loop {
                     let next = bands.lock().expect("条带领取不 panic").next();
                     let Some((band, output)) = next else {
                         break;
                     };
                     draw_band(
+                        &mut scratch,
                         &bins[band],
                         projection,
                         options,
