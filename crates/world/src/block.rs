@@ -40,15 +40,36 @@ pub enum BlockReadResult {
     OutOfWorld,
 }
 
-/// A bounded copy of current loaded blocks for an image renderer. This is not
-/// observed-block memory, and does not itself decide which surfaces are visible.
-/// Pose is the latest tick snapshot; blocks are copied under one world read lock.
-/// The two are not an atomic server tick transaction.
+/// 原版客户端的默认视距（区块）。登录前随客户端信息上报；实际视距取它与服务端给的较小者。
+pub const CLIENT_VIEW_DISTANCE: u8 = 12;
+
+/// 供成像用的一份当前已加载方块拷贝：视距内全高度，只含**表面**方块——
+/// 至少有一面没被挡住的方块。六面都贴着完整不透明方块的方块看不见，不拷贝。
+/// 这不是观察记忆，也不判断哪些面最终可见（那是成像的事）。
+/// 位姿取最新 tick 快照，方块在同一把世界读锁下拷贝；两者不是同一服务端 tick 的原子事务。
 #[derive(Clone, Debug)]
 pub struct BlockRegion {
     pub snapshot: std::sync::Arc<crate::TickSnapshot>,
-    pub blocks: Vec<BlockSnapshot>,
+    pub blocks: Vec<RegionBlock>,
+    /// 身边（[`NEAR_LOADED_RADIUS`] 格内）还没加载的格数。非 0 时不该出图：
+    /// 未加载会被画成空气。更远处没加载的区块和原版一样直接不画。
     pub unloaded: usize,
+    /// 实际视距（区块）：客户端视距与服务端视距的较小者。
+    pub view_distance: u32,
+    /// 原版地平线高度：超平坦是世界底，其余是 63。眼睛低于它时天空下半是黑的。
+    pub horizon_height: f64,
+}
+
+/// 身边必须加载完整的半径（格）。
+pub const NEAR_LOADED_RADIUS: i32 = 16;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegionBlock {
+    pub block: BlockSnapshot,
+    /// 六个方向上这一面是否被邻格挡住，位序：下、上、北（-z）、南（+z）、西（-x）、东（+x）。
+    /// 挡住 = 邻格是完整不透明方块；流体另算同种流体相邻（原版 `FluidRenderer` 不画这种面）。
+    /// 视距边界外与没加载的邻格按挡住算，世界顶之上按空气、世界底之下按挡住算。
+    pub covered: u8,
 }
 
 /// 视口扫描热路径上唯一用得到的事实。

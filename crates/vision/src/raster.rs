@@ -2,11 +2,115 @@
 use image::RgbaImage;
 
 use crate::geometry::{build, dot, sub, Triangle, V3};
-use crate::{Camera, Frame, Options, Report, Resources, Scene};
+use crate::{Camera, Environment, Frame, Options, Report, Resources, Scene};
 
 const NEAR: f64 = 1e-4;
 const SKY: [f64; 3] = [150.0, 185.0, 215.0];
 const MAX_LAYERS: usize = 16;
+
+/// 原版的视距雾与天空：`FogRenderer.setupFog`、`AtmosphericFogEnvironment`、`SkyRenderer`
+/// 与 `fog.glsl`（26.1.2 客户端）。颜色暂取主世界白天的值，见 [`Environment`]。
+pub(crate) struct Sky {
+    fog_color: [f64; 3],
+    sky_color: [f64; 3],
+    render_start: f64,
+    render_end: f64,
+    sky_end: f64,
+    /// 眼睛低于地平线：天空下半是黑盘（`SkyRenderer.shouldRenderDarkDisc`）。
+    dark_disc: bool,
+}
+
+/// `dimension_type/overworld` 的 `visual/sky_color` 与 `visual/fog_color`。
+const OVERWORLD_SKY: [f64; 3] = [120.0, 167.0, 255.0];
+const OVERWORLD_FOG: [f64; 3] = [192.0, 216.0, 255.0];
+/// `EnvironmentAttributes` 默认值：环境雾 0–1024 格、天空雾止于 512 格。
+const ENVIRONMENTAL_FOG_END: f64 = 1024.0;
+const SKY_FOG_END: f64 = 512.0;
+/// 天空盘半径（`SkyRenderer.SKY_DISC_RADIUS`）与高度；黑盘在眼下 16-12 格。
+const SKY_DISC_RADIUS: f64 = 512.0;
+const SKY_DISC_HEIGHT: f64 = 16.0;
+const DARK_DISC_DEPTH: f64 = 4.0;
+
+impl Sky {
+    pub(crate) fn new(environment: &Environment, eye_y: f64) -> Self {
+        let render_distance = f64::from(environment.view_distance) * 16.0;
+        // AtmosphericFogEnvironment.getBaseColor：雾色按视距朝天空色偏。
+        let sky_fog_end_chunks = (SKY_FOG_END / 16.0).min(f64::from(environment.view_distance));
+        let factor = 0.25 + 0.75 * (sky_fog_end_chunks / 32.0).clamp(0.0, 1.0);
+        let mix = 1.0 - factor.powf(0.25);
+        let fog_color = std::array::from_fn(|i| {
+            (OVERWORLD_FOG[i] + mix * (OVERWORLD_SKY[i] - OVERWORLD_FOG[i])).trunc()
+        });
+        let span = (render_distance / 10.0).clamp(4.0, 64.0);
+        Self {
+            fog_color,
+            sky_color: OVERWORLD_SKY,
+            render_start: render_distance - span,
+            render_end: render_distance,
+            sky_end: render_distance.min(SKY_FOG_END),
+            dark_disc: eye_y < environment.horizon_height,
+        }
+    }
+
+    /// `fog.glsl` 的 `total_fog_value`：球面距离走环境雾，柱面距离走视距雾，取大。
+    fn fog(&self, relative: V3) -> f64 {
+        let spherical = dot(relative, relative).sqrt();
+        let cylindrical = relative[0].hypot(relative[2]).max(relative[1].abs());
+        linear_fog(spherical, 0.0, ENVIRONMENTAL_FOG_END).max(linear_fog(
+            cylindrical,
+            self.render_start,
+            self.render_end,
+        ))
+    }
+
+    fn apply(&self, color: [f64; 4], relative: V3) -> [f64; 4] {
+        let fog = self.fog(relative);
+        if fog <= 0.0 {
+            return color;
+        }
+        [
+            color[0] + fog * (self.fog_color[0] - color[0]),
+            color[1] + fog * (self.fog_color[1] - color[1]),
+            color[2] + fog * (self.fog_color[2] - color[2]),
+            color[3],
+        ]
+    }
+
+    /// 没有地形挡住时看到的颜色：清屏色是雾色，上面画天空盘，眼低于地平线时下面画黑盘；
+    /// 两张盘都按 `sky.fsh` 的天空雾渐变到雾色。
+    fn background(&self, direction: V3) -> [f64; 3] {
+        let (plane, base) = if direction[1] > 0.0 {
+            (SKY_DISC_HEIGHT, self.sky_color)
+        } else if direction[1] < 0.0 && self.dark_disc {
+            (-DARK_DISC_DEPTH, [0.0; 3])
+        } else {
+            return self.fog_color;
+        };
+        let hit = direction.map(|v| v * plane / direction[1]);
+        let radius = hit[0].hypot(hit[2]);
+        if radius > SKY_DISC_RADIUS {
+            return self.fog_color;
+        }
+        let spherical = dot(hit, hit).sqrt();
+        let cylindrical = radius.max(plane.abs());
+        let fog = linear_fog(spherical, 0.0, self.sky_end).max(linear_fog(
+            cylindrical,
+            self.sky_end,
+            self.sky_end,
+        ));
+        std::array::from_fn(|i| base[i] + fog * (self.fog_color[i] - base[i]))
+    }
+}
+
+fn linear_fog(distance: f64, start: f64, end: f64) -> f64 {
+    if distance <= start {
+        0.0
+    } else if distance >= end {
+        1.0
+    } else {
+        (distance - start) / (end - start)
+    }
+}
 
 struct Projection {
     axes: [V3; 3], // right, up, forward
@@ -203,6 +307,7 @@ struct Fragment {
 struct Pixel {
     z: f64,
     color: [f64; 3],
+    background: [f64; 3],
     layers: Vec<Fragment>,
 }
 
@@ -247,10 +352,11 @@ impl Pixel {
                 break;
             }
         }
+        // 透明层超过上限时深处已丢，按看不穿处理成背景（天空/雾）。
         let background = if count < MAX_LAYERS && remaining >= 0.005 {
             self.color
         } else {
-            SKY
+            self.background
         };
         [
             (color[0] + remaining * background[0]).clamp(0.0, 255.0) as u8,
@@ -282,16 +388,33 @@ fn draw_band(
     projected: &[Projected<'_>],
     projection: &Projection,
     options: Options,
+    sky: Option<&Sky>,
     y0: usize,
     output: &mut [u8],
 ) {
     let width = options.width as usize;
     let rows = output.len() / (width * 4);
-    let mut pixels: Vec<_> = (0..width * rows)
-        .map(|_| Pixel {
-            z: f64::INFINITY,
-            color: SKY,
-            layers: Vec::new(),
+    // 每个像素的视线方向（世界坐标，前向分量为 1）：片元位置 = 深度 × 方向。
+    let directions: Vec<V3> = (0..width * rows)
+        .map(|i| {
+            let (x, y) = (i % width, y0 + i / width);
+            let right = (2.0 * (x as f64 + 0.5) / projection.size[0] - 1.0) * projection.scale[0];
+            let up = (1.0 - 2.0 * (y as f64 + 0.5) / projection.size[1]) * projection.scale[1];
+            std::array::from_fn(|k| {
+                right * projection.axes[0][k] + up * projection.axes[1][k] + projection.axes[2][k]
+            })
+        })
+        .collect();
+    let mut pixels: Vec<_> = directions
+        .iter()
+        .map(|&direction| {
+            let background = sky.map_or(SKY, |sky| sky.background(direction));
+            Pixel {
+                z: f64::INFINITY,
+                color: background,
+                background,
+                layers: Vec::new(),
+            }
         })
         .collect();
     // Preserve radial far distance, not a camera-Z-only far plane.
@@ -339,7 +462,11 @@ fn draw_band(
                         + weights[2] * v[2].uv_over_z[i])
                         * z
                 });
-                let color = sample(t.triangle, uv);
+                let mut color = sample(t.triangle, uv);
+                if let Some(sky) = sky {
+                    let direction = directions[(y - y0) * width + x];
+                    color = sky.apply(color, direction.map(|v| v * z));
+                }
                 if color[3] >= 0.01 {
                     pixel.insert(Fragment { z, color });
                 }
@@ -351,7 +478,12 @@ fn draw_band(
     }
 }
 
-pub(crate) fn draw(triangles: &[Triangle], camera: &Camera, options: Options) -> RgbaImage {
+pub(crate) fn draw(
+    triangles: &[Triangle],
+    camera: &Camera,
+    options: Options,
+    sky: Option<&Sky>,
+) -> RgbaImage {
     let projection = Projection::new(camera, options);
     let projected = project(triangles, camera, &projection, options.far);
     let mut pixels = vec![0; options.width as usize * options.height as usize * 4];
@@ -372,7 +504,14 @@ pub(crate) fn draw(triangles: &[Triangle], camera: &Camera, options: Options) ->
                     .chunks_mut(16 * options.width as usize * 4)
                     .enumerate()
                 {
-                    draw_band(projected, projection, options, i * rows + band * 16, output);
+                    draw_band(
+                        projected,
+                        projection,
+                        options,
+                        sky,
+                        i * rows + band * 16,
+                        output,
+                    );
                 }
             });
         }
@@ -381,6 +520,15 @@ pub(crate) fn draw(triangles: &[Triangle], camera: &Camera, options: Options) ->
 }
 
 pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Result<Frame, String> {
+    let mut options = options;
+    let sky = scene
+        .environment
+        .as_ref()
+        .map(|environment| Sky::new(environment, scene.camera.eye[1]));
+    if let Some(environment) = &scene.environment {
+        // 视距雾按柱面距离算，最远的角落在斜上方；放宽到能覆盖整个视距立方体。
+        options.far = (f64::from(environment.view_distance) * 16.0 * 1.8).max(1.0);
+    }
     if scene.game_version != resources.version() {
         return Err(format!(
             "scene version {} does not match client resources {}",
@@ -391,17 +539,17 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
     if !(1..=2048).contains(&options.width)
         || !(1..=2048).contains(&options.height)
         || !options.far.is_finite()
-        || !(1.0..=256.0).contains(&options.far)
+        || !(1.0..=1024.0).contains(&options.far)
         || !scene.camera.eye.iter().all(|n| n.is_finite())
         || !scene.camera.yaw.is_finite()
         || !scene.camera.pitch.is_finite()
         || !(-90.0..=90.0).contains(&scene.camera.pitch)
         || !scene.camera.vertical_fov.is_finite()
         || !(10.0..=150.0).contains(&scene.camera.vertical_fov)
-        || scene.blocks.len() > 300_000
+        || scene.blocks.len() > 8_000_000
     {
         return Err(
-            "invalid camera, image size (1..2048), distance (1..256), or block count (>300000)"
+            "invalid camera, image size (1..2048), distance (1..1024), or block count (>8000000)"
                 .to_owned(),
         );
     }
@@ -409,7 +557,11 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
         blocks: scene.blocks.len(),
         ..Report::default()
     };
-    report.warnings.insert("prototype: fixed daylight/background, no server lighting, block-entity contents, weather; HUD is only the crosshair".to_owned());
+    report.warnings.insert(if scene.environment.is_some() {
+        "prototype: view-distance fog and sky use overworld daytime colours; no server lighting, sun/moon/stars/clouds, block-entity contents, weather; HUD is only the crosshair"
+    } else {
+        "prototype: fixed daylight/background, no fog, no server lighting, block-entity contents, weather; HUD is only the crosshair"
+    }.to_owned());
     report
         .warnings
         .insert("transparency is composited through at most 16 surfaces".to_owned());
@@ -423,7 +575,7 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
         ));
     }
     report.triangles = triangles.len();
-    let mut image = draw(&triangles, &scene.camera, options);
+    let mut image = draw(&triangles, &scene.camera, options, sky.as_ref());
     if options.crosshair {
         draw_crosshair(&mut image, resources, &mut report);
     }

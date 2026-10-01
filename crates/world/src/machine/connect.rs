@@ -155,6 +155,13 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
         return;
     }
     match event {
+        // 原版客户端默认视距 12 区块。登录前设好，世界存储按它开范围、登录时随包上报。
+        Event::Init => {
+            bot.set_client_information(azalea::ClientInformation {
+                view_distance: crate::CLIENT_VIEW_DISTANCE,
+                ..Default::default()
+            });
+        }
         Event::Spawn => {
             let dimension = bot
                 .try_query_self::<Option<&WorldName>, _>(|world_name| {
@@ -182,6 +189,22 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                 if let Some(clock) = set_time.clock_updates.values().next() {
                     inner.apply_set_time(clock.total_ticks);
                 }
+            }
+            ClientboundGamePacket::Login(login) => {
+                inner
+                    .server_view_distance
+                    .store(login.chunk_radius, Ordering::Relaxed);
+                inner.is_flat.store(login.common.is_flat, Ordering::Relaxed);
+            }
+            ClientboundGamePacket::Respawn(respawn) => {
+                inner
+                    .is_flat
+                    .store(respawn.common.is_flat, Ordering::Relaxed);
+            }
+            ClientboundGamePacket::SetChunkCacheRadius(radius) => {
+                inner
+                    .server_view_distance
+                    .store(radius.radius, Ordering::Relaxed);
             }
             ClientboundGamePacket::GameEvent(game_event) => {
                 inner.apply_game_event(game_event.event, game_event.param);

@@ -29,6 +29,10 @@ pub struct Block {
     /// Only true for a full opaque block; used to omit neighbour-facing quads.
     #[serde(default)]
     pub opaque: bool,
+    /// 采集方已算好的六面遮挡位（下、上、北、南、西、东）。给了就按它剔面，
+    /// 不再查邻格——采集只交表面方块，被埋住的邻格不在场景里，查邻格会把贴着它们的面误画出来。
+    #[serde(default)]
+    pub covered: Option<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,6 +52,19 @@ pub struct Scene {
     /// 视野里的实体（不含观察者自己）。
     #[serde(default)]
     pub entities: Vec<Entity>,
+    /// 视距与天空。没有时按旧口径：固定背景色、只按 `Options::far` 截断、不加雾。
+    #[serde(default)]
+    pub environment: Option<Environment>,
+}
+
+/// 原版的视距雾与天空所需的世界状态。颜色暂取主世界白天的值（`dimension_type/overworld`
+/// 的 `sky_color`/`fog_color`，日间时间轴乘子为白）；昼夜与生物群系随光照一起接入。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Environment {
+    /// 实际视距（区块）。
+    pub view_distance: u32,
+    /// 原版地平线高度：眼睛低于它时，天空下半画黑盘。
+    pub horizon_height: f64,
 }
 
 #[derive(Clone, Copy, Debug)]

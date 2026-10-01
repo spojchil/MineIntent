@@ -26,25 +26,22 @@ impl PictureDoor for ModulePictureDoor {
             tokio::task::spawn_blocking(move || {
                 let mut resources = resources.lock().map_err(|_| "图片资源暂不可用")?;
                 // One bounded copy, no polling: let the caller choose when to retry.
-                let scene = scene_from_region(module.capture_blocks(16)?)?;
-                let frame = vision::render(
-                    &scene,
-                    &mut resources,
-                    vision::Options {
-                        far: 16.0,
-                        ..Default::default()
-                    },
-                )?;
+                let region = module.capture_view()?;
+                let view_distance = region.view_distance;
+                let scene = scene_from_region(region)?;
+                let frame = vision::render(&scene, &mut resources, vision::Options::default())?;
                 Ok(Picture {
                     png: frame.png()?,
                     // Reports describe the entire captured region and can name occluded
                     // blocks. Do not send that inventory or raw scene to the model.
-                    description: "当前朝向的第一人称画面，范围 16 格，640×360，正中是准星。\
+                    description: format!(
+                        "当前朝向的第一人称画面，视距 {view_distance} 区块，远处渐隐入雾，640×360，正中是准星。\
 画出方块、玩家、掉落物和常见生物（猪、牛、羊、鸡、苦力怕、蜘蛛、僵尸、骷髅）；\
-生物是静止姿态、默认花色，不画装备、手持物、界面、天气和粒子；亮度固定，植物颜色和水面简化。\
-紫黑块表示模型或资源尚未支持的方块或实体（大小即其碰撞箱）；未绘制及范围外内容不代表不存在。\
+生物是静止姿态、默认花色，不画装备、手持物、界面、天气和粒子；\
+亮度与天空固定为白天，不能据此判断昼夜或照明；植物颜色和水面简化。\
+紫黑块表示模型或资源尚未支持的方块或实体（大小即其碰撞箱）；未绘制及视距外内容不代表不存在。\
 视点采用站姿眼高 1.62 格，姿态与方块采集并非同一服务端 tick 的原子快照。"
-                        .to_owned(),
+                    ),
                 })
             })
             .await
@@ -74,10 +71,15 @@ fn scene_from_region(region: world::BlockRegion) -> Result<vision::Scene, String
             .blocks
             .into_iter()
             .map(|block| vision::Block {
-                position: [block.position.x, block.position.y, block.position.z],
-                name: block.name,
-                properties: block.properties,
-                opaque: !block.transparent_hint,
+                position: [
+                    block.block.position.x,
+                    block.block.position.y,
+                    block.block.position.z,
+                ],
+                name: block.block.name,
+                properties: block.block.properties,
+                opaque: !block.block.transparent_hint,
+                covered: Some(block.covered),
             })
             .collect(),
         entities: region
@@ -97,6 +99,10 @@ fn scene_from_region(region: world::BlockRegion) -> Result<vision::Scene, String
                 item: entity.item_name.clone(),
             })
             .collect(),
+        environment: Some(vision::Environment {
+            view_distance: region.view_distance,
+            horizon_height: region.horizon_height,
+        }),
     })
 }
 
@@ -119,6 +125,8 @@ mod tests {
             snapshot: Arc::new(snapshot),
             blocks: vec![],
             unloaded: 1,
+            view_distance: 6,
+            horizon_height: 63.0,
         };
         assert!(scene_from_region(region.clone()).is_err());
         region.unloaded = 0;

@@ -1,4 +1,7 @@
 //! Live protocol-client image probe. No model/provider, commands or world writes.
+//!
+//! 输出路径给 `-` 时常驻在线：从标准输入逐行读输出路径，每行按当前位姿出一张图，
+//! 便于让人旁观同一个视点做对照。
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,7 +11,7 @@ async fn main() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.len() != 5 {
         return Err(
-            "usage: capture <client-26.1.2.jar> <host> <port> <offline-name> <output.png>"
+            "usage: capture <client-26.1.2.jar> <host> <port> <offline-name> <output.png | ->"
                 .to_owned(),
         );
     }
@@ -21,9 +24,33 @@ async fn main() -> Result<(), String> {
         port: args[2].parse().map_err(|_| "invalid port")?,
         username: args[3].clone(),
     })?);
-    let result = capture(module.clone(), &mut resources, &args[4]).await;
+    let result = if args[4] == "-" {
+        resident(module.clone(), &mut resources).await
+    } else {
+        capture(module.clone(), &mut resources, &args[4]).await
+    };
     let _ = module.stop("图片采集完成").await;
     result
+}
+
+async fn resident(
+    module: Arc<world::Module>,
+    resources: &mut vision::Resources,
+) -> Result<(), String> {
+    module.wait_ready(Duration::from_secs(45)).await?;
+    println!("ready");
+    for line in std::io::stdin().lines() {
+        let output = line.map_err(|e| e.to_string())?;
+        let output = output.trim();
+        if output.is_empty() {
+            continue;
+        }
+        match capture(module.clone(), resources, output).await {
+            Ok(()) => println!("done {output}"),
+            Err(error) => println!("failed {output}: {error}"),
+        }
+    }
+    Ok(())
 }
 
 async fn capture(
@@ -36,17 +63,20 @@ async fn capture(
     let region = loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let source = module.clone();
-        let region = tokio::task::spawn_blocking(move || source.capture_blocks(16))
+        let region = tokio::task::spawn_blocking(move || source.capture_view())
             .await
-            .map_err(|e| e.to_string())??;
-        if region.unloaded == 0 {
-            break region;
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
+            .map_err(|e| e.to_string())?;
+        // Ready 可能先于出生事件发布，那一刻世界句柄还没装上；截止前一律重试。
+        let pending = match region {
+            Ok(region) if region.unloaded == 0 => break region,
+            Ok(region) => format!(
                 "{} cells are not loaded; refusing to render them as air",
                 region.unloaded
-            ));
+            ),
+            Err(error) => error,
+        };
+        if Instant::now() >= deadline {
+            return Err(pending);
         }
     };
     let pose = &region.snapshot.self_state;
@@ -66,10 +96,11 @@ async fn capture(
             .blocks
             .into_iter()
             .map(|b| vision::Block {
-                position: [b.position.x, b.position.y, b.position.z],
-                name: b.name,
-                properties: b.properties,
-                opaque: !b.transparent_hint,
+                position: [b.block.position.x, b.block.position.y, b.block.position.z],
+                name: b.block.name,
+                properties: b.block.properties,
+                opaque: !b.block.transparent_hint,
+                covered: Some(b.covered),
             })
             .collect(),
         entities: region
@@ -89,16 +120,13 @@ async fn capture(
                 item: entity.item_name.clone(),
             })
             .collect(),
+        environment: Some(vision::Environment {
+            view_distance: region.view_distance,
+            horizon_height: region.horizon_height,
+        }),
     };
     let started = Instant::now();
-    let mut frame = vision::render(
-        &scene,
-        resources,
-        vision::Options {
-            far: 16.0,
-            ..Default::default()
-        },
-    )?;
+    let mut frame = vision::render(&scene, resources, vision::Options::default())?;
     frame.report.warnings.insert("capture uses latest tick pose and current block-region copy, not an atomic server tick; standing eye height 1.62".to_owned());
     std::fs::write(output, frame.png()?).map_err(|e| e.to_string())?;
     std::fs::write(

@@ -62,6 +62,14 @@ fn resources() -> (TestJar, Resources) {
             png.get_ref(),
         );
     }
+    let mut png = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([128, 128, 128, 180])))
+        .write_to(&mut png, ImageFormat::Png)
+        .unwrap();
+    write(
+        "assets/minecraft/textures/block/water_still.png",
+        png.get_ref(),
+    );
     write("assets/minecraft/models/block/panel.json",json!({"textures":{"all":"block/red"},"elements":[{"from":[0,0,0],"to":[16,16,2],"faces":{"north":{"texture":"#all"}}}]}).to_string().as_bytes());
     write("assets/minecraft/blockstates/panel.json",json!({"variants":{"facing=east":{"model":"block/panel","y":90},"facing=north":{"model":"block/panel"}}}).to_string().as_bytes());
     write("assets/minecraft/blockstates/multi.json",json!({"multipart":[{"when":{"east":"true"},"apply":{"model":"block/panel","y":90}},{"when":{"north":"true"},"apply":{"model":"block/panel"}}]}).to_string().as_bytes());
@@ -76,6 +84,7 @@ fn block(name: &str, position: [i32; 3]) -> Block {
         name: name.to_owned(),
         properties: BTreeMap::new(),
         opaque: false,
+        covered: None,
     }
 }
 fn scene(blocks: Vec<Block>) -> Scene {
@@ -89,6 +98,7 @@ fn scene(blocks: Vec<Block>) -> Scene {
         },
         blocks,
         entities: Vec::new(),
+        environment: None,
     }
 }
 fn small() -> Options {
@@ -283,6 +293,50 @@ fn only_opaque_neighbours_remove_shared_faces() {
 }
 
 #[test]
+fn supplied_cover_mask_overrides_neighbour_lookup() {
+    let (_jar, mut resources) = resources();
+    let mut report = crate::Report::default();
+    // 场景里没有邻格：按邻格查会画满 6 面；采集给的遮挡位说只有上面露着。
+    let mut lone = block("red", [0, 0, 0]);
+    lone.covered = Some(0b11_1101);
+    assert_eq!(
+        geometry::build(&scene(vec![lone]), &mut resources, &mut report).len(),
+        2
+    );
+}
+
+#[test]
+fn faces_between_the_same_fluid_are_not_drawn() {
+    let (_jar, mut resources) = resources();
+    let mut report = crate::Report::default();
+    let water = |x| {
+        let mut b = block("water", [x, 0, 0]);
+        b.properties.insert("level".to_owned(), "0".to_owned());
+        b
+    };
+    // 两格水并排：各自 6 面，共享的那对面不画 → 10 面 20 个三角形。
+    assert_eq!(
+        geometry::build(
+            &scene(vec![water(0), water(1)]),
+            &mut resources,
+            &mut report
+        )
+        .len(),
+        20
+    );
+    // 水贴着别的透明方块时照画。
+    assert_eq!(
+        geometry::build(
+            &scene(vec![water(0), block("clear", [1, 0, 0])]),
+            &mut resources,
+            &mut report
+        )
+        .len(),
+        24
+    );
+}
+
+#[test]
 fn resource_scene_matches_ray_reference_at_several_camera_angles() {
     let (_jar, mut resources) = resources();
     let mut scene = scene(vec![
@@ -372,7 +426,7 @@ fn transparency_is_depth_ordered_and_shared_diagonal_is_not_blended_twice() {
     let expected = trace::draw(make_mesh(), &camera, small());
     let mut mesh = make_mesh();
     for _ in 0..2 {
-        let image = crate::raster::draw(&mesh, &camera, small());
+        let image = crate::raster::draw(&mesh, &camera, small(), None);
         assert_images_close(&image, &expected, 0);
         assert_eq!(image.get_pixel(4, 4).0, [128, 63, 63, 255]);
         mesh.reverse();
@@ -417,7 +471,7 @@ fn raster_clipping_perspective_uv_cutouts_and_far_distance_match_ray_reference()
             .collect::<Vec<_>>()
     };
     let expected = trace::draw(mesh(), &camera, options);
-    let actual = crate::raster::draw(&mesh(), &camera, options);
+    let actual = crate::raster::draw(&mesh(), &camera, options, None);
     assert_images_close(&actual, &expected, 0);
 }
 
@@ -443,7 +497,7 @@ fn many_translucent_layers_are_bounded_and_keep_the_nearest_surfaces() {
             .collect::<Vec<_>>()
     };
     let expected = trace::draw(make_mesh(), &camera, small());
-    let actual = crate::raster::draw(&make_mesh(), &camera, small());
+    let actual = crate::raster::draw(&make_mesh(), &camera, small(), None);
     assert_images_close(&actual, &expected, 0);
 }
 

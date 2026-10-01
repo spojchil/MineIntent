@@ -84,10 +84,23 @@ pub(crate) fn build(
                         cube_faces(missing_texture(), [1.0; 3], 1.0, 1.0)
                     }
                 });
+        let fluid = is_fluid(&block.name);
         for face in faces.iter() {
             if let Some(direction) = face.cull {
-                let pos = std::array::from_fn(|i| block.position[i].saturating_add(direction[i]));
-                if neighbours.get(&pos).is_some_and(|b| b.opaque) {
+                let hidden = match block.covered {
+                    Some(mask) => {
+                        direction_bit(direction).is_some_and(|bit| mask & (1 << bit) != 0)
+                    }
+                    None => {
+                        let pos =
+                            std::array::from_fn(|i| block.position[i].saturating_add(direction[i]));
+                        // 原版 FluidRenderer：同种流体相邻的面不画。
+                        neighbours
+                            .get(&pos)
+                            .is_some_and(|b| b.opaque || (fluid && b.name == block.name))
+                    }
+                };
+                if hidden {
                     continue;
                 }
             }
@@ -106,6 +119,26 @@ pub(crate) fn build(
     triangles
 }
 
+fn is_fluid(name: &str) -> bool {
+    matches!(
+        name.strip_prefix("minecraft:").unwrap_or(name),
+        "water" | "lava"
+    )
+}
+
+/// 剔面方向在 [`crate::Block::covered`] 里的位：下、上、北、南、西、东。
+fn direction_bit(direction: [i32; 3]) -> Option<usize> {
+    match direction {
+        [0, -1, 0] => Some(0),
+        [0, 1, 0] => Some(1),
+        [0, 0, -1] => Some(2),
+        [0, 0, 1] => Some(3),
+        [-1, 0, 0] => Some(4),
+        [1, 0, 0] => Some(5),
+        _ => None,
+    }
+}
+
 /// 用方块自己的模型画一个缩小的方块（掉落在地上的方块物品）。`place` 把 0..1 的方块
 /// 空间换到世界坐标。方块状态取默认属性；需要属性才能选出模型的方块会返回 Err。
 pub(crate) fn block_item_triangles(
@@ -119,6 +152,7 @@ pub(crate) fn block_item_triangles(
         name: name.to_owned(),
         properties: Default::default(),
         opaque: false,
+        covered: None,
     };
     let faces = block_faces(&block, resources, report)?;
     if faces.is_empty() {
@@ -299,7 +333,7 @@ fn cube_faces(texture: Arc<RgbaImage>, color: V3, alpha: f64, height: f64) -> Ve
     ["down", "up", "north", "south", "west", "east"]
         .into_iter()
         .map(|direction| {
-            let (vertices, _, _) =
+            let (vertices, normal, _) =
                 face_geometry(direction, [0.0; 3], [1.0, height, 1.0]).expect("known direction");
             Face {
                 vertices,
@@ -307,7 +341,7 @@ fn cube_faces(texture: Arc<RgbaImage>, color: V3, alpha: f64, height: f64) -> Ve
                 texture: texture.clone(),
                 color,
                 alpha,
-                cull: None,
+                cull: Some(normal.map(|v| v.round() as i32)),
             }
         })
         .collect()
@@ -396,6 +430,7 @@ pub(crate) fn fixture_block(
         name: name.to_owned(),
         properties: serde_json::from_value(properties).unwrap_or_default(),
         opaque,
+        covered: None,
     }
 }
 
@@ -454,5 +489,6 @@ pub fn fixture() -> Scene {
         },
         blocks,
         entities: Vec::new(),
+        environment: None,
     }
 }

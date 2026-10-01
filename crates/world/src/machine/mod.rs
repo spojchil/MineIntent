@@ -239,12 +239,14 @@ impl Module {
         self.execute(DoorCommand::Chat(line.to_owned())).await
     }
 
-    /// Copy a bounded region for on-demand rendering, then release the world
-    /// lock before parsing assets or rendering pixels. Call on a blocking worker.
-    pub fn capture_blocks(&self, radius: u32) -> Result<crate::BlockRegion, String> {
-        if !(1..=32).contains(&radius) {
-            return Err("图片采集半径必须在 1–32 格之间".to_owned());
-        }
+    /// 拷贝视距内的表面方块供按需成像，随即放开世界读锁；解析资源与出像素都在锁外。
+    /// 在阻塞线程上调用。
+    ///
+    /// 范围与原版一致：以所在区块为中心、视距内的区块，全世界高度。视距取客户端
+    /// 默认视距与服务端视距的较小者。
+    pub fn capture_view(&self) -> Result<crate::BlockRegion, String> {
+        use self::blocks::{render_class, RenderClass};
+
         let snapshot = self.latest();
         if !matches!(snapshot.phase, ConnectionPhase::Ready) {
             return Err("尚未连接到世界，无法采集图片".to_owned());
@@ -255,53 +257,182 @@ impl Module {
             .lock()
             .clone()
             .ok_or_else(|| "世界模型尚未就绪".to_owned())?;
-        let loaded = handle.read();
+        let server = self
+            .inner
+            .server_view_distance
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let client = u32::from(crate::CLIENT_VIEW_DISTANCE);
+        let view_distance = if server == 0 {
+            client
+        } else {
+            client.min(server)
+        };
+
         let position = &snapshot.self_state.position;
-        let center = [position.x, position.y, position.z].map(|v| v.floor() as i32);
-        let radius = radius as i32;
-        if center
+        let feet = [position.x, position.y, position.z].map(|v| v.floor() as i32);
+        let reach = (view_distance as i32 + 1) * 16;
+        if feet
             .iter()
-            .any(|v| v.checked_add(radius).is_none() || v.checked_sub(radius).is_none())
+            .any(|v| v.checked_add(reach).is_none() || v.checked_sub(reach).is_none())
         {
             return Err("图片采集坐标越界".to_owned());
         }
-        let mut states = Vec::new();
-        let mut unloaded = 0;
-        let min_y = i64::from(loaded.chunks.min_y());
-        let max_y = min_y + i64::from(loaded.chunks.height());
-        for y in center[1] - radius..=center[1] + radius {
-            if i64::from(y) < min_y || i64::from(y) >= max_y {
+        let span = (view_distance as i32 * 2 + 1) * 16;
+        let origin_x = (feet[0].div_euclid(16) - view_distance as i32) * 16;
+        let origin_z = (feet[2].div_euclid(16) - view_distance as i32) * 16;
+
+        // 第一遍：整块拷出状态号，未加载记 `UNLOADED`。世界读锁里只取各区块的句柄，
+        // 逐格拷贝在锁外、每个区块各自短暂加锁——长时间持有世界读锁会饿住客户端循环，
+        // 心跳超时被服务端踢掉（实测：视距 6 时整段持锁即掉线）。
+        const UNLOADED: u16 = u16::MAX;
+        let loaded = handle.read();
+        let min_y = loaded.chunks.min_y();
+        let height = loaded.chunks.height() as i32;
+        let chunks_per_side = view_distance as i32 * 2 + 1;
+        let columns: Vec<_> = (0..chunks_per_side * chunks_per_side)
+            .map(|i| {
+                let pos = azalea::core::position::ChunkPos::new(
+                    origin_x.div_euclid(16) + i % chunks_per_side,
+                    origin_z.div_euclid(16) + i / chunks_per_side,
+                );
+                loaded.chunks.0.get(&pos)
+            })
+            .collect();
+        drop(loaded);
+        let index = |x: i32, y: i32, z: i32| -> usize {
+            (((y - min_y) * span + (z - origin_z)) * span + (x - origin_x)) as usize
+        };
+        let mut states = vec![UNLOADED; (span * span * height) as usize];
+        for (i, column) in columns.into_iter().enumerate() {
+            let Some(column) = column else {
                 continue;
-            }
-            for z in center[2] - radius..=center[2] + radius {
-                for x in center[0] - radius..=center[0] + radius {
-                    let position = crate::BlockPosition { x, y, z };
-                    match loaded.get_block_state(azalea::BlockPos::new(x, y, z)) {
-                        Some(state) if !state.is_air() => states.push((position, state)),
-                        None => unloaded += 1,
-                        _ => {}
+            };
+            let base_x = origin_x + (i as i32 % chunks_per_side) * 16;
+            let base_z = origin_z + (i as i32 / chunks_per_side) * 16;
+            let column = column.read();
+            for (section_index, section) in column.sections.iter().enumerate() {
+                let base_y = min_y + section_index as i32 * 16;
+                if base_y >= min_y + height {
+                    break;
+                }
+                for y in 0..16u8 {
+                    for z in 0..16u8 {
+                        for x in 0..16u8 {
+                            let state = section.get_block_state(
+                                azalea::core::position::ChunkSectionBlockPos::new(x, y, z),
+                            );
+                            states[index(
+                                base_x + i32::from(x),
+                                base_y + i32::from(y),
+                                base_z + i32::from(z),
+                            )] = state.id();
+                        }
                     }
                 }
             }
         }
-        drop(loaded);
-        // Decode each distinct state only once, outside the world read lock.
+
+        let class_at = |x: i32, y: i32, z: i32| -> Option<RenderClass> {
+            if y >= min_y + height {
+                return Some(RenderClass::Air);
+            }
+            if y < min_y
+                || !(origin_x..origin_x + span).contains(&x)
+                || !(origin_z..origin_z + span).contains(&z)
+            {
+                return None;
+            }
+            match states[index(x, y, z)] {
+                UNLOADED => None,
+                id => Some(render_class(id)),
+            }
+        };
+
+        let mut unloaded = 0;
+        for y in feet[1] - crate::NEAR_LOADED_RADIUS..=feet[1] + crate::NEAR_LOADED_RADIUS {
+            if !(min_y..min_y + height).contains(&y) {
+                continue;
+            }
+            for z in feet[2] - crate::NEAR_LOADED_RADIUS..=feet[2] + crate::NEAR_LOADED_RADIUS {
+                for x in feet[0] - crate::NEAR_LOADED_RADIUS..=feet[0] + crate::NEAR_LOADED_RADIUS {
+                    if class_at(x, y, z).is_none() {
+                        unloaded += 1;
+                    }
+                }
+            }
+        }
+
+        // 第二遍：只留至少一面没被挡住的方块。没加载的邻格按挡住算，否则视距边缘
+        // 和未加载区块的边上会立起一整面墙。
+        const DIRECTIONS: [[i32; 3]; 6] = [
+            [0, -1, 0],
+            [0, 1, 0],
+            [0, 0, -1],
+            [0, 0, 1],
+            [-1, 0, 0],
+            [1, 0, 0],
+        ];
+        let mut surface = Vec::new();
+        for y in min_y..min_y + height {
+            for z in origin_z..origin_z + span {
+                for x in origin_x..origin_x + span {
+                    let Some(class) = class_at(x, y, z) else {
+                        continue;
+                    };
+                    if class == RenderClass::Air {
+                        continue;
+                    }
+                    let mut covered = 0u8;
+                    for (bit, [dx, dy, dz]) in DIRECTIONS.into_iter().enumerate() {
+                        let hidden = match class_at(x + dx, y + dy, z + dz) {
+                            None | Some(RenderClass::Opaque) => true,
+                            Some(neighbour) => {
+                                matches!(class, RenderClass::Water | RenderClass::Lava)
+                                    && neighbour == class
+                            }
+                        };
+                        if hidden {
+                            covered |= 1 << bit;
+                        }
+                    }
+                    if covered != 0b11_1111 {
+                        surface.push((x, y, z, states[index(x, y, z)], covered));
+                    }
+                }
+            }
+        }
+        drop(states);
+
+        // 每种状态只解码一次。
         let mut palette = std::collections::HashMap::new();
-        let blocks = states
-            .into_iter()
-            .map(|(position, state)| {
-                let template = palette
-                    .entry(state.id())
-                    .or_insert_with(|| blocks::snapshot_from_state(state, position.clone()));
-                let mut block = template.clone();
-                block.position = position;
-                block
-            })
-            .collect();
+        let mut blocks = Vec::with_capacity(surface.len());
+        for (x, y, z, id, covered) in surface {
+            let position = crate::BlockPosition { x, y, z };
+            let template = palette.entry(id).or_insert_with(|| {
+                azalea::block::BlockState::try_from(id)
+                    .map(|state| blocks::snapshot_from_state(state, position.clone()))
+            });
+            let Ok(template) = template else {
+                continue;
+            };
+            let mut block = template.clone();
+            block.position = position;
+            blocks.push(crate::RegionBlock { block, covered });
+        }
         Ok(crate::BlockRegion {
             snapshot,
             blocks,
             unloaded,
+            view_distance,
+            horizon_height: if self
+                .inner
+                .is_flat
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                f64::from(min_y)
+            } else {
+                63.0
+            },
         })
     }
 

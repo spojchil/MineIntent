@@ -7,7 +7,7 @@
 //! 消费必须用 seq 做游标。
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
@@ -101,6 +101,10 @@ pub(crate) struct Inner {
     /// (rain_level, thunder_level)。
     pub(super) weather: Mutex<(f32, f32)>,
     pub(super) dimension: Mutex<String>,
+    /// 服务端给的视距（区块），来自登录包与 SetChunkCacheRadius。0 = 还没收到。
+    pub(super) server_view_distance: AtomicU32,
+    /// 当前维度是不是超平坦（登录与重生包的 `is_flat`）。原版地平线高度由它定。
+    pub(super) is_flat: AtomicBool,
 }
 
 pub(super) const EPOCH: Epoch = Epoch(1);
@@ -134,6 +138,8 @@ impl Inner {
             held_input: Mutex::new(None),
             jump_reset: AtomicBool::new(false),
             world_handle: Mutex::new(None),
+            server_view_distance: AtomicU32::new(0),
+            is_flat: AtomicBool::new(false),
             observed: Mutex::new(None),
             observed_request: Mutex::new(None),
             stop_reason: OnceLock::new(),

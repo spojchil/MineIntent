@@ -136,3 +136,58 @@ pub(super) fn snapshot_from_state(
         bounding_box,
     }
 }
+
+/// 成像用的方块分类：只回答「这一格挡不挡住邻格的面」与「是哪种流体」。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RenderClass {
+    Air,
+    /// 完整不透明方块：贴着它的面原版不画。
+    Opaque,
+    Water,
+    Lava,
+    /// 其余看得见但不挡面的方块（半砖、树叶、玻璃、花草……）。
+    Other,
+}
+
+/// 按 `state_id` 预先算好的 [`RenderClass`]，与 [`probe_table`] 一样首次使用时建表。
+pub(super) fn render_class(state_id: u16) -> RenderClass {
+    static TABLE: std::sync::OnceLock<Box<[RenderClass]>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        (0..=azalea::block::BlockState::MAX_STATE)
+            .map(|state_id| {
+                let Ok(state) = azalea::block::BlockState::try_from(state_id) else {
+                    return RenderClass::Opaque;
+                };
+                let block: Box<dyn azalea::block::BlockTrait> = Box::from(state);
+                let name = block.id();
+                if crate::is_air_name(name) {
+                    RenderClass::Air
+                } else if name == "water" {
+                    RenderClass::Water
+                } else if name == "lava" {
+                    RenderClass::Lava
+                } else if transparent_hint(name, state.outline_shape()) || renders_through(name) {
+                    RenderClass::Other
+                } else {
+                    RenderClass::Opaque
+                }
+            })
+            .collect()
+    })[usize::from(state_id)]
+}
+
+/// 轮廓是完整方块、但原版渲染不遮挡邻面的方块（半透明或镂空材质、不可见方块）。
+fn renders_through(name: &str) -> bool {
+    matches!(
+        name,
+        "ice"
+            | "frosted_ice"
+            | "slime_block"
+            | "honey_block"
+            | "barrier"
+            | "spawner"
+            | "beacon"
+            | "trial_spawner"
+            | "vault"
+    )
+}
