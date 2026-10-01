@@ -47,7 +47,7 @@ name = "swap_probe"
 required-features = ["azalea"]
 
 [[example]]
-name = "dig_place_probe"
+name = "place_probe"
 required-features = ["azalea"]
 
 [[example]]

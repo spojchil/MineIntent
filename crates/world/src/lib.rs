@@ -420,54 +420,13 @@ pub enum JobEnd {
     ConnectionEnded,
 }
 
-/// 具体动作的参数与动作自己的事件。
+/// 具体动作的参数与动作自己的事件。现在没有动作接入任务槽：正式构建里它没有值，
+/// 任务事实不会产生；接入一种持续动作时在这里加它的一项。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JobDetail {
-    /// 按顺序挖一串方块。**队列而非单块**：模型一次给出坐标数组，机器逐块挖完。
-    ///
-    /// 之所以是队列，是因为 `start_mining` 是单目标槽——换目标即放弃上一个。
-    /// 旧接口一次只收一块，模型以为自己在排队，实测连发四次把四块全掐断了，
-    /// 一块没挖掉。
-    Mine {
-        targets: Vec<[i32; 3]>,
-        /// 已经挖碎的块数。
-        done: usize,
-        /// 挖掘自己的事件；任务槽写出的生命周期结束（顶替、取消、连接结束）没有。
-        event: Option<MineEvent>,
-    },
     /// 任务槽自己的测试用：框架不认识具体动作，测试也不该借某个动作。
     #[cfg(test)]
     Probe,
-}
-
-/// 挖掘自己的事件。第一个是进展，其余是终局。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MineEvent {
-    /// 又碎了一块。
-    Broke { done: usize, total: usize },
-    /// 整队挖完。
-    Cleared,
-    /// 目标仍可读且为实心，但 Azalea 的 `MineProgress` 连续没有增长。队列就此停下。
-    Blocked { at: [i32; 3] },
-    /// 同步排队的请求一直没有被 Azalea 调度链消费；不是方块不可挖的结论。
-    DispatchNotObserved { at: [i32; 3], ticks: u64 },
-    /// 请求曾经排队，随后在进入匹配的活跃挖掘前结束；更细原因没有产生方证据。
-    RequestEnded { at: [i32; 3] },
-    /// 本地方块预测在协议边界内一直没有得到服务端确认或回滚；不代表成功或不可挖。
-    PredictionNotSettled { at: [i32; 3], ticks: u64 },
-    /// 当前世界模型读不到目标；没有把未知猜成实心或已挖碎。
-    TargetUnavailable { at: [i32; 3] },
-}
-
-impl MineEvent {
-    /// 这个事件落在生命周期的哪一步。
-    pub fn stage(&self) -> JobStage {
-        match self {
-            MineEvent::Broke { .. } => JobStage::Progress,
-            MineEvent::Cleared => JobStage::Ended(JobEnd::Completed),
-            _ => JobStage::Ended(JobEnd::Failed),
-        }
-    }
 }
 
 /// 一条在途任务的现状（只读查询用）。
@@ -490,12 +449,6 @@ pub struct JobStatus {
 /// 在途任务的参数快照：具体动作的那一层，只有任务表按动作去读。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JobStatusKind {
-    Mine {
-        targets: Vec<[i32; 3]>,
-        done: usize,
-        /// 正在挖的那一块。
-        current: Option<[i32; 3]>,
-    },
     /// 任务槽自己的测试用，见 [`JobDetail::Probe`]。
     #[cfg(test)]
     Probe,

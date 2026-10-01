@@ -76,22 +76,9 @@ fn common(id: JobId, elapsed_ticks: u64) -> Value {
     })
 }
 
-/// 具体动作的那几项。
-fn describe_kind(kind: &JobStatusKind, object: &mut serde_json::Map<String, Value>) {
-    match kind {
-        JobStatusKind::Mine {
-            targets,
-            done,
-            current,
-        } => {
-            object.insert("做什么".to_owned(), json!("挖掘"));
-            object.insert("已挖".to_owned(), json!(done));
-            object.insert("总数".to_owned(), json!(targets.len()));
-            if let Some(current) = current {
-                object.insert("正在挖".to_owned(), json!(current));
-            }
-        }
-    }
+/// 具体动作的那几项。现在没有动作接入任务槽。
+fn describe_kind(kind: &JobStatusKind, _object: &mut serde_json::Map<String, Value>) {
+    match *kind {}
 }
 
 impl ToolProvider for JobsTools {
@@ -112,7 +99,7 @@ impl ToolProvider for JobsTools {
             }),
         );
         definition.description = Some(
-            "看一眼你现在有什么在后台跑（挖掘）。**不要轮询**：任务做完、\
+            "看一眼你现在有什么在后台跑。**不要轮询**：任务做完、\
 放弃或卡住都会主动通知你，这个动作只在你确实拿不准时用一次。\
 表里给的是在途时长，久不久由你自己判断——机器不替你下「卡住了」这个结论。"
                 .to_owned(),
@@ -161,27 +148,6 @@ mod tests {
         let result = tools(vec![]).call(call(json!({"action": "list"}))).await;
         assert_eq!(result.status, ToolResultStatus::Success);
         assert_eq!(json_of(&result)["jobs"].as_array().expect("数组").len(), 0);
-    }
-
-    #[tokio::test]
-    async fn mining_appears_with_its_progress() {
-        let jobs = vec![JobStatus {
-            id: JobId(2),
-            kind: JobStatusKind::Mine {
-                targets: vec![[1, 2, 3], [1, 3, 3]],
-                done: 1,
-                current: Some([1, 3, 3]),
-            },
-            started_tick: 10,
-            elapsed_ticks: 30,
-        }];
-        let result = tools(jobs).call(call(json!({"action": "list"}))).await;
-        let listed = json_of(&result);
-        let listed = listed["jobs"].as_array().expect("数组");
-        assert_eq!(listed[0]["做什么"], "挖掘");
-        assert_eq!(listed[0]["id"], 2);
-        assert_eq!(listed[0]["已挖"], 1);
-        assert_eq!(listed[0]["正在挖"], json!([1, 3, 3]));
     }
 
     /// 机器只给在途时长，不替模型判断「卡住了」——那是推测，不是事实。

@@ -16,8 +16,8 @@ use parking_lot::{Mutex, RwLock};
 use tokio::sync::{oneshot, watch, Notify};
 
 use super::door::{DoorCommand, PendingCommand};
+#[cfg(test)]
 use super::job::JobSlot;
-use super::mining::MiningJob;
 use super::{
     DAMAGE_WINDOW_ENTRIES, INVENTORY_WINDOW_ENTRIES, JOBS_WINDOW_ENTRIES, PICKUP_WINDOW_ENTRIES,
     SCREEN_WINDOW_ENTRIES, SOUND_WINDOW_ENTRIES,
@@ -47,8 +47,6 @@ pub(crate) struct Inner {
     pub(super) jobs_window: Mutex<VecDeque<JobEntry>>,
     /// 上一 tick 的生命值；下降即产伤害条目。None = 尚无基线（首帧不产）。
     pub(super) last_health: Mutex<Option<f64>>,
-    /// 在途挖掘任务（单意图槽，内含坐标队列）。
-    pub(super) mining_job: JobSlot<MiningJob>,
     /// 接线测试用的探测槽：生命周期收槽与任务表要对每个槽都成立，不借某个动作测。
     #[cfg(test)]
     pub(super) probe_job: JobSlot<super::job::ProbeJob>,
@@ -86,6 +84,7 @@ pub(crate) struct Inner {
     /// 跨窗可比先后，各窗游标互不干扰。
     pub(super) fact_seq: AtomicU64,
     /// 任务 id 发放器：顶替时新旧任务要能区分。
+    #[cfg_attr(not(test), allow(dead_code))] // 见 `machine::job` 的说明。
     pub(super) job_seq: AtomicU64,
     pub(super) day_time: AtomicU64,
     /// (rain_level, thunder_level)。
@@ -118,7 +117,6 @@ impl Inner {
             damage_window: Mutex::new(VecDeque::new()),
             jobs_window: Mutex::new(VecDeque::new()),
             last_health: Mutex::new(None),
-            mining_job: JobSlot::default(),
             #[cfg(test)]
             probe_job: JobSlot::default(),
             inventory_window: Mutex::new(VecDeque::new()),
@@ -189,10 +187,13 @@ impl Inner {
     /// client、swarm 与线程退出都可能报告同一次断线；槽位 take 语义保证只落一次。
     pub(super) fn end_running_jobs(&self) -> bool {
         super::input::connection_ended(self);
-        // 不短路：每个槽都要收。
-        let ended = self.mining_job.connection_ended(self);
+        // 每个接入的槽都要收，不短路。现在没有动作接入，只有测试的探测槽。
+        #[allow(unused_mut)]
+        let mut ended = false;
         #[cfg(test)]
-        let ended = self.probe_job.connection_ended(self) | ended;
+        {
+            ended |= self.probe_job.connection_ended(self);
+        }
         ended
     }
 
@@ -485,12 +486,14 @@ impl Inner {
     }
 
     /// 发一个新的任务 id。
+    #[cfg_attr(not(test), allow(dead_code))] // 见 `machine::job` 的说明。
     pub(super) fn next_job_id(&self) -> crate::JobId {
         crate::JobId(self.job_seq.fetch_add(1, Ordering::AcqRel))
     }
 
     /// 落一条任务事实。**只由 [`super::job::JobSlot`] 调用**——事实与槽位状态
     /// 必须同源，绕过槽位直接写窗口会让「必有终局」这条不变量失去保证。
+    #[cfg_attr(not(test), allow(dead_code))] // 见 `machine::job` 的说明。
     pub(super) fn push_job_fact(&self, id: crate::JobId, fact: crate::JobFact) {
         let entry = JobEntry {
             seq: self.fact_seq.fetch_add(1, Ordering::AcqRel),
@@ -508,11 +511,12 @@ impl Inner {
 
     /// 全部在途任务。槽位是唯一真相源——不另建镜像表。
     pub(super) fn jobs_in_flight(&self) -> Vec<crate::JobStatus> {
-        let now = self.now_tick();
-        let jobs = self.mining_job.status(now).into_iter();
+        // 现在没有动作接入任务槽，只有测试的探测槽。
+        #[allow(unused_mut)]
+        let mut jobs = Vec::new();
         #[cfg(test)]
-        let jobs = jobs.chain(self.probe_job.status(now));
-        jobs.collect()
+        jobs.extend(self.probe_job.status(self.now_tick()));
+        jobs
     }
 
     pub(super) fn push_chat(&self, sender: Option<(String, Option<String>)>, plain_text: String) {

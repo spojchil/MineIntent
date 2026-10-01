@@ -74,8 +74,6 @@ pub(super) fn begin(
         .take()
         .ok_or_else(|| "这次输入已经提交过".to_owned())?;
     let from = position(bot)?;
-    // 旧的坐标式挖掘与键鼠抢同一副身体：先收掉，免得松开后它接着挖。
-    inner.mining_job.cancel(inner);
 
     let previous = inner.held_input.lock().take();
     if let Some(previous) = previous {
@@ -191,6 +189,20 @@ fn press_keys(bot: &Client, keys: HeldKeys) {
     bot.set_crouching(keys.sneak);
 }
 
+/// 收掉 Azalea 的活跃/排队挖掘状态：只摘「自动挖准星」组件不够，正在挖的那一块
+/// 还会接着挖。停挖要发真事件（`AbortDestroyBlock` 由它触发），并在同一把锁里摘掉
+/// `MiningQueued`，否则已经取消的请求下一 tick 仍会开始挖。
+pub(super) fn stop_mining(bot: &Client) {
+    let mut ecs = bot.ecs.write();
+    let is_active = ecs.get::<azalea::mining::Mining>(bot.entity).is_some();
+    ecs.entity_mut(bot.entity)
+        .remove::<azalea::mining::MiningQueued>();
+    // 守卫：Azalea 的停挖处理器在没挖时会 panic（`MineBlockPos` 内层 expect），只有真在挖才发。
+    if is_active {
+        ecs.write_message(azalea::mining::StopMiningBlockEvent { entity: bot.entity });
+    }
+}
+
 /// 松开这次输入按下的一切。没按的也一并归零：身体上不该留着任何按键。
 fn release(bot: &Client, spec: &InputSpec) {
     bot.walk(WalkDirection::None);
@@ -199,7 +211,7 @@ fn release(bot: &Client, spec: &InputSpec) {
     match spec.mouse {
         Some(MouseButton::Left) => {
             bot.left_click_mine(false);
-            super::mining::retire_mining(bot);
+            stop_mining(bot);
         }
         Some(MouseButton::Right) => {
             // 松右键总发：点按吃东西时服务端的「在用」回声可能还没到，

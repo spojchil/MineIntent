@@ -28,7 +28,7 @@ use crate::{JobDetail, JobEnd, JobFact, JobId, JobStage, JobStatus};
 /// 生命周期结束（顶替、取消、连接结束）由槽位写出，动词不必为它们各造事件；
 /// 动词只回答自己的事件落在哪一步、怎样连同参数写成细节。
 pub(super) trait JobVerb: Sized {
-    /// 该动词自己的事件枚举（如 `MineEvent`）。
+    /// 该动词自己的事件枚举。
     type Event: Copy + std::fmt::Debug;
 
     /// 这个事件是进展、做完还是做不下去。
@@ -173,18 +173,26 @@ impl<J: JobVerb> JobSlot<J> {
 #[cfg(test)]
 pub(super) struct ProbeJob;
 
-/// 探测动词的事件：一步进展。
+/// 探测动词的事件。
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct Stepped;
+pub(super) enum ProbeEvent {
+    /// 一步进展。
+    Stepped,
+    /// 做完了。
+    Finished,
+}
 
 #[cfg(test)]
 impl JobVerb for ProbeJob {
-    type Event = Stepped;
-    fn stage(_: Stepped) -> JobStage {
-        JobStage::Progress
+    type Event = ProbeEvent;
+    fn stage(event: ProbeEvent) -> JobStage {
+        match event {
+            ProbeEvent::Stepped => JobStage::Progress,
+            ProbeEvent::Finished => JobStage::Ended(JobEnd::Completed),
+        }
     }
-    fn detail(&self, _: Option<Stepped>) -> JobDetail {
+    fn detail(&self, _: Option<ProbeEvent>) -> JobDetail {
         JobDetail::Probe
     }
     fn status(&self, id: JobId, started_tick: u64, now_tick: u64) -> JobStatus {
@@ -213,13 +221,13 @@ mod tests {
     }
 
     impl JobVerb for BlockingFake {
-        type Event = Stepped;
+        type Event = ProbeEvent;
 
-        fn stage(_: Stepped) -> JobStage {
-            JobStage::Progress
+        fn stage(event: ProbeEvent) -> JobStage {
+            ProbeJob::stage(event)
         }
 
-        fn detail(&self, event: Option<Stepped>) -> JobDetail {
+        fn detail(&self, event: Option<ProbeEvent>) -> JobDetail {
             if event.is_some() && !self.blocked_once.swap(true, Ordering::AcqRel) {
                 self.entered_fact.wait();
                 self.release_fact.wait();
@@ -290,7 +298,7 @@ mod tests {
         let polling = {
             let inner = inner.clone();
             let slot = slot.clone();
-            std::thread::spawn(move || slot.poll(&inner, |_| Step::Progress(Stepped)))
+            std::thread::spawn(move || slot.poll(&inner, |_| Step::Progress(ProbeEvent::Stepped)))
         };
         entered_fact.wait();
 
@@ -312,7 +320,7 @@ mod tests {
         );
 
         release_fact.wait();
-        assert_eq!(polling.join().unwrap(), Some(Stepped));
+        assert_eq!(polling.join().unwrap(), Some(ProbeEvent::Stepped));
         ending.join().unwrap();
         assert!(ended_rx.recv().unwrap());
         assert_eq!(
@@ -332,5 +340,36 @@ mod tests {
         slot.cancel(&inner);
         assert_eq!(stages(&inner), vec![JobStage::Ended(JobEnd::Cancelled)]);
         assert!(slot.status(0).is_none());
+    }
+
+    /// 轮询：继续不落事实；进展落一条、槽位还在；做完落一条终局、槽位清空。
+    #[test]
+    fn polling_keeps_reports_progress_and_ends_exactly_once() {
+        let inner = Inner::new();
+        let slot = JobSlot::<ProbeJob>::default();
+        assert_eq!(
+            slot.poll(&inner, |_| Step::Keep),
+            None,
+            "没任务时轮询不做事"
+        );
+
+        slot.begin(&inner, ProbeJob);
+        assert_eq!(slot.poll(&inner, |_| Step::Keep), None);
+        assert!(slot.peek(|_| ()).is_some(), "继续时任务还在");
+        assert_eq!(
+            slot.poll(&inner, |_| Step::Progress(ProbeEvent::Stepped)),
+            Some(ProbeEvent::Stepped)
+        );
+        assert!(slot.status(inner.now_tick()).is_some(), "进展之后任务还在");
+        assert_eq!(
+            slot.poll(&inner, |_| Step::End(ProbeEvent::Finished)),
+            Some(ProbeEvent::Finished)
+        );
+        assert!(slot.peek(|_| ()).is_none(), "终局之后槽位清空");
+        assert_eq!(slot.poll(&inner, |_| Step::Keep), None);
+        assert_eq!(
+            stages(&inner),
+            vec![JobStage::Progress, JobStage::Ended(JobEnd::Completed)]
+        );
     }
 }

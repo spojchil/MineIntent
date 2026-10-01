@@ -20,9 +20,10 @@ mod capture;
 mod connect;
 mod door;
 mod input;
+// 现在没有持续动作接入任务槽：框架只在测试里被探测动词走到，正式构建里如实是死代码。
+#[cfg_attr(not(test), allow(dead_code, unreachable_code, unused_variables))]
 mod job;
 mod light;
-mod mining;
 mod state;
 
 pub use door::DoorCommand;
@@ -34,6 +35,7 @@ use self::state::Inner;
 /// 伤害窗条目上限。关注类窗口 ≥ 最长一轮时长；伤害事件稀疏，按条数封顶即可。
 const DAMAGE_WINDOW_ENTRIES: usize = 100;
 /// 任务窗条目上限。
+#[cfg_attr(not(test), allow(dead_code))] // 见 `mod job` 的说明。
 const JOBS_WINDOW_ENTRIES: usize = 32;
 /// 物品栏变化窗条目上限。
 const INVENTORY_WINDOW_ENTRIES: usize = 64;
@@ -44,16 +46,6 @@ const PICKUP_WINDOW_ENTRIES: usize = 64;
 const SOUND_WINDOW_ENTRIES: usize = 256;
 /// 屏开/关事实窗条目上限。开关稀疏，小窗足矣。
 const SCREEN_WINDOW_ENTRIES: usize = 16;
-/// 同步写入的 `MiningQueued` 等待 Azalea GameTick 消费的最大 tick 数。命中说明
-/// 调度链没有接单，不是方块挖不动。
-const MINING_DISPATCH_TIMEOUT_TICKS: u64 = 100;
-/// 本地方块预测等待服务端确认的最大 tick 数。它约束的是协议确认悬挂，不能与
-/// `MineProgress` 停滞混为一谈。
-const MINING_PREDICTION_SETTLE_TIMEOUT_TICKS: u64 = 400;
-/// 同一目标的 `MineProgress` 连续多久没有严格增长，才判挖掘没有产生进展。
-/// 这是无进展窗口，不是总工期：再慢的方块只要进度仍在增长，就不会被时间误杀。
-const MINING_NO_PROGRESS_TICKS: u64 = 400;
-
 /// 连接配置。v1 只有离线身份、重连固定 Never。
 #[derive(Clone, Debug)]
 pub struct ConnectionConfig {

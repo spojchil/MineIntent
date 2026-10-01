@@ -40,11 +40,6 @@ pub enum DoorCommand {
     Attack {
         entity_key: String,
     },
-    /// 挖掉一格方块（异步持续：挖穿与否由世界变化通知证实）。
-    /// 按顺序挖一串方块。**队列**：`start_mining` 是单目标槽，一次只收一块
-    /// 会让模型以为在排队、实则每发一次就掐断上一块。
-    /// 新队列顶替旧队列（与移动的单意图槽同款）。
-    Mine(Vec<[i32; 3]>),
     UseOnBlock([i32; 3]),
     /// 把手持方块放到目标空位（目标须紧挨已有方块，被点的是共享面）。
     PlaceBlock([i32; 3]),
@@ -124,25 +119,6 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             bot.attack(entity);
             Ok(())
         }
-        DoorCommand::Mine(targets) => {
-            if targets.is_empty() {
-                return Err("没给要挖的坐标".to_owned());
-            }
-            // 只校验第一块：后面的等轮到它时再看。中途世界会变（自己挖塌、
-            // 别人动土），提前校验全部等于拿过期事实拒绝一个还没发生的动作。
-            let [x, y, z] = targets[0];
-            let (name, _) = read_target_block(inner, [x, y, z])?;
-            if crate::is_air_name(&name) {
-                return Err(format!("({x},{y},{z}) 没有方块，是空气"));
-            }
-            check_reach(bot, BlockPos::new(x, y, z).center())?;
-            inner.mining_job.begin(
-                inner,
-                super::mining::MiningJob::new(targets.clone(), inner.now_tick()),
-            );
-            begin_mining(bot, targets[0]);
-            Ok(())
-        }
         DoorCommand::UseOnBlock([x, y, z]) => {
             bot.block_interact(BlockPos::new(x, y, z));
             Ok(())
@@ -159,23 +135,7 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             Ok(())
         }
         DoorCommand::ReleaseHand => {
-            // 停挖要发真事件（AbortDestroyBlock 由它触发）。旧实现调的
-            // left_click_mine(false) 只摘「自动挖准星」组件——从未装过，
-            // 等于停不掉挖掘。同步排队 API 还要求在同一把锁里摘掉 MiningQueued，
-            // 否则 release 早于下一 tick 时，已经取消的请求仍会开始挖。
-            {
-                let mut ecs = bot.ecs.write();
-                let is_mining = ecs.get::<azalea::mining::Mining>(bot.entity).is_some();
-                ecs.entity_mut(bot.entity)
-                    .remove::<azalea::mining::MiningQueued>();
-                // 守卫：Azalea 的停挖处理器在没挖时会 panic（MineBlockPos 内层
-                // expect），只有真在挖才发。
-                if is_mining {
-                    ecs.write_message(azalea::mining::StopMiningBlockEvent { entity: bot.entity });
-                }
-            }
-            // MineIntent 的意图队列也要收；否则轮询仍会尝试自愈。
-            inner.mining_job.cancel(inner);
+            super::input::stop_mining(bot);
             bot.write_packet(s_player_action::ServerboundPlayerAction {
                 action: s_player_action::Action::ReleaseUseItem,
                 pos: BlockPos::new(0, 0, 0),
@@ -768,12 +728,6 @@ pub(super) fn place_block(inner: &Inner, bot: &Client, [x, y, z]: [i32; 3]) -> R
         seq,
     });
     Ok(())
-}
-
-pub(super) fn begin_mining(bot: &Client, [x, y, z]: [i32; 3]) {
-    let target = BlockPos::new(x, y, z);
-    bot.look_at(target.center());
-    bot.start_mining(target);
 }
 
 /// 某格现在是不是空气。挖碎的唯一判据——不按时间猜。

@@ -145,33 +145,12 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
 | `mod.rs` | `Module` 公开面、`ConnectionConfig` |
 | `state.rs` | `Inner`：共享状态、时间窗、写口队列——**可脱离 azalea 单测** |
 | `capture.rs` | ECS → `TickSnapshot` 直译 |
-| `job.rs` | `JobSlot`：后台任务的形状，**每个任务恰好一条终局** |
+| `job.rs` | `JobSlot`：后台任务的形状，**每个任务恰好一条终局**；现在没有动作接入 |
 | `input.rs` | 键鼠输入的时序：起手转向、下一 tick 按键、按满或提前结束后全部松开，回执经一次性通道送回 `Module::input` |
-| `mining.rs` | 坐标式挖掘的判定表与轮询（已无模型面，见 §4a） |
 | `connect.rs` | azalea 接入、客户端回调、停机 |
 | `door.rs` | `DoorCommand` 与 tick 内执行 |
 | `blocks.rs` | 成像拷贝的方块解码、渲染分类与原版光照属性表 |
 | `light.rs` | 服务端光照包的自存（azalea 只解析不存） |
-
-## 4a. 挖掘请求与结果
-
-本节描述坐标式挖掘队列（`DoorCommand::Mine`），已无模型面，只剩探针在用。
-模型挖掘是 `input` 按住左键：Azalea 的 `LeftClickMine` 每 tick 挖准星下的方块，
-`machine::input` 记下上一 tick 准星下的方块，它变成空气（客户端所见，与玩家屏幕一致）
-即算挖碎并提前松开全部按键。
-
-- fork 的 `Client::start_mining` 在同一 ECS 写锁内直接写入 `MiningQueued`；MineIntent
-  每 tick 再用同一读锁核对 `Mining`、`MiningQueued`、`MineBlockPos`、`MineProgress`
-  与 `MineTicks` 的目标一致性，并查询目标格是否还有 `BlockStatePredictionHandler`
-  的待确认预测。因此 queued→active 的调度窗口不会被误判成中断、反复重发清零
-  进度；本地预测出的空气也不会在服务端确认前冒充成功。挖碎只由已收敛的目标变空气
-  证明；目标读不到产生独立终局，不能默认成实心。预测从首次 pending 起超过协议确认
-  边界会单独报告 `PredictionNotSettled`，不冒充成功、不可挖或进度停滞。queued 长时间
-  未被消费单独报告 `DispatchNotObserved`；queued 在进入匹配 Active 前消失报告
-  `RequestEnded`，不再用
-  无进展窗口或循环补发掩盖调度/权限拒绝。只有曾进入匹配 Active 才允许一次补发；
-  第二次仍未进入 Active 就终局。`Blocked` 只表示目标仍为实心且 Active 状态下的
-  `MineProgress` 连续一个窗口没有严格增长，总工期本身不设上限。
 
 ## 4d. 任务生命周期
 
@@ -180,8 +159,12 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
   取消不叫醒）只读阶段，不认识具体动作；只有 `render` 的措辞与 `jobs` 的任务表按动作
   去读细节。动词实现 `JobVerb`：答自己的事件落在哪个阶段、怎样连同参数写成细节；
   生命周期结束由槽位写出。框架的测试用只在 world 测试里存在的探测动词，不借具体动作。
+- 现在没有持续动作接入任务槽：`JobDetail` 在正式构建里没有值，任务窗恒空，帧
+  不会发车，`jobs list` 总是空表。模型挖掘是 `input` 按住左键：Azalea 的
+  `LeftClickMine` 每 tick 挖准星下的方块，`machine::input` 记下上一 tick 准星下的
+  方块，它变成空气（客户端所见，与玩家屏幕一致）即算挖碎并提前松开全部按键。
 - 连接结束后不再有 tick，因此 client 断线、swarm 断线、连接线程退出与显式
-  `Module::stop` 都在生命周期边界幂等收掉移动/挖掘槽，落独立 `ConnectionEnded`
+  `Module::stop` 都在生命周期边界幂等收掉任务槽，落独立 `ConnectionEnded`
   终局；它不冒充取消、超时或目标失败。
 
 ## 5. `agent` 是 git 依赖 midturn
@@ -200,7 +183,7 @@ rev → 修下游破口 → 推送。内核自己的测试在上游仓跑，不�
 
 - `world::machine` 独占一个线程（tokio current_thread + LocalSet，azalea 需要）。
   ECS 只在这个所有者线程的客户端回调与 Bevy schedule 内触碰；外部调用不跨线程直写。
-- 挖掘槽及其副作用同样由该线程单写。`Module::stop` 只记录不可逆请求并唤醒
+- 任务槽及其副作用同样由该线程单写。`Module::stop` 只记录不可逆请求并唤醒
   owner；已领取的 tick/命令先完成，owner 销毁 LocalSet/runtime、
   收掉任务并报告完成后，外部才发布 `Stopped`。超时只返回合流失败，不虚称已经停止。
 - 对外全部经共享状态：快照 latest-wins（外部持旧 `Arc` 用多久都行），
