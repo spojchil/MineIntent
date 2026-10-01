@@ -73,6 +73,7 @@ fn variant(block: &Block) -> Option<&'static Variant> {
 /// 方块实体部分的三角形；这个状态不画方块实体时为空。
 pub(crate) fn triangles(
     block: &Block,
+    eye: Option<V3>,
     cells: Option<&Cells>,
     resources: &mut Resources,
     report: &mut Report,
@@ -99,6 +100,13 @@ pub(crate) fn triangles(
     let offset = block.position.map(f64::from);
     let mut triangles = Vec::with_capacity(quads.len() * 2);
     for (vertices, normal) in quads {
+        // 背面剔除：方块实体的渲染类型（entityCutout、entitySolid）开着面剔除。
+        if let Some(eye) = eye {
+            let to_eye: V3 = std::array::from_fn(|k| eye[k] - vertices[0][k] - offset[k]);
+            if (0..3).map(|k| normal[k] * to_eye[k]).sum::<f64>() <= 0.0 {
+                continue;
+            }
+        }
         let shade = crate::entity::shade(*normal);
         let position = |i: usize| -> V3 { std::array::from_fn(|k| vertices[i][k] + offset[k]) };
         // 光栅器按「贴图宽 16 单位」采样。

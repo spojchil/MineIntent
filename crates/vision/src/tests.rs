@@ -141,7 +141,8 @@ fn depth_and_parent_texture_aliases_survive_input_order() {
         let frame = render(&scene(blocks), &mut resources, small()).unwrap();
         let p = frame.image.get_pixel(4, 4).0;
         assert!(p[0] > 150 && p[1] == 0 && p[2] == 0, "{p:?}");
-        assert_eq!(frame.report.triangles, 24);
+        // 背面剔除：两块各只剩朝向相机的北面。
+        assert_eq!(frame.report.triangles, 4);
         assert!(frame.png().unwrap().starts_with(b"\x89PNG"));
     }
 }
@@ -317,7 +318,8 @@ fn unknown_models_are_visible_and_reported() {
         small(),
     )
     .unwrap();
-    assert_eq!(frame.report.triangles, 12);
+    // 背面剔除后只剩朝向相机的北面（2 个三角形）。
+    assert_eq!(frame.report.triangles, 2);
     assert!(frame
         .report
         .warnings

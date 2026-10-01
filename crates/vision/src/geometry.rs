@@ -52,7 +52,6 @@ pub(crate) fn mul(a: V3, b: f64) -> V3 {
 pub(crate) fn dot(a: V3, b: V3) -> f64 {
     (0..3).map(|i| a[i] * b[i]).sum()
 }
-#[cfg(test)]
 pub(crate) fn cross(a: V3, b: V3) -> V3 {
     [
         a[1] * b[2] - a[2] * b[1],
@@ -94,6 +93,18 @@ pub(crate) struct Triangle {
 }
 
 impl Face {
+    /// 从方块内坐标 `eye` 看过去是不是正面：顶点算出的法线按面的朝向取外侧，
+    /// 眼睛在面所在平面的外侧才是正面（与 GPU 按屏幕绕序剔除等价）。
+    fn faces(&self, eye: V3) -> bool {
+        let [a, b, c, _] = self.vertices;
+        let mut normal = cross(sub(b, a), sub(c, a));
+        let outward = self.direction.vector().map(f64::from);
+        if dot(normal, outward) < 0.0 {
+            normal = normal.map(|n| -n);
+        }
+        dot(normal, sub(eye, a)) > 0.0
+    }
+
     fn directional_shade(&self) -> f64 {
         if self.shade {
             self.direction.cardinal_shade()
@@ -129,11 +140,12 @@ pub(crate) fn build(
     report: &mut Report,
 ) -> Vec<Triangle> {
     let biomes = Biomes::new(scene, resources, report).ok();
-    build_lit(scene, None, biomes.as_ref(), None, resources, report)
+    build_lit(scene, None, biomes.as_ref(), None, None, resources, report)
 }
 
 /// `cells` 为 `Some` 时按原版平滑光照与光照坐标逐顶点算光；`biomes` 给模型面染色
-/// （没有时染色面按白）；`frustum` 为 `Some` 时整段跳过视锥外的区块段。
+/// （没有时染色面按白）；`frustum` 为 `Some` 时整段跳过视锥外的区块段；`eye` 为 `Some`
+/// 时剔除背向它的面（只看面结构的测试不传）。
 ///
 /// 分三步（参照原版 `SectionRenderDispatcher` 与 Sodium 的分段编译）：视锥按段筛方块；
 /// 串行解析每种方块状态的面与方块实体（要读资源）；再按方块并行出三角形，每个线程一份
@@ -143,6 +155,7 @@ pub(crate) fn build_lit(
     cells: Option<&Cells>,
     biomes: Option<&Biomes>,
     frustum: Option<&crate::raster::Frustum>,
+    eye: Option<V3>,
     resources: &mut Resources,
     report: &mut Report,
 ) -> Vec<Triangle> {
@@ -165,7 +178,7 @@ pub(crate) fn build_lit(
     let mut faces_by_state: Vec<Vec<Face>> = Vec::new();
     let mut prepared: Vec<(usize, Vec<Triangle>)> = Vec::with_capacity(visible.len());
     for block in &visible {
-        let entity = crate::block_entity::triangles(block, cells, resources, report);
+        let entity = crate::block_entity::triangles(block, eye, cells, resources, report);
         let state = *states
             .entry((block.name.as_str(), &block.properties))
             .or_insert_with(|| {
@@ -213,6 +226,7 @@ pub(crate) fn build_lit(
                         triangles.append(entity);
                         emit_block(
                             block,
+                            eye,
                             &faces_by_state[*state],
                             neighbours,
                             cells,
@@ -244,9 +258,11 @@ fn is_air(name: &str) -> bool {
     )
 }
 
-/// 一个方块的模型面：剔掉被遮挡的面，染色、算光，写成三角形。
+/// 一个方块的模型面：剔掉被遮挡的面与背向眼睛的面，染色、算光，写成三角形。
+#[allow(clippy::too_many_arguments)]
 fn emit_block(
     block: &Block,
+    eye: Option<V3>,
     faces: &[Face],
     neighbours: &PositionMap<&Block>,
     cells: Option<&Cells>,
@@ -273,6 +289,10 @@ fn emit_block(
             }
         }
         let offset = block.position.map(f64::from);
+        // 背面剔除：原版方块的渲染管线都开着面剔除（流体除外，FluidRenderer 自己补反面）。
+        if !face.fluid && eye.is_some_and(|eye| !face.faces(sub(eye, offset))) {
+            continue;
+        }
         let tint = match (face.tint_index, biomes) {
             (Some(index), Some(biomes)) => {
                 let color =

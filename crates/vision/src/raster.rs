@@ -247,7 +247,8 @@ fn project_part<'a>(
             if area.abs() < 1e-12 {
                 continue;
             }
-            // Both sides are visible, matching the prototype's model semantics.
+            // 光栅器两种绕序都画：方块与方块实体的背面已在建几何时按原版剔掉，
+            // 留下的生物（entityCutoutNoCull）与流体本就双面。
             if area < 0.0 {
                 vertices.swap(1, 2);
                 area = -area;
@@ -670,6 +671,7 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
         cells,
         biomes.as_ref(),
         Some(&frustum),
+        Some(scene.camera.eye),
         resources,
         &mut report,
     );
