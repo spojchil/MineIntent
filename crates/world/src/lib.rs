@@ -366,16 +366,63 @@ pub struct JobEntry {
     pub fact: JobFact,
 }
 
-/// 任务事实：**参数与事件同层，按动词收口**。
+/// 任务事实：**通用阶段 + 动作细节**。
 ///
-/// 这样「挖掘任务到达了目的地」在类型上就拼不出来。此前 `(JobKind, JobOutcome)`
-/// 是二维匹配，合法组合只占稀疏一角，非法组合靠 `render` 里一句运行时兜底挡着。
+/// 两层各有读者。阶段是任务框架的语言——帧只问「是不是进展」，唤醒只问「是不是
+/// 自己下令造成的结束」，任务槽只保证「恰好一条终局」，它们都只读 `stage`，
+/// 不认识任何具体动作。细节是具体动作的语言，只有措辞层（`render`）和任务表
+/// （`jobs`）按动作去读。增删一种动作因此只动动作自己的模块、它在 [`JobDetail`]
+/// 里的那一项、它的措辞与描述，框架与帧、唤醒都不必改。
 ///
-/// 参数每条事实复述一遍（而不是只在开始时给、后续靠 id 回查）：窗口只有 32 条、
-/// `targets` 最多几十个坐标，代价可忽略；换来的是**呈现层保持纯函数、每条事实
-/// 自足可读**，不必维护一张 id → 参数的表。
+/// 参数每条事实复述一遍（而不是只在开始时给、后续靠 id 回查）：窗口只有 32 条，
+/// 代价可忽略；换来的是**呈现层保持纯函数、每条事实自足可读**，不必维护一张
+/// id → 参数的表。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum JobFact {
+pub struct JobFact {
+    pub stage: JobStage,
+    pub detail: JobDetail,
+}
+
+impl JobFact {
+    /// 这条事实是不是终局。终局之后该任务不再有事实。
+    pub fn is_terminal(&self) -> bool {
+        self.stage.is_terminal()
+    }
+}
+
+/// 任务走到哪一步：每种动作共有的生命周期。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JobStage {
+    /// 还在跑，又往前走了一步。
+    Progress,
+    /// 结束了；之后该任务不再有事实。
+    Ended(JobEnd),
+}
+
+impl JobStage {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, JobStage::Ended(_))
+    }
+}
+
+/// 任务怎么结束的。前两种由动作自己的状态机判出，后三种由任务槽在生命周期边界写出。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JobEnd {
+    /// 做完了。
+    Completed,
+    /// 动作自己观察到做不下去（具体原因在细节里）。
+    Failed,
+    /// 被同一动作的新任务顶替。
+    Replaced,
+    /// 被停止动词取消。
+    Cancelled,
+    /// 服务器连接或整个接入模块结束；此后不再有 tick，任务随连接同步收束。
+    ConnectionEnded,
+}
+
+/// 具体动作的参数与动作自己的事件。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JobDetail {
     /// 按顺序挖一串方块。**队列而非单块**：模型一次给出坐标数组，机器逐块挖完。
     ///
     /// 之所以是队列，是因为 `start_mining` 是单目标槽——换目标即放弃上一个。
@@ -385,20 +432,15 @@ pub enum JobFact {
         targets: Vec<[i32; 3]>,
         /// 已经挖碎的块数。
         done: usize,
-        event: MineEvent,
+        /// 挖掘自己的事件；任务槽写出的生命周期结束（顶替、取消、连接结束）没有。
+        event: Option<MineEvent>,
     },
+    /// 任务槽自己的测试用：框架不认识具体动作，测试也不该借某个动作。
+    #[cfg(test)]
+    Probe,
 }
 
-impl JobFact {
-    /// 这条事实是不是终局。终局之后该任务不再有事实。
-    pub fn is_terminal(&self) -> bool {
-        match self {
-            JobFact::Mine { event, .. } => event.is_terminal(),
-        }
-    }
-}
-
-/// 挖掘任务的事件。第一个是进展，其余是终局。
+/// 挖掘自己的事件。第一个是进展，其余是终局。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MineEvent {
     /// 又碎了一块。
@@ -415,17 +457,16 @@ pub enum MineEvent {
     PredictionNotSettled { at: [i32; 3], ticks: u64 },
     /// 当前世界模型读不到目标；没有把未知猜成实心或已挖碎。
     TargetUnavailable { at: [i32; 3] },
-    /// 被新的队列顶替。
-    Replaced,
-    /// 被 release 取消。
-    Cancelled,
-    /// 服务器连接或整个接入模块结束；此后不再有 tick，任务随连接同步收束。
-    ConnectionEnded,
 }
 
 impl MineEvent {
-    pub fn is_terminal(&self) -> bool {
-        !matches!(self, MineEvent::Broke { .. })
+    /// 这个事件落在生命周期的哪一步。
+    pub fn stage(&self) -> JobStage {
+        match self {
+            MineEvent::Broke { .. } => JobStage::Progress,
+            MineEvent::Cleared => JobStage::Ended(JobEnd::Completed),
+            _ => JobStage::Ended(JobEnd::Failed),
+        }
     }
 }
 
@@ -446,7 +487,7 @@ pub struct JobStatus {
     pub elapsed_ticks: u64,
 }
 
-/// 在途任务的参数快照。
+/// 在途任务的参数快照：具体动作的那一层，只有任务表按动作去读。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JobStatusKind {
     Mine {
@@ -455,6 +496,9 @@ pub enum JobStatusKind {
         /// 正在挖的那一块。
         current: Option<[i32; 3]>,
     },
+    /// 任务槽自己的测试用，见 [`JobDetail::Probe`]。
+    #[cfg(test)]
+    Probe,
 }
 /// 物品栏格位变化：菜单协议号（0-45）上的内容更替。
 #[derive(Clone, Debug, PartialEq)]

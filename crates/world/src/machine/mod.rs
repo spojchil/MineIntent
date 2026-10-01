@@ -774,10 +774,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_stop_waits_for_owner_cleanup_and_is_repeatable() {
         let inner = Arc::new(Inner::new());
-        inner.mining_job.begin(
-            &inner,
-            mining::MiningJob::new(vec![[10, 64, -3]], inner.now_tick()),
-        );
+        inner.probe_job.begin(&inner, job::ProbeJob);
         let (done_tx, done_rx) = watch::channel(false);
         let module = Module {
             inner: inner.clone(),
@@ -807,11 +804,12 @@ mod tests {
             .jobs
             .entries
             .iter()
-            .map(|entry| match entry.fact {
-                crate::JobFact::Mine { event, .. } => event,
-            })
+            .map(|entry| entry.fact.stage)
             .collect();
-        assert_eq!(ended, vec![crate::MineEvent::ConnectionEnded]);
+        assert_eq!(
+            ended,
+            vec![crate::JobStage::Ended(crate::JobEnd::ConnectionEnded)]
+        );
     }
 
     #[tokio::test]

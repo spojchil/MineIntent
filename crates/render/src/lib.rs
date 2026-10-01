@@ -659,58 +659,71 @@ pub fn render_container_menu(snap: &TickSnapshot, kind: &str) -> String {
     }
 }
 
-/// 任务事实的措辞：进展与终局各一句。
+/// 任务事实的措辞：进展与终局各一句。具体动作说具体的话，所以按动作分派。
 pub fn render_job_entry(entry: &world::JobEntry) -> String {
-    match &entry.fact {
-        world::JobFact::Mine {
+    match &entry.fact.detail {
+        world::JobDetail::Mine {
             targets,
             done,
             event,
-        } => {
-            let total = targets.len();
-            match event {
-                world::MineEvent::Broke { done, total } => format!(
-                    "挖掉了第 {done} 块，还剩 {} 块。",
-                    total.saturating_sub(*done)
-                ),
-                world::MineEvent::Cleared => format!("你挖完了这一串 {total} 块方块。"),
-                world::MineEvent::Blocked { at: [x, y, z] } => format!(
-                    "挖到第 {} 块就停下了：({x}, {y}, {z}) 仍是实心，但底层挖掘进度连续没有增长；可能是交互被拒绝、够不着，或手上的工具无法产生进度。前面 {done} 块已经挖掉了。",
-                    done + 1
-                ),
-                world::MineEvent::DispatchNotObserved {
-                    at: [x, y, z],
-                    ticks,
-                } => format!(
-                    "挖第 {} 块的请求在 Azalea 队列里等待了 {ticks} tick，调度链始终没有进入 ({x}, {y}, {z}) 的活跃挖掘。机器按调度故障收束；这不是方块挖不动的结论。前面 {done} 块已经挖掉了。",
-                    done + 1
-                ),
-                world::MineEvent::RequestEnded { at: [x, y, z] } => format!(
-                    "挖第 {} 块的请求曾经排队，随后在进入 ({x}, {y}, {z}) 的活跃挖掘前结束。底层没有提供更细原因；机器没有把它说成够不着或工具挖不动。前面 {done} 块已经挖掉了。",
-                    done + 1
-                ),
-                world::MineEvent::PredictionNotSettled {
-                    at: [x, y, z],
-                    ticks,
-                } => format!(
-                    "挖第 {} 块后，对 ({x}, {y}, {z}) 的本地方块预测等待了 {ticks} tick，仍没有得到服务端确认或回滚。机器按协议确认悬挂收束；这既不是挖掘成功，也不是方块不可挖的结论。前面 {done} 块已经挖掉了。",
-                    done + 1
-                ),
-                world::MineEvent::TargetUnavailable { at: [x, y, z] } => format!(
-                    "挖到第 {} 块时，当前世界模型读不到 ({x}, {y}, {z})（例如区块尚未加载或坐标在世界高度外）。机器没有猜它是实心或空气，队列已停；前面 {done} 块已经挖掉了。",
-                    done + 1
-                ),
-                world::MineEvent::Replaced => {
-                    format!("先前的挖掘被新的队列顶替了（已挖掉 {done}/{total} 块）。")
-                }
-                world::MineEvent::Cancelled => {
-                    format!("你停下了挖掘（已挖掉 {done}/{total} 块）。")
-                }
-                world::MineEvent::ConnectionEnded => format!(
-                    "挖掘期间连接结束了，任务随连接收束（已挖掉 {done}/{total} 块）。"
-                ),
+        } => render_mine(targets.len(), *done, *event, entry.fact.stage),
+    }
+}
+
+/// 挖掘的措辞。动作自己的事件说原因；没有事件的是任务槽写的生命周期结束。
+fn render_mine(
+    total: usize,
+    done: usize,
+    event: Option<world::MineEvent>,
+    stage: world::JobStage,
+) -> String {
+    let Some(event) = event else {
+        return match stage {
+            world::JobStage::Ended(world::JobEnd::Replaced) => {
+                format!("先前的挖掘被新的队列顶替了（已挖掉 {done}/{total} 块）。")
             }
-        }
+            world::JobStage::Ended(world::JobEnd::Cancelled) => {
+                format!("你停下了挖掘（已挖掉 {done}/{total} 块）。")
+            }
+            world::JobStage::Ended(world::JobEnd::ConnectionEnded) => {
+                format!("挖掘期间连接结束了，任务随连接收束（已挖掉 {done}/{total} 块）。")
+            }
+            // 挖掘的进展、做完与做不下去都带事件；走到这里说明事实拼错了，不编原因。
+            _ => format!("挖掘任务（已挖掉 {done}/{total} 块）。"),
+        };
+    };
+    match &event {
+        world::MineEvent::Broke { done, total } => format!(
+            "挖掉了第 {done} 块，还剩 {} 块。",
+            total.saturating_sub(*done)
+        ),
+        world::MineEvent::Cleared => format!("你挖完了这一串 {total} 块方块。"),
+        world::MineEvent::Blocked { at: [x, y, z] } => format!(
+            "挖到第 {} 块就停下了：({x}, {y}, {z}) 仍是实心，但底层挖掘进度连续没有增长；可能是交互被拒绝、够不着，或手上的工具无法产生进度。前面 {done} 块已经挖掉了。",
+            done + 1
+        ),
+        world::MineEvent::DispatchNotObserved {
+            at: [x, y, z],
+            ticks,
+        } => format!(
+            "挖第 {} 块的请求在 Azalea 队列里等待了 {ticks} tick，调度链始终没有进入 ({x}, {y}, {z}) 的活跃挖掘。机器按调度故障收束；这不是方块挖不动的结论。前面 {done} 块已经挖掉了。",
+            done + 1
+        ),
+        world::MineEvent::RequestEnded { at: [x, y, z] } => format!(
+            "挖第 {} 块的请求曾经排队，随后在进入 ({x}, {y}, {z}) 的活跃挖掘前结束。底层没有提供更细原因；机器没有把它说成够不着或工具挖不动。前面 {done} 块已经挖掉了。",
+            done + 1
+        ),
+        world::MineEvent::PredictionNotSettled {
+            at: [x, y, z],
+            ticks,
+        } => format!(
+            "挖第 {} 块后，对 ({x}, {y}, {z}) 的本地方块预测等待了 {ticks} tick，仍没有得到服务端确认或回滚。机器按协议确认悬挂收束；这既不是挖掘成功，也不是方块不可挖的结论。前面 {done} 块已经挖掉了。",
+            done + 1
+        ),
+        world::MineEvent::TargetUnavailable { at: [x, y, z] } => format!(
+            "挖到第 {} 块时，当前世界模型读不到 ({x}, {y}, {z})（例如区块尚未加载或坐标在世界高度外）。机器没有猜它是实心或空气，队列已停；前面 {done} 块已经挖掉了。",
+            done + 1
+        ),
     }
 }
 

@@ -1,7 +1,7 @@
 //! 唤醒判据的纯函数部分：从一帧快照里挑出「该把同伴叫起来」的事实。
 //!
 //! **这是脚手架，不是判据。** 正式的关注清单未裁（issue #135），
-//! 这里只做最朴素的三条：别人对我说话、我受伤了、我下的移动任务有果了。
+//! 这里只做最朴素的三条：别人对我说话、我受伤了、我下的任务有果了。
 //!
 //! 抽成纯函数的理由：它是组合根里唯一有分支的逻辑，而组合根跑起来要一台
 //! Minecraft 服务器和一个模型端点。分支判断不该只能靠实盘验证。
@@ -10,7 +10,7 @@
 //! 不会漏——tick 会重复，seq 不会。
 
 use world::{
-    DamageEntry, FactSource, InventoryChangeEntry, JobEntry, JobFact, MineEvent, ScreenEvent,
+    DamageEntry, FactSource, InventoryChangeEntry, JobEnd, JobEntry, JobStage, ScreenEvent,
     TickSnapshot,
 };
 
@@ -111,7 +111,7 @@ impl WakeCursors {
             }
             // 进展不走这条通道：它是「还在跑」，不是「出事了」，由帧搭车呈现
             // （组合根另有一个游标）。这里只管终局。
-            if entry.fact.is_terminal() && wakes_on(&entry.fact) {
+            if wakes_on(entry.fact.stage) {
                 lines.push(render_job(entry));
             }
         }
@@ -169,13 +169,13 @@ fn advance(cursor: &mut Option<u64>, seq: u64) -> bool {
 /// 哪些终局值得叫醒。**自己干的不必回报**：顶替与取消都是模型刚下的命令，
 /// 告诉它「你停下了」只是复述它自己的动作。运行时观察到的失败或资源边界要报——
 /// 那才是它不知道的事实。
-fn wakes_on(fact: &JobFact) -> bool {
-    match fact {
-        JobFact::Mine { event, .. } => !matches!(
-            event,
-            MineEvent::Replaced | MineEvent::Cancelled | MineEvent::Broke { .. }
-        ),
-    }
+///
+/// 只看阶段，不认识具体动作：每种任务都同样适用。
+fn wakes_on(stage: JobStage) -> bool {
+    matches!(
+        stage,
+        JobStage::Ended(end) if !matches!(end, JobEnd::Replaced | JobEnd::Cancelled)
+    )
 }
 
 /// 哪些库存变化值得通知：预期之外的（ServerObserved）。
@@ -239,20 +239,6 @@ mod tests {
         ChatEntry {
             sender: None,
             ..chat(seq, "", None, text)
-        }
-    }
-
-    fn job(seq: u64, event: MineEvent) -> JobEntry {
-        JobEntry {
-            seq,
-            tick: seq,
-            occurred_at: std::time::SystemTime::UNIX_EPOCH,
-            id: world::JobId(seq),
-            fact: JobFact::Mine {
-                targets: vec![[1, 2, 3]],
-                done: 0,
-                event,
-            },
         }
     }
 
@@ -362,43 +348,37 @@ mod tests {
 
     #[test]
     fn only_terminals_we_did_not_command_wake_us() {
-        let mut snap = snapshot();
-        let mut cursors = WakeCursors::default();
-        snap.jobs = Window {
-            entries: vec![
-                job(1, MineEvent::Cleared),
-                job(2, MineEvent::Replaced),
-                job(3, MineEvent::Cancelled),
-                job(4, MineEvent::Blocked { at: [1, 2, 3] }),
-                job(5, MineEvent::Broke { done: 1, total: 2 }),
-            ],
-        };
-
-        // 三类被挡下，只剩挖完与挖不动：
+        // 三类被挡下：
         //   顶替、取消——模型自己下的令的回声，不该把它自己吵醒；
-        //   碎了一块——它是**进展**不是终局（任务还在跑），由帧搭车呈现。
-        assert_eq!(cursors.collect(&snap, identity(), false).lines.len(), 2);
+        //   进展——任务还在跑，不是终局，由帧搭车呈现。
+        assert!(!wakes_on(JobStage::Progress));
+        assert!(!wakes_on(JobStage::Ended(JobEnd::Replaced)));
+        assert!(!wakes_on(JobStage::Ended(JobEnd::Cancelled)));
+        // 它不知道的事实才叫醒：做完、做不下去、连接结束。
+        assert!(wakes_on(JobStage::Ended(JobEnd::Completed)));
+        assert!(wakes_on(JobStage::Ended(JobEnd::Failed)));
+        assert!(wakes_on(JobStage::Ended(JobEnd::ConnectionEnded)));
     }
 
     #[test]
     fn three_windows_share_one_seq_but_keep_independent_cursors() {
         let mut snap = snapshot();
         let mut cursors = WakeCursors::default();
-        // 单调 seq 跨窗交错：聊天 1、伤害 2、任务 3。
+        // 单调 seq 跨窗交错：聊天 1、伤害 2、物品栏 3。
         snap.chat = Window {
             entries: vec![chat(1, "alice", None, "小心")],
         };
         snap.damage = Window {
             entries: vec![damage(2, 20.0, 14.0)],
         };
-        snap.jobs = Window {
-            entries: vec![job(3, MineEvent::Cleared)],
+        snap.inventory_changes = Window {
+            entries: vec![inventory_change(3, 36, FactSource::ServerObserved)],
         };
 
-        let lines = cursors.collect(&snap, identity(), false).lines;
+        let lines = cursors.collect(&snap, identity(), true).lines;
 
         assert_eq!(lines.len(), 3, "三个窗各出一条：{lines:?}");
-        assert!(cursors.collect(&snap, identity(), false).is_empty());
+        assert!(cursors.collect(&snap, identity(), true).is_empty());
     }
 
     fn inventory_change(seq: u64, slot: u16, source: FactSource) -> world::InventoryChangeEntry {

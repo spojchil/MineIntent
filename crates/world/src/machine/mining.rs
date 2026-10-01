@@ -23,7 +23,7 @@ use super::state::Inner;
 use super::{
     MINING_DISPATCH_TIMEOUT_TICKS, MINING_NO_PROGRESS_TICKS, MINING_PREDICTION_SETTLE_TIMEOUT_TICKS,
 };
-use crate::{JobFact, JobId, JobStatus, JobStatusKind, MineEvent};
+use crate::{JobDetail, JobId, JobStage, JobStatus, JobStatusKind, MineEvent};
 
 /// 在途的挖掘任务（单意图槽，与移动同款）。
 pub(super) struct MiningJob {
@@ -102,22 +102,16 @@ impl MiningAttempt {
 impl JobVerb for MiningJob {
     type Event = MineEvent;
 
-    fn fact(&self, event: MineEvent) -> JobFact {
-        JobFact::Mine {
+    fn stage(event: MineEvent) -> JobStage {
+        event.stage()
+    }
+
+    fn detail(&self, event: Option<MineEvent>) -> JobDetail {
+        JobDetail::Mine {
             targets: self.targets.clone(),
             done: self.cursor,
             event,
         }
-    }
-
-    fn replaced() -> MineEvent {
-        MineEvent::Replaced
-    }
-    fn cancelled() -> MineEvent {
-        MineEvent::Cancelled
-    }
-    fn connection_ended() -> MineEvent {
-        MineEvent::ConnectionEnded
     }
 
     fn status(&self, id: JobId, started_tick: u64, now_tick: u64) -> JobStatus {

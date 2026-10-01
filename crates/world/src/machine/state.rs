@@ -47,9 +47,11 @@ pub(crate) struct Inner {
     pub(super) jobs_window: Mutex<VecDeque<JobEntry>>,
     /// 上一 tick 的生命值；下降即产伤害条目。None = 尚无基线（首帧不产）。
     pub(super) last_health: Mutex<Option<f64>>,
-    /// 在途移动任务（单意图槽）。
     /// 在途挖掘任务（单意图槽，内含坐标队列）。
     pub(super) mining_job: JobSlot<MiningJob>,
+    /// 接线测试用的探测槽：生命周期收槽与任务表要对每个槽都成立，不借某个动作测。
+    #[cfg(test)]
+    pub(super) probe_job: JobSlot<super::job::ProbeJob>,
     pub(super) inventory_window: Mutex<VecDeque<InventoryChangeEntry>>,
     /// 各格上一个已知内容：(容器 id, 菜单号) → (物品名, 数量)。
     /// 服务端重发同值不算变化——判据在 [`Inner::push_inventory_change`]。
@@ -117,6 +119,8 @@ impl Inner {
             jobs_window: Mutex::new(VecDeque::new()),
             last_health: Mutex::new(None),
             mining_job: JobSlot::default(),
+            #[cfg(test)]
+            probe_job: JobSlot::default(),
             inventory_window: Mutex::new(VecDeque::new()),
             last_slot_contents: Mutex::new(SlotLedger::new()),
             expected_slots: Mutex::new(Vec::new()),
@@ -185,7 +189,11 @@ impl Inner {
     /// client、swarm 与线程退出都可能报告同一次断线；槽位 take 语义保证只落一次。
     pub(super) fn end_running_jobs(&self) -> bool {
         super::input::connection_ended(self);
-        self.mining_job.connection_ended(self)
+        // 不短路：每个槽都要收。
+        let ended = self.mining_job.connection_ended(self);
+        #[cfg(test)]
+        let ended = self.probe_job.connection_ended(self) | ended;
+        ended
     }
 
     pub(super) fn chat_window_now(&self) -> Window<ChatEntry> {
@@ -501,7 +509,10 @@ impl Inner {
     /// 全部在途任务。槽位是唯一真相源——不另建镜像表。
     pub(super) fn jobs_in_flight(&self) -> Vec<crate::JobStatus> {
         let now = self.now_tick();
-        self.mining_job.status(now).into_iter().collect()
+        let jobs = self.mining_job.status(now).into_iter();
+        #[cfg(test)]
+        let jobs = jobs.chain(self.probe_job.status(now));
+        jobs.collect()
     }
 
     pub(super) fn push_chat(&self, sender: Option<(String, Option<String>)>, plain_text: String) {
@@ -581,7 +592,6 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MineEvent;
 
     #[test]
     fn first_stop_request_wakes_state_waiters_and_preserves_its_reason() {
@@ -641,23 +651,27 @@ mod tests {
     }
 
     #[test]
-    fn mining_job_replacement_and_release_are_recorded() {
+    fn job_replacement_and_release_are_recorded() {
+        use crate::{JobEnd, JobStage};
         let inner = Inner::new();
-        let job = |at: [i32; 3]| crate::machine::mining::MiningJob::new(vec![at], 0);
-        inner.mining_job.begin(&inner, job([10, 64, -3]));
-        inner.mining_job.begin(&inner, job([20, 64, 5])); // 顶替
-        inner.mining_job.cancel(&inner); // 松手
-        inner.mining_job.cancel(&inner); // 没任务时不是事件
+        inner.probe_job.begin(&inner, super::super::job::ProbeJob);
+        inner.probe_job.begin(&inner, super::super::job::ProbeJob); // 顶替
+        inner.probe_job.cancel(&inner); // 松手
+        inner.probe_job.cancel(&inner); // 没任务时不是事件
 
         let window = inner.jobs_window_now();
-        let events: Vec<MineEvent> = window
+        let stages: Vec<JobStage> = window
             .entries
             .iter()
-            .map(|entry| match entry.fact {
-                crate::JobFact::Mine { event, .. } => event,
-            })
+            .map(|entry| entry.fact.stage)
             .collect();
-        assert_eq!(events, vec![MineEvent::Replaced, MineEvent::Cancelled]);
+        assert_eq!(
+            stages,
+            vec![
+                JobStage::Ended(JobEnd::Replaced),
+                JobStage::Ended(JobEnd::Cancelled)
+            ]
+        );
         // 顶替与取消分属两个任务，id 必须不同——否则下游分不出谁的进展。
         assert_ne!(window.entries[0].id, window.entries[1].id);
     }
@@ -665,10 +679,7 @@ mod tests {
     #[test]
     fn connection_end_closes_the_job_once_and_phase_snapshot_contains_it() {
         let inner = Inner::new();
-        inner.mining_job.begin(
-            &inner,
-            crate::machine::mining::MiningJob::new(vec![[3, 64, 4]], 0),
-        );
+        inner.probe_job.begin(&inner, super::super::job::ProbeJob);
 
         assert!(inner.end_running_jobs());
         assert!(!inner.end_running_jobs(), "重复断线通知不能重复产终局");
@@ -676,16 +687,13 @@ mod tests {
             reason: "网络断开".to_owned(),
         });
 
-        assert!(inner.mining_job.status(inner.now_tick()).is_none());
+        assert!(inner.jobs_in_flight().is_empty());
         let latest = inner.latest.read();
         assert_eq!(latest.jobs.entries.len(), 1);
-        assert!(matches!(
-            latest.jobs.entries[0].fact,
-            crate::JobFact::Mine {
-                event: MineEvent::ConnectionEnded,
-                ..
-            }
-        ));
+        assert_eq!(
+            latest.jobs.entries[0].fact.stage,
+            crate::JobStage::Ended(crate::JobEnd::ConnectionEnded)
+        );
     }
 
     /// 判定表全景：armed 前后各态的行动结论。

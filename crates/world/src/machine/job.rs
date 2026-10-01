@@ -21,25 +21,40 @@
 use parking_lot::Mutex;
 
 use super::state::Inner;
-use crate::{JobFact, JobId, JobStatus};
+use crate::{JobDetail, JobEnd, JobFact, JobId, JobStage, JobStatus};
 
 /// 一个动词要回答的问题。每个持续动作实现它，形状就统一了。
+///
+/// 生命周期结束（顶替、取消、连接结束）由槽位写出，动词不必为它们各造事件；
+/// 动词只回答自己的事件落在哪一步、怎样连同参数写成细节。
 pub(super) trait JobVerb: Sized {
-    /// 该动词的事件枚举（`MoveEvent` / `MineEvent`）。
+    /// 该动词自己的事件枚举（如 `MineEvent`）。
     type Event: Copy + std::fmt::Debug;
 
-    /// 用当前任务参数 + 事件拼一条事实。
-    fn fact(&self, event: Self::Event) -> JobFact;
+    /// 这个事件是进展、做完还是做不下去。
+    fn stage(event: Self::Event) -> JobStage;
 
-    /// 被新意图顶替时落哪个事件。
-    fn replaced() -> Self::Event;
-    /// 被停止动词取消时落哪个事件。
-    fn cancelled() -> Self::Event;
-    /// 连接或整个模块结束时落哪个事件。
-    fn connection_ended() -> Self::Event;
+    /// 当前任务参数 + 事件拼成细节；槽位写生命周期结束时 `event` 为 `None`。
+    fn detail(&self, event: Option<Self::Event>) -> JobDetail;
 
     /// 只读现状，供任务表用。
     fn status(&self, id: JobId, started_tick: u64, now_tick: u64) -> JobStatus;
+}
+
+/// 动词事件拼成的事实。
+fn verb_fact<J: JobVerb>(job: &J, event: J::Event) -> JobFact {
+    JobFact {
+        stage: J::stage(event),
+        detail: job.detail(Some(event)),
+    }
+}
+
+/// 槽位在生命周期边界写的终局。
+fn lifecycle_fact<J: JobVerb>(job: &J, end: JobEnd) -> JobFact {
+    JobFact {
+        stage: JobStage::Ended(end),
+        detail: job.detail(None),
+    }
 }
 
 /// 轮询的结论。**收槽的唯一出口是 [`Step::End`]。**
@@ -86,7 +101,7 @@ impl<J: JobVerb> JobSlot<J> {
         if let Some(live) = previous {
             // 固定锁序为 slot → jobs_window。状态转换与事实提交必须原子，否则并发
             // 生命周期收束可能夹进来，让同一任务的终局排在旧 Progress/Replaced 前面。
-            inner.push_job_fact(live.id, live.job.fact(J::replaced()));
+            inner.push_job_fact(live.id, lifecycle_fact(&live.job, JobEnd::Replaced));
         }
         id
     }
@@ -106,14 +121,14 @@ impl<J: JobVerb> JobSlot<J> {
         match decide(&mut live.job) {
             Step::Keep => None,
             Step::Progress(event) => {
-                let fact = live.job.fact(event);
+                let fact = verb_fact(&live.job, event);
                 debug_assert!(!fact.is_terminal(), "Step::Progress 收到终局事件 {event:?}");
                 inner.push_job_fact(live.id, fact);
                 Some(event)
             }
             Step::End(event) => {
                 let live = slot.take().expect("上面刚借到 Some");
-                let fact = live.job.fact(event);
+                let fact = verb_fact(&live.job, event);
                 debug_assert!(fact.is_terminal(), "Step::End 收到非终局事件 {event:?}");
                 inner.push_job_fact(live.id, fact);
                 Some(event)
@@ -123,23 +138,21 @@ impl<J: JobVerb> JobSlot<J> {
 
     /// 取消在途任务。没有任务时不是错误（与 `release`／`stop` 的语义一致）。
     pub(super) fn cancel(&self, inner: &Inner) {
-        self.finish(inner, J::cancelled());
+        self.finish(inner, JobEnd::Cancelled);
     }
 
     /// 连接一旦结束就不再有 tick；在生命周期边界同步收槽。
     /// 返回是否真的结束了一个任务，重复的 client/swarm/thread 断线通知因此无害。
     pub(super) fn connection_ended(&self, inner: &Inner) -> bool {
-        self.finish(inner, J::connection_ended())
+        self.finish(inner, JobEnd::ConnectionEnded)
     }
 
-    fn finish(&self, inner: &Inner, event: J::Event) -> bool {
+    fn finish(&self, inner: &Inner, end: JobEnd) -> bool {
         let mut slot = self.live.lock();
         let Some(live) = slot.take() else {
             return false;
         };
-        let fact = live.job.fact(event);
-        debug_assert!(fact.is_terminal(), "生命周期收槽收到非终局事件 {event:?}");
-        inner.push_job_fact(live.id, fact);
+        inner.push_job_fact(live.id, lifecycle_fact(&live.job, end));
         true
     }
 
@@ -156,6 +169,34 @@ impl<J: JobVerb> JobSlot<J> {
     }
 }
 
+/// 测试用动词：任务框架与它的接线不认识具体动作，测试也不借某个动作。
+#[cfg(test)]
+pub(super) struct ProbeJob;
+
+/// 探测动词的事件：一步进展。
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct Stepped;
+
+#[cfg(test)]
+impl JobVerb for ProbeJob {
+    type Event = Stepped;
+    fn stage(_: Stepped) -> JobStage {
+        JobStage::Progress
+    }
+    fn detail(&self, _: Option<Stepped>) -> JobDetail {
+        JobDetail::Probe
+    }
+    fn status(&self, id: JobId, started_tick: u64, now_tick: u64) -> JobStatus {
+        JobStatus {
+            id,
+            kind: crate::JobStatusKind::Probe,
+            started_tick,
+            elapsed_ticks: now_tick.saturating_sub(started_tick),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -163,43 +204,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::{JobStatusKind, MineEvent};
-
-    struct Fake {
-        destination: [i32; 3],
-    }
-
-    impl JobVerb for Fake {
-        type Event = MineEvent;
-        fn fact(&self, event: MineEvent) -> JobFact {
-            JobFact::Mine {
-                targets: vec![self.destination],
-                done: 0,
-                event,
-            }
-        }
-        fn replaced() -> MineEvent {
-            MineEvent::Replaced
-        }
-        fn cancelled() -> MineEvent {
-            MineEvent::Cancelled
-        }
-        fn connection_ended() -> MineEvent {
-            MineEvent::ConnectionEnded
-        }
-        fn status(&self, id: JobId, started_tick: u64, now_tick: u64) -> JobStatus {
-            JobStatus {
-                id,
-                kind: JobStatusKind::Mine {
-                    targets: vec![self.destination],
-                    done: 0,
-                    current: None,
-                },
-                started_tick,
-                elapsed_ticks: now_tick.saturating_sub(started_tick),
-            }
-        }
-    }
+    use crate::JobStatusKind;
 
     struct BlockingFake {
         entered_fact: Arc<Barrier>,
@@ -208,54 +213,36 @@ mod tests {
     }
 
     impl JobVerb for BlockingFake {
-        type Event = MineEvent;
+        type Event = Stepped;
 
-        fn fact(&self, event: MineEvent) -> JobFact {
-            if matches!(event, MineEvent::Broke { .. })
-                && !self.blocked_once.swap(true, Ordering::AcqRel)
-            {
+        fn stage(_: Stepped) -> JobStage {
+            JobStage::Progress
+        }
+
+        fn detail(&self, event: Option<Stepped>) -> JobDetail {
+            if event.is_some() && !self.blocked_once.swap(true, Ordering::AcqRel) {
                 self.entered_fact.wait();
                 self.release_fact.wait();
             }
-            JobFact::Mine {
-                targets: vec![[1, 0, 0]],
-                done: 0,
-                event,
-            }
-        }
-
-        fn replaced() -> MineEvent {
-            MineEvent::Replaced
-        }
-        fn cancelled() -> MineEvent {
-            MineEvent::Cancelled
-        }
-        fn connection_ended() -> MineEvent {
-            MineEvent::ConnectionEnded
+            JobDetail::Probe
         }
 
         fn status(&self, id: JobId, started_tick: u64, now_tick: u64) -> JobStatus {
             JobStatus {
                 id,
-                kind: JobStatusKind::Mine {
-                    targets: vec![[1, 0, 0]],
-                    done: 0,
-                    current: None,
-                },
+                kind: JobStatusKind::Probe,
                 started_tick,
                 elapsed_ticks: now_tick.saturating_sub(started_tick),
             }
         }
     }
 
-    fn events(inner: &Inner) -> Vec<MineEvent> {
+    fn stages(inner: &Inner) -> Vec<JobStage> {
         inner
             .jobs_window_now()
             .entries
             .iter()
-            .map(|entry| match entry.fact {
-                JobFact::Mine { event, .. } => event,
-            })
+            .map(|entry| entry.fact.stage)
             .collect()
     }
 
@@ -263,37 +250,25 @@ mod tests {
     #[test]
     fn replacing_always_closes_the_previous_job() {
         let inner = Inner::new();
-        let slot = JobSlot::<Fake>::default();
-        let first = slot.begin(
-            &inner,
-            Fake {
-                destination: [1, 0, 0],
-            },
-        );
-        let second = slot.begin(
-            &inner,
-            Fake {
-                destination: [2, 0, 0],
-            },
-        );
+        let slot = JobSlot::<ProbeJob>::default();
+        let first = slot.begin(&inner, ProbeJob);
+        let second = slot.begin(&inner, ProbeJob);
         assert_ne!(first, second, "顶替时新旧任务必须是两个 id");
-        assert_eq!(events(&inner), vec![MineEvent::Replaced]);
+        assert_eq!(stages(&inner), vec![JobStage::Ended(JobEnd::Replaced)]);
     }
 
     #[test]
     fn connection_end_closes_a_live_job_exactly_once_without_more_ticks() {
         let inner = Inner::new();
-        let slot = JobSlot::<Fake>::default();
-        slot.begin(
-            &inner,
-            Fake {
-                destination: [1, 0, 0],
-            },
-        );
+        let slot = JobSlot::<ProbeJob>::default();
+        slot.begin(&inner, ProbeJob);
 
         assert!(slot.connection_ended(&inner));
         assert!(!slot.connection_ended(&inner));
-        assert_eq!(events(&inner), vec![MineEvent::ConnectionEnded]);
+        assert_eq!(
+            stages(&inner),
+            vec![JobStage::Ended(JobEnd::ConnectionEnded)]
+        );
         assert!(slot.status(inner.now_tick()).is_none());
     }
 
@@ -315,11 +290,7 @@ mod tests {
         let polling = {
             let inner = inner.clone();
             let slot = slot.clone();
-            std::thread::spawn(move || {
-                slot.poll(&inner, |_| {
-                    Step::Progress(MineEvent::Broke { done: 1, total: 2 })
-                })
-            })
+            std::thread::spawn(move || slot.poll(&inner, |_| Step::Progress(Stepped)))
         };
         entered_fact.wait();
 
@@ -341,18 +312,12 @@ mod tests {
         );
 
         release_fact.wait();
-        assert_eq!(
-            polling.join().unwrap(),
-            Some(MineEvent::Broke { done: 1, total: 2 })
-        );
+        assert_eq!(polling.join().unwrap(), Some(Stepped));
         ending.join().unwrap();
         assert!(ended_rx.recv().unwrap());
         assert_eq!(
-            events(&inner),
-            vec![
-                MineEvent::Broke { done: 1, total: 2 },
-                MineEvent::ConnectionEnded
-            ],
+            stages(&inner),
+            vec![JobStage::Progress, JobStage::Ended(JobEnd::ConnectionEnded)],
             "终局之后不能再补写进展"
         );
     }
@@ -361,16 +326,11 @@ mod tests {
     #[test]
     fn cancelling_closes_and_cancelling_nothing_is_silent() {
         let inner = Inner::new();
-        let slot = JobSlot::<Fake>::default();
-        slot.begin(
-            &inner,
-            Fake {
-                destination: [1, 0, 0],
-            },
-        );
+        let slot = JobSlot::<ProbeJob>::default();
+        slot.begin(&inner, ProbeJob);
         slot.cancel(&inner);
         slot.cancel(&inner);
-        assert_eq!(events(&inner), vec![MineEvent::Cancelled]);
+        assert_eq!(stages(&inner), vec![JobStage::Ended(JobEnd::Cancelled)]);
         assert!(slot.status(0).is_none());
     }
 }

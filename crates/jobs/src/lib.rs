@@ -18,7 +18,7 @@ use std::sync::Arc;
 use agent::{PortFuture, ToolCall, ToolDefinition, ToolResult};
 use dispatch::{ToolClass, ToolProvider};
 use serde_json::{json, Value};
-use world::{JobStatus, JobStatusKind};
+use world::{JobId, JobStatus, JobStatusKind};
 
 /// 接入模块只读口的窄化。
 pub trait JobsDoor: Send + Sync {
@@ -62,13 +62,23 @@ impl JobsTools {
 /// 一条任务的只读描述。**不替模型判断「卡住了没有」**——给出在途时长，
 /// 它自己看。机器下这个结论就是把推测讲成事实。
 fn describe(status: &JobStatus) -> Value {
-    let common = json!({
-        "id": status.id.0,
-        "已在途游戏刻": status.elapsed_ticks,
-    });
-    let mut value = common;
-    let object = value.as_object_mut().expect("上面就是对象");
-    match &status.kind {
+    let mut value = common(status.id, status.elapsed_ticks);
+    let object = value.as_object_mut().expect("common 给的就是对象");
+    describe_kind(&status.kind, object);
+    value
+}
+
+/// 每种任务都有的两项：身份与在途时长。
+fn common(id: JobId, elapsed_ticks: u64) -> Value {
+    json!({
+        "id": id.0,
+        "已在途游戏刻": elapsed_ticks,
+    })
+}
+
+/// 具体动作的那几项。
+fn describe_kind(kind: &JobStatusKind, object: &mut serde_json::Map<String, Value>) {
+    match kind {
         JobStatusKind::Mine {
             targets,
             done,
@@ -82,7 +92,6 @@ fn describe(status: &JobStatus) -> Value {
             }
         }
     }
-    value
 }
 
 impl ToolProvider for JobsTools {
@@ -121,7 +130,6 @@ mod tests {
     use std::sync::Mutex;
 
     use agent::{ContentPart, ToolResultStatus};
-    use world::JobId;
 
     use super::*;
 
@@ -177,20 +185,9 @@ mod tests {
     }
 
     /// 机器只给在途时长，不替模型判断「卡住了」——那是推测，不是事实。
-    #[tokio::test]
-    async fn the_table_states_elapsed_time_and_does_not_conclude_stuck() {
-        let jobs = vec![JobStatus {
-            id: JobId(9),
-            kind: JobStatusKind::Mine {
-                targets: vec![[0, 0, 0]],
-                done: 0,
-                current: None,
-            },
-            started_tick: 0,
-            elapsed_ticks: 9_999,
-        }];
-        let result = tools(jobs).call(call(json!({"action": "list"}))).await;
-        let text = serde_json::to_string(&json_of(&result)).expect("序列化");
+    #[test]
+    fn the_table_states_elapsed_time_and_does_not_conclude_stuck() {
+        let text = serde_json::to_string(&common(JobId(9), 9_999)).expect("序列化");
         assert!(text.contains("9999"), "{text}");
         assert!(!text.contains("卡住"), "机器不该下这个结论：{text}");
     }

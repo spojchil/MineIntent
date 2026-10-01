@@ -298,10 +298,13 @@ fn mining_failures_name_the_observed_boundary() {
         tick: 100,
         occurred_at: SystemTime::now(),
         id: world::JobId(8),
-        fact: world::JobFact::Mine {
-            targets: vec![[1, 64, 2], [2, 64, 2]],
-            done: 0,
-            event,
+        fact: world::JobFact {
+            stage: world::MineEvent::stage(&event),
+            detail: world::JobDetail::Mine {
+                targets: vec![[1, 64, 2], [2, 64, 2]],
+                done: 0,
+                event: Some(event),
+            },
         },
     };
 
@@ -339,20 +342,32 @@ fn mining_failures_name_the_observed_boundary() {
 /// 进展不是终局：类型上就该分得开，呈现也不该说成结束了。
 #[test]
 fn progress_is_not_terminal() {
-    assert!(!world::MineEvent::Broke { done: 1, total: 3 }.is_terminal());
-    assert!(world::MineEvent::Blocked { at: [1, 2, 3] }.is_terminal());
-    assert!(world::MineEvent::DispatchNotObserved {
-        at: [1, 2, 3],
-        ticks: 100
+    assert!(!world::MineEvent::Broke { done: 1, total: 3 }
+        .stage()
+        .is_terminal());
+    for event in [
+        world::MineEvent::Blocked { at: [1, 2, 3] },
+        world::MineEvent::DispatchNotObserved {
+            at: [1, 2, 3],
+            ticks: 100,
+        },
+        world::MineEvent::RequestEnded { at: [1, 2, 3] },
+        world::MineEvent::PredictionNotSettled {
+            at: [1, 2, 3],
+            ticks: 400,
+        },
+        world::MineEvent::TargetUnavailable { at: [1, 2, 3] },
+    ] {
+        assert_eq!(
+            event.stage(),
+            world::JobStage::Ended(world::JobEnd::Failed),
+            "{event:?}"
+        );
     }
-    .is_terminal());
-    assert!(world::MineEvent::RequestEnded { at: [1, 2, 3] }.is_terminal());
-    assert!(world::MineEvent::PredictionNotSettled {
-        at: [1, 2, 3],
-        ticks: 400
-    }
-    .is_terminal());
-    assert!(world::MineEvent::TargetUnavailable { at: [1, 2, 3] }.is_terminal());
+    assert_eq!(
+        world::MineEvent::Cleared.stage(),
+        world::JobStage::Ended(world::JobEnd::Completed)
+    );
 }
 
 #[test]

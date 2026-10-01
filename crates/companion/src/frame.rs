@@ -38,7 +38,7 @@
 //! 是 `Replaced`（`wake` 判它不值得叫醒），也不是进展——两条通道都按设计沉默。
 //! 判据本身还没改，先让它站到能被单测钉住的地方。
 
-use world::TickSnapshot;
+use world::{JobStage, TickSnapshot};
 
 use crate::situation::SituationTracker;
 
@@ -46,6 +46,13 @@ use crate::situation::SituationTracker;
 ///
 /// 真攒到这一步说明久没发车，旧的拾取对「我现在有什么」已经由快捷栏那行代答了。
 const PICKUP_BACKLOG: usize = 32;
+
+/// 帧眼里的一条任务事实：序号、阶段和已经写好的那句话。帧只看阶段，不认识具体动作。
+struct JobLine {
+    seq: u64,
+    stage: JobStage,
+    text: String,
+}
 
 /// 攒帧的人：拿着两条游标、一份没吐出去的拾取，和处境的比对基准。
 pub struct FrameComposer {
@@ -90,16 +97,37 @@ impl FrameComposer {
         snapshot: &TickSnapshot,
         chat_read: (u64, u64),
     ) -> Option<Vec<String>> {
+        // 只给游标之后的条目写句子；游标在下面推进。
+        let jobs = snapshot
+            .jobs
+            .entries
+            .iter()
+            .filter(|entry| !self.progress_seq.is_some_and(|seen| entry.seq <= seen))
+            .map(|entry| JobLine {
+                seq: entry.seq,
+                stage: entry.fact.stage,
+                text: render::render_job_entry(entry),
+            })
+            .collect();
+        self.compose_lines(snapshot, chat_read, jobs)
+    }
+
+    fn compose_lines(
+        &mut self,
+        snapshot: &TickSnapshot,
+        chat_read: (u64, u64),
+        jobs: Vec<JobLine>,
+    ) -> Option<Vec<String>> {
         self.collect_pickups(snapshot);
 
         let mut progress = Vec::new();
-        for entry in &snapshot.jobs.entries {
-            if self.progress_seq.is_some_and(|seen| entry.seq <= seen) {
+        for line in jobs {
+            if self.progress_seq.is_some_and(|seen| line.seq <= seen) {
                 continue;
             }
-            self.progress_seq = Some(entry.seq);
-            if !entry.fact.is_terminal() {
-                progress.push(render::render_job_entry(entry));
+            self.progress_seq = Some(line.seq);
+            if !line.stage.is_terminal() {
+                progress.push(line.text);
             }
         }
         if progress.is_empty() {
@@ -138,7 +166,7 @@ impl FrameComposer {
 mod tests {
     use std::time::SystemTime;
 
-    use world::{ConnectionPhase, Epoch, JobEntry, JobFact, JobId, MineEvent, PickupEntry};
+    use world::{ConnectionPhase, Epoch, JobEnd, PickupEntry};
 
     use super::*;
 
@@ -157,18 +185,12 @@ mod tests {
         snap
     }
 
-    fn job(seq: u64, event: MineEvent) -> JobEntry {
-        JobEntry {
+    fn job(seq: u64, stage: JobStage) -> Vec<JobLine> {
+        vec![JobLine {
             seq,
-            tick: seq,
-            occurred_at: SystemTime::now(),
-            id: JobId(1),
-            fact: JobFact::Mine {
-                targets: vec![[10, 64, 0], [11, 64, 0]],
-                done: 0,
-                event,
-            },
-        }
+            stage,
+            text: format!("任务事实 {seq}"),
+        }]
     }
 
     fn pickup(seq: u64, item: &str) -> PickupEntry {
@@ -196,9 +218,9 @@ mod tests {
     #[test]
     fn a_replaced_job_alone_drives_nothing() {
         let mut frames = FrameComposer::new();
-        let mut snapshot = snap(1, 0.5);
-        snapshot.jobs.entries.push(job(1, MineEvent::Replaced));
-        assert!(frames.compose(&snapshot, READ).is_none());
+        let snapshot = snap(1, 0.5);
+        let replaced = job(1, JobStage::Ended(JobEnd::Replaced));
+        assert!(frames.compose_lines(&snapshot, READ, replaced).is_none());
     }
 
     /// 拾取搭车不叫车：没车的那些次照样攒着，等有车了一并带走。
@@ -211,11 +233,9 @@ mod tests {
 
         let mut driving = snap(2, 0.5);
         driving.pickups.entries.push(pickup(1, "minecraft:coal"));
-        driving
-            .jobs
-            .entries
-            .push(job(1, MineEvent::Broke { done: 1, total: 2 }));
-        let frame = frames.compose(&driving, READ).expect("有进展就该发车");
+        let frame = frames
+            .compose_lines(&driving, READ, job(1, JobStage::Progress))
+            .expect("有进展就该发车");
         assert!(
             frame.iter().any(|line| line.contains("coal")),
             "攒下的拾取没跟车走：{frame:?}"
@@ -227,24 +247,20 @@ mod tests {
     #[test]
     fn a_carless_round_does_not_swallow_the_situation_it_computed() {
         let mut frames = FrameComposer::new();
-        let mut first = snap(1, 0.5);
-        first
-            .jobs
-            .entries
-            .push(job(1, MineEvent::Broke { done: 1, total: 2 }));
-        let opening = frames.compose(&first, READ).expect("开局该投全量");
+        let first = snap(1, 0.5);
+        let opening = frames
+            .compose_lines(&first, READ, job(1, JobStage::Progress))
+            .expect("开局该投全量");
         assert!(opening.iter().any(|line| line.contains("位置 (0, 64, 0)")));
 
         // 走到了 x=9，但这一次没有新进展：不发车。
         assert!(frames.compose(&snap(2, 9.5), READ).is_none());
 
         // 下一次有车了，新位置必须还在。
-        let mut later = snap(3, 9.5);
-        later
-            .jobs
-            .entries
-            .push(job(2, MineEvent::Broke { done: 1, total: 2 }));
-        let frame = frames.compose(&later, READ).expect("有进展就该发车");
+        let later = snap(3, 9.5);
+        let frame = frames
+            .compose_lines(&later, READ, job(2, JobStage::Progress))
+            .expect("有进展就该发车");
         assert!(
             frame.iter().any(|line| line.contains("位置 (9, 64, 0)")),
             "无车那次把位置差异吞了：{frame:?}"
@@ -263,12 +279,10 @@ mod tests {
                 .push(pickup(seq, &format!("minecraft:item_{seq}")));
             assert!(frames.compose(&quiet, READ).is_none());
         }
-        let mut driving = snap(100, 0.5);
-        driving
-            .jobs
-            .entries
-            .push(job(1, MineEvent::Broke { done: 1, total: 2 }));
-        let frame = frames.compose(&driving, READ).expect("有进展就该发车");
+        let driving = snap(100, 0.5);
+        let frame = frames
+            .compose_lines(&driving, READ, job(1, JobStage::Progress))
+            .expect("有进展就该发车");
         assert!(
             !frame.iter().any(|line| line.contains("item_1 ")),
             "最旧的拾取该被挤掉：{frame:?}"
@@ -283,28 +297,22 @@ mod tests {
     #[test]
     fn compaction_makes_the_next_frame_say_everything_again() {
         let mut frames = FrameComposer::new();
-        let mut first = snap(1, 0.5);
-        first
-            .jobs
-            .entries
-            .push(job(1, MineEvent::Broke { done: 1, total: 2 }));
-        let opening = frames.compose(&first, READ).expect("开局该投全量");
+        let first = snap(1, 0.5);
+        let opening = frames
+            .compose_lines(&first, READ, job(1, JobStage::Progress))
+            .expect("开局该投全量");
 
-        let mut second = snap(2, 0.5);
-        second
-            .jobs
-            .entries
-            .push(job(2, MineEvent::Broke { done: 1, total: 2 }));
-        let quiet = frames.compose(&second, READ).expect("有进展就该发车");
+        let second = snap(2, 0.5);
+        let quiet = frames
+            .compose_lines(&second, READ, job(2, JobStage::Progress))
+            .expect("有进展就该发车");
         assert!(quiet.len() < opening.len(), "没变的行不该重复：{quiet:?}");
 
         frames.resend_situation();
-        let mut third = snap(3, 0.5);
-        third
-            .jobs
-            .entries
-            .push(job(3, MineEvent::Broke { done: 1, total: 2 }));
-        let after = frames.compose(&third, READ).expect("有进展就该发车");
+        let third = snap(3, 0.5);
+        let after = frames
+            .compose_lines(&third, READ, job(3, JobStage::Progress))
+            .expect("有进展就该发车");
         assert_eq!(
             after.len(),
             opening.len(),

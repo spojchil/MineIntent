@@ -607,7 +607,8 @@ async fn main() {
     println!();
     println!("聊天：`alice: 过来一下`（发言者名: 原文）\n");
     println!("任务通知（render_job_entry 全谱）：\n");
-    for event in [
+    let lifecycle = |end| (world::JobStage::Ended(end), None);
+    for (stage, event) in [
         world::MineEvent::Broke { done: 1, total: 2 },
         world::MineEvent::Cleared,
         world::MineEvent::Blocked { at: [36, 71, 3] },
@@ -621,37 +622,37 @@ async fn main() {
             ticks: 400,
         },
         world::MineEvent::TargetUnavailable { at: [36, 71, 3] },
-        world::MineEvent::Replaced,
-        world::MineEvent::Cancelled,
-        world::MineEvent::ConnectionEnded,
-    ] {
+    ]
+    .into_iter()
+    .map(|event| (event.stage(), Some(event)))
+    .chain([
+        lifecycle(world::JobEnd::Replaced),
+        lifecycle(world::JobEnd::Cancelled),
+        lifecycle(world::JobEnd::ConnectionEnded),
+    ]) {
         let entry = world::JobEntry {
             seq: 1,
             tick: 100,
             occurred_at: std::time::SystemTime::UNIX_EPOCH,
             id: world::JobId(4),
-            fact: world::JobFact::Mine {
-                targets: vec![[36, 71, 3], [37, 71, 3]],
-                done: usize::from(matches!(event, world::MineEvent::Broke { .. })),
-                event,
+            fact: world::JobFact {
+                stage,
+                detail: world::JobDetail::Mine {
+                    targets: vec![[36, 71, 3], [37, 71, 3]],
+                    done: usize::from(stage == world::JobStage::Progress),
+                    event,
+                },
             },
         };
-        let terminal = entry.fact.is_terminal();
-        let wakes = !matches!(
-            event,
-            world::MineEvent::Replaced
-                | world::MineEvent::Cancelled
-                | world::MineEvent::Broke { .. }
-        );
-        println!(
-            "- {}`{}`",
-            match (terminal, wakes) {
-                (false, _) => "（进展·搭帧）",
-                (true, true) => "",
-                (true, false) => "（终局·入窗不叫醒）",
-            },
-            render::render_job_entry(&entry)
-        );
+        // 与 companion::wake 的判据一致：进展搭帧，顶替与取消不叫醒。
+        let label = match stage {
+            world::JobStage::Progress => "（进展·搭帧）",
+            world::JobStage::Ended(world::JobEnd::Replaced | world::JobEnd::Cancelled) => {
+                "（终局·入窗不叫醒）"
+            }
+            world::JobStage::Ended(_) => "",
+        };
+        println!("- {label}`{}`", render::render_job_entry(&entry));
     }
     println!("\n受伤通知：\n");
     for (before, after) in [(20.0_f32, 14.0_f32), (14.0, 0.0)] {
