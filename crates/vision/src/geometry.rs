@@ -152,7 +152,8 @@ pub(crate) fn build(
 /// 时剔除背向它的面（只看面结构的测试不传）。
 ///
 /// 分三步（参照原版 `SectionRenderDispatcher` 与 Sodium 的分段编译）：视锥按段筛方块；
-/// 串行解析每种方块状态的面与方块实体（要读资源）；再按方块并行出三角形，每个线程一份
+/// 方块归到状态，每种状态串行解析一次面与方块实体几何（要读资源）；再按方块并行出
+/// 三角形（方块实体在前、模型面在后），每个线程一份
 /// 染色缓存（原版 `ClientLevel` 的 `tintCaches` 也是每线程一份）。返回各线程的分段，
 /// 按顺序接起来就是方块原顺序；不拼成一个大数组，省一次整体搬运。
 pub(crate) fn build_lit(
@@ -180,16 +181,47 @@ pub(crate) fn build_lit(
         .collect();
     report.stage("geometry: frustum select", &mut clock);
 
-    let mut states: HashMap<(&str, &std::collections::BTreeMap<String, String>), usize> =
-        HashMap::new();
-    let mut faces_by_state: Vec<Vec<Face>> = Vec::new();
-    let mut prepared: Vec<(usize, Vec<Triangle>)> = Vec::with_capacity(visible.len());
-    for block in &visible {
-        let entity = crate::block_entity::triangles(block, eye, cells, resources, report);
-        let state = *states
-            .entry((block.name.as_str(), &block.properties))
-            .or_insert_with(|| {
-                faces_by_state.push(match block_faces(block, resources, report) {
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(8);
+    let chunk = visible.len().div_ceil(workers).max(1);
+    // 状态键每个方块都要哈希、比较一次：按出三角形的分段并行，各段给自己的方块编本地状态号
+    // （按首次出现的顺序），记下每种状态首次出现的方块。
+    let local: Vec<(Vec<&Block>, Vec<usize>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = visible
+            .chunks(chunk)
+            .map(|blocks| {
+                scope.spawn(move || {
+                    let mut states = StateMap::default();
+                    let mut firsts = Vec::new();
+                    let ids = blocks
+                        .iter()
+                        .map(|block| {
+                            *states.entry(state_key(block)).or_insert_with(|| {
+                                firsts.push(*block);
+                                firsts.len() - 1
+                            })
+                        })
+                        .collect();
+                    (firsts, ids)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("状态编号线程不 panic"))
+            .collect()
+    });
+    // 再按段的顺序串行合并成全局状态号（仍是首次出现的顺序），新状态解析一次。
+    let mut states = StateMap::default();
+    let mut by_state: Vec<(Vec<Face>, Option<crate::block_entity::Model>)> = Vec::new();
+    let mut to_global: Vec<Vec<usize>> = Vec::with_capacity(local.len());
+    for (firsts, _) in &local {
+        let mut remap = Vec::with_capacity(firsts.len());
+        for block in firsts {
+            let state = *states.entry(state_key(block)).or_insert_with(|| {
+                let entity = crate::block_entity::model(block, resources, report);
+                let faces = match block_faces(block, resources, report) {
                     Ok(faces) if !faces.is_empty() => faces,
                     // 箱子、潜影盒等没有资源定义的几何，整个外形由方块实体画。
                     _ if crate::block_entity::has(&block.name) => Vec::new(),
@@ -203,10 +235,13 @@ pub(crate) fn build_lit(
                         ));
                         cube_faces(missing_texture(), [1.0; 3], 1.0, 1.0)
                     }
-                });
-                faces_by_state.len() - 1
+                };
+                by_state.push((faces, entity));
+                by_state.len() - 1
             });
-        prepared.push((state, entity));
+            remap.push(state);
+        }
+        to_global.push(remap);
     }
     report.stage("geometry: state faces, block entities", &mut clock);
 
@@ -216,28 +251,27 @@ pub(crate) fn build_lit(
     } else {
         PositionMap::default()
     };
-    let workers = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .min(8);
-    let chunk = visible.len().div_ceil(workers).max(1);
-    let faces_by_state = &faces_by_state;
+    let by_state = &by_state;
     let neighbours = &neighbours;
     let parts: Vec<Vec<Triangle>> = std::thread::scope(|scope| {
         let handles: Vec<_> = visible
             .chunks(chunk)
-            .zip(prepared.chunks_mut(chunk))
-            .map(|(blocks, prepared)| {
+            .zip(local.iter().zip(&to_global))
+            .map(|(blocks, ((_, ids), remap))| {
                 scope.spawn(move || {
                     let mut tints = crate::biome::TintCache::new();
                     // 大多数方块露出一个面、两个三角形；先留够，免得边推边扩容搬运。
                     let mut triangles = Vec::with_capacity(blocks.len() * 2);
-                    for (block, (state, entity)) in blocks.iter().zip(prepared) {
-                        triangles.append(entity);
+                    for (block, id) in blocks.iter().zip(ids) {
+                        let (faces, entity) = &by_state[remap[*id]];
+                        if let Some(entity) = entity {
+                            entity.emit(block.position, eye, cells, &mut triangles);
+                        }
                         emit_block(
                             block,
                             eye,
                             frustum,
-                            &faces_by_state[*state],
+                            faces,
                             neighbours,
                             cells,
                             biomes,
@@ -257,6 +291,17 @@ pub(crate) fn build_lit(
     });
     report.stage("geometry: emit", &mut clock);
     parts
+}
+
+/// 方块状态键：方块名与属性。每个方块都要哈希一次，与坐标表同用 FxHash。
+type StateMap<'s> = HashMap<
+    (&'s str, &'s std::collections::BTreeMap<String, String>),
+    usize,
+    std::hash::BuildHasherDefault<PositionHasher>,
+>;
+
+fn state_key(block: &Block) -> (&str, &std::collections::BTreeMap<String, String>) {
+    (&block.name, &block.properties)
 }
 
 fn is_air(name: &str) -> bool {

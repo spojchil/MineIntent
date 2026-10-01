@@ -10,8 +10,9 @@
 //! 架上物品等）尚未接入；圣诞节期间原版箱子换皮，这里不换。
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+use image::RgbaImage;
 use serde::Deserialize;
 
 use crate::geometry::{Triangle, V3};
@@ -70,20 +71,20 @@ fn variant(block: &Block) -> Option<&'static Variant> {
     family.variants.get(&key)
 }
 
-/// 方块实体部分的三角形；这个状态不画方块实体时为空。
-pub(crate) fn triangles(
+/// 一个方块状态的方块实体几何与贴图。按状态解析一次（要读资源），各方块再按位置出三角形。
+pub(crate) struct Model {
+    quads: &'static [Quad],
+    texture: Arc<RgbaImage>,
+}
+
+/// 这个状态的方块实体几何；不画方块实体时为 `None`。
+pub(crate) fn model(
     block: &Block,
-    eye: Option<V3>,
-    cells: Option<&Cells>,
     resources: &mut Resources,
     report: &mut Report,
-) -> Vec<Triangle> {
-    let Some(variant) = variant(block) else {
-        return Vec::new();
-    };
-    let Some(quads) = data().geometries.get(&variant.geometry) else {
-        return Vec::new();
-    };
+) -> Option<Model> {
+    let variant = variant(block)?;
+    let quads = data().geometries.get(&variant.geometry)?;
     report.warnings.insert(
         "block entities: static pose (lids closed, bell still, enchanting book closed); signs, banners, heads, pots and other server-data contents not drawn yet".to_owned(),
     );
@@ -94,35 +95,46 @@ pub(crate) fn triangles(
         ));
         crate::assets::missing_texture()
     });
-    let light = cells.map_or(FULL_BRIGHT, |cells| {
-        cells.coords(cells.get(block.position), block.position)
-    });
-    let offset = block.position.map(f64::from);
-    let mut triangles = Vec::with_capacity(quads.len() * 2);
-    for (vertices, normal) in quads {
-        // 背面剔除：方块实体的渲染类型（entityCutout、entitySolid）开着面剔除。
-        if let Some(eye) = eye {
-            let to_eye: V3 = std::array::from_fn(|k| eye[k] - vertices[0][k] - offset[k]);
-            if (0..3).map(|k| normal[k] * to_eye[k]).sum::<f64>() <= 0.0 {
-                continue;
+    Some(Model { quads, texture })
+}
+
+impl Model {
+    /// 放在 `position` 的这个方块实体的三角形，接在 `triangles` 后面。
+    pub(crate) fn emit(
+        &self,
+        position: [i32; 3],
+        eye: Option<V3>,
+        cells: Option<&Cells>,
+        triangles: &mut Vec<Triangle>,
+    ) {
+        let light = cells.map_or(FULL_BRIGHT, |cells| {
+            cells.coords(cells.get(position), position)
+        });
+        let offset = position.map(f64::from);
+        for (vertices, normal) in self.quads {
+            // 背面剔除：方块实体的渲染类型（entityCutout、entitySolid）开着面剔除。
+            if let Some(eye) = eye {
+                let to_eye: V3 = std::array::from_fn(|k| eye[k] - vertices[0][k] - offset[k]);
+                if (0..3).map(|k| normal[k] * to_eye[k]).sum::<f64>() <= 0.0 {
+                    continue;
+                }
+            }
+            let shade = crate::entity::shade(*normal);
+            let vertex = |i: usize| -> V3 { std::array::from_fn(|k| vertices[i][k] + offset[k]) };
+            // 光栅器按「贴图宽 16 单位」采样。
+            let uv = |i: usize| [vertices[i][3] * 16.0, vertices[i][4] * 16.0];
+            for indices in [[0, 1, 2], [0, 2, 3]] {
+                triangles.push(Triangle {
+                    vertices: indices.map(vertex),
+                    uv: indices.map(uv),
+                    texture: self.texture.clone(),
+                    color: [[shade; 3]; 3],
+                    light: [light; 3],
+                    alpha: 1.0,
+                });
             }
         }
-        let shade = crate::entity::shade(*normal);
-        let position = |i: usize| -> V3 { std::array::from_fn(|k| vertices[i][k] + offset[k]) };
-        // 光栅器按「贴图宽 16 单位」采样。
-        let uv = |i: usize| [vertices[i][3] * 16.0, vertices[i][4] * 16.0];
-        for indices in [[0, 1, 2], [0, 2, 3]] {
-            triangles.push(Triangle {
-                vertices: indices.map(position),
-                uv: indices.map(uv),
-                texture: texture.clone(),
-                color: [[shade; 3]; 3],
-                light: [light; 3],
-                alpha: 1.0,
-            });
-        }
     }
-    triangles
 }
 
 #[cfg(test)]
