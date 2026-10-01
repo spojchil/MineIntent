@@ -189,6 +189,69 @@ fn top_left(a: [f64; 2], b: [f64; 2]) -> bool {
     b[1] < a[1] || (b[1] == a[1] && b[0] > a[0])
 }
 
+/// 第 `y` 行里被三角形覆盖的像素 `[from, to)`（在 `x0..x1` 之内）。
+///
+/// 同一行上 [`edge`] 是「常数 × 横坐标 + 常数」，浮点乘、加的舍入都是单调的，所以每条边
+/// 的内侧判定沿 x 至多翻转一次，三条边的交是一个区间。先按解析解估出端点，再用与逐像素
+/// 测试完全相同的判定校正，得到的像素集合与逐个测试相同，只是不再测区间外的像素。
+fn row_span(
+    pairs: &[([f64; 2], [f64; 2]); 3],
+    inclusive: [bool; 3],
+    y: usize,
+    [x0, x1]: [usize; 2],
+    probes: &mut u64,
+) -> [usize; 2] {
+    let py = y as f64 + 0.5;
+    let mut inside = |k: usize, x: usize| {
+        *probes += 1;
+        let (a, b) = pairs[k];
+        let e = edge(a, b, [x as f64 + 0.5, py]);
+        e > 0.0 || (e == 0.0 && inclusive[k])
+    };
+    let (mut from, mut to) = (x0, x1);
+    for (k, (a, b)) in pairs.iter().enumerate() {
+        if from >= to {
+            break;
+        }
+        let slope = a[1] - b[1];
+        if slope == 0.0 {
+            // 水平边：整行同一个判定。
+            if !inside(k, from) {
+                return [from, from];
+            }
+            continue;
+        }
+        // 像素中心正好落在边上的横坐标，只作起点；端点以下面的逐像素判定为准。
+        let constant = (b[0] - a[0]) * py + (a[0] * b[1] - a[1] * b[0]);
+        let crossing = -constant / slope - 0.5;
+        let mut x = if crossing.is_finite() {
+            crossing.ceil().clamp(from as f64, to as f64) as usize
+        } else {
+            from
+        };
+        if slope > 0.0 {
+            // 内侧在右：找第一个在内侧的像素。
+            while x > from && inside(k, x - 1) {
+                x -= 1;
+            }
+            while x < to && !inside(k, x) {
+                x += 1;
+            }
+            from = x;
+        } else {
+            // 内侧在左：找第一个不在内侧的像素。
+            while x > from && !inside(k, x - 1) {
+                x -= 1;
+            }
+            while x < to && inside(k, x) {
+                x += 1;
+            }
+            to = x;
+        }
+    }
+    [from, to.max(from)]
+}
+
 /// 投影、裁剪所有三角形，按块并行，按原顺序拼回后从近到远排序。
 fn project<'a>(
     triangles: &'a [Triangle],
@@ -500,7 +563,7 @@ fn draw_band(
             ((1.0 - 2.0 * (y as f64 + 0.5) / projection.size[1]) * projection.scale[1]).powi(2)
         })
         .collect();
-    let [mut tests, mut covered, mut passed, mut transparent, mut fogged] = [0u64; 5];
+    let [mut tests, mut probes, mut covered, mut passed, mut transparent, mut fogged] = [0u64; 6];
     for t in bin {
         let [x0, ty0, x1, ty1] = t.bounds;
         let first_y = ty0.max(y0);
@@ -514,12 +577,11 @@ fn draw_band(
         let inclusive = pairs.map(|(a, b)| top_left(a, b));
         let inverse_area = 1.0 / t.area;
         for y in first_y..last_y {
-            for x in x0..x1 {
+            let [from, to] = row_span(&pairs, inclusive, y, [x0, x1], &mut probes);
+            for x in from..to {
                 let p = [x as f64 + 0.5, y as f64 + 0.5];
                 let e = pairs.map(|(a, b)| edge(a, b, p));
-                if (0..3).any(|i| e[i] < 0.0 || (e[i] == 0.0 && !inclusive[i])) {
-                    continue;
-                }
+                debug_assert!((0..3).all(|i| e[i] > 0.0 || (e[i] == 0.0 && inclusive[i])));
                 covered += 1;
                 let weights = e.map(|value| value * inverse_area);
                 let inv_z =
@@ -560,6 +622,7 @@ fn draw_band(
     }
     use crate::counters::{add, Counter};
     add(Counter::CoverageTests, tests);
+    add(Counter::SpanProbes, probes);
     add(Counter::Covered, covered);
     add(Counter::DepthPassed, passed);
     add(Counter::Transparent, transparent);

@@ -34,6 +34,7 @@ counters! {
     TrianglesDropped => "project: triangles fully clipped away",
     TrianglesOut => "project: screen triangles out",
     CoverageTests => "raster: coverage tests (bounding-box pixels)",
+    SpanProbes => "raster: span end probes",
     Covered => "raster: pixels inside triangles",
     DepthPassed => "raster: fragments passing depth and far",
     Transparent => "raster: transparent texels discarded",
