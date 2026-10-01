@@ -252,14 +252,14 @@ fn row_span(
     [from, to.max(from)]
 }
 
-/// 投影、裁剪所有三角形，每个分段一个线程，按原顺序拼回后从近到远排序。
+/// 投影、裁剪所有三角形，每个分段一个线程；结果按段留着，不拼成一个大数组。
 fn project<'a>(
     parts: &'a [Vec<Triangle>],
     camera: &Camera,
     projection: &Projection,
     far: f64,
-) -> Vec<Projected<'a>> {
-    let parts: Vec<Vec<Projected<'a>>> = std::thread::scope(|scope| {
+) -> Vec<Vec<Projected<'a>>> {
+    std::thread::scope(|scope| {
         let handles: Vec<_> = parts
             .iter()
             .map(|part| {
@@ -274,14 +274,20 @@ fn project<'a>(
             .into_iter()
             .map(|handle| handle.join().expect("投影线程不 panic"))
             .collect()
-    });
-    let mut result = Vec::with_capacity(parts.iter().map(Vec::len).sum());
-    for mut part in parts {
-        result.append(&mut part);
-    }
-    // Front-to-back improves early depth rejection; correctness does not require sorting.
-    result.sort_unstable_by(|a, b| b.nearest.total_cmp(&a.nearest));
-    result
+    })
+}
+
+/// 从近到远的绘制顺序：近的先画，深度测试能早早挡掉后面的片元（正确性不依赖顺序）。
+/// 只排「深度键 + 序号」的小对，不搬 200 多字节的投影记录；同键按原顺序。
+fn front_to_back<'p, 'a>(parts: &'p [Vec<Projected<'a>>]) -> Vec<&'p Projected<'a>> {
+    let all: Vec<&Projected<'a>> = parts.iter().flatten().collect();
+    let mut keys: Vec<(f64, u32)> = all
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.nearest, i as u32))
+        .collect();
+    keys.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    keys.into_iter().map(|(_, i)| all[i as usize]).collect()
 }
 
 fn project_part<'a>(
@@ -657,11 +663,13 @@ pub(crate) fn draw(
     let mut clock = std::time::Instant::now();
     let projection = Projection::new(camera, options);
     let projected = project(parts, camera, &projection, options.far);
-    report.stage("project, clip, sort", &mut clock);
+    report.stage("project, clip", &mut clock);
+    let ordered = front_to_back(&projected);
+    report.stage("sort", &mut clock);
     // 分箱：每个三角形按（已排好的）顺序登记到它覆盖的每个 16 行条带，条带只扫自己的箱。
     let band_count = (options.height as usize).div_ceil(BAND);
     let mut bins: Vec<Vec<&Projected<'_>>> = vec![Vec::new(); band_count];
-    for t in &projected {
+    for t in ordered {
         for bin in &mut bins[t.bounds[1] / BAND..t.bounds[3].div_ceil(BAND)] {
             bin.push(t);
         }
