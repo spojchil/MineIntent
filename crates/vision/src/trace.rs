@@ -1,7 +1,7 @@
 //! Test-only ray-tracing reference, independent of the rasterizer.
 use image::RgbaImage;
 
-use crate::geometry::{add, build, cross, dot, mul, sub, Triangle, V3};
+use crate::geometry::{add, build, cross, dot, mul, sub, Textures, Triangle, V3};
 use crate::{Camera, Frame, Options, Report, Resources, Scene};
 
 struct Node {
@@ -12,15 +12,17 @@ struct Node {
     children: Option<[usize; 2]>,
 }
 
-struct Mesh {
+struct Mesh<'t> {
     triangles: Vec<Triangle>,
+    textures: &'t Textures,
     nodes: Vec<Node>,
 }
 
-impl Mesh {
-    fn new(triangles: Vec<Triangle>) -> Self {
+impl<'t> Mesh<'t> {
+    fn new(triangles: Vec<Triangle>, textures: &'t Textures) -> Self {
         let mut mesh = Self {
             triangles,
+            textures,
             nodes: Vec::new(),
         };
         mesh.partition(0, mesh.triangles.len());
@@ -90,7 +92,7 @@ impl Mesh {
                     if t < near || t >= distance {
                         continue;
                     }
-                    let color = sample(triangle, u, v);
+                    let color = sample(self.textures, triangle, u, v);
                     if color[3] < 0.01 {
                         continue;
                     }
@@ -143,19 +145,17 @@ fn intersect_triangle(triangle: &Triangle, origin: V3, direction: V3) -> Option<
     Some((dot(b, q) / determinant, u, v))
 }
 
-fn sample(triangle: &Triangle, u: f64, v: f64) -> [f64; 4] {
+fn sample(textures: &Textures, triangle: &Triangle, u: f64, v: f64) -> [f64; 4] {
+    let texture = textures.get(triangle.texture);
     let uv: [f64; 2] = std::array::from_fn(|i| {
         triangle.uv[0][i] * (1.0 - u - v) + triangle.uv[1][i] * u + triangle.uv[2][i] * v
     });
-    let width = triangle.texture.width();
+    let width = texture.width();
     // Vanilla animated block sheets are vertical; freeze the first square tile.
-    let height = triangle.texture.height().min(width);
+    let height = texture.height().min(width);
     let x = ((uv[0] / 16.0).clamp(0.0, 1.0) * f64::from(width)) as u32;
     let y = ((uv[1] / 16.0).clamp(0.0, 1.0) * f64::from(height)) as u32;
-    let color = triangle
-        .texture
-        .get_pixel(x.min(width - 1), y.min(height - 1))
-        .0;
+    let color = texture.get_pixel(x.min(width - 1), y.min(height - 1)).0;
     let tint: [f64; 3] = std::array::from_fn(|i| {
         triangle.color[0][i] * (1.0 - u - v) + triangle.color[1][i] * u + triangle.color[2][i] * v
     });
@@ -214,16 +214,22 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
     report
         .warnings
         .insert("transparency is composited through at most 16 surfaces".to_owned());
-    let triangles = build(scene, resources, &mut report);
+    let mut textures = Textures::default();
+    let triangles = build(scene, resources, &mut textures, &mut report);
     report.triangles = triangles.len();
     Ok(Frame {
-        image: draw(triangles, &scene.camera, options),
+        image: draw(triangles, &textures, &scene.camera, options),
         report,
     })
 }
 
-pub(crate) fn draw(triangles: Vec<Triangle>, camera: &Camera, options: Options) -> RgbaImage {
-    let mesh = Mesh::new(triangles);
+pub(crate) fn draw(
+    triangles: Vec<Triangle>,
+    textures: &Textures,
+    camera: &Camera,
+    options: Options,
+) -> RgbaImage {
+    let mesh = Mesh::new(triangles, textures);
     let mut pixels = vec![0u8; options.width as usize * options.height as usize * 4];
     let workers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())

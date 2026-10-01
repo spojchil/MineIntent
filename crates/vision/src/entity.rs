@@ -11,13 +11,11 @@
 //! 装备与手持物、受伤变红、光照。认不出的实体画成与碰撞箱等大的占位块。
 
 use std::f64::consts::FRAC_PI_2;
-use std::sync::Arc;
 
-use image::RgbaImage;
 use serde::{Deserialize, Serialize};
 
 use crate::assets::missing_texture;
-use crate::geometry::{add, Triangle, V3};
+use crate::geometry::{add, TextureId, Textures, Triangle, V3};
 use crate::{Report, Resources};
 
 /// 场景里的一个实体。朝向用原版角度制（yaw 0 = 朝南，90 = 朝西；pitch 向下为正）。
@@ -651,7 +649,7 @@ pub(crate) fn shade(normal: V3) -> f64 {
 fn emit_cube(
     cube: &Cube,
     pose: &Pose,
-    texture: &Arc<RgbaImage>,
+    texture: TextureId,
     size: [f64; 2],
     triangles: &mut Vec<Triangle>,
 ) {
@@ -714,7 +712,7 @@ fn emit_cube(
             triangles.push(Triangle {
                 vertices: indices.map(|i| world[i]),
                 uv: indices.map(|i| uv[i]),
-                texture: texture.clone(),
+                texture,
                 color: [[light; 3]; 3],
                 light: [crate::light::FULL_BRIGHT; 3],
                 alpha: 1.0,
@@ -727,7 +725,7 @@ fn emit_part(
     part: &Part,
     parent: &Pose,
     head: (f64, f64),
-    texture: &Arc<RgbaImage>,
+    texture: TextureId,
     size: [f64; 2],
     triangles: &mut Vec<Triangle>,
 ) {
@@ -766,12 +764,13 @@ pub(crate) fn build(
     eye: V3,
     cells: Option<&crate::light::Cells>,
     resources: &mut Resources,
+    textures: &mut Textures,
     report: &mut Report,
 ) -> Vec<Triangle> {
     let mut triangles = Vec::new();
     for entity in entities {
         let start = triangles.len();
-        emit_entity(entity, eye, resources, report, &mut triangles);
+        emit_entity(entity, eye, resources, textures, report, &mut triangles);
         // 原版实体按眼睛所在格取光（`getLightProbePosition`），整只实体一个光照值。
         if let Some(cells) = cells {
             let probe = [
@@ -795,6 +794,7 @@ fn emit_entity(
     entity: &Entity,
     eye: V3,
     resources: &mut Resources,
+    textures: &mut Textures,
     report: &mut Report,
     triangles: &mut Vec<Triangle>,
 ) {
@@ -812,8 +812,8 @@ fn emit_entity(
         .strip_prefix("minecraft:")
         .unwrap_or(&entity.kind);
     if kind == "item" {
-        if !dropped_item(entity, eye, resources, report, triangles) {
-            placeholder(entity, triangles);
+        if !dropped_item(entity, eye, resources, textures, report, triangles) {
+            placeholder(entity, textures, triangles);
         }
         return;
     }
@@ -822,7 +822,7 @@ fn emit_entity(
             "{}: no entity model yet, drawn as hitbox placeholder",
             entity.kind
         ));
-        placeholder(entity, triangles);
+        placeholder(entity, textures, triangles);
         return;
     };
     // LivingEntityRenderer：平移到脚底 → 绕 Y 转 180-bodyYaw → scale(-1,-1,1) → 下移 1.501。
@@ -843,8 +843,9 @@ fn emit_entity(
                 .insert(format!("{}: texture unavailable ({error})", entity.kind));
             missing_texture()
         });
+        let texture = textures.id(&texture);
         for part in &layer.parts {
-            emit_part(part, &root, head, &texture, layer.texture_size, triangles);
+            emit_part(part, &root, head, texture, layer.texture_size, triangles);
         }
     }
 }
@@ -856,6 +857,7 @@ fn dropped_item(
     entity: &Entity,
     eye: V3,
     resources: &mut Resources,
+    textures: &mut Textures,
     report: &mut Report,
     triangles: &mut Vec<Triangle>,
 ) -> bool {
@@ -873,6 +875,7 @@ fn dropped_item(
     let block = crate::geometry::block_item_triangles(
         name,
         resources,
+        textures,
         report,
         crate::light::FULL_BRIGHT,
         |p| {
@@ -893,6 +896,7 @@ fn dropped_item(
         ));
         return false;
     };
+    let texture = textures.id(&texture);
     // 水平方向朝向镜头的竖直方片。
     let to_eye = [eye[0] - x, 0.0, eye[2] - z];
     let length = (to_eye[0] * to_eye[0] + to_eye[2] * to_eye[2])
@@ -913,7 +917,7 @@ fn dropped_item(
         triangles.push(Triangle {
             vertices: indices.map(|i| vertices[i]),
             uv: indices.map(|i| uv[i]),
-            texture: texture.clone(),
+            texture,
             color: [[1.0; 3]; 3],
             light: [crate::light::FULL_BRIGHT; 3],
             alpha: 1.0,
@@ -923,7 +927,7 @@ fn dropped_item(
 }
 
 /// 认不出的实体：碰撞箱大小的紫黑块，和认不出的方块一样显眼，不假装知道它长什么样。
-fn placeholder(entity: &Entity, triangles: &mut Vec<Triangle>) {
+fn placeholder(entity: &Entity, textures: &mut Textures, triangles: &mut Vec<Triangle>) {
     let half = entity.width.max(0.1) / 2.0;
     let height = entity.height.max(0.1);
     let min = [-half, 0.0, -half];
@@ -932,7 +936,7 @@ fn placeholder(entity: &Entity, triangles: &mut Vec<Triangle>) {
         linear: rot_y(0.0),
         translation: entity.position,
     };
-    let texture = missing_texture();
+    let texture = textures.id(&missing_texture());
     // 复用方块体展开，贴图坐标铺满 0..16。
     let cube = Cube {
         tex: [0.0, 0.0],
@@ -943,7 +947,7 @@ fn placeholder(entity: &Entity, triangles: &mut Vec<Triangle>) {
     };
     let span = size.map(|c| c * 16.0);
     let texture_size = [span[2] * 2.0 + span[0] * 2.0, span[2] + span[1]];
-    emit_cube(&cube, &pose, &texture, texture_size, triangles);
+    emit_cube(&cube, &pose, texture, texture_size, triangles);
 }
 
 #[cfg(test)]
@@ -999,13 +1003,13 @@ mod tests {
             [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]],
         )
         .then([0.0, -1.501, 0.0], rot_x(0.0));
-        let texture = missing_texture();
+        let texture = Textures::default().id(&missing_texture());
         for part in &layers[0].parts {
             emit_part(
                 part,
                 &root,
                 (0.0, 0.0),
-                &texture,
+                texture,
                 [64.0, 64.0],
                 &mut triangles,
             );

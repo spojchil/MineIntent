@@ -259,7 +259,12 @@ fn variants_rotate_geometry_and_multipart_selects_connections() {
         .properties
         .insert("facing".to_owned(), "east".to_owned());
     let mut report = crate::Report::default();
-    let triangles = geometry::build(&scene(vec![panel]), &mut resources, &mut report);
+    let triangles = geometry::build(
+        &scene(vec![panel]),
+        &mut resources,
+        &mut Default::default(),
+        &mut report,
+    );
     assert_eq!(triangles.len(), 2);
     assert!(triangles
         .iter()
@@ -273,14 +278,26 @@ fn variants_rotate_geometry_and_multipart_selects_connections() {
         .properties
         .insert("north".to_owned(), "false".to_owned());
     assert_eq!(
-        geometry::build(&scene(vec![multi.clone()]), &mut resources, &mut report).len(),
+        geometry::build(
+            &scene(vec![multi.clone()]),
+            &mut resources,
+            &mut Default::default(),
+            &mut report
+        )
+        .len(),
         2
     );
     multi
         .properties
         .insert("north".to_owned(), "true".to_owned());
     assert_eq!(
-        geometry::build(&scene(vec![multi]), &mut resources, &mut report).len(),
+        geometry::build(
+            &scene(vec![multi]),
+            &mut resources,
+            &mut Default::default(),
+            &mut report
+        )
+        .len(),
         4
     );
 }
@@ -336,12 +353,24 @@ fn only_opaque_neighbours_remove_shared_faces() {
     }
     let mut report = crate::Report::default();
     assert_eq!(
-        geometry::build(&scene(blocks.clone()), &mut resources, &mut report).len(),
+        geometry::build(
+            &scene(blocks.clone()),
+            &mut resources,
+            &mut Default::default(),
+            &mut report
+        )
+        .len(),
         20
     );
     blocks[1].opaque = false;
     assert_eq!(
-        geometry::build(&scene(blocks), &mut resources, &mut report).len(),
+        geometry::build(
+            &scene(blocks),
+            &mut resources,
+            &mut Default::default(),
+            &mut report
+        )
+        .len(),
         22
     );
 }
@@ -354,7 +383,13 @@ fn supplied_cover_mask_overrides_neighbour_lookup() {
     let mut lone = block("red", [0, 0, 0]);
     lone.covered = Some(0b11_1101);
     assert_eq!(
-        geometry::build(&scene(vec![lone]), &mut resources, &mut report).len(),
+        geometry::build(
+            &scene(vec![lone]),
+            &mut resources,
+            &mut Default::default(),
+            &mut report
+        )
+        .len(),
         2
     );
 }
@@ -373,6 +408,7 @@ fn faces_between_the_same_fluid_are_not_drawn() {
         geometry::build(
             &scene(vec![water(0), water(1)]),
             &mut resources,
+            &mut Default::default(),
             &mut report
         )
         .len(),
@@ -383,6 +419,7 @@ fn faces_between_the_same_fluid_are_not_drawn() {
         geometry::build(
             &scene(vec![water(0), block("clear", [1, 0, 0])]),
             &mut resources,
+            &mut Default::default(),
             &mut report
         )
         .len(),
@@ -430,7 +467,7 @@ fn assert_images_close(actual: &RgbaImage, expected: &RgbaImage, allowed_pixels:
     );
 }
 
-fn triangle(vertices: [[f64; 3]; 3], texture: Arc<RgbaImage>) -> geometry::Triangle {
+fn triangle(vertices: [[f64; 3]; 3], texture: geometry::TextureId) -> geometry::Triangle {
     geometry::Triangle {
         vertices,
         uv: [[0.0, 0.0], [16.0, 0.0], [0.0, 16.0]],
@@ -441,15 +478,12 @@ fn triangle(vertices: [[f64; 3]; 3], texture: Arc<RgbaImage>) -> geometry::Trian
     }
 }
 
-fn quad(z: f64, texture: Arc<RgbaImage>) -> Vec<geometry::Triangle> {
+fn quad(z: f64, texture: geometry::TextureId) -> Vec<geometry::Triangle> {
     let a = [-3.0, -3.0, z];
     let b = [3.0, -3.0, z];
     let c = [3.0, 3.0, z];
     let d = [-3.0, 3.0, z];
-    vec![
-        triangle([a, b, c], texture.clone()),
-        triangle([a, c, d], texture),
-    ]
+    vec![triangle([a, b, c], texture), triangle([a, c, d], texture)]
 }
 
 #[test]
@@ -458,31 +492,28 @@ fn transparency_is_depth_ordered_and_shared_diagonal_is_not_blended_twice() {
         eye: [0.0; 3],
         ..scene(vec![]).camera
     };
+    let mut textures = geometry::Textures::default();
+    let [green, red, blue, white] = [
+        [0, 255, 0, 255],
+        [255, 0, 0, 128],
+        [0, 0, 255, 128],
+        [255, 255, 255, 128],
+    ]
+    .map(|c| textures.id(&Arc::new(RgbaImage::from_pixel(1, 1, Rgba(c)))));
     let make_mesh = || {
-        let mut mesh = quad(
-            4.0,
-            Arc::new(RgbaImage::from_pixel(1, 1, Rgba([0, 255, 0, 255]))),
-        );
-        mesh.extend(quad(
-            2.0,
-            Arc::new(RgbaImage::from_pixel(1, 1, Rgba([255, 0, 0, 128]))),
-        ));
-        mesh.extend(quad(
-            3.0,
-            Arc::new(RgbaImage::from_pixel(1, 1, Rgba([0, 0, 255, 128]))),
-        ));
+        let mut mesh = quad(4.0, green);
+        mesh.extend(quad(2.0, red));
+        mesh.extend(quad(3.0, blue));
         // Fully hidden transparency must not affect the image.
-        mesh.extend(quad(
-            5.0,
-            Arc::new(RgbaImage::from_pixel(1, 1, Rgba([255, 255, 255, 128]))),
-        ));
+        mesh.extend(quad(5.0, white));
         mesh
     };
-    let expected = trace::draw(make_mesh(), &camera, small());
+    let expected = trace::draw(make_mesh(), &textures, &camera, small());
     let mut mesh = make_mesh();
     for _ in 0..2 {
         let image = crate::raster::draw(
             std::slice::from_ref(&mesh),
+            &textures,
             &camera,
             small(),
             None,
@@ -516,7 +547,8 @@ fn raster_clipping_perspective_uv_cutouts_and_far_distance_match_ray_reference()
             if (x + y) % 3 == 0 { 0 } else { 255 },
         ]);
     }
-    let texture = Arc::new(texture);
+    let mut textures = geometry::Textures::default();
+    let texture = textures.id(&Arc::new(texture));
     // Triangle crossing the camera plane, an oblique textured surface, one crossing
     // the radial far limit, one behind the camera, and a degenerate triangle.
     let positions = [
@@ -528,12 +560,19 @@ fn raster_clipping_perspective_uv_cutouts_and_far_distance_match_ray_reference()
     ];
     let mesh = || {
         positions
-            .map(|p| triangle(p, texture.clone()))
+            .map(|p| triangle(p, texture))
             .into_iter()
             .collect::<Vec<_>>()
     };
-    let expected = trace::draw(mesh(), &camera, options);
-    let actual = crate::raster::draw(&[mesh()], &camera, options, None, &mut Default::default());
+    let expected = trace::draw(mesh(), &textures, &camera, options);
+    let actual = crate::raster::draw(
+        &[mesh()],
+        &textures,
+        &camera,
+        options,
+        None,
+        &mut Default::default(),
+    );
     assert_images_close(&actual, &expected, 0);
 }
 
@@ -543,24 +582,26 @@ fn many_translucent_layers_are_bounded_and_keep_the_nearest_surfaces() {
         eye: [0.0; 3],
         ..scene(vec![]).camera
     };
+    let mut textures = geometry::Textures::default();
+    let layers: Vec<_> = (0..25u8)
+        .map(|i| {
+            textures.id(&Arc::new(RgbaImage::from_pixel(
+                1,
+                1,
+                Rgba([i * 10, 20, 230, 20]),
+            )))
+        })
+        .collect();
     let make_mesh = || {
         (0..25)
             .rev()
-            .flat_map(|i| {
-                quad(
-                    1.0 + f64::from(i) * 0.1,
-                    Arc::new(RgbaImage::from_pixel(
-                        1,
-                        1,
-                        Rgba([(i * 10) as u8, 20, 230, 20]),
-                    )),
-                )
-            })
+            .flat_map(|i| quad(1.0 + f64::from(i) * 0.1, layers[i as usize]))
             .collect::<Vec<_>>()
     };
-    let expected = trace::draw(make_mesh(), &camera, small());
+    let expected = trace::draw(make_mesh(), &textures, &camera, small());
     let actual = crate::raster::draw(
         &[make_mesh()],
+        &textures,
         &camera,
         small(),
         None,

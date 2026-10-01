@@ -3,7 +3,7 @@ use image::RgbaImage;
 
 use crate::biome::Biomes;
 use crate::daylight::Daylight;
-use crate::geometry::{build_lit, dot, sub, Triangle, V3};
+use crate::geometry::{build_lit, dot, sub, Textures, Triangle, V3};
 use crate::light::{Cells, Lightmap, LightmapInputs};
 use crate::sky::{Sky, SkyPlan};
 use crate::{Camera, Frame, Options, Report, Resources, Scene};
@@ -590,15 +590,13 @@ impl Flat {
     }
 }
 
-fn sample(triangle: &Triangle, uv: [f64; 2], tint: V3) -> [f64; 4] {
-    let width = triangle.texture.width();
-    let height = triangle.texture.height().min(width);
+fn sample(textures: &Textures, triangle: &Triangle, uv: [f64; 2], tint: V3) -> [f64; 4] {
+    let texture = textures.get(triangle.texture);
+    let width = texture.width();
+    let height = texture.height().min(width);
     let x = ((uv[0] / 16.0).clamp(0.0, 1.0) * f64::from(width)) as u32;
     let y = ((uv[1] / 16.0).clamp(0.0, 1.0) * f64::from(height)) as u32;
-    let c = triangle
-        .texture
-        .get_pixel(x.min(width - 1), y.min(height - 1))
-        .0;
+    let c = texture.get_pixel(x.min(width - 1), y.min(height - 1)).0;
     [
         f64::from(c[0]) * tint[0],
         f64::from(c[1]) * tint[1],
@@ -613,6 +611,7 @@ fn sample(triangle: &Triangle, uv: [f64; 2], tint: V3) -> [f64; 4] {
 fn draw_band(
     scratch: &mut BandScratch,
     bin: &[&Projected<'_>],
+    textures: &Textures,
     projection: &Projection,
     options: Options,
     sky: Option<&SkyPlan<'_>>,
@@ -702,7 +701,7 @@ fn draw_band(
                         + weights[2] * v[2].color_over_z[i])
                         * z
                 });
-                let mut color = sample(t.triangle, uv, tint);
+                let mut color = sample(textures, t.triangle, uv, tint);
                 // 镂空纹素先丢：雾不改 alpha，算了也白算。
                 if color[3] < 0.01 {
                     transparent += 1;
@@ -737,6 +736,7 @@ fn draw_band(
 /// `parts` 按顺序接起来是全部三角形（几何各线程的分段与实体）。
 pub(crate) fn draw(
     parts: &[Vec<Triangle>],
+    textures: &Textures,
     camera: &Camera,
     options: Options,
     sky: Option<&Sky>,
@@ -775,6 +775,7 @@ pub(crate) fn draw(
                     draw_band(
                         &mut scratch,
                         &bins[band],
+                        textures,
                         projection,
                         options,
                         sky,
@@ -893,6 +894,7 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
     report.stage("biomes, daylight, sky, light cells", &mut clock);
     let cells = lighting.as_ref().map(|(cells, _, _)| cells);
     let frustum = Projection::new(&scene.camera, options).frustum(scene.camera.eye, options.far);
+    let mut textures = Textures::default();
     let mut parts = build_lit(
         scene,
         cells,
@@ -900,6 +902,7 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
         Some(&frustum),
         Some(scene.camera.eye),
         resources,
+        &mut textures,
         &mut report,
     );
     clock = std::time::Instant::now();
@@ -909,6 +912,7 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
             scene.camera.eye,
             cells,
             resources,
+            &mut textures,
             &mut report,
         ));
     }
@@ -931,7 +935,7 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
     report.stage("entities, lightmap", &mut clock);
     report.triangles = parts.iter().map(Vec::len).sum();
     let sky = lighting.as_ref().map(|(_, _, sky)| sky);
-    let mut image = draw(&parts, &scene.camera, options, sky, &mut report);
+    let mut image = draw(&parts, &textures, &scene.camera, options, sky, &mut report);
     clock = std::time::Instant::now();
     if options.crosshair {
         draw_crosshair(&mut image, resources, &mut report);

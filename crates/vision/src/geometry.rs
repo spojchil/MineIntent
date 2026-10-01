@@ -84,12 +84,40 @@ struct Face {
 pub(crate) struct Triangle {
     pub vertices: [V3; 3],
     pub uv: [[f64; 2]; 3],
-    pub texture: Arc<RgbaImage>,
+    pub texture: TextureId,
     /// 逐顶点颜色：染色 × 朝向明暗 × 环境光遮蔽。光照贴图另由 `light` 取样后乘上。
     pub color: [V3; 3],
     /// 逐顶点光照坐标 `[方块光, 天空光]`，原版单位。
     pub light: [Coords; 3],
     pub alpha: f64,
+}
+
+/// 一次成像用到的贴图表。三角形只记表里的序号：几十万个三角形若各持一份 `Arc`，出三角形时
+/// 各线程要在同一个共享计数上加，成像完还要串行走一遍全部三角形去减。
+#[derive(Default)]
+pub(crate) struct Textures {
+    images: Vec<Arc<RgbaImage>>,
+    /// 按 `Arc` 指向的地址去重（表里留着 `Arc`，地址在表存在期间不会被复用）。
+    ids: HashMap<usize, TextureId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TextureId(u32);
+
+impl Textures {
+    pub(crate) fn id(&mut self, texture: &Arc<RgbaImage>) -> TextureId {
+        *self
+            .ids
+            .entry(Arc::as_ptr(texture) as usize)
+            .or_insert_with(|| {
+                self.images.push(texture.clone());
+                TextureId(self.images.len() as u32 - 1)
+            })
+    }
+
+    pub(crate) fn get(&self, id: TextureId) -> &RgbaImage {
+        &self.images[id.0 as usize]
+    }
 }
 
 impl Face {
@@ -138,13 +166,23 @@ impl Face {
 pub(crate) fn build(
     scene: &Scene,
     resources: &mut Resources,
+    textures: &mut Textures,
     report: &mut Report,
 ) -> Vec<Triangle> {
     let biomes = Biomes::new(scene, resources, report).ok();
-    build_lit(scene, None, biomes.as_ref(), None, None, resources, report)
-        .into_iter()
-        .flatten()
-        .collect()
+    build_lit(
+        scene,
+        None,
+        biomes.as_ref(),
+        None,
+        None,
+        resources,
+        textures,
+        report,
+    )
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// `cells` 为 `Some` 时按原版平滑光照与光照坐标逐顶点算光；`biomes` 给模型面染色
@@ -156,6 +194,7 @@ pub(crate) fn build(
 /// 三角形（方块实体在前、模型面在后），每个线程一份
 /// 染色缓存（原版 `ClientLevel` 的 `tintCaches` 也是每线程一份）。返回各线程的分段，
 /// 按顺序接起来就是方块原顺序；不拼成一个大数组，省一次整体搬运。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_lit(
     scene: &Scene,
     cells: Option<&Cells>,
@@ -163,6 +202,7 @@ pub(crate) fn build_lit(
     frustum: Option<&crate::raster::Frustum>,
     eye: Option<V3>,
     resources: &mut Resources,
+    textures: &mut Textures,
     report: &mut Report,
 ) -> Vec<Vec<Triangle>> {
     let mut clock = std::time::Instant::now();
@@ -214,13 +254,18 @@ pub(crate) fn build_lit(
     });
     // 再按段的顺序串行合并成全局状态号（仍是首次出现的顺序），新状态解析一次。
     let mut states = StateMap::default();
-    let mut by_state: Vec<(Vec<Face>, Option<crate::block_entity::Model>)> = Vec::new();
+    // 每种状态：模型面、各面贴图在表里的序号、方块实体几何。
+    let mut by_state: Vec<(
+        Vec<Face>,
+        Vec<TextureId>,
+        Option<crate::block_entity::Model>,
+    )> = Vec::new();
     let mut to_global: Vec<Vec<usize>> = Vec::with_capacity(local.len());
     for (firsts, _) in &local {
         let mut remap = Vec::with_capacity(firsts.len());
         for block in firsts {
             let state = *states.entry(state_key(block)).or_insert_with(|| {
-                let entity = crate::block_entity::model(block, resources, report);
+                let entity = crate::block_entity::model(block, resources, textures, report);
                 let faces = match block_faces(block, resources, report) {
                     Ok(faces) if !faces.is_empty() => faces,
                     // 箱子、潜影盒等没有资源定义的几何，整个外形由方块实体画。
@@ -236,7 +281,11 @@ pub(crate) fn build_lit(
                         cube_faces(missing_texture(), [1.0; 3], 1.0, 1.0)
                     }
                 };
-                by_state.push((faces, entity));
+                let ids = faces
+                    .iter()
+                    .map(|face| textures.id(&face.texture))
+                    .collect();
+                by_state.push((faces, ids, entity));
                 by_state.len() - 1
             });
             remap.push(state);
@@ -263,7 +312,7 @@ pub(crate) fn build_lit(
                     // 大多数方块露出一个面、两个三角形；先留够，免得边推边扩容搬运。
                     let mut triangles = Vec::with_capacity(blocks.len() * 2);
                     for (block, id) in blocks.iter().zip(ids) {
-                        let (faces, entity) = &by_state[remap[*id]];
+                        let (faces, texture_ids, entity) = &by_state[remap[*id]];
                         if let Some(entity) = entity {
                             entity.emit(block.position, eye, cells, &mut triangles);
                         }
@@ -272,6 +321,7 @@ pub(crate) fn build_lit(
                             eye,
                             frustum,
                             faces,
+                            texture_ids,
                             neighbours,
                             cells,
                             biomes,
@@ -318,6 +368,7 @@ fn emit_block(
     eye: Option<V3>,
     frustum: Option<&crate::raster::Frustum>,
     faces: &[Face],
+    texture_ids: &[TextureId],
     neighbours: &PositionMap<&Block>,
     cells: Option<&Cells>,
     biomes: Option<&Biomes>,
@@ -326,7 +377,7 @@ fn emit_block(
 ) {
     let fluid = is_fluid(&block.name);
     let [mut covered, mut backfacing, mut outside, mut emitted] = [0u64; 4];
-    for face in faces {
+    for (face, &texture) in faces.iter().zip(texture_ids) {
         if let Some(direction) = face.cull {
             let hidden = match block.covered {
                 Some(mask) => direction_bit(direction).is_some_and(|bit| mask & (1 << bit) != 0),
@@ -369,7 +420,7 @@ fn emit_block(
             triangles.push(Triangle {
                 vertices: indices.map(|i| add(face.vertices[i], offset)),
                 uv: indices.map(|i| face.uv[i]),
-                texture: face.texture.clone(),
+                texture,
                 color: indices.map(|i| lit[i].0),
                 light: indices.map(|i| lit[i].1),
                 alpha: face.alpha,
@@ -409,6 +460,7 @@ fn direction_bit(direction: [i32; 3]) -> Option<usize> {
 pub(crate) fn block_item_triangles(
     name: &str,
     resources: &mut Resources,
+    textures: &mut Textures,
     report: &mut Report,
     light: Coords,
     place: impl Fn(V3) -> V3,
@@ -438,7 +490,7 @@ pub(crate) fn block_item_triangles(
             triangles.push(Triangle {
                 vertices: indices.map(|i| place(face.vertices[i])),
                 uv: indices.map(|i| face.uv[i]),
-                texture: face.texture.clone(),
+                texture: textures.id(&face.texture),
                 color: [color; 3],
                 light: [light; 3],
                 alpha: face.alpha,

@@ -10,12 +10,11 @@
 //! 架上物品等）尚未接入；圣诞节期间原版箱子换皮，这里不换。
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
-use image::RgbaImage;
 use serde::Deserialize;
 
-use crate::geometry::{Triangle, V3};
+use crate::geometry::{TextureId, Textures, Triangle, V3};
 use crate::light::{Cells, FULL_BRIGHT};
 use crate::{Block, Report, Resources};
 
@@ -74,13 +73,14 @@ fn variant(block: &Block) -> Option<&'static Variant> {
 /// 一个方块状态的方块实体几何与贴图。按状态解析一次（要读资源），各方块再按位置出三角形。
 pub(crate) struct Model {
     quads: &'static [Quad],
-    texture: Arc<RgbaImage>,
+    texture: TextureId,
 }
 
 /// 这个状态的方块实体几何；不画方块实体时为 `None`。
 pub(crate) fn model(
     block: &Block,
     resources: &mut Resources,
+    textures: &mut Textures,
     report: &mut Report,
 ) -> Option<Model> {
     let variant = variant(block)?;
@@ -95,7 +95,10 @@ pub(crate) fn model(
         ));
         crate::assets::missing_texture()
     });
-    Some(Model { quads, texture })
+    Some(Model {
+        quads,
+        texture: textures.id(&texture),
+    })
 }
 
 impl Model {
@@ -127,7 +130,7 @@ impl Model {
                 triangles.push(Triangle {
                     vertices: indices.map(vertex),
                     uv: indices.map(uv),
-                    texture: self.texture.clone(),
+                    texture: self.texture,
                     color: [[shade; 3]; 3],
                     light: [light; 3],
                     alpha: 1.0,
