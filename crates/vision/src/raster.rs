@@ -305,17 +305,19 @@ struct Fragment {
     color: [f64; 4],
 }
 
+/// 一个像素除深度外的状态。最近不透明面的深度单独放在一个连续数组里：深度测试是
+/// 内层循环里最频繁的访存，只碰 8 字节比拉一整个 `Pixel` 省缓存。
 struct Pixel {
-    z: f64,
     color: [f64; 3],
     background: [f64; 3],
     layers: Vec<Fragment>,
 }
 
 impl Pixel {
-    fn insert(&mut self, fragment: Fragment) {
+    /// `depth` 是这个像素最近不透明面的深度。
+    fn insert(&mut self, depth: &mut f64, fragment: Fragment) {
         if fragment.color[3] >= 1.0 {
-            self.z = fragment.z;
+            *depth = fragment.z;
             self.color = [fragment.color[0], fragment.color[1], fragment.color[2]];
             return;
         }
@@ -339,11 +341,11 @@ impl Pixel {
         }
     }
 
-    fn finish(&self) -> [u8; 4] {
+    fn finish(&self, depth: f64) -> [u8; 4] {
         let mut color = [0.0; 3];
         let mut remaining = 1.0;
         let mut count = 0;
-        for fragment in self.layers.iter().take_while(|f| f.z < self.z) {
+        for fragment in self.layers.iter().take_while(|f| f.z < depth) {
             for (i, channel) in color.iter_mut().enumerate() {
                 *channel += remaining * fragment.color[3] * fragment.color[i];
             }
@@ -448,6 +450,8 @@ fn sample(triangle: &Triangle, uv: [f64; 2], tint: V3) -> [f64; 4] {
     ]
 }
 
+// `x` 同时是像素横坐标与下标，迭代器写法反而难读。
+#[allow(clippy::needless_range_loop)]
 fn draw_band(
     bin: &[&Projected<'_>],
     projection: &Projection,
@@ -466,13 +470,13 @@ fn draw_band(
         .map(|i| {
             let background = background.map_or(SKY, |image| image[y0 * width + i]);
             Pixel {
-                z: f64::INFINITY,
                 color: background,
                 background,
                 layers: Vec::new(),
             }
         })
         .collect();
+    let mut depths = vec![f64::INFINITY; width * rows];
     // Preserve radial far distance, not a camera-Z-only far plane.
     let x_squared: Vec<_> = (0..width)
         .map(|x| {
@@ -509,8 +513,8 @@ fn draw_band(
                 let inv_z =
                     weights[0] * v[0].inv_z + weights[1] * v[1].inv_z + weights[2] * v[2].inv_z;
                 let z = 1.0 / inv_z;
-                let pixel = &mut pixels[(y - y0) * width + x];
-                if z >= pixel.z
+                let index = (y - y0) * width + x;
+                if z >= depths[index]
                     || z * z * (1.0 + x_squared[x] + y_squared[y - y0]) >= options.far * options.far
                 {
                     continue;
@@ -529,16 +533,16 @@ fn draw_band(
                         * z
                 });
                 let mut color = sample(t.triangle, uv, tint);
+                // 镂空纹素先丢：雾不改 alpha，算了也白算。
+                if color[3] < 0.01 {
+                    transparent += 1;
+                    continue;
+                }
                 if let Some(sky) = sky {
                     fogged += 1;
-                    let direction = directions[(y - y0) * width + x];
-                    color = sky.apply(color, direction.map(|v| v * z));
+                    color = sky.apply(color, directions[index].map(|v| v * z));
                 }
-                if color[3] >= 0.01 {
-                    pixel.insert(Fragment { z, color });
-                } else {
-                    transparent += 1;
-                }
+                pixels[index].insert(&mut depths[index], Fragment { z, color });
             }
         }
     }
@@ -548,8 +552,12 @@ fn draw_band(
     add(Counter::DepthPassed, passed);
     add(Counter::Transparent, transparent);
     add(Counter::FogApplied, fogged);
-    for (pixel, out) in pixels.iter().zip(output.as_chunks_mut::<4>().0) {
-        *out = pixel.finish();
+    for ((pixel, depth), out) in pixels
+        .iter()
+        .zip(&depths)
+        .zip(output.as_chunks_mut::<4>().0)
+    {
+        *out = pixel.finish(*depth);
     }
 }
 
@@ -579,29 +587,30 @@ pub(crate) fn draw(
     let workers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(8);
-    // 每个线程整数个条带，箱与条带一一对应。
-    let rows = (options.height as usize).div_ceil(workers).div_ceil(BAND) * BAND;
+    // 条带按需领取：天空条带轻、地面条带重，固定分段会让最慢的线程决定墙钟时间。
+    // 箱与条带一一对应；条带也限制了透明层的临时内存。
+    let bands = std::sync::Mutex::new(
+        pixels
+            .chunks_mut(BAND * options.width as usize * 4)
+            .enumerate(),
+    );
     std::thread::scope(|scope| {
-        for (i, output) in pixels
-            .chunks_mut(rows * options.width as usize * 4)
-            .enumerate()
-        {
-            let projection = &projection;
-            let bins = &bins;
+        for _ in 0..workers {
+            let (projection, bins, bands) = (&projection, &bins, &bands);
             let background = background.as_deref();
             scope.spawn(move || {
-                // Limit transparency scratch memory even for large images.
-                for (band, output) in output
-                    .chunks_mut(BAND * options.width as usize * 4)
-                    .enumerate()
-                {
+                loop {
+                    let next = bands.lock().expect("条带领取不 panic").next();
+                    let Some((band, output)) = next else {
+                        break;
+                    };
                     draw_band(
-                        &bins[i * rows / BAND + band],
+                        &bins[band],
                         projection,
                         options,
                         sky,
                         background,
-                        i * rows + band * BAND,
+                        band * BAND,
                         output,
                     );
                 }
