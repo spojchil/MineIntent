@@ -1,7 +1,7 @@
 //! Live protocol-client image probe. No model/provider, commands or world writes.
 //!
 //! 输出路径给 `-` 时常驻在线：从标准输入逐行读 `输出路径 [宽x高]`，每行按当前位姿出一张图
-//! （不给尺寸用默认 640x360），便于让人旁观同一个视点做对照。
+//! （不给尺寸用默认 1920x1080），便于让人旁观同一个视点做对照。
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

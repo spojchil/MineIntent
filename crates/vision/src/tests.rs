@@ -598,7 +598,7 @@ fn benchmark_ray_and_raster_with_local_resources() {
         println!(
             "{}",
             json!({"scene":name,"blocks":scene.blocks.len(),
-            "ray_ms":times[0],"raster_ms":times[1], "width":640,"height":360})
+            "ray_ms":times[0],"raster_ms":times[1], "width":options.width,"height":options.height})
         );
     }
 }

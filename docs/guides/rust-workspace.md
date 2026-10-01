@@ -57,7 +57,7 @@ export PATH="$HOME/.rustup/toolchains/nightly-x86_64-apple-darwin/bin:$PATH"
 | `MODEL_ENDPOINT` | 对应协议的 DeepSeek endpoint | 完整 endpoint，含协议路径；Responses 默认 `https://api.deepseek.com/responses` |
 | `MODEL_NAME` | Chat 为 `deepseek-chat`，其余为 `deepseek-flash` | 模型必须支持所选协议；启用图片还需视觉能力 |
 | `MINEINTENT_CLIENT_JAR` | 未设置 | 本地 26.1.2 客户端 JAR；设置后加载资源并注册 `view` 图片工具，JAR 只读 |
-| `MINEINTENT_VIEW_SIZE` | `640x360` | `view` 的屏幕像素尺寸 `宽x高`（每边 1–2048）；`view` 的 `region` 只从这块屏幕上裁，不会更清楚 |
+| `MINEINTENT_VIEW_SIZE` | `1920x1080` | `view` 的屏幕像素尺寸 `宽x高`（每边 1–2048）；`view` 的 `region` 只从这块屏幕上裁，不会更清楚 |
 
 ```bash
 MINEINTENT_MODEL_API_KEY_FILE=/path/to/key cargo run -p companion

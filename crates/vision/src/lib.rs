@@ -132,8 +132,8 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            width: 640,
-            height: 360,
+            width: 1920,
+            height: 1080,
             far: 48.0,
             crosshair: true,
             crop: None,
