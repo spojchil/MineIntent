@@ -11,6 +11,7 @@ use image::RgbaImage;
 
 use crate::daylight::Daylight;
 use crate::geometry::{dot, V3};
+use crate::random::JavaRandom;
 use crate::raster::{rasterize, Projection};
 use crate::{Camera, Environment, Report, Resources};
 
@@ -340,41 +341,9 @@ fn normalize(v: V3) -> V3 {
     v.map(|c| c / length)
 }
 
-/// `java.util.Random` 同款线性同余（原版 `LegacyRandomSource` / `SingleThreadedRandomSource`）。
-struct JavaRandom(u64);
-
-impl JavaRandom {
-    const MULTIPLIER: u64 = 0x5_DEEC_E66D;
-    const MASK: u64 = (1 << 48) - 1;
-
-    fn new(seed: u64) -> Self {
-        Self((seed ^ Self::MULTIPLIER) & Self::MASK)
-    }
-
-    fn next(&mut self, bits: u32) -> u64 {
-        self.0 = (self.0.wrapping_mul(Self::MULTIPLIER).wrapping_add(0xB)) & Self::MASK;
-        self.0 >> (48 - bits)
-    }
-
-    fn next_float(&mut self) -> f64 {
-        self.next(24) as f64 / f64::from(1u32 << 24)
-    }
-
-    fn next_double(&mut self) -> f64 {
-        ((self.next(26) << 27) + self.next(27)) as f64 * (1.0 / (1u64 << 53) as f64)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn java_random_matches_the_jdk_sequence() {
-        // new java.util.Random(42).nextInt() == -1170105035
-        let mut random = JavaRandom::new(42);
-        assert_eq!(random.next(32) as u32 as i32, -1_170_105_035);
-    }
 
     #[test]
     fn most_samples_become_stars() {

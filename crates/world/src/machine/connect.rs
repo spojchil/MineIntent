@@ -194,12 +194,18 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                     .server_view_distance
                     .store(login.chunk_radius, Ordering::Relaxed);
                 inner.is_flat.store(login.common.is_flat, Ordering::Relaxed);
+                inner
+                    .biome_zoom_seed
+                    .store(login.common.seed, Ordering::Relaxed);
                 inner.light.lock().clear();
             }
             ClientboundGamePacket::Respawn(respawn) => {
                 inner
                     .is_flat
                     .store(respawn.common.is_flat, Ordering::Relaxed);
+                inner
+                    .biome_zoom_seed
+                    .store(respawn.common.seed, Ordering::Relaxed);
                 inner.light.lock().clear();
             }
             ClientboundGamePacket::LevelChunkWithLight(chunk) => {

@@ -1,6 +1,7 @@
 //! CPU rasterization into an image: no surface, window or graphics device.
 use image::RgbaImage;
 
+use crate::biome::Biomes;
 use crate::daylight::Daylight;
 use crate::geometry::{build_lit, dot, sub, Triangle, V3};
 use crate::light::{Cells, Lightmap, LightmapInputs};
@@ -549,9 +550,22 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
         .warnings
         .insert("transparency is composited through at most 16 surfaces".to_owned());
     // 有环境才有光照与昼夜；没有时（模型夹具、测试）满亮度、固定背景。
+    let biomes = match Biomes::new(scene, resources, &mut report) {
+        Ok(biomes) => Some(biomes),
+        Err(error) => {
+            report.warnings.insert(format!(
+                "biome tint unavailable ({error}); tinted faces drawn white"
+            ));
+            None
+        }
+    };
     let lighting = match &scene.environment {
         Some(environment) => {
-            let daylight = Daylight::evaluate(resources, environment.clock_ticks)?;
+            let layer = biomes
+                .as_ref()
+                .map(|biomes| biomes.camera_weights(scene.camera.eye))
+                .unwrap_or_default();
+            let daylight = Daylight::evaluate(resources, environment.clock_ticks, &layer)?;
             let lightmap = Lightmap::new(&LightmapInputs {
                 sky_factor: daylight.sky_light_factor,
                 // LightmapRenderStateExtractor：1.4 加方块光闪烁（这里不模拟闪烁）。
@@ -568,7 +582,7 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
         None => None,
     };
     let cells = lighting.as_ref().map(|(cells, _, _)| cells);
-    let mut triangles = build_lit(scene, cells, resources, &mut report);
+    let mut triangles = build_lit(scene, cells, biomes.as_ref(), resources, &mut report);
     if !scene.entities.is_empty() {
         triangles.extend(crate::entity::build(
             &scene.entities,

@@ -7,7 +7,7 @@
 //! 消费必须用 seq 做游标。
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
@@ -93,6 +93,9 @@ pub(crate) struct Inner {
     pub(super) server_view_distance: AtomicU32,
     /// 当前维度是不是超平坦（登录与重生包的 `is_flat`）。原版地平线高度由它定。
     pub(super) is_flat: AtomicBool,
+    /// 登录与重生包的 `seed`：服务端已混淆过的生物群系缩放种子（原版 `BiomeManager`
+    /// 用它把 4×4×4 生物群系格模糊成逐格的生物群系）。
+    pub(super) biome_zoom_seed: AtomicI64,
     /// 服务端下发的天空光与方块光（azalea 不存）。
     pub(super) light: Mutex<super::light::LightStore>,
 }
@@ -129,6 +132,7 @@ impl Inner {
             world_handle: Mutex::new(None),
             server_view_distance: AtomicU32::new(0),
             is_flat: AtomicBool::new(false),
+            biome_zoom_seed: AtomicI64::new(0),
             light: Mutex::new(super::light::LightStore::default()),
             stop_reason: OnceLock::new(),
             shutdown: Notify::new(),

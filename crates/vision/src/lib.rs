@@ -3,10 +3,12 @@
 //! assets are not embedded. See README for the deliberately incomplete effects.
 
 mod assets;
+mod biome;
 mod daylight;
 mod entity;
 mod geometry;
 mod light;
+mod random;
 mod raster;
 mod sky;
 #[cfg(test)]
@@ -61,6 +63,19 @@ pub struct Scene {
     /// 光照格：原版平滑光照与环境光遮蔽要查的格子。查不到的格按露天空气。
     #[serde(default)]
     pub cells: Vec<Cell>,
+    /// 生物群系注册表名（如 `minecraft:plains`），[`BiomeCell::biome`] 是它的下标。
+    #[serde(default)]
+    pub biome_names: Vec<String>,
+    /// 染色与环境属性要查的 4×4×4 生物群系格。查不到的格按原版空区块，即平原。
+    #[serde(default)]
+    pub biomes: Vec<BiomeCell>,
+}
+
+/// 一个 4×4×4 生物群系格（原版 quart 坐标 = 方块坐标 >> 2）。
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct BiomeCell {
+    pub quart: [i32; 3],
+    pub biome: u16,
 }
 
 /// 一格的服务端光照与原版方块渲染属性。
@@ -81,7 +96,7 @@ pub struct Cell {
 }
 
 /// 原版的视距雾、天空与光照所需的世界状态。颜色与光照参数按主世界维度属性
-/// （`dimension_type/overworld`）叠加日时间轴（`timeline/day`）求值；生物群系尚未接入。
+/// （`dimension_type/overworld`）、相机处的生物群系、日时间轴（`timeline/day`）依次求值。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Environment {
     /// 实际视距（区块）。
@@ -90,6 +105,16 @@ pub struct Environment {
     pub horizon_height: f64,
     /// 主世界时钟的累计 tick；各时间轴按自己的周期取模。
     pub clock_ticks: u64,
+    /// 生物群系格的 y 范围（含两端）：原版查格时把 y 夹进去。
+    #[serde(default = "full_quart_range")]
+    pub biome_quart_y: [i32; 2],
+    /// 登录/重生包的生物群系缩放种子（原版 `BiomeManager` 的模糊缩放用）。
+    #[serde(default)]
+    pub biome_zoom_seed: i64,
+}
+
+fn full_quart_range() -> [i32; 2] {
+    [i32::MIN, i32::MAX]
 }
 
 #[derive(Clone, Copy, Debug)]

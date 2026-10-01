@@ -302,7 +302,24 @@ impl Module {
                 })
                 .collect()
         };
+        // 生物群系协议号 → 注册表名（服务端在配置阶段同步的顺序）。
+        let biome_names: Vec<String> = {
+            use azalea::registry::DataRegistry;
+            let registry = azalea::Identifier::from(azalea::registry::data::Biome::NAME);
+            (0u32..)
+                .map_while(|id| {
+                    loaded
+                        .registries
+                        .protocol_id_to_identifier(registry.clone(), id)
+                        .map(|name| name.to_string())
+                })
+                .collect()
+        };
         drop(loaded);
+        let biome_zoom_seed = self
+            .inner
+            .biome_zoom_seed
+            .load(std::sync::atomic::Ordering::Relaxed);
         let clock_ticks = self
             .inner
             .day_time
@@ -311,6 +328,19 @@ impl Module {
             (((y - min_y) * span + (z - origin_z)) * span + (x - origin_x)) as usize
         };
         let mut states = vec![UNLOADED; (span * span * height) as usize];
+        // 生物群系按 4×4×4 格存（原版 quart 坐标）。
+        let (quart_x0, quart_z0, quart_y0) = (origin_x >> 2, origin_z >> 2, min_y >> 2);
+        let (quart_span, quart_height) = (span / 4, height / 4);
+        let quart_index = |qx: i32, qy: i32, qz: i32| -> Option<usize> {
+            ((quart_x0..quart_x0 + quart_span).contains(&qx)
+                && (quart_y0..quart_y0 + quart_height).contains(&qy)
+                && (quart_z0..quart_z0 + quart_span).contains(&qz))
+            .then(|| {
+                (((qy - quart_y0) * quart_span + (qz - quart_z0)) * quart_span + (qx - quart_x0))
+                    as usize
+            })
+        };
+        let mut quarts = vec![u32::MAX; (quart_span * quart_span * quart_height) as usize];
         for (i, column) in columns.into_iter().enumerate() {
             let Some(column) = column else {
                 continue;
@@ -321,6 +351,26 @@ impl Module {
                 let base_y = min_y + section_index as i32 * 16;
                 if base_y >= min_y + height {
                     break;
+                }
+                for y in 0..4u8 {
+                    for z in 0..4u8 {
+                        for x in 0..4u8 {
+                            let biome =
+                                section.get_biome(azalea::core::position::ChunkSectionBiomePos {
+                                    x,
+                                    y,
+                                    z,
+                                });
+                            if let Some(i) = quart_index(
+                                (base_x >> 2) + i32::from(x),
+                                (base_y >> 2) + i32::from(y),
+                                (base_z >> 2) + i32::from(z),
+                            ) {
+                                use azalea::registry::DataRegistry;
+                                quarts[i] = biome.protocol_id();
+                            }
+                        }
+                    }
                 }
                 for y in 0..16u8 {
                     for z in 0..16u8 {
@@ -488,6 +538,55 @@ impl Module {
         drop(needed);
         drop(states);
 
+        // 第四遍：成像要查的生物群系格。原版染色在同一 y 上取 5×5 格的生物群系
+        // （高草上半取下面一格），每格经 `BiomeManager.getBiome` 的模糊缩放落到相邻的
+        // 8 个 quart 之一；天空等环境属性在相机处按 6³ quart 高斯加权。y 按原版夹进范围。
+        let quart_y_range = [quart_y0, quart_y0 + quart_height - 1];
+        let mut wanted = vec![false; quarts.len()];
+        let mut want = |qx: i32, qy: i32, qz: i32| {
+            if let Some(i) = quart_index(qx, qy.clamp(quart_y_range[0], quart_y_range[1]), qz) {
+                wanted[i] = true;
+            }
+        };
+        for &(x, y, z, _, _) in &surface {
+            for qy in (y - 3) >> 2..=((y - 2) >> 2) + 1 {
+                for qz in (z - 4) >> 2..=(z >> 2) + 1 {
+                    for qx in (x - 4) >> 2..=(x >> 2) + 1 {
+                        want(qx, qy, qz);
+                    }
+                }
+            }
+        }
+        let eye = [position.x, position.y + crate::EYE_HEIGHT, position.z]
+            .map(|v| (v * 0.25 - 0.5).floor() as i32);
+        for qy in eye[1] - 2..=eye[1] + 3 {
+            for qz in eye[2] - 2..=eye[2] + 3 {
+                for qx in eye[0] - 2..=eye[0] + 3 {
+                    want(qx, qy, qz);
+                }
+            }
+        }
+        let mut biomes = Vec::new();
+        for qy in quart_y0..quart_y0 + quart_height {
+            for qz in quart_z0..quart_z0 + quart_span {
+                for qx in quart_x0..quart_x0 + quart_span {
+                    let Some(i) = quart_index(qx, qy, qz) else {
+                        continue;
+                    };
+                    if !wanted[i] || quarts[i] == u32::MAX {
+                        continue;
+                    }
+                    let Ok(biome) = u16::try_from(quarts[i]) else {
+                        continue;
+                    };
+                    biomes.push(crate::BiomeCell {
+                        quart: [qx, qy, qz],
+                        biome,
+                    });
+                }
+            }
+        }
+
         // 每种状态只解码一次。
         let mut palette = std::collections::HashMap::new();
         let mut blocks = Vec::with_capacity(surface.len());
@@ -519,6 +618,10 @@ impl Module {
                 63.0
             },
             cells,
+            biome_names,
+            biomes,
+            biome_quart_y: quart_y_range,
+            biome_zoom_seed,
             clock_ticks,
         })
     }

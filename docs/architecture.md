@@ -1,7 +1,7 @@
 # 当前实现结构
 
 > 无产品权威。绑定 `feat/keymouse-actions` 当前工作树与
-> Azalea fork `29cf8e3f0d57abf767e9ab42d52ff2f57b4ab704`、midturn
+> Azalea fork `279a16a6d7761e8a7bfc63a1c0b6557782699e88`、midturn
 > `bf8bc7a7126dc2943145b03a0b4a3481de8177e1`。
 >
 > 本仓只有一条线。此前并存的两套实现都已移出：
@@ -97,6 +97,12 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
 （`RegionBlock`：六面里至少一面没被完整不透明方块挡住；流体另算同种流体相邻），
 每块附六面遮挡位供成像剔面；身边 16 格内有未加载格时报出数量，更远处未加载的区块和
 原版一样不画。另附地平线高度（超平坦是世界底，其余 63）与主世界时钟累计 tick。
+
+生物群系：同在读锁里取注册表的生物群系名表与各段的生物群系调色板（4×4×4 一格的
+「四分格」），锁外只交成像用得到的格——每个表面方块的原版模糊取样（`BiomeManager`
+八角）与 5×5 染色混合所及的格，加相机眼睛周围 6³ 格（环境属性的高斯取样）；
+另附登录/重生包里服务端已哈希的 `seed`（模糊取样的扰动种子，`state.rs` 的
+`biome_zoom_seed`）与世界的四分格高度范围。
 
 光照：azalea 解析光照包但不存，`machine/light.rs` 的 `LightStore` 按原版
 `applyLightData` 口径自存每柱天空光与方块光（区块包整柱重来、光照更新包逐段覆盖），

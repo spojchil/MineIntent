@@ -5,6 +5,7 @@ use image::RgbaImage;
 use serde_json::{json, Value};
 
 use crate::assets::{missing_texture, texture_id};
+use crate::biome::Biomes;
 use crate::light::{self, Cells, Coords, Direction, FULL_BRIGHT};
 use crate::{Block, Report, Resources, Scene};
 
@@ -36,8 +37,10 @@ struct Face {
     vertices: [V3; 4],
     uv: [[f64; 2]; 4],
     texture: Arc<RgbaImage>,
-    /// 染色（植物色等）；不染色为白。
+    /// 不随方块变的底色；不染色为白。
     tint: V3,
+    /// 模型的 `tintindex`：有就按方块与位置取原版染色（[`crate::biome`]），乘在底色上。
+    tint_index: Option<usize>,
     alpha: f64,
     cull: Option<[i32; 3]>,
     /// 原版烘焙出的四边形朝向（法线最接近的轴）。
@@ -70,9 +73,9 @@ impl Face {
     }
 
     /// 本面四个顶点的（颜色, 光照坐标）。`cells` 为 `None` 时不算光照：满亮度、无遮蔽。
-    fn lighting(&self, position: [i32; 3], cells: Option<&Cells>) -> [(V3, Coords); 4] {
+    fn lighting(&self, position: [i32; 3], tint: V3, cells: Option<&Cells>) -> [(V3, Coords); 4] {
         let shade = self.directional_shade();
-        let plain = mul(self.tint, shade);
+        let plain = mul(tint, shade);
         let Some(cells) = cells else {
             return [(plain, FULL_BRIGHT); 4];
         };
@@ -81,7 +84,7 @@ impl Face {
         }
         if self.ambient_occlusion && cells.get(position).emission == 0 {
             let values = light::ambient_occlusion(cells, position, self.direction, &self.vertices);
-            return std::array::from_fn(|i| (mul(self.tint, shade * values[i].0), values[i].1));
+            return std::array::from_fn(|i| (mul(tint, shade * values[i].0), values[i].1));
         }
         let coords = light::flat(cells, position, self.direction, self.cull.is_some());
         [(plain, coords); 4]
@@ -95,13 +98,16 @@ pub(crate) fn build(
     resources: &mut Resources,
     report: &mut Report,
 ) -> Vec<Triangle> {
-    build_lit(scene, None, resources, report)
+    let biomes = Biomes::new(scene, resources, report).ok();
+    build_lit(scene, None, biomes.as_ref(), resources, report)
 }
 
-/// `cells` 为 `Some` 时按原版平滑光照与光照坐标逐顶点算光。
+/// `cells` 为 `Some` 时按原版平滑光照与光照坐标逐顶点算光；`biomes` 给模型面染色
+/// （没有时染色面按白）。
 pub(crate) fn build_lit(
     scene: &Scene,
     cells: Option<&Cells>,
+    biomes: Option<&Biomes>,
     resources: &mut Resources,
     report: &mut Report,
 ) -> Vec<Triangle> {
@@ -158,7 +164,15 @@ pub(crate) fn build_lit(
                 }
             }
             let offset = block.position.map(f64::from);
-            let lit = face.lighting(block.position, cells);
+            let tint = match (face.tint_index, biomes) {
+                (Some(index), Some(biomes)) => {
+                    let color =
+                        biomes.block_tint(&block.name, &block.properties, index, block.position);
+                    std::array::from_fn(|i| face.tint[i] * color[i])
+                }
+                _ => face.tint,
+            };
+            let lit = face.lighting(block.position, tint, cells);
             for indices in [[0, 1, 2], [0, 2, 3]] {
                 triangles.push(Triangle {
                     vertices: indices.map(|i| add(face.vertices[i], offset)),
@@ -216,7 +230,14 @@ pub(crate) fn block_item_triangles(
     }
     let mut triangles = Vec::new();
     for face in faces {
-        let color = mul(face.tint, face.directional_shade());
+        let tint = match face.tint_index {
+            Some(index) => crate::biome::item_tint(name, &block.properties, index, resources),
+            None => [1.0; 3],
+        };
+        let color = mul(
+            std::array::from_fn(|i| face.tint[i] * tint[i]),
+            face.directional_shade(),
+        );
         for indices in [[0, 1, 2], [0, 2, 3]] {
             triangles.push(Triangle {
                 vertices: indices.map(|i| place(face.vertices[i])),
@@ -239,8 +260,7 @@ fn block_faces(
     let name = block.name.strip_prefix("minecraft:").unwrap_or(&block.name);
     if name == "water" || name == "lava" {
         report.warnings.insert(
-            "fluids use flat level surfaces; flow, biome tint and waterlogging are not reproduced"
-                .to_owned(),
+            "fluids use flat level surfaces; flow and waterlogging are not reproduced".to_owned(),
         );
         let level = block
             .properties
@@ -253,18 +273,11 @@ fn block_faces(
             (8 - level) as f64 / 9.0
         };
         let texture = resources.texture(&format!("block/{name}_still"))?;
-        let mut faces = cube_faces(
-            texture,
-            if name == "water" {
-                [0.25, 0.45, 0.95]
-            } else {
-                [1.0; 3]
-            },
-            if name == "water" { 0.65 } else { 1.0 },
-            height,
-        );
+        // 水的透明度在贴图自身的 alpha 里；颜色是生物群系水色（流体模型的 tint 源）。
+        let mut faces = cube_faces(texture, [1.0; 3], 1.0, height);
         for face in &mut faces {
             face.fluid = true;
+            face.tint_index = (name == "water").then_some(0);
         }
         return Ok(faces);
     }
@@ -358,15 +371,9 @@ fn block_faces(
                     *vertex = mul(*vertex, 1.0 / 16.0);
                 }
                 let normal = rotate(rotate(normal, 0, -x), 1, -y);
-                let tint = if definition["tintindex"].as_i64().is_some_and(|i| i >= 0) {
-                    report.warnings.insert(
-                        "tinted models use a fixed vegetation color; biome/redstone tints are not yet used"
-                            .to_owned(),
-                    );
-                    [0.55, 0.8, 0.32]
-                } else {
-                    [1.0; 3]
-                };
+                let tint_index = definition["tintindex"]
+                    .as_i64()
+                    .and_then(|i| usize::try_from(i).ok());
                 let cull = definition["cullface"]
                     .as_str()
                     .map(|face| {
@@ -380,7 +387,8 @@ fn block_faces(
                     vertices,
                     uv,
                     texture,
-                    tint,
+                    tint: [1.0; 3],
+                    tint_index,
                     alpha: 1.0,
                     cull,
                     direction: Direction::nearest(normal),
@@ -405,6 +413,7 @@ fn cube_faces(texture: Arc<RgbaImage>, tint: V3, alpha: f64, height: f64) -> Vec
                 uv: [[0.0, 0.0], [16.0, 0.0], [16.0, 16.0], [0.0, 16.0]],
                 texture: texture.clone(),
                 tint,
+                tint_index: None,
                 alpha,
                 cull: Some(normal.map(|v| v.round() as i32)),
                 direction: Direction::nearest(normal),
@@ -560,5 +569,7 @@ pub fn fixture() -> Scene {
         entities: Vec::new(),
         environment: None,
         cells: Vec::new(),
+        biome_names: Vec::new(),
+        biomes: Vec::new(),
     }
 }

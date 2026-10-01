@@ -56,6 +56,15 @@ pub struct BlockRegion {
     /// 原版平滑光照要查的格子：每个表面方块周围一圈，加上露出面前方第二层的四个侧格。
     /// 视距外、没加载的格不在里面。
     pub cells: Vec<LightCell>,
+    /// 生物群系注册表名（服务端同步的协议序，如 `minecraft:plains`）；
+    /// [`BiomeCell::biome`] 是这里的下标。
+    pub biome_names: Vec<String>,
+    /// 成像要查的生物群系格：表面方块的 5×5 混色与模糊缩放邻域、相机周围 6³。
+    pub biomes: Vec<BiomeCell>,
+    /// 生物群系格的 y 范围（含两端，单位 4 格）：原版查格时把 y 夹进这个范围。
+    pub biome_quart_y: [i32; 2],
+    /// 登录/重生包的生物群系缩放种子。
+    pub biome_zoom_seed: i64,
     /// 主世界时钟的累计 tick（服务端时间包）。原版各时间轴按各自周期取模：
     /// 昼夜 `timeline/day` 24000，月相 `timeline/moon` 192000。
     pub clock_ticks: u64,
@@ -76,6 +85,14 @@ pub struct LightCell {
     pub solid_render: bool,
     pub emissive: bool,
     pub full_collision: bool,
+}
+
+/// 一个 4×4×4 生物群系格（原版 quart 坐标 = 方块坐标 >> 2）。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BiomeCell {
+    pub quart: [i32; 3],
+    /// [`BlockRegion::biome_names`] 的下标。
+    pub biome: u16,
 }
 
 /// 身边必须加载完整的半径（格）。

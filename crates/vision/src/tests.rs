@@ -100,6 +100,8 @@ fn scene(blocks: Vec<Block>) -> Scene {
         entities: Vec::new(),
         environment: None,
         cells: Vec::new(),
+        biome_names: Vec::new(),
+        biomes: Vec::new(),
     }
 }
 fn small() -> Options {

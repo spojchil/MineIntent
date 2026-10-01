@@ -135,10 +135,21 @@ async fn capture(
                 full_collision: cell.full_collision,
             })
             .collect(),
+        biome_names: region.biome_names.clone(),
+        biomes: region
+            .biomes
+            .iter()
+            .map(|cell| vision::BiomeCell {
+                quart: cell.quart,
+                biome: cell.biome,
+            })
+            .collect(),
         environment: Some(vision::Environment {
             view_distance: region.view_distance,
             horizon_height: region.horizon_height,
             clock_ticks: region.clock_ticks,
+            biome_quart_y: region.biome_quart_y,
+            biome_zoom_seed: region.biome_zoom_seed,
         }),
     };
     let started = Instant::now();

@@ -1,8 +1,9 @@
 //! 昼夜：原版环境属性（`EnvironmentAttributes`）在主世界的取值。
 //!
-//! 底值取维度属性（`dimension_type/overworld.json` 的 `attributes`），没有的取属性默认值；
-//! 再按主世界的时间轴（`tags/timeline/in_overworld` 里的 `timeline/day`、`timeline/moon`）
-//! 逐轨道叠加。数据全部从客户端 jar 读，不在代码里抄数值。生物群系属性尚未接入。
+//! 原版 `EnvironmentAttributeSystem` 的层序：底值取维度属性（`dimension_type/overworld.json`
+//! 的 `attributes`），没有的取属性默认值；再叠相机处的生物群系层（各生物群系 json 的
+//! `attributes`，按高斯权重插值）；最后按主世界的时间轴（`tags/timeline/in_overworld` 里的
+//! `timeline/day`、`timeline/moon`）逐轨道叠加。数据全部从客户端 jar 读，不在代码里抄数值。
 
 use serde_json::Value;
 
@@ -32,7 +33,13 @@ pub(crate) struct Daylight {
 const TIMELINES: [&str; 2] = ["day", "moon"];
 
 impl Daylight {
-    pub(crate) fn evaluate(resources: &mut Resources, clock_ticks: u64) -> Result<Self, String> {
+    /// `biomes` 是相机处各生物群系的属性表与权重（首次出现顺序），见
+    /// [`crate::biome::Biomes::camera_weights`]；空表即没有生物群系层。
+    pub(crate) fn evaluate(
+        resources: &mut Resources,
+        clock_ticks: u64,
+        biomes: &[(&Value, f64)],
+    ) -> Result<Self, String> {
         let dimension = resources.json("data/minecraft/dimension_type/overworld.json")?;
         let base = &dimension["attributes"];
         let color = |key: &str, default: u32| {
@@ -55,6 +62,14 @@ impl Daylight {
             star_brightness: 0.0,
             moon_phase: "full_moon".to_owned(),
         };
+        for (key, target) in [
+            ("sky_color", &mut daylight.sky_color),
+            ("fog_color", &mut daylight.fog_color),
+            ("sky_light_color", &mut daylight.sky_light_color),
+            ("ambient_light_color", &mut daylight.ambient_light_color),
+        ] {
+            *target = biome_layer(biomes, key, *target);
+        }
         for name in TIMELINES {
             let timeline = resources.json(&format!("data/minecraft/timeline/{name}.json"))?;
             let period = timeline["period_ticks"].as_u64().unwrap_or(24_000).max(1);
@@ -182,6 +197,41 @@ fn parse(value: &Value, kind: Kind) -> Option<Sampled> {
         Kind::Float => value.as_f64().map(Sampled::Float),
         Kind::Color => parse_color(value).map(Sampled::Color),
         Kind::Name => value.as_str().map(|s| Sampled::Name(s.to_owned())),
+    }
+}
+
+/// 生物群系层（`SpatialAttributeInterpolator.applyAttributeLayer`）：只有一个来源时直接取它；
+/// 多个来源时按首次出现顺序累积，每次以「本来源权重 / 累计权重」做 `ARGB.srgbLerp`。
+/// 生物群系没给这个属性就用底值。
+fn biome_layer(biomes: &[(&Value, f64)], key: &str, base: V3) -> V3 {
+    let value_of = |attributes: &Value| {
+        attributes
+            .get(format!("minecraft:visual/{key}"))
+            .and_then(parse_color)
+            .map_or(base, rgb)
+    };
+    let to_int = |c: V3| c.map(|v| (v * 255.0).round());
+    match biomes {
+        [] => base,
+        [(attributes, _)] => value_of(attributes),
+        _ => {
+            let mut result: Option<V3> = None;
+            let mut accumulated = 0.0;
+            for (attributes, weight) in biomes {
+                let value = to_int(value_of(attributes));
+                accumulated += weight;
+                result = Some(match result {
+                    None => value,
+                    Some(previous) => {
+                        let t = (weight / accumulated) as f32;
+                        std::array::from_fn(|i| {
+                            previous[i] + (f64::from(t) * (value[i] - previous[i])).floor()
+                        })
+                    }
+                });
+            }
+            result.map_or(base, |c| c.map(|v| v / 255.0))
+        }
     }
 }
 
