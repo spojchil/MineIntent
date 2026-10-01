@@ -253,6 +253,8 @@ fn for_each_pixel(projection: &Projection, image: &mut [V3], f: impl Fn(&mut V3,
                     let index = chunk * rows * width + offset;
                     f(pixel, projection.direction(index % width, index / width));
                 }
+                crate::counters::add(crate::counters::Counter::SkyPixels, pixels.len() as u64);
+                crate::counters::flush();
             });
         }
     });

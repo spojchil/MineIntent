@@ -5,6 +5,7 @@
 mod assets;
 mod biome;
 mod block_entity;
+mod counters;
 mod daylight;
 mod entity;
 mod geometry;
@@ -151,6 +152,8 @@ pub struct Report {
     pub warnings: BTreeSet<String>,
     /// 各阶段耗时（毫秒，按发生顺序），供性能测量；不进模型可见的说明。
     pub stage_ms: Vec<(&'static str, f64)>,
+    /// 工作量计数（与耗时无关的性能指标，见 `counters`）；不进模型可见的说明。
+    pub counters: Vec<(&'static str, u64)>,
 }
 
 impl Report {

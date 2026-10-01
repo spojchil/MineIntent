@@ -191,7 +191,13 @@ fn project<'a>(
     let parts: Vec<Vec<Projected<'a>>> = std::thread::scope(|scope| {
         let handles: Vec<_> = triangles
             .chunks(chunk)
-            .map(|part| scope.spawn(move || project_part(part, camera, projection, far)))
+            .map(|part| {
+                scope.spawn(move || {
+                    let projected = project_part(part, camera, projection, far);
+                    crate::counters::flush();
+                    projected
+                })
+            })
             .collect();
         handles
             .into_iter()
@@ -217,6 +223,7 @@ fn project_part<'a>(
     let mut polygon = Vec::with_capacity(12);
     let mut scratch = Vec::with_capacity(12);
     let planes = projection.planes(far);
+    let mut dropped = 0;
     for triangle in triangles {
         polygon.clear();
         polygon.extend((0..3).map(|i| {
@@ -239,6 +246,9 @@ fn project_part<'a>(
             if polygon.is_empty() {
                 break;
             }
+        }
+        if polygon.is_empty() {
+            dropped += 1;
         }
         for i in 1..polygon.len().saturating_sub(1) {
             let mut vertices =
@@ -282,6 +292,10 @@ fn project_part<'a>(
             }
         }
     }
+    use crate::counters::{add, Counter};
+    add(Counter::TrianglesProjected, triangles.len() as u64);
+    add(Counter::TrianglesDropped, dropped);
+    add(Counter::TrianglesOut, result.len() as u64);
     result
 }
 
@@ -470,6 +484,7 @@ fn draw_band(
             ((1.0 - 2.0 * (y as f64 + 0.5) / projection.size[1]) * projection.scale[1]).powi(2)
         })
         .collect();
+    let [mut tests, mut covered, mut passed, mut transparent, mut fogged] = [0u64; 5];
     for t in bin {
         let [x0, ty0, x1, ty1] = t.bounds;
         let first_y = ty0.max(y0);
@@ -477,6 +492,7 @@ fn draw_band(
         if first_y >= last_y {
             continue;
         }
+        tests += ((last_y - first_y) * (x1 - x0)) as u64;
         let v = t.vertices;
         let pairs = [(v[1].xy, v[2].xy), (v[2].xy, v[0].xy), (v[0].xy, v[1].xy)];
         let inclusive = pairs.map(|(a, b)| top_left(a, b));
@@ -488,6 +504,7 @@ fn draw_band(
                 if (0..3).any(|i| e[i] < 0.0 || (e[i] == 0.0 && !inclusive[i])) {
                     continue;
                 }
+                covered += 1;
                 let weights = e.map(|value| value * inverse_area);
                 let inv_z =
                     weights[0] * v[0].inv_z + weights[1] * v[1].inv_z + weights[2] * v[2].inv_z;
@@ -498,6 +515,7 @@ fn draw_band(
                 {
                     continue;
                 }
+                passed += 1;
                 let uv = std::array::from_fn(|i| {
                     (weights[0] * v[0].uv_over_z[i]
                         + weights[1] * v[1].uv_over_z[i]
@@ -512,15 +530,24 @@ fn draw_band(
                 });
                 let mut color = sample(t.triangle, uv, tint);
                 if let Some(sky) = sky {
+                    fogged += 1;
                     let direction = directions[(y - y0) * width + x];
                     color = sky.apply(color, direction.map(|v| v * z));
                 }
                 if color[3] >= 0.01 {
                     pixel.insert(Fragment { z, color });
+                } else {
+                    transparent += 1;
                 }
             }
         }
     }
+    use crate::counters::{add, Counter};
+    add(Counter::CoverageTests, tests);
+    add(Counter::Covered, covered);
+    add(Counter::DepthPassed, passed);
+    add(Counter::Transparent, transparent);
+    add(Counter::FogApplied, fogged);
     for (pixel, out) in pixels.iter().zip(output.as_chunks_mut::<4>().0) {
         *out = pixel.finish();
     }
@@ -578,6 +605,7 @@ pub(crate) fn draw(
                         output,
                     );
                 }
+                crate::counters::flush();
             });
         }
     });
@@ -643,6 +671,7 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
         blocks: scene.blocks.len(),
         ..Report::default()
     };
+    crate::counters::take();
     report.warnings.insert(if scene.environment.is_some() {
         "prototype: overworld only, no clouds, weather, block-entity contents or block-light flicker; HUD is only the crosshair"
     } else {
@@ -696,7 +725,7 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
         resources,
         &mut report,
     );
-    report.stage("block geometry", &mut clock);
+    clock = std::time::Instant::now();
     if !scene.entities.is_empty() {
         triangles.extend(crate::entity::build(
             &scene.entities,
@@ -727,6 +756,7 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
         image = image::imageops::crop_imm(&image, x, y, width, height).to_image();
     }
     report.stage("crosshair, crop", &mut clock);
+    report.counters = crate::counters::take();
     Ok(Frame { image, report })
 }
 

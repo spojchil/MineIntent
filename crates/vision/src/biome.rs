@@ -202,6 +202,7 @@ impl Biomes {
 
     /// `BiomeManager.getBiome`：在相邻 8 个 quart 里挑抖动距离最近的那个。
     fn biome_at(&self, position: [i32; 3]) -> usize {
+        crate::counters::add(crate::counters::Counter::BiomeSamples, 1);
         let absolute = position.map(|v| v - 2);
         let parent = absolute.map(|v| v >> 2);
         let fraction = absolute.map(|v| f64::from(v & 3) / 4.0);
@@ -265,9 +266,11 @@ impl Biomes {
         resolver: Resolver,
         cache: &mut TintCache,
     ) -> V3 {
+        crate::counters::add(crate::counters::Counter::TintLookups, 1);
         if let Some(rgb) = cache.get(&(position, resolver)) {
             return rgb.map(|c| f64::from(c) / 255.0);
         }
+        crate::counters::add(crate::counters::Counter::TintBlends, 1);
         let [x, y, z] = position;
         let mut total = [0u32; 3];
         for dz in -BLEND_RADIUS..=BLEND_RADIUS {

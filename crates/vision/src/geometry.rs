@@ -124,6 +124,7 @@ impl Face {
             return [(plain, light::fluid(cells, position)); 4];
         }
         if self.ambient_occlusion && cells.get(position).emission == 0 {
+            crate::counters::add(crate::counters::Counter::AoFaces, 1);
             let values = light::ambient_occlusion(cells, position, self.direction, &self.vertices);
             return std::array::from_fn(|i| (mul(tint, shade * values[i].0), values[i].1));
         }
@@ -159,6 +160,7 @@ pub(crate) fn build_lit(
     resources: &mut Resources,
     report: &mut Report,
 ) -> Vec<Triangle> {
+    let mut clock = std::time::Instant::now();
     let mut sections: PositionMap<bool> = PositionMap::default();
     let visible: Vec<&Block> = scene
         .blocks
@@ -172,6 +174,7 @@ pub(crate) fn build_lit(
             })
         })
         .collect();
+    report.stage("geometry: frustum select", &mut clock);
 
     let mut states: HashMap<(&str, &std::collections::BTreeMap<String, String>), usize> =
         HashMap::new();
@@ -201,6 +204,7 @@ pub(crate) fn build_lit(
             });
         prepared.push((state, entity));
     }
+    report.stage("geometry: state faces, block entities", &mut clock);
 
     // 只有缺遮挡位的方块（测试夹具）才要查邻居。
     let neighbours: PositionMap<&Block> = if visible.iter().any(|b| b.covered.is_none()) {
@@ -235,6 +239,7 @@ pub(crate) fn build_lit(
                             &mut triangles,
                         );
                     }
+                    crate::counters::flush();
                     triangles
                 })
             })
@@ -248,6 +253,7 @@ pub(crate) fn build_lit(
     for mut part in parts {
         triangles.append(&mut part);
     }
+    report.stage("geometry: emit", &mut clock);
     triangles
 }
 
@@ -271,6 +277,7 @@ fn emit_block(
     triangles: &mut Vec<Triangle>,
 ) {
     let fluid = is_fluid(&block.name);
+    let [mut covered, mut backfacing, mut emitted] = [0u64; 3];
     for face in faces {
         if let Some(direction) = face.cull {
             let hidden = match block.covered {
@@ -285,14 +292,17 @@ fn emit_block(
                 }
             };
             if hidden {
+                covered += 1;
                 continue;
             }
         }
         let offset = block.position.map(f64::from);
         // 背面剔除：原版方块的渲染管线都开着面剔除（流体除外，FluidRenderer 自己补反面）。
         if !face.fluid && eye.is_some_and(|eye| !face.faces(sub(eye, offset))) {
+            backfacing += 1;
             continue;
         }
+        emitted += 1;
         let tint = match (face.tint_index, biomes) {
             (Some(index), Some(biomes)) => {
                 let color =
@@ -313,6 +323,11 @@ fn emit_block(
             });
         }
     }
+    use crate::counters::Counter;
+    crate::counters::add(Counter::FacesConsidered, faces.len() as u64);
+    crate::counters::add(Counter::FacesCovered, covered);
+    crate::counters::add(Counter::FacesBackfacing, backfacing);
+    crate::counters::add(Counter::FacesEmitted, emitted);
 }
 
 fn is_fluid(name: &str) -> bool {

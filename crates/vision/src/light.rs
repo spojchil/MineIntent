@@ -36,6 +36,7 @@ impl Cells {
     }
 
     pub(crate) fn get(&self, position: [i32; 3]) -> &Cell {
+        crate::counters::add(crate::counters::Counter::CellLookups, 1);
         self.0.get(&position).unwrap_or(&OPEN_AIR)
     }
 
