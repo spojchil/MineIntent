@@ -252,21 +252,48 @@ fn row_span(
     [from, to.max(from)]
 }
 
+/// 一段投影结果与它在段内从近到远的顺序。
+type ProjectedPart<'a> = (Vec<Projected<'a>>, Vec<Order>);
+
+/// 排序与分箱只用到的小记录：深度键、段内序号、覆盖的条带 `[首, 尾)`。归并分箱时只读这些
+/// 连续的小记录，不必按排好的顺序跳读 200 多字节的投影记录。
+#[derive(Clone, Copy)]
+struct Order {
+    nearest: f64,
+    index: u32,
+    bands: [u16; 2],
+}
+
 /// 投影、裁剪所有三角形，每个分段一个线程；结果按段留着，不拼成一个大数组。
+/// 各线程顺手把本段排好（刚投影完的数据还在缓存里），见 [`front_to_back`]。
 fn project<'a>(
     parts: &'a [Vec<Triangle>],
     camera: &Camera,
     projection: &Projection,
     far: f64,
-) -> Vec<Vec<Projected<'a>>> {
+) -> Vec<ProjectedPart<'a>> {
     std::thread::scope(|scope| {
         let handles: Vec<_> = parts
             .iter()
             .map(|part| {
                 scope.spawn(move || {
                     let projected = project_part(part, camera, projection, far);
+                    // 只排小记录，不搬投影记录；键大（近）的在前，同键按原顺序。
+                    let mut order: Vec<Order> = projected
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| Order {
+                            nearest: t.nearest,
+                            index: i as u32,
+                            bands: [t.bounds[1] / BAND, t.bounds[3].div_ceil(BAND)]
+                                .map(|band| band as u16),
+                        })
+                        .collect();
+                    order.sort_unstable_by(|a, b| {
+                        b.nearest.total_cmp(&a.nearest).then(a.index.cmp(&b.index))
+                    });
                     crate::counters::flush();
-                    projected
+                    (projected, order)
                 })
             })
             .collect();
@@ -277,17 +304,37 @@ fn project<'a>(
     })
 }
 
-/// 从近到远的绘制顺序：近的先画，深度测试能早早挡掉后面的片元（正确性不依赖顺序）。
-/// 只排「深度键 + 序号」的小对，不搬 200 多字节的投影记录；同键按原顺序。
-fn front_to_back<'p, 'a>(parts: &'p [Vec<Projected<'a>>]) -> Vec<&'p Projected<'a>> {
-    let all: Vec<&Projected<'a>> = parts.iter().flatten().collect();
-    let mut keys: Vec<(f64, u32)> = all
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (t.nearest, i as u32))
-        .collect();
-    keys.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-    keys.into_iter().map(|(_, i)| all[i as usize]).collect()
+/// 按从近到远的顺序把三角形登记到它覆盖的每个条带的箱里，条带只扫自己的箱。近的先画，
+/// 深度测试能早早挡掉后面的片元（正确性不依赖顺序）。各段已排好，这里多路归并：同键先取
+/// 靠前的段，段内按序号，合起来就是同键按原顺序。
+fn bin_front_to_back<'p, 'a>(
+    parts: &'p [ProjectedPart<'a>],
+    band_count: usize,
+) -> Vec<Vec<&'p Projected<'a>>> {
+    let mut bins: Vec<Vec<&Projected<'_>>> = vec![Vec::new(); band_count];
+    let mut heads = vec![0; parts.len()];
+    loop {
+        // 段数只比线程数多一，逐个比较各段的队首即可。
+        let mut best: Option<(usize, f64)> = None;
+        for (part, (_, order)) in parts.iter().enumerate() {
+            if let Some(head) = order.get(heads[part]) {
+                if best.is_none_or(|(_, nearest)| head.nearest.total_cmp(&nearest).is_gt()) {
+                    best = Some((part, head.nearest));
+                }
+            }
+        }
+        let Some((part, _)) = best else {
+            break;
+        };
+        let (projected, order) = &parts[part];
+        let head = order[heads[part]];
+        heads[part] += 1;
+        let t = &projected[head.index as usize];
+        for bin in &mut bins[usize::from(head.bands[0])..usize::from(head.bands[1])] {
+            bin.push(t);
+        }
+    }
+    bins
 }
 
 fn project_part<'a>(
@@ -698,18 +745,9 @@ pub(crate) fn draw(
     let mut clock = std::time::Instant::now();
     let projection = Projection::new(camera, options);
     let projected = project(parts, camera, &projection, options.far);
-    report.stage("project, clip", &mut clock);
-    let ordered = front_to_back(&projected);
-    report.stage("sort", &mut clock);
-    // 分箱：每个三角形按（已排好的）顺序登记到它覆盖的每个 16 行条带，条带只扫自己的箱。
-    let band_count = (options.height as usize).div_ceil(BAND);
-    let mut bins: Vec<Vec<&Projected<'_>>> = vec![Vec::new(); band_count];
-    for t in ordered {
-        for bin in &mut bins[t.bounds[1] / BAND..t.bounds[3].div_ceil(BAND)] {
-            bin.push(t);
-        }
-    }
-    report.stage("bin", &mut clock);
+    report.stage("project, clip, sort parts", &mut clock);
+    let bins = bin_front_to_back(&projected, (options.height as usize).div_ceil(BAND));
+    report.stage("merge, bin", &mut clock);
     // 天空各层多边形先裁好；天空本身由各条带只画自己的几行。
     let sky = sky.map(|sky| sky.plan(&projection));
     report.stage("sky plan", &mut clock);
