@@ -11,8 +11,55 @@ pub(crate) type Coords = [f64; 2];
 /// 自发光渲染（岩浆块等）与无光照场景用的满亮度。
 pub(crate) const FULL_BRIGHT: Coords = [240.0, 240.0];
 
-/// 场景里的光照格。查不到的格按露天空气（天空光 15、方块光 0）。
-pub(crate) struct Cells(PositionMap<Cell>);
+/// 场景里的光照格，按区块段平铺（Sodium `ArrayLightDataCache` 的做法）：段网格记每段的
+/// 槽号，有格的段在 `data` 里占连续的 16³ 格，每格压成 5 字节。查一格只做移位与数组下标，
+/// 不再按坐标哈希。查不到的格按露天空气（天空光 15、方块光 0）。
+pub(crate) struct Cells {
+    sections: Sections,
+    data: Vec<Stored>,
+}
+
+/// 区块段坐标 → 槽号。场景都在视距窗口内时用稠密网格；范围大得离谱（手写场景）时退回哈希。
+enum Sections {
+    Grid {
+        first: [i32; 3],
+        span: [i32; 3],
+        slots: Vec<u32>,
+    },
+    Sparse(PositionMap<u32>),
+}
+
+/// 稠密网格最多这么多个段槽（每槽 4 字节）；视距 32 区块、全高度也只有约 10 万。
+const MAX_GRID_SLOTS: i64 = 1 << 22;
+const NO_SLOT: u32 = u32::MAX;
+
+/// 一格压缩后的样子：`[天空光, 方块光, 发光, 透光]` 与标志位（下面四个属性 + 是否有数据）。
+#[derive(Clone, Copy, Default)]
+struct Stored {
+    light: [u8; 4],
+    flags: u8,
+}
+
+const VIEW_BLOCKING: u8 = 1;
+const SOLID_RENDER: u8 = 2;
+const EMISSIVE: u8 = 4;
+const FULL_COLLISION: u8 = 8;
+const PRESENT: u8 = 16;
+
+impl Sections {
+    fn slot(&self, section: [i32; 3]) -> u32 {
+        match self {
+            Sections::Grid { first, span, slots } => {
+                let local: [i32; 3] = std::array::from_fn(|i| section[i] - first[i]);
+                if (0..3).any(|i| local[i] < 0 || local[i] >= span[i]) {
+                    return NO_SLOT;
+                }
+                slots[((local[1] * span[2] + local[2]) * span[0] + local[0]) as usize]
+            }
+            Sections::Sparse(map) => map.get(&section).copied().unwrap_or(NO_SLOT),
+        }
+    }
+}
 
 const OPEN_AIR: Cell = Cell {
     position: [0; 3],
@@ -28,20 +75,96 @@ const OPEN_AIR: Cell = Cell {
 
 impl Cells {
     pub(crate) fn new(cells: &[Cell]) -> Self {
-        let mut map = PositionMap::with_capacity_and_hasher(cells.len(), Default::default());
+        let section_of = |cell: &Cell| cell.position.map(|c| c >> 4);
+        let (min, max) =
+            cells
+                .iter()
+                .map(section_of)
+                .fold(([i32::MAX; 3], [i32::MIN; 3]), |(min, max), s| {
+                    (
+                        std::array::from_fn(|i| min[i].min(s[i])),
+                        std::array::from_fn(|i| max[i].max(s[i])),
+                    )
+                });
+        let span: [i64; 3] = std::array::from_fn(|i| i64::from(max[i]) - i64::from(min[i]) + 1);
+        let grid = !cells.is_empty() && span.iter().product::<i64>() <= MAX_GRID_SLOTS;
+        let mut sections = if grid {
+            Sections::Grid {
+                first: min,
+                span: span.map(|n| n as i32),
+                slots: vec![NO_SLOT; span.iter().product::<i64>() as usize],
+            }
+        } else {
+            Sections::Sparse(PositionMap::default())
+        };
+        let mut count = 0u32;
+        let mut data = Vec::new();
         for cell in cells {
-            map.insert(cell.position, *cell);
+            let section = section_of(cell);
+            let mut slot = sections.slot(section);
+            if slot == NO_SLOT {
+                slot = count;
+                count += 1;
+                match &mut sections {
+                    Sections::Grid { first, span, slots } => {
+                        let local: [i32; 3] = std::array::from_fn(|i| section[i] - first[i]);
+                        slots[((local[1] * span[2] + local[2]) * span[0] + local[0]) as usize] =
+                            slot;
+                    }
+                    Sections::Sparse(map) => {
+                        map.insert(section, slot);
+                    }
+                }
+                data.resize(data.len() + 4096, Stored::default());
+            }
+            let flags = PRESENT
+                | if cell.view_blocking { VIEW_BLOCKING } else { 0 }
+                | if cell.solid_render { SOLID_RENDER } else { 0 }
+                | if cell.emissive { EMISSIVE } else { 0 }
+                | if cell.full_collision {
+                    FULL_COLLISION
+                } else {
+                    0
+                };
+            data[slot as usize * 4096 + local_index(cell.position)] = Stored {
+                light: [
+                    cell.sky_light,
+                    cell.block_light,
+                    cell.emission,
+                    cell.dampening,
+                ],
+                flags,
+            };
         }
-        Self(map)
+        Self { sections, data }
     }
 
-    pub(crate) fn get(&self, position: [i32; 3]) -> &Cell {
+    pub(crate) fn get(&self, position: [i32; 3]) -> Cell {
         crate::counters::add(crate::counters::Counter::CellLookups, 1);
-        self.0.get(&position).unwrap_or(&OPEN_AIR)
+        let slot = self.sections.slot(position.map(|c| c >> 4));
+        if slot == NO_SLOT {
+            return OPEN_AIR;
+        }
+        let stored = self.data[slot as usize * 4096 + local_index(position)];
+        if stored.flags & PRESENT == 0 {
+            return OPEN_AIR;
+        }
+        let [sky_light, block_light, emission, dampening] = stored.light;
+        Cell {
+            position,
+            sky_light,
+            block_light,
+            emission,
+            dampening,
+            view_blocking: stored.flags & VIEW_BLOCKING != 0,
+            solid_render: stored.flags & SOLID_RENDER != 0,
+            emissive: stored.flags & EMISSIVE != 0,
+            full_collision: stored.flags & FULL_COLLISION != 0,
+        }
     }
 
     /// `LevelRenderer.getLightCoords(state, pos)`：`state` 决定自发光，`pos` 决定存储的光照。
-    pub(crate) fn coords(&self, state: &Cell, position: [i32; 3]) -> Coords {
+    pub(crate) fn coords(&self, state: Cell, position: [i32; 3]) -> Coords {
         if state.emissive {
             return FULL_BRIGHT;
         }
@@ -60,6 +183,12 @@ impl Cells {
             1.0
         }
     }
+}
+
+/// 段内下标，(y, z, x) 序。
+fn local_index(position: [i32; 3]) -> usize {
+    let [x, y, z] = position.map(|c| (c & 15) as usize);
+    (y * 16 + z) * 16 + x
 }
 
 /// `LightCoordsUtil.smoothBlend`：四格取平均；中心格够亮时，某格某通道为 0 就用中心值顶替。
