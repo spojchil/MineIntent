@@ -114,8 +114,21 @@ fn colormap(map: &RgbaImage, temperature: f32, downfall: f32) -> u32 {
 
 /// 混色缓存的键：方块位置与取色方式。
 type TintKey = ([i32; 3], Resolver);
-/// 混合染色的缓存，每个出几何的线程一份（原版 `ClientLevel.tintCaches` 也按线程分）。
-pub(crate) type TintCache = HashMap<TintKey, [u8; 3]>;
+
+/// 每个出几何的线程一份（原版 `ClientLevel.tintCaches` 也按线程分）：混好的颜色，以及
+/// 各位置经模糊缩放选中的生物群系——相邻方块的 5×5 窗口大面积重叠，同一位置会被反复
+/// 取样；[`Biomes::biome_at`] 是位置的纯函数，缓存不改结果。
+#[derive(Default)]
+pub(crate) struct TintCache {
+    blends: HashMap<TintKey, [u8; 3]>,
+    biomes: crate::geometry::PositionMap<usize>,
+}
+
+impl TintCache {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
 
 pub(crate) struct Biomes {
     definitions: Vec<Definition>,
@@ -267,7 +280,7 @@ impl Biomes {
         cache: &mut TintCache,
     ) -> V3 {
         crate::counters::add(crate::counters::Counter::TintLookups, 1);
-        if let Some(rgb) = cache.get(&(position, resolver)) {
+        if let Some(rgb) = cache.blends.get(&(position, resolver)) {
             return rgb.map(|c| f64::from(c) / 255.0);
         }
         crate::counters::add(crate::counters::Counter::TintBlends, 1);
@@ -275,7 +288,8 @@ impl Biomes {
         let mut total = [0u32; 3];
         for dz in -BLEND_RADIUS..=BLEND_RADIUS {
             for dx in -BLEND_RADIUS..=BLEND_RADIUS {
-                let biome = self.biome_at([x + dx, y, z + dz]);
+                let at = [x + dx, y, z + dz];
+                let biome = *cache.biomes.entry(at).or_insert_with(|| self.biome_at(at));
                 let color = self.resolve(biome, resolver, x + dx, z + dz);
                 total[0] += color >> 16 & 0xFF;
                 total[1] += color >> 8 & 0xFF;
@@ -284,7 +298,7 @@ impl Biomes {
         }
         let count = ((BLEND_RADIUS * 2 + 1) * (BLEND_RADIUS * 2 + 1)) as u32;
         let rgb = total.map(|c| (c / count) as u8);
-        cache.insert((position, resolver), rgb);
+        cache.blends.insert((position, resolver), rgb);
         rgb.map(|c| f64::from(c) / 255.0)
     }
 
