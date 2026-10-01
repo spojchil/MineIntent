@@ -5,7 +5,7 @@ MineIntent 的全 Rust 单进程实现。目标服务端 **Paper 26.1.2 / 协议
 
 | crate | 职责 |
 |---|---|
-| [`crates/world`](../../crates/world) | 接入 azalea、tick 快照、视口内核、方块读取 |
+| [`crates/world`](../../crates/world) | 接入 azalea、tick 快照、成像用的方块与光照拷贝 |
 | [`crates/render`](../../crates/render) | 快照 → 模型可读文字（全纯函数） |
 | [`crates/perception`](../../crates/perception) | 按需看画面：`view` |
 | [`crates/vision`](../../crates/vision) | 方块状态 + 本地客户端资源 → PNG（原型） |
@@ -122,21 +122,3 @@ git 依赖、不再是工作区成员，那个示例**跑不到本仓**（`cargo
 （`Module::start` 起线程、`stop` 合流即终，`EPOCH` 是硬常量），且离线期间
 没有 tick，唤醒循环整个停摆。
 
-## 视口
-
-视口内核（视锥 + 遮挡 + 暴露面）只服务「眼睛」：组合根周期性调用
-`Module::absorb`，把合法可见的方块与射线穿过的空格写进方块记忆，供寻路读。
-模型不直接调用它，看世界走画面（`view`）。
-
-未加载方块让相关可见性射线**保守失败**，不会被当作空气。
-
-投影是纯 CPU 重活，组合根放 `spawn_blocking`，不占异步线程。
-
-## 寻路观察边界
-
-`forward` 与 `go_to`（都已从模型面撤下，只剩探针在用）的 A\* 只使用最后观察到的三态地图：Known Block 恢复最后所见
-`state_id`，Known Empty 是空气，Unseen 是规划专用屏障。单次 A\* 使用冻结快照；路径
-交给腿以后，局部障碍/卡住修补可以读取更新后的最后所见，但不回读离屏实时世界。
-Azalea fork 的 partial continuation 已关闭，完整重规划由 Direct/Survey/Frontier 接管；
-严格观察图同时关闭自动挖掘，因为挖掘成本分支仍会读取 loaded world。
-战争迷雾的扩张流程与终止边界见[架构说明](../architecture.md#4b-战争迷雾-go_to)。

@@ -43,6 +43,9 @@ use wake::{ScreenDirective, SelfIdentity, WakeCursors};
 /// 末尾那句「开发中，欢迎反馈」是**开发阶段专用**，正式上线前删掉。它存在的理由：
 /// 实机测试的三种信息来源里，「问模型原因」是唯一能解释「为什么它那样做」的一种，
 /// 而它此前只能靠我们事后翻转录去猜。让它自己说「这里反直觉」，比我们猜准得多。
+/// 帧的定时触发间隔：没有模型响应落定时，进展最迟这么久被看见。
+const FRAME_INTERVAL: Duration = Duration::from_millis(250);
+
 const PLACEHOLDER_PERSONA: &str = "\
 你是这个 Minecraft 世界里的一位同伴，说中文。\
 重要：你直接写出的文字只是内心独白，世界里没有任何人能看到——写\"我告诉了他\"\
@@ -382,109 +385,7 @@ impl agent::ContentObserver for TraceObserver {
     }
 }
 
-/// 眼睛的自适应节律。
-///
-/// 一次投影就是一整幅视口——纯 CPU 重活。它现在**只为记忆服务**（方块不进会话区），
-/// 但快慢仍然要按实测让路：拍一个常数在密林里会把 tick 处理拖垮，在旷野里又白等。
-///
-/// 一次增量就是一整幅视口投影——纯 CPU 重活，耗时随视野里方块多少浮动，
-/// 拍一个常数（比如「每 5 tick」）在密林里会把 tick 处理拖垮，在旷野里又
-/// 白等。所以按**实测**来：每次投影计时，取近几次均值，下一次间隔 = 均值 ×
-/// 倍率，再夹到 [最短, 最长] 之间。
-///
-/// 倍率的含义是「投影占用的时间份额」：×4 即最多花 1/5 的时间在投影上，
-/// 剩下留给 tick 处理与模型往返。
-///
-/// 三个数都能用环境变量调，好在实盘里对着日志找合适值：
-/// `MINEINTENT_FRAME_MIN_MS`（默认 250）、`MINEINTENT_FRAME_MAX_MS`（默认 5000）、
-/// `MINEINTENT_FRAME_FACTOR`（默认 4）。
-struct FramePace {
-    recent: std::collections::VecDeque<Duration>,
-    min: Duration,
-    max: Duration,
-    factor: u32,
-    /// 全程统计（含空 diff 的那些）。滑窗管节律，这几个管「到底多久」。
-    total: u64,
-    /// 投影本身的累计（不含排队）。
-    sum: Duration,
-    /// 含排队的累计。两者之差就是调度开销。
-    round_sum: Duration,
-    fastest: Duration,
-    slowest: Duration,
-}
-
-impl FramePace {
-    /// 均值取最近这么多次：够平滑，又能跟上场景切换（进洞、出林）。
-    const WINDOW: usize = 8;
-
-    fn new() -> Self {
-        let ms = |name: &str, fallback: u64| -> u64 {
-            std::env::var(name)
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(fallback)
-        };
-        Self {
-            recent: std::collections::VecDeque::with_capacity(Self::WINDOW),
-            min: Duration::from_millis(ms("MINEINTENT_FRAME_MIN_MS", 250)),
-            max: Duration::from_millis(ms("MINEINTENT_FRAME_MAX_MS", 5_000)),
-            factor: ms("MINEINTENT_FRAME_FACTOR", 4) as u32,
-            total: 0,
-            sum: Duration::ZERO,
-            round_sum: Duration::ZERO,
-            fastest: Duration::MAX,
-            slowest: Duration::ZERO,
-        }
-    }
-
-    /// `work` 是投影本身，`round` 含排队。节律按 round 退让（忙就让路），
-    /// 分布报 work（那才是算法的成本）。
-    fn record(&mut self, work: Duration, round: Duration) {
-        if self.recent.len() == Self::WINDOW {
-            self.recent.pop_front();
-        }
-        self.recent.push_back(round);
-        self.total += 1;
-        self.sum += work;
-        self.round_sum += round;
-        self.slowest = self.slowest.max(work);
-        self.fastest = self.fastest.min(work);
-    }
-
-    /// 每这么多次投影汇报一次分布。**空 diff 的投影不投递也不打帧日志**，
-    /// 只按非空帧统计会漏掉「无事发生时多久」那一半——那正是常态。
-    const REPORT_EVERY: u64 = 40;
-
-    fn due_report(&self) -> Option<String> {
-        if self.total == 0 || !self.total.is_multiple_of(Self::REPORT_EVERY) {
-            return None;
-        }
-        let n = self.total as u32;
-        Some(format!(
-            "[组合根] 投影分布：{} 次，最快 {}ms，均值 {}ms，最慢 {}ms；含排队均值 {}ms（排队开销 {}ms）",
-            self.total,
-            self.fastest.as_millis(),
-            (self.sum / n).as_millis(),
-            self.slowest.as_millis(),
-            (self.round_sum / n).as_millis(),
-            ((self.round_sum - self.sum) / n).as_millis()
-        ))
-    }
-
-    fn average(&self) -> Duration {
-        if self.recent.is_empty() {
-            return Duration::ZERO;
-        }
-        self.recent.iter().sum::<Duration>() / self.recent.len() as u32
-    }
-
-    /// 下次定时触发的间隔。还没测过时先用最短间隔起步。
-    fn next_interval(&self) -> Duration {
-        (self.average() * self.factor).clamp(self.min, self.max)
-    }
-}
-
-/// 眼睛的第二个触发源：一轮模型响应落定（AttemptCommitted）时发信号；
+/// 帧的第一个触发源：一轮模型响应落定（AttemptCommitted）时发信号；
 /// 收集与投递在旁路任务做——观察端契约要求快速返回。
 struct RoundEndSignal(tokio::sync::mpsc::UnboundedSender<()>);
 
@@ -659,19 +560,6 @@ async fn main() -> Result<(), String> {
     // ---- 中间层装配 ----
     let occupancy = Arc::new(Occupancy::new());
     let screen_state = Arc::new(ScreenState::new());
-    // 方块记忆：同伴「已知道什么」的共享认知状态，三态（有东西／确认为空／
-    // 没看过）都在这一本里。眼睛每 250ms 写，寻路与查询读。
-    let block_memory = Arc::new(std::sync::Mutex::new(world::BlockMemory::new()));
-    // 合法寻路：寻路只按这本记忆里观察过的方块规划，不再读服务端推来的全量世界。
-    // 必须是同一本——眼睛每 250ms 把看见的写进去，寻路要读的正是那一份。
-    module.use_observed_pathfinding(block_memory.clone());
-    // 装不上就不开跑：同伴会照读服务端推来的全量世界，看穿没去过的地方，
-    // 而这一行日志本身正是上次实盘里唯一「证明」战争迷雾开着的东西。
-    module
-        .wait_observed_pathfinding(Duration::from_secs(30))
-        .await
-        .map_err(|error| format!("合法寻路未能装上：{error}"))?;
-    println!("[组合根] 合法寻路已装上：只按观察过的方块规划路线");
     let read_mark = Arc::new(ChatReadMark::new());
     let memory_file = Arc::new(MemoryFile::new(memory_path));
     let snapshots: Arc<dyn SnapshotSource> = module.clone();
@@ -730,19 +618,8 @@ async fn main() -> Result<(), String> {
     // 前缀只有人设与记忆——两者都不逐轮变，吃满前缀缓存。处境不在这里：
     // 它每轮都变，随帧追加在对话末尾（见 `situation` 模块）。
     let strategy = Arc::new(ContextStrategy::new(persona, memory_file));
-    // 眼睛：持续把**合法可见**的方块写进记忆。
-    //
-    // 这个循环以前叫「轮末帧」，任务是把方块差异送给模型。方块不再进会话区之后，
-    // 它的身份变了——**它是眼睛，不是帧**：视口判据（视锥 + 遮挡 +
-    // ExposedFace）决定什么算看过，看过的自动进 BlockMemory，模型既不花轮次、也
-    // 看不见这个过程。就像人不「决定去看」，睁着眼东西就自己进了记忆。
-    //
-    // 视口因此仍然不可少，但角色是**合法性守门人**而非呈现：直接吸收服务端推来的
-    // 已加载区块会让记忆退化成「服务端给了什么」，刚从寻路里赶出去的开挂就会
-    // 从记忆的后门回来。
-    //
-    // 顺带还投递两样**非方块**的东西：处境变了的那几行、在途 job 的进展。它们便宜，
-    // 且只在真有内容时才发。
+    // 帧：把处境变了的那几行、攒下的拾取和在途 job 的进展投给模型。
+    // 它们便宜，且只在真有进展时才发（判据见 `frame`）。
     let (round_end_tx, mut round_end_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let mut assembled = AgentSession::new(
         strategy.clone(),
@@ -770,69 +647,28 @@ async fn main() -> Result<(), String> {
     let session = Arc::new(assembled);
     {
         let session = session.clone();
-        let module = module.clone();
-        let block_memory = block_memory.clone();
         let snapshots = snapshots.clone();
         let read_mark = read_mark.clone();
         let compacted = compacted.clone();
         tokio::spawn(async move {
-            let mut pace = FramePace::new();
             // 攒什么、什么时候发车，都在 `frame` 里，带单测；这里只负责取快照与投递。
             let mut frames = FrameComposer::new();
             loop {
                 // 两个触发源，谁先到算谁：
                 //   一、模型响应落定（工具刚跑完，世界多半刚变）；
-                //   二、定时——**间隔由上几次实测耗时自适应**，不是拍脑袋的常数。
-                // 世界不变就没有 diff，也就不投递、不唤醒；固定心跳会为无事发生
-                // 烧轮，这里不会。
+                //   二、定时。
+                // 没有进展就不投递、不唤醒；定时只是让进展及时被看见。
                 tokio::select! {
                     signal = round_end_rx.recv() => {
                         if signal.is_none() {
                             break;
                         }
-                        // 合并积压：连续几轮落定只收集一次，diff 是累积的不丢事。
+                        // 合并积压：连续几轮落定只收集一次，进展是累积的不丢事。
                         while round_end_rx.try_recv().is_ok() {}
                     }
-                    _ = tokio::time::sleep(pace.next_interval()) => {}
+                    _ = tokio::time::sleep(FRAME_INTERVAL) => {}
                 }
 
-                let scan_module = module.clone();
-                let scan_memory = block_memory.clone();
-                // 两个时长，别混：
-                //   work  —— 投影本身（闭包内计时）。
-                //   round —— 派发 + 在阻塞池排队 + 执行 + join。节律按它退让。
-                // 分开后实测排队开销 ≈0ms（1000 次采样，两者均值同为 26ms）；两个数
-                // 留着，是因为阻塞池一旦真忙起来它们会分开，而节律要跟着退。
-
-                // **方块信息不进会话区**：眼睛把看见的吸进记忆——那是给机器用的
-                // （寻路读它）——但一格都不推给模型。
-                //
-                // 逐格推送在数学上走不通：站着转两分钟就能攒几千格，按 10.5 token/格
-                // 折算，半个 1M 窗口只装得下约 4.8 万格。不是优化得好不好的问题。
-                //
-                // 模型要看世界就看画面（`view`）。
-                let dispatched = std::time::Instant::now();
-                let outcome = tokio::task::spawn_blocking(move || {
-                    let at = std::time::Instant::now();
-                    // 全量吸收，不算差异——差异没有消费者了（见 Module::absorb）。
-                    // 参数用 for_memory：判据不动，只把「一次记多少」的呈现预算放开。
-                    let absorbed =
-                        scan_module.absorb(&scan_memory, &world::ViewportOptions::for_memory());
-                    (absorbed, at.elapsed())
-                })
-                .await;
-                let round = dispatched.elapsed();
-                let (absorbed, work) = match outcome {
-                    Ok((absorbed, work)) => (absorbed, work),
-                    Err(_) => (Ok(0), std::time::Duration::ZERO),
-                };
-                pace.record(work, round);
-                if let Some(report) = pace.due_report() {
-                    println!("{report}");
-                }
-
-                // 未连接/世界未就绪等如实拒绝：静默跳过，不是错误。
-                let Ok(absorbed) = absorbed else { continue };
                 // 压缩旗子先收：只置位，真正重投在下面的 `compose` 里发生——
                 // 本轮没进展而提前返回，位也留着不会丢。
                 if compacted.swap(false, std::sync::atomic::Ordering::Relaxed) {
@@ -844,14 +680,7 @@ async fn main() -> Result<(), String> {
                     continue;
                 };
                 let text = sections.join("\n");
-                println!(
-                    "[组合根] 投递 {} 行（本次看进记忆 {absorbed} 格；投影 {}ms，含排队 {}ms，均值 {}ms，下次间隔 {}ms）",
-                    sections.len(),
-                    work.as_millis(),
-                    round.as_millis(),
-                    pace.average().as_millis(),
-                    pace.next_interval().as_millis()
-                );
+                println!("[组合根] 投递 {} 行", sections.len());
                 let item: agent::TranscriptItem = InputMessage::text("user", text).into();
                 // 为什么是 `NextModelRequest` 而不是 `WhenIdle`，见 `frame` 的头注释。
                 if let Err(rejected) = session

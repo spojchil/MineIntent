@@ -74,9 +74,7 @@ pub(super) fn begin(
         .take()
         .ok_or_else(|| "这次输入已经提交过".to_owned())?;
     let from = position(bot)?;
-    // 旧的坐标式任务（寻路、坐标挖掘）与键鼠抢同一副身体：先收掉，免得松开后它接着走。
-    inner.movement_job.cancel(inner);
-    bot.force_retire_pathfinding();
+    // 旧的坐标式挖掘与键鼠抢同一副身体：先收掉，免得松开后它接着挖。
     inner.mining_job.cancel(inner);
 
     let previous = inner.held_input.lock().take();

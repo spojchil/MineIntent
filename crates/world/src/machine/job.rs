@@ -163,35 +163,37 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::{JobStatusKind, MoveEvent};
+    use crate::{JobStatusKind, MineEvent};
 
     struct Fake {
         destination: [i32; 3],
     }
 
     impl JobVerb for Fake {
-        type Event = MoveEvent;
-        fn fact(&self, event: MoveEvent) -> JobFact {
-            JobFact::Move {
-                destination: self.destination,
+        type Event = MineEvent;
+        fn fact(&self, event: MineEvent) -> JobFact {
+            JobFact::Mine {
+                targets: vec![self.destination],
+                done: 0,
                 event,
             }
         }
-        fn replaced() -> MoveEvent {
-            MoveEvent::Replaced
+        fn replaced() -> MineEvent {
+            MineEvent::Replaced
         }
-        fn cancelled() -> MoveEvent {
-            MoveEvent::Cancelled
+        fn cancelled() -> MineEvent {
+            MineEvent::Cancelled
         }
-        fn connection_ended() -> MoveEvent {
-            MoveEvent::ConnectionEnded
+        fn connection_ended() -> MineEvent {
+            MineEvent::ConnectionEnded
         }
         fn status(&self, id: JobId, started_tick: u64, now_tick: u64) -> JobStatus {
             JobStatus {
                 id,
-                kind: JobStatusKind::Move {
-                    destination: self.destination,
-                    leg: None,
+                kind: JobStatusKind::Mine {
+                    targets: vec![self.destination],
+                    done: 0,
+                    current: None,
                 },
                 started_tick,
                 elapsed_ticks: now_tick.saturating_sub(started_tick),
@@ -206,37 +208,39 @@ mod tests {
     }
 
     impl JobVerb for BlockingFake {
-        type Event = MoveEvent;
+        type Event = MineEvent;
 
-        fn fact(&self, event: MoveEvent) -> JobFact {
-            if matches!(event, MoveEvent::Leg { .. })
+        fn fact(&self, event: MineEvent) -> JobFact {
+            if matches!(event, MineEvent::Broke { .. })
                 && !self.blocked_once.swap(true, Ordering::AcqRel)
             {
                 self.entered_fact.wait();
                 self.release_fact.wait();
             }
-            JobFact::Move {
-                destination: [1, 0, 0],
+            JobFact::Mine {
+                targets: vec![[1, 0, 0]],
+                done: 0,
                 event,
             }
         }
 
-        fn replaced() -> MoveEvent {
-            MoveEvent::Replaced
+        fn replaced() -> MineEvent {
+            MineEvent::Replaced
         }
-        fn cancelled() -> MoveEvent {
-            MoveEvent::Cancelled
+        fn cancelled() -> MineEvent {
+            MineEvent::Cancelled
         }
-        fn connection_ended() -> MoveEvent {
-            MoveEvent::ConnectionEnded
+        fn connection_ended() -> MineEvent {
+            MineEvent::ConnectionEnded
         }
 
         fn status(&self, id: JobId, started_tick: u64, now_tick: u64) -> JobStatus {
             JobStatus {
                 id,
-                kind: JobStatusKind::Move {
-                    destination: [1, 0, 0],
-                    leg: None,
+                kind: JobStatusKind::Mine {
+                    targets: vec![[1, 0, 0]],
+                    done: 0,
+                    current: None,
                 },
                 started_tick,
                 elapsed_ticks: now_tick.saturating_sub(started_tick),
@@ -244,14 +248,13 @@ mod tests {
         }
     }
 
-    fn events(inner: &Inner) -> Vec<MoveEvent> {
+    fn events(inner: &Inner) -> Vec<MineEvent> {
         inner
             .jobs_window_now()
             .entries
             .iter()
             .map(|entry| match entry.fact {
-                JobFact::Move { event, .. } => event,
-                ref other => panic!("期望移动事实，得到 {other:?}"),
+                JobFact::Mine { event, .. } => event,
             })
             .collect()
     }
@@ -274,7 +277,7 @@ mod tests {
             },
         );
         assert_ne!(first, second, "顶替时新旧任务必须是两个 id");
-        assert_eq!(events(&inner), vec![MoveEvent::Replaced]);
+        assert_eq!(events(&inner), vec![MineEvent::Replaced]);
     }
 
     #[test]
@@ -290,7 +293,7 @@ mod tests {
 
         assert!(slot.connection_ended(&inner));
         assert!(!slot.connection_ended(&inner));
-        assert_eq!(events(&inner), vec![MoveEvent::ConnectionEnded]);
+        assert_eq!(events(&inner), vec![MineEvent::ConnectionEnded]);
         assert!(slot.status(inner.now_tick()).is_none());
     }
 
@@ -313,7 +316,9 @@ mod tests {
             let inner = inner.clone();
             let slot = slot.clone();
             std::thread::spawn(move || {
-                slot.poll(&inner, |_| Step::Progress(MoveEvent::Leg { to: [1, 0, 0] }))
+                slot.poll(&inner, |_| {
+                    Step::Progress(MineEvent::Broke { done: 1, total: 2 })
+                })
             })
         };
         entered_fact.wait();
@@ -338,13 +343,16 @@ mod tests {
         release_fact.wait();
         assert_eq!(
             polling.join().unwrap(),
-            Some(MoveEvent::Leg { to: [1, 0, 0] })
+            Some(MineEvent::Broke { done: 1, total: 2 })
         );
         ending.join().unwrap();
         assert!(ended_rx.recv().unwrap());
         assert_eq!(
             events(&inner),
-            vec![MoveEvent::Leg { to: [1, 0, 0] }, MoveEvent::ConnectionEnded],
+            vec![
+                MineEvent::Broke { done: 1, total: 2 },
+                MineEvent::ConnectionEnded
+            ],
             "终局之后不能再补写进展"
         );
     }
@@ -362,7 +370,7 @@ mod tests {
         );
         slot.cancel(&inner);
         slot.cancel(&inner);
-        assert_eq!(events(&inner), vec![MoveEvent::Cancelled]);
+        assert_eq!(events(&inner), vec![MineEvent::Cancelled]);
         assert!(slot.status(0).is_none());
     }
 }

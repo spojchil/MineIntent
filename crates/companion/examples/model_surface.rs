@@ -605,57 +605,6 @@ async fn main() {
     println!("聊天：`alice: 过来一下`（发言者名: 原文）\n");
     println!("任务通知（render_job_entry 全谱）：\n");
     for event in [
-        world::MoveEvent::Leg { to: [20, 70, 1] },
-        world::MoveEvent::Stalled,
-        world::MoveEvent::Arrived,
-        world::MoveEvent::PathEnded,
-        world::MoveEvent::DestinationRejected { at: [18, 70, 1] },
-        world::MoveEvent::NavigationLimitReached {
-            at: [17, 70, 2],
-            plans: 41,
-            travelled: 23,
-        },
-        world::MoveEvent::DispatchNotObserved {
-            at: [17, 70, 2],
-            ticks: 100,
-        },
-        world::MoveEvent::NoBodyProgressLimitReached {
-            at: [17, 70, 2],
-            ticks: 1_200,
-        },
-        world::MoveEvent::Replaced,
-        world::MoveEvent::Cancelled,
-        world::MoveEvent::ConnectionEnded,
-    ] {
-        let entry = world::JobEntry {
-            seq: 1,
-            tick: 100,
-            occurred_at: std::time::SystemTime::UNIX_EPOCH,
-            id: world::JobId(3),
-            fact: world::JobFact::Move {
-                destination: [35, 72, 3],
-                event,
-            },
-        };
-        let terminal = entry.fact.is_terminal();
-        let wakes = !matches!(
-            event,
-            world::MoveEvent::Replaced
-                | world::MoveEvent::Cancelled
-                | world::MoveEvent::Leg { .. }
-                | world::MoveEvent::Stalled
-        );
-        println!(
-            "- {}`{}`",
-            match (terminal, wakes) {
-                (false, _) => "（进展·搭帧）",
-                (true, true) => "",
-                (true, false) => "（终局·入窗不叫醒）",
-            },
-            render::render_job_entry(&entry)
-        );
-    }
-    for event in [
         world::MineEvent::Broke { done: 1, total: 2 },
         world::MineEvent::Cleared,
         world::MineEvent::Blocked { at: [36, 71, 3] },

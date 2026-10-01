@@ -1,8 +1,7 @@
-//! 方块观察词汇：拉路径的读取原语。
+//! 方块词汇：成像用的方块拷贝与光照格。
 //!
-//! 方块不进 tick 快照——最深最重的嵌套留在 azalea 世界模型原地，读方按
-//! 绝对坐标拉取。`BlockReadResult` 只回答"这一格是什么"，看不看得见由
-//! 视口层从观察者位置做视锥与遮挡判断。
+//! 方块不进 tick 快照——最深最重的嵌套留在 azalea 世界模型原地，成像时由
+//! `Module::capture_view` 按视距整体拷贝一份。
 
 use std::collections::BTreeMap;
 
@@ -33,12 +32,8 @@ pub struct BlockSnapshot {
     pub bounding_box: BlockBoundingBox,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum BlockReadResult {
-    Loaded { block: BlockSnapshot },
-    Unloaded,
-    OutOfWorld,
-}
+/// 站姿第一人称眼睛高度（格）。
+pub const EYE_HEIGHT: f64 = 1.62;
 
 /// 原版客户端的默认视距（区块）。登录前随客户端信息上报；实际视距取它与服务端给的较小者。
 pub const CLIENT_VIEW_DISTANCE: u8 = 12;
@@ -95,38 +90,7 @@ pub struct RegionBlock {
     pub covered: u8,
 }
 
-/// 视口扫描热路径上唯一用得到的事实。
-///
-/// 一次全量投影要问十几万次「这一格挡不挡视线」，而每次问的都只有两位：
-/// 是不是空气、透不透光。完整 DTO 为回答这两位携带三个持堆字段；
-/// 这个类型是 `Copy` 的，缓存命中不分配。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BlockProbe {
-    Loaded {
-        /// 不是三种空气之一——也就是这一格"有东西"。
-        visible: bool,
-        transparent_hint: bool,
-    },
-    Unloaded,
-    OutOfWorld,
-}
-
-impl BlockProbe {
-    /// 从完整 DTO 折出探针。给测试与合成读取器用；生产读取器应当
-    /// 直接从注册表状态取探针，不为热路径建 DTO。
-    pub fn from_read(result: &BlockReadResult) -> Self {
-        match result {
-            BlockReadResult::Loaded { block } => Self::Loaded {
-                visible: !is_air_name(&block.name),
-                transparent_hint: block.transparent_hint,
-            },
-            BlockReadResult::Unloaded => Self::Unloaded,
-            BlockReadResult::OutOfWorld => Self::OutOfWorld,
-        }
-    }
-}
-
-/// 三种空气的注册名。视口把它们当作"这一格没有东西"。
+/// 三种空气的注册名：这一格"没有东西"。
 pub fn is_air_name(name: &str) -> bool {
     matches!(name, "air" | "cave_air" | "void_air")
 }

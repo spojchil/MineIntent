@@ -10,8 +10,8 @@
 //! 不会漏——tick 会重复，seq 不会。
 
 use world::{
-    DamageEntry, FactSource, InventoryChangeEntry, JobEntry, JobFact, MineEvent, MoveEvent,
-    ScreenEvent, TickSnapshot,
+    DamageEntry, FactSource, InventoryChangeEntry, JobEntry, JobFact, MineEvent, ScreenEvent,
+    TickSnapshot,
 };
 
 /// 屏事实要组合根做的事：状态翻转与占域是副作用，出纯函数交给外面。
@@ -109,7 +109,7 @@ impl WakeCursors {
             if !advance(&mut self.jobs, entry.seq) {
                 continue;
             }
-            // 进展不走这条通道：它是「还在走」，不是「出事了」，由帧搭车呈现
+            // 进展不走这条通道：它是「还在跑」，不是「出事了」，由帧搭车呈现
             // （组合根另有一个游标）。这里只管终局。
             if entry.fact.is_terminal() && wakes_on(&entry.fact) {
                 lines.push(render_job(entry));
@@ -171,10 +171,6 @@ fn advance(cursor: &mut Option<u64>, seq: u64) -> bool {
 /// 那才是它不知道的事实。
 fn wakes_on(fact: &JobFact) -> bool {
     match fact {
-        JobFact::Move { event, .. } => !matches!(
-            event,
-            MoveEvent::Replaced | MoveEvent::Cancelled | MoveEvent::Leg { .. } | MoveEvent::Stalled
-        ),
         JobFact::Mine { event, .. } => !matches!(
             event,
             MineEvent::Replaced | MineEvent::Cancelled | MineEvent::Broke { .. }
@@ -246,14 +242,15 @@ mod tests {
         }
     }
 
-    fn job(seq: u64, event: MoveEvent) -> JobEntry {
+    fn job(seq: u64, event: MineEvent) -> JobEntry {
         JobEntry {
             seq,
             tick: seq,
             occurred_at: std::time::SystemTime::UNIX_EPOCH,
             id: world::JobId(seq),
-            fact: JobFact::Move {
-                destination: [1, 2, 3],
+            fact: JobFact::Mine {
+                targets: vec![[1, 2, 3]],
+                done: 0,
                 event,
             },
         }
@@ -369,17 +366,17 @@ mod tests {
         let mut cursors = WakeCursors::default();
         snap.jobs = Window {
             entries: vec![
-                job(1, MoveEvent::Arrived),
-                job(2, MoveEvent::Replaced),
-                job(3, MoveEvent::Cancelled),
-                job(4, MoveEvent::PathEnded),
-                job(5, MoveEvent::Stalled),
+                job(1, MineEvent::Cleared),
+                job(2, MineEvent::Replaced),
+                job(3, MineEvent::Cancelled),
+                job(4, MineEvent::Blocked { at: [1, 2, 3] }),
+                job(5, MineEvent::Broke { done: 1, total: 2 }),
             ],
         };
 
-        // 三类被挡下，只剩到达与走不到：
+        // 三类被挡下，只剩挖完与挖不动：
         //   顶替、取消——模型自己下的令的回声，不该把它自己吵醒；
-        //   卡住——它是**进展**不是终局（任务还在跑），由帧搭车呈现。
+        //   碎了一块——它是**进展**不是终局（任务还在跑），由帧搭车呈现。
         assert_eq!(cursors.collect(&snap, identity(), false).lines.len(), 2);
     }
 
@@ -395,7 +392,7 @@ mod tests {
             entries: vec![damage(2, 20.0, 14.0)],
         };
         snap.jobs = Window {
-            entries: vec![job(3, MoveEvent::Arrived)],
+            entries: vec![job(3, MineEvent::Cleared)],
         };
 
         let lines = cursors.collect(&snap, identity(), false).lines;

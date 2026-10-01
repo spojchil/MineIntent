@@ -18,7 +18,6 @@ use tokio::sync::{oneshot, watch, Notify};
 use super::door::{DoorCommand, PendingCommand};
 use super::job::JobSlot;
 use super::mining::MiningJob;
-use super::movement::MovementJob;
 use super::{
     DAMAGE_WINDOW_ENTRIES, INVENTORY_WINDOW_ENTRIES, JOBS_WINDOW_ENTRIES, PICKUP_WINDOW_ENTRIES,
     SCREEN_WINDOW_ENTRIES, SOUND_WINDOW_ENTRIES,
@@ -49,7 +48,6 @@ pub(crate) struct Inner {
     /// 上一 tick 的生命值；下降即产伤害条目。None = 尚无基线（首帧不产）。
     pub(super) last_health: Mutex<Option<f64>>,
     /// 在途移动任务（单意图槽）。
-    pub(super) movement_job: JobSlot<MovementJob>,
     /// 在途挖掘任务（单意图槽，内含坐标队列）。
     pub(super) mining_job: JobSlot<MiningJob>,
     pub(super) inventory_window: Mutex<VecDeque<InventoryChangeEntry>>,
@@ -77,16 +75,6 @@ pub(crate) struct Inner {
     /// azalea 世界模型句柄（Spawn 登记）。方块读取走它的读锁，
     /// 可在任意线程进行——世界模型不是 ECS。
     pub(super) world_handle: Mutex<Option<Arc<RwLock<azalea::world::World>>>>,
-    /// 合法寻路的知识面。`None` = 还没装上，寻路照旧读全量世界。
-    /// 由连接层的 tick 从 [`Inner::observed_request`] 兑现，之后每 tick 推进它的脚下格。
-    pub(super) observed: Mutex<Option<Arc<super::observed::ObservedBlocks>>>,
-    /// 组合根声明过、但还没兑现成观察源的那本记忆。
-    ///
-    /// 声明与安装分开，是因为 `Module::use_observed_pathfinding` 可能早于世界模型
-    /// 就绪：Ready 相由 `Event::Tick` 与 `Event::Spawn` 两处发布，前者先到时世界句柄
-    /// 还没登记。声明只入这里、绝不因为「现在装不上」被丢掉；owner 线程的下一次
-    /// tick 手上一定有活客户端，安装在那里完成。
-    pub(super) observed_request: Mutex<Option<Arc<std::sync::Mutex<crate::BlockMemory>>>>,
     /// 首次停机请求及其理由。`OnceLock` 同时充当不可逆的 stopping 状态，避免
     /// “已经请求停止”和“最终该写哪个理由”成为两份可能漂移的状态。
     stop_reason: OnceLock<String>,
@@ -125,7 +113,6 @@ impl Inner {
             damage_window: Mutex::new(VecDeque::new()),
             jobs_window: Mutex::new(VecDeque::new()),
             last_health: Mutex::new(None),
-            movement_job: JobSlot::default(),
             mining_job: JobSlot::default(),
             inventory_window: Mutex::new(VecDeque::new()),
             last_slot_contents: Mutex::new(SlotLedger::new()),
@@ -143,8 +130,6 @@ impl Inner {
             server_view_distance: AtomicU32::new(0),
             is_flat: AtomicBool::new(false),
             light: Mutex::new(super::light::LightStore::default()),
-            observed: Mutex::new(None),
-            observed_request: Mutex::new(None),
             stop_reason: OnceLock::new(),
             shutdown: Notify::new(),
             tick: AtomicU64::new(0),
@@ -192,13 +177,11 @@ impl Inner {
         self.publish(snapshot);
     }
 
-    /// 连接生命周期结束后不会再有 tick，两个持续任务必须在这个边界同步落终局。
+    /// 连接生命周期结束后不会再有 tick，持续任务必须在这个边界同步落终局。
     /// client、swarm 与线程退出都可能报告同一次断线；槽位 take 语义保证只落一次。
     pub(super) fn end_running_jobs(&self) -> bool {
         super::input::connection_ended(self);
-        let movement = self.movement_job.connection_ended(self);
-        let mining = self.mining_job.connection_ended(self);
-        movement || mining
+        self.mining_job.connection_ended(self)
     }
 
     pub(super) fn chat_window_now(&self) -> Window<ChatEntry> {
@@ -514,10 +497,7 @@ impl Inner {
     /// 全部在途任务。槽位是唯一真相源——不另建镜像表。
     pub(super) fn jobs_in_flight(&self) -> Vec<crate::JobStatus> {
         let now = self.now_tick();
-        [self.movement_job.status(now), self.mining_job.status(now)]
-            .into_iter()
-            .flatten()
-            .collect()
+        self.mining_job.status(now).into_iter().collect()
     }
 
     pub(super) fn push_chat(&self, sender: Option<(String, Option<String>)>, plain_text: String) {
@@ -597,7 +577,7 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MineEvent, MoveEvent};
+    use crate::MineEvent;
 
     #[test]
     fn first_stop_request_wakes_state_waiters_and_preserves_its_reason() {
@@ -657,45 +637,30 @@ mod tests {
     }
 
     #[test]
-    fn movement_job_replacement_and_stop_are_recorded() {
+    fn mining_job_replacement_and_release_are_recorded() {
         let inner = Inner::new();
-        let job = |d: [i32; 3]| {
-            crate::machine::movement::MovementJob::new(d, 0, azalea::BlockPos::new(0, 64, 0), None)
-        };
-        inner.movement_job.begin(&inner, job([10, 64, -3]));
-        inner.movement_job.begin(&inner, job([20, 64, 5])); // 顶替
-        inner.movement_job.cancel(&inner); // 停止
-        inner.movement_job.cancel(&inner); // 没任务时不是事件
+        let job = |at: [i32; 3]| crate::machine::mining::MiningJob::new(vec![at], 0);
+        inner.mining_job.begin(&inner, job([10, 64, -3]));
+        inner.mining_job.begin(&inner, job([20, 64, 5])); // 顶替
+        inner.mining_job.cancel(&inner); // 松手
+        inner.mining_job.cancel(&inner); // 没任务时不是事件
 
         let window = inner.jobs_window_now();
-        let events: Vec<crate::MoveEvent> = window
+        let events: Vec<MineEvent> = window
             .entries
             .iter()
             .map(|entry| match entry.fact {
-                crate::JobFact::Move { event, .. } => event,
-                ref other => panic!("期望移动事实，得到 {other:?}"),
+                crate::JobFact::Mine { event, .. } => event,
             })
             .collect();
-        assert_eq!(
-            events,
-            vec![crate::MoveEvent::Replaced, crate::MoveEvent::Cancelled]
-        );
+        assert_eq!(events, vec![MineEvent::Replaced, MineEvent::Cancelled]);
         // 顶替与取消分属两个任务，id 必须不同——否则下游分不出谁的进展。
         assert_ne!(window.entries[0].id, window.entries[1].id);
     }
 
     #[test]
-    fn connection_end_closes_both_job_kinds_once_and_phase_snapshot_contains_them() {
+    fn connection_end_closes_the_job_once_and_phase_snapshot_contains_it() {
         let inner = Inner::new();
-        inner.movement_job.begin(
-            &inner,
-            crate::machine::movement::MovementJob::new(
-                [10, 64, -3],
-                0,
-                azalea::BlockPos::new(0, 64, 0),
-                None,
-            ),
-        );
         inner.mining_job.begin(
             &inner,
             crate::machine::mining::MiningJob::new(vec![[3, 64, 4]], 0),
@@ -707,19 +672,11 @@ mod tests {
             reason: "网络断开".to_owned(),
         });
 
-        assert!(inner.movement_job.status(inner.now_tick()).is_none());
         assert!(inner.mining_job.status(inner.now_tick()).is_none());
         let latest = inner.latest.read();
-        assert_eq!(latest.jobs.entries.len(), 2);
+        assert_eq!(latest.jobs.entries.len(), 1);
         assert!(matches!(
             latest.jobs.entries[0].fact,
-            crate::JobFact::Move {
-                event: MoveEvent::ConnectionEnded,
-                ..
-            }
-        ));
-        assert!(matches!(
-            latest.jobs.entries[1].fact,
             crate::JobFact::Mine {
                 event: MineEvent::ConnectionEnded,
                 ..

@@ -189,8 +189,8 @@ impl Sky {
             for star in stars() {
                 let corners = star.map(|v| (celestial(daylight.star_angle, v), [0.0; 2], [1.0; 3]));
                 rasterize(projection, &corners, |index, _, _| {
-                    for channel in 0..3 {
-                        image[index][channel] += added;
+                    for channel in &mut image[index] {
+                        *channel += added;
                     }
                 });
             }

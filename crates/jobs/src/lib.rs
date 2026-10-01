@@ -69,13 +69,6 @@ fn describe(status: &JobStatus) -> Value {
     let mut value = common;
     let object = value.as_object_mut().expect("上面就是对象");
     match &status.kind {
-        JobStatusKind::Move { destination, leg } => {
-            object.insert("做什么".to_owned(), json!("走路"));
-            object.insert("目的地".to_owned(), json!(destination));
-            if let Some(leg) = leg {
-                object.insert("这一程走到".to_owned(), json!(leg));
-            }
-        }
         JobStatusKind::Mine {
             targets,
             done,
@@ -110,7 +103,7 @@ impl ToolProvider for JobsTools {
             }),
         );
         definition.description = Some(
-            "看一眼你现在有什么在后台跑（走路、挖掘）。**不要轮询**：任务做完、\
+            "看一眼你现在有什么在后台跑（挖掘）。**不要轮询**：任务做完、\
 放弃或卡住都会主动通知你，这个动作只在你确实拿不准时用一次。\
 表里给的是在途时长，久不久由你自己判断——机器不替你下「卡住了」这个结论。"
                 .to_owned(),
@@ -163,35 +156,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn both_verbs_appear_with_their_own_shape() {
-        let jobs = vec![
-            JobStatus {
-                id: JobId(1),
-                kind: JobStatusKind::Move {
-                    destination: [10, 64, -3],
-                    leg: Some([5, 64, -1]),
-                },
-                started_tick: 0,
-                elapsed_ticks: 40,
+    async fn mining_appears_with_its_progress() {
+        let jobs = vec![JobStatus {
+            id: JobId(2),
+            kind: JobStatusKind::Mine {
+                targets: vec![[1, 2, 3], [1, 3, 3]],
+                done: 1,
+                current: Some([1, 3, 3]),
             },
-            JobStatus {
-                id: JobId(2),
-                kind: JobStatusKind::Mine {
-                    targets: vec![[1, 2, 3], [1, 3, 3]],
-                    done: 1,
-                    current: Some([1, 3, 3]),
-                },
-                started_tick: 10,
-                elapsed_ticks: 30,
-            },
-        ];
+            started_tick: 10,
+            elapsed_ticks: 30,
+        }];
         let result = tools(jobs).call(call(json!({"action": "list"}))).await;
         let listed = json_of(&result);
         let listed = listed["jobs"].as_array().expect("数组");
-        assert_eq!(listed[0]["做什么"], "走路");
-        assert_eq!(listed[0]["id"], 1);
-        assert_eq!(listed[1]["做什么"], "挖掘");
-        assert_eq!(listed[1]["已挖"], 1);
+        assert_eq!(listed[0]["做什么"], "挖掘");
+        assert_eq!(listed[0]["id"], 2);
+        assert_eq!(listed[0]["已挖"], 1);
+        assert_eq!(listed[0]["正在挖"], json!([1, 3, 3]));
     }
 
     /// 机器只给在途时长，不替模型判断「卡住了」——那是推测，不是事实。
@@ -199,9 +181,10 @@ mod tests {
     async fn the_table_states_elapsed_time_and_does_not_conclude_stuck() {
         let jobs = vec![JobStatus {
             id: JobId(9),
-            kind: JobStatusKind::Move {
-                destination: [0, 0, 0],
-                leg: None,
+            kind: JobStatusKind::Mine {
+                targets: vec![[0, 0, 0]],
+                done: 0,
+                current: None,
             },
             started_tick: 0,
             elapsed_ticks: 9_999,

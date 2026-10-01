@@ -292,63 +292,6 @@ fn wrap_degrees_matches_the_vanilla_half_open_range() {
 }
 
 #[test]
-fn job_entries_render_each_outcome_in_world_language() {
-    let entry = |event| world::JobEntry {
-        seq: 1,
-        tick: 100,
-        occurred_at: SystemTime::now(),
-        id: world::JobId(7),
-        fact: world::JobFact::Move {
-            destination: [10, 64, -3],
-            event,
-        },
-    };
-    assert_eq!(
-        render_job_entry(&entry(world::MoveEvent::Arrived)),
-        "你到达了目的地 (10, 64, -3)。"
-    );
-    let unclassified = render_job_entry(&entry(world::MoveEvent::PathEnded));
-    assert!(unclassified.contains("没有到达"));
-    assert!(unclassified.contains("没有足够证据"));
-    let occupied = render_job_entry(&entry(world::MoveEvent::DestinationRejected {
-        at: [9, 64, -3],
-    }));
-    assert!(occupied.contains("自动寻路规则"));
-    assert!(occupied.contains("精确身体节点"));
-    assert!(!occupied.contains("有碰撞体"));
-    assert!(!occupied.contains("身体不能进入"));
-    let limited = render_job_entry(&entry(world::MoveEvent::NavigationLimitReached {
-        at: [8, 64, -2],
-        plans: 41,
-        travelled: 23,
-    }));
-    assert!(limited.contains("工作上限"));
-    assert!(limited.contains("不证明目的地不可达"));
-    assert!(limited.contains("规划 41 段"));
-    let dispatch = render_job_entry(&entry(world::MoveEvent::DispatchNotObserved {
-        at: [8, 64, -2],
-        ticks: 100,
-    }));
-    assert!(dispatch.contains("listener 一直没有接单"));
-    assert!(dispatch.contains("不是无路可走"));
-    let stationary = render_job_entry(&entry(world::MoveEvent::NoBodyProgressLimitReached {
-        at: [8, 64, -2],
-        ticks: 1_200,
-    }));
-    assert!(stationary.contains("身体连续 1200 tick 没有换格"));
-    assert!(stationary.contains("不证明目的地不可达"));
-    assert!(render_job_entry(&entry(world::MoveEvent::Stalled)).contains("卡住"));
-    assert_eq!(
-        render_job_entry(&entry(world::MoveEvent::Cancelled)),
-        "你停下了移动。"
-    );
-    assert!(render_job_entry(&entry(world::MoveEvent::Replaced)).contains("顶替"));
-    let disconnected = render_job_entry(&entry(world::MoveEvent::ConnectionEnded));
-    assert!(disconnected.contains("连接结束"));
-    assert!(disconnected.contains("没有到达结论"));
-}
-
-#[test]
 fn mining_failures_name_the_observed_boundary() {
     let entry = |event| world::JobEntry {
         seq: 1,
@@ -393,11 +336,9 @@ fn mining_failures_name_the_observed_boundary() {
     assert!(unavailable.contains("没有猜它是实心或空气"));
 }
 
-/// 「卡住」是进展不是终局：类型上就该分得开，呈现也不该说成结束了。
+/// 进展不是终局：类型上就该分得开，呈现也不该说成结束了。
 #[test]
-fn stalling_is_progress_while_giving_up_is_terminal() {
-    assert!(!world::MoveEvent::Stalled.is_terminal());
-    assert!(world::MoveEvent::PathEnded.is_terminal());
+fn progress_is_not_terminal() {
     assert!(!world::MineEvent::Broke { done: 1, total: 3 }.is_terminal());
     assert!(world::MineEvent::Blocked { at: [1, 2, 3] }.is_terminal());
     assert!(world::MineEvent::DispatchNotObserved {

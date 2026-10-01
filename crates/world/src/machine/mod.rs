@@ -23,15 +23,11 @@ mod input;
 mod job;
 mod light;
 mod mining;
-mod movement;
-mod navigation;
-pub mod observed;
 mod state;
 
 pub use door::DoorCommand;
 pub use input::InputCompletion;
 
-use self::blocks::{probe_block_from_world, read_block_from_world};
 use self::connect::run_swarm;
 use self::state::Inner;
 
@@ -48,16 +44,6 @@ const PICKUP_WINDOW_ENTRIES: usize = 64;
 const SOUND_WINDOW_ENTRIES: usize = 256;
 /// 屏开/关事实窗条目上限。开关稀疏，小窗足矣。
 const SCREEN_WINDOW_ENTRIES: usize = 16;
-/// stamped Goto 已同步进入 Azalea 队列后，listener 消费它的最大 tick 数。fork 的
-/// `queued_goto_id` 是稳定事实，越界会明确报调度未接单，不冒充普通无路可走。
-const MOVEMENT_DISPATCH_TIMEOUT_TICKS: u64 = 100;
-/// 身体格连续不推进多久后发一次 Stalled 诊断。只读真实身体，不读会被局部 patch
-/// 重置的内部 node 计数。
-const MOVEMENT_STALL_TICKS: u64 = 200;
-/// 活跃导航连续没有真实身体换格的产品资源边界。新腿、重规划和 Leg 文案都不能刷新；
-/// 命中时单独报告物理无进展，不把它伪装成寻路结果或笼统超时。
-const MOVEMENT_NO_BODY_PROGRESS_TICKS: u64 = MOVEMENT_STALL_TICKS * 6;
-
 /// 同步写入的 `MiningQueued` 等待 Azalea GameTick 消费的最大 tick 数。命中说明
 /// 调度链没有接单，不是方块挖不动。
 const MINING_DISPATCH_TIMEOUT_TICKS: u64 = 100;
@@ -537,163 +523,6 @@ impl Module {
         })
     }
 
-    /// 全景视口投影，另把射线走过的空格记进 [`crate::ObservedSpace`]。
-    ///
-    /// 服务的是**眼睛**：每帧都跑，是三态记忆里「确认为空」那一位的唯一产生方。
-    /// 投影是纯 CPU 重活，调用方自行放阻塞池。
-    fn scan_observing(
-        &self,
-        options: &crate::ViewportOptions,
-        space: &mut crate::ObservedSpace,
-    ) -> Result<crate::ViewportProjection, String> {
-        let snapshot = self.latest();
-        if !matches!(snapshot.phase, ConnectionPhase::Ready) {
-            return Err("尚未连接到世界，无法观察".to_owned());
-        }
-        let world = self
-            .inner
-            .world_handle
-            .lock()
-            .clone()
-            .ok_or_else(|| "世界模型尚未就绪".to_owned())?;
-        let world = world.read();
-        let pose = crate::viewport::Pose {
-            position: snapshot.self_state.position,
-            yaw: snapshot.self_state.yaw,
-            pitch: snapshot.self_state.pitch,
-        };
-        crate::viewport::project_observing(
-            &pose,
-            &snapshot.entities,
-            crate::viewport::WorldReader::new(
-                |position| probe_block_from_world(&world, position),
-                |position| read_block_from_world(&world, position),
-            ),
-            options,
-            || Ok(()),
-            space,
-        )
-        .map_err(|error| error.to_string())
-    }
-
-    /// 开启**合法寻路**：寻路只按 `memory` 里观察过的方块规划路线
-    /// （不调用就是原样——azalea 读服务端推来的全部已加载区块，包括同伴从没看过的
-    /// 地方，那会泄露未见地形；理由详见 `machine::observed` 模块文档）。
-    ///
-    /// 传进来的必须是**组合根那一份**记忆：眼睛每 250ms 往里推进增量，寻路要
-    /// 看到的正是同一份，两份会各说各话。
-    /// 这只是**声明**，不是安装：真正装上要等 owner 线程的下一次 tick（那里世界句柄
-    /// 一定拿得到）。想要回执就接着 [`Module::wait_observed_pathfinding`]，别把
-    /// 「调用过」当成「装上了」。
-    pub fn use_observed_pathfinding(
-        &self,
-        memory: std::sync::Arc<std::sync::Mutex<crate::BlockMemory>>,
-    ) {
-        *self.inner.observed_request.lock() = Some(memory);
-    }
-
-    /// 合法寻路的 `BlockSource` 组件此刻是否真的在 ECS 里。
-    pub fn observed_pathfinding_installed(&self) -> bool {
-        self.inner
-            .observed
-            .lock()
-            .as_ref()
-            .is_some_and(|source| source.is_installed())
-    }
-
-    /// 等到合法寻路真的装上；超时返回 Err。
-    ///
-    /// 没有这个回执，组合根只能凭「调用过」印一行成功——2026-08-25 那次 64 分钟
-    /// 长游玩正是这样：声明被启动时序吃掉，日志照样说开了，实际全程读的是服务端
-    /// 推来的全量世界。
-    pub async fn wait_observed_pathfinding(&self, timeout: Duration) -> Result<(), String> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut ticked = self.inner.ticked_tx.subscribe();
-        loop {
-            if self.observed_pathfinding_installed() {
-                return Ok(());
-            }
-            if self.inner.is_stopping() {
-                return Err("连接正在停止".to_owned());
-            }
-            tokio::select! {
-                changed = ticked.changed() => {
-                    if changed.is_err() {
-                        return Err("接入机器已退出".to_owned());
-                    }
-                }
-                _ = tokio::time::sleep_until(deadline) => {
-                    return Err("等待合法寻路装上超时".to_owned());
-                }
-            }
-        }
-    }
-
-    /// 诊断：同一目标，全量世界 vs 只按观察过的地图，各算一次路。
-    ///
-    /// 不产生移动，也不装组件——纯粹为了回答「合法之后还找不找得到路、路长多少、
-    /// 算多久」。返回 `(全量, 合法)`。
-    ///
-    /// `kind` 把**目标语义**也当变量：实盘里模型给的坐标常是实心方块或悬空点，
-    /// 精确语义下 A* 把可达集穷尽也命不中。两种语义跑在同一份地图上才比得出
-    /// 「是地图太薄」还是「是目标要求太严」。
-    pub fn compare_paths(
-        &self,
-        memory: std::sync::Arc<std::sync::Mutex<crate::BlockMemory>>,
-        goal: [i32; 3],
-        kind: crate::machine::observed::GoalKind,
-    ) -> Result<
-        (
-            crate::machine::observed::PathAttempt,
-            crate::machine::observed::PathAttempt,
-        ),
-        String,
-    > {
-        let snapshot = self.latest();
-        if !matches!(snapshot.phase, ConnectionPhase::Ready) {
-            return Err("尚未连接到世界".to_owned());
-        }
-        let position = &snapshot.self_state.position;
-        let start = azalea::pathfinder::player_pos_to_block_pos(azalea::Vec3::new(
-            position.x, position.y, position.z,
-        ));
-        crate::machine::observed::compare(
-            &self.inner,
-            memory,
-            start,
-            azalea::BlockPos::new(goal[0], goal[1], goal[2]),
-            kind,
-        )
-    }
-
-    /// 睁眼一次：把合法可见的方块整份写进记忆，返回吸收了多少格。
-    ///
-    /// 记忆只需要「把看见的收进来」，不需要知道哪些是新的。
-    pub fn absorb(
-        &self,
-        memory: &std::sync::Mutex<crate::BlockMemory>,
-        options: &crate::ViewportOptions,
-    ) -> Result<usize, String> {
-        // 自由空间先落在一份本次投影专用的暂存里，**投影全程不持记忆的锁**：
-        // 投影约十毫秒，而寻路器每 tick 要读这本记忆上千次。
-        // 观察发生的刻取自同一份快照：投影读的就是它的姿态与实体。
-        let at_tick = self.latest().tick;
-        let mut free_space = crate::ObservedSpace::new();
-        let projection = self.scan_observing(options, &mut free_space)?;
-        let mut memory = memory.lock().map_err(|_| "方块记忆锁中毒".to_owned())?;
-        // 空的先上账、方块后上账：两者由构造保证不相交（射线撞到第一个非空气
-        // 就停），万一相交也让「有东西」赢，与三态的优先级一致。
-        memory.absorb_empty(&free_space, at_tick);
-        memory.absorb_visible(&projection.visible_blocks.blocks, at_tick);
-        for block in [&projection.standing_on_block, &projection.looked_at_block]
-            .into_iter()
-            .flatten()
-        {
-            memory.absorb_visible(std::slice::from_ref(block), at_tick);
-        }
-        Ok(projection.visible_blocks.blocks.len())
-    }
-
     /// 全部在途任务。空 = 什么都没在跑。
     ///
     /// 槽位是唯一真相源，不另建镜像表——两份真相迟早会不一致。
@@ -754,14 +583,9 @@ mod tests {
     #[tokio::test]
     async fn explicit_stop_waits_for_owner_cleanup_and_is_repeatable() {
         let inner = Arc::new(Inner::new());
-        inner.movement_job.begin(
+        inner.mining_job.begin(
             &inner,
-            movement::MovementJob::new(
-                [10, 64, -3],
-                inner.now_tick(),
-                azalea::BlockPos::new(0, 64, 0),
-                None,
-            ),
+            mining::MiningJob::new(vec![[10, 64, -3]], inner.now_tick()),
         );
         let (done_tx, done_rx) = watch::channel(false);
         let module = Module {
@@ -792,12 +616,11 @@ mod tests {
             .jobs
             .entries
             .iter()
-            .filter_map(|entry| match entry.fact {
-                crate::JobFact::Move { event, .. } => Some(event),
-                _ => None,
+            .map(|entry| match entry.fact {
+                crate::JobFact::Mine { event, .. } => event,
             })
             .collect();
-        assert_eq!(ended, vec![crate::MoveEvent::ConnectionEnded]);
+        assert_eq!(ended, vec![crate::MineEvent::ConnectionEnded]);
     }
 
     #[tokio::test]

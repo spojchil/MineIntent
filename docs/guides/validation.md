@@ -32,55 +32,6 @@ cargo test -p render -p context -p dispatch          # 纯函数与策略层
 （`machine/state.rs`）与移动判定表（`machine/movement.rs`）都能脱离 azalea 跑。
 这不是可选项——它是「纯状态转换可单测」这条设计的验收方式。
 
-### 战争迷雾 `go_to`
-
-先在 Azalea fork 的 pinned revision 跑底层生命周期检查：
-
-```sh
-cargo test -p azalea --lib --no-fail-fast
-cargo test -p azalea --doc --no-fail-fast
-cargo clippy -p azalea --lib --tests -- -D warnings
-```
-
-它们覆盖 calculation generation、stop、partial/no-retry 收尾、空执行组件、换世界、
-未知方块 fallback 与极端坐标启发式。MineIntent 的 workspace 不会运行 git 依赖自己的
-单测，因此这组证据不能省略。
-
-再跑本仓的高层状态与契约检查：
-
-```sh
-cargo test -p world --features azalea machine::
-cargo test -p render
-cargo clippy -p world -p render --features world/azalea --all-targets -- -D warnings
-```
-
-它们分别钉住：未知格不进入执行图、最后所见而非离屏实时状态、冻结图一致性、
-Direct/Survey/Frontier 转移、排队 Goto 的本地租约、执行期观察源刷新、A↔B 循环的
-有限工作预算，以及各终局的诚实呈现。它们**不证明**真实 Minecraft 物理下能到达目标。
-
-实服使用生产状态机探针：
-
-```sh
-cargo run --release -p world --features azalea --example fog_goto_probe -- \
-  <host> <port> <username> <dx> <dy> <dz> 180
-```
-
-验收至少分两种场景：一项使用受控平地上可站立的精确身体格，要求 `Arrived`；另一项
-把目标放在首帧视野之外，要求日志出现 Survey/Frontier 链，并在 `Arrived`、
-`DestinationRejected`、`PathEnded`、`NavigationLimitReached`、
-`DispatchNotObserved`、`NoBodyProgressLimitReached` 或 `ConnectionEnded` 中给出
-一条真实终局。终局后探针继续逐 tick 观察 5 秒，必须 `in_flight=0` 且身体格不再移动；
-这是实服交叉证据，Azalea goal/计算/执行组件的严格 retirement 由 fork 生命周期单测
-直接证明。自然地形上“保持同 y 的相对坐标”可能本来就没有可站 stance，不能拿它单独
-充当到达验收。`go_to` 与 `forward` 都已从模型面撤下，只剩探针经由这条寻路；Issue #139 的
-near/reach 语义随之搁置。
-
-> 内核（依赖键 `agent`，本体是 [midturn](https://github.com/spojchil/midturn)）
-> 自 2026-08-16 起是 git 依赖，**不再是工作区成员**：`cargo test -p agent` 与
-> `cargo test -p midturn` 都跑不了（后者会报「requires dev-dependencies and is
-> not a member of the workspace」）。内核的测试与协议冒烟随上游仓跑；本仓验收
-> 的是「钉住的那个 rev 能把下游编过、测过」。
-
 ## 按需图片原型
 
 `cargo test -p vision --all-targets` 使用自制资源验证模型解析、几何、相机、透明
@@ -269,8 +220,7 @@ MINUTES=30 MINEINTENT_ACCEPT_EULA=1 bash long-run.sh
 `i32::MIN`，第一次必然重发；之后一格抖动就再重发，**中间一声不吭**。模型发完
 `go_to` 就永远等着。终局统计 `到达 ×4 / 没能到达 **×0**`，而 08-18 那跑两者都有。
 
-当前实现不再按“一格位移”静默重发同一个目标；现行状态机与复验入口见本页顶部
-“战争迷雾 `go_to`”。
+坐标寻路（`go_to`）已整体删除，见 git 历史。
 
 ### 观测盲区：投递给模型的内容不进轨迹
 
@@ -411,79 +361,6 @@ user 消息（帧、唤醒、job 终局）一个字都不记**。job 进展行�
 | 新格位地址用错 | **0 次** |
 | 每批调用数 | `{1: 129, 2: 5}` —— **合批那句没起作用**，描述改了行为没变 |
 
-## 视口参数的代价（2026-08-19，`scan_bench_probe`）
-
-方块不再进会话区之后，视口只服务记忆，参数该重定。同一起点、release、20 次取样：
-
-| 参数 | 可见格 | 中位耗时 |
-| --- | --- | --- |
-| 默认 32 格，上限 256 | 256（截断） | 11.7ms |
-| **记忆 32 格，不限** | **503** | **9.1ms** |
-| 48 格，不限 | 888 | 66.3ms |
-| 64 格，不限 | 961 | 138.8ms |
-| 160 格＝服务端默认 10 区块 | 5,047 | **2,628ms** |
-
-**去掉方块数上限是白赚的**：32 格下记忆量翻倍（256 → 503），耗时反而略降。排序截断
-发生在最后——候选集本来就全算了，截断只省 DTO 的钱。所以 `ViewportOptions::for_memory`
-只放开 `block_limit`，不动距离。
-
-**放远极不划算**：48 格 6 倍、64 格 13 倍、160 格 **250 倍**，而可见格数只涨 10 倍。
-视锥体积按 r³ 长、暴露面只按 r² 长，多花的全在遍历看不见的空气。160 格 2.6 秒一次，
-模型一轮才 2 秒——连主动 `scan` 都用不了，更不用说每 250ms 的眼睛。
-
-**结论：眼睛用 32 格 + 不限方块数**。（`scan` 工具与这个探针已删，见 git 历史。）
-
-### 已知的下一档优化（未做）
-
-当前形状是「外层遍历视锥内的候选格，每格发射线判暴露面」（`VisibilityPredicate::
-ExposedFace`；`BlockCentre` 中心射线作旧基线留着对照）。成本随**体积** r³。
-
-另一种是把外层换成射线——从眼睛按立体角铺一层，内层步进，成本随 r²，更接近光栅化。
-Minecraft 自己的 section 级 cave culling 我们已经有对应物（section AABB 剔除）。
-
-**不做**：32 格 9ms 够用，而这个改动动的是合法性判据本身，风险换不来性能。
-
-## 一次增量要多少毫秒（2026-08-18）
-
-问题是「测量各种情况下，一次增量的毫秒数」。答案不是一个数，是一条分布。
-
-### 三个口径，别混
-
-| 口径 | 含义 | 怎么量 |
-| --- | --- | --- |
-| `work` | 投影本身：视锥 + 遮挡 + 聚合（+ 记忆 diff） | `spawn_blocking` **闭包内**计时 |
-| `round` | 派发 + 在阻塞池排队 + 执行 + join | 闭包**外**计时 |
-| 每 tick 采集 | 主循环里从 ECS 装配快照 | `MINEINTENT_CAPTURE_TIMING=1` |
-
-自适应节律按 `round` 退让（系统忙时排队是真实代价），分布报 `work`（那才是
-算法成本）。**此前只量 round 却标成「本次投影」**，把排队记在了投影头上；订
-正后两者可以直接相减看调度开销。
-
-### 实测
-
-`scan_bench_probe` 与 `scan_changes` 已删，下表是当时的记录，复现需回到 git 历史。
-
-| 场景 | 构建 | 最快 | 中位/均值 | 最慢 |
-| --- | --- | --- | --- | --- |
-| 静止基线，纯 `scan` | release | — | 8.8ms | — |
-| 静止基线，`scan_changes` | release | — | 13.3ms | — |
-| 实盘（边走边挖），1000 次采样 | release | 7ms | 26ms | 122ms |
-| 实盘 | debug | — | 244ms | — |
-
-- **记忆那层 +3.7ms（35%）**：`scan_changes` 减 `scan`。
-- **排队开销 ≈0ms**：同一 1000 次采样里 `work` 与 `round` 均值同为 26ms。
-- **每 tick 采集 0.13ms**：20 次/秒即 0.26% CPU，不是主循环的负担。
-
-### 结论
-
-1. 慢的两个真因是 **debug 构建（9 倍）** 和 **场景（17 倍浮动）**。
-2. 三项旧优化（section AABB 剔除、`ExposedFace` 判据、零分配探针查表）都还在，
-   「旧线压到过 10ms」与今天的 8.8ms 静止基线是一致的——旧记忆没错，错的是拿
-   静止基线去对实盘。
-3. 曾经怀疑过的**排队**、**ECS 写锁 / 每 tick 采集**、**记忆增长**，逐一实测
-   排除。`MINEINTENT_CAPTURE_TIMING` 留在树里，就是给下次同类怀疑当场证伪用的。
-4. 因此**单点数字没有意义**。要报就报分布，且必须写明构建档与场景。
-
 ## 前缀修复的对照跑（2026-08-20，30 分钟，Windows + DeepSeek）
 
 08-18 那跑的账写着「修改后必须重跑同样的场景比对」。这是那一跑：同一句指派式
@@ -588,10 +465,7 @@ usage: input 284,278（其中缓存 275,968）
 
 ### 账五：寻路对不可达目标空转
 
-当前实现使用 fork 的 `recalculate_partial_paths(false)` 关闭 partial continuation，
-同时用 `retry_on_no_path(false)` 关闭无路自动重试；Direct/Survey/Frontier 状态机按
-冻结观察图接管重规划，并用有限导航工作预算保证开放世界中的循环最终给出诚实终局。
-现行复验入口见本页顶部“战争迷雾 `go_to`”。
+坐标寻路（`go_to`）已整体删除，见 git 历史。
 
 ### 本跑留档
 

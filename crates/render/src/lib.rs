@@ -659,64 +659,9 @@ pub fn render_container_menu(snap: &TickSnapshot, kind: &str) -> String {
     }
 }
 
-/// 进行中的进展措辞。
-///
-/// 一趟远路是多段的——按自己观察到的地图规划，只能先走到知识边界，到了看到更多
-/// 再往前。每段开始说一句这一程走到哪，模型才知道自己为什么走走停停；不说，它
-/// 看到的就是「走了一段莫名其妙停下」。
-///
-/// **不解释为什么到此为止**：路径是被知识边界截断还是被超时截断，`is_partial`
-/// 分不出，说了就是把未知讲成已知。
+/// 任务事实的措辞：进展与终局各一句。
 pub fn render_job_entry(entry: &world::JobEntry) -> String {
     match &entry.fact {
-        world::JobFact::Move {
-            destination: [x, y, z],
-            event,
-        } => match event {
-            world::MoveEvent::Leg { to: [lx, ly, lz] } => {
-                if [*lx, *ly, *lz] == [*x, *y, *z] {
-                    format!("这一程直接走到 ({x}, {y}, {z})。")
-                } else {
-                    format!(
-                        "去 ({x}, {y}, {z})：这一程先走到 ({lx}, {ly}, {lz})，到了再看能不能接着走。"
-                    )
-                }
-            }
-            world::MoveEvent::Stalled => {
-                format!("你在前往 ({x}, {y}, {z}) 的路上卡住了一阵子，一直没有进展。")
-            }
-            world::MoveEvent::Arrived => format!("你到达了目的地 ({x}, {y}, {z})。"),
-            world::MoveEvent::PathEnded => {
-                format!("去 ({x}, {y}, {z}) 的这段寻路停了，但你没有到达；机器没有足够证据说明是哪里过不去。")
-            }
-            world::MoveEvent::DestinationRejected { at: [ax, ay, az] } => format!(
-                "你停在 ({ax}, {ay}, {az})：目的地 ({x}, {y}, {z}) 这一格最后观察到的状态不被当前自动寻路规则接受为精确身体节点（可能是实心或危险格）。请改给一个寻路器接受的身体格。"
-            ),
-            world::MoveEvent::NavigationLimitReached {
-                at: [ax, ay, az],
-                plans,
-                travelled,
-            } => format!(
-                "你停在 ({ax}, {ay}, {az})：前往 ({x}, {y}, {z}) 的本次战争迷雾导航达到机器工作上限（规划 {plans} 段、累计移动 {travelled} 格）。你没有精确到达；这不证明目的地不可达。"
-            ),
-            world::MoveEvent::DispatchNotObserved {
-                at: [ax, ay, az],
-                ticks,
-            } => format!(
-                "你停在 ({ax}, {ay}, {az})：前往 ({x}, {y}, {z}) 的请求在 Azalea 队列里等待了 {ticks} tick，listener 一直没有接单。机器按调度故障收束；这不是无路可走的结论。"
-            ),
-            world::MoveEvent::NoBodyProgressLimitReached {
-                at: [ax, ay, az],
-                ticks,
-            } => format!(
-                "你停在 ({ax}, {ay}, {az})：前往 ({x}, {y}, {z}) 的导航仍活跃，但身体连续 {ticks} tick 没有换格，达到机器的物理推进边界。这不证明目的地不可达。"
-            ),
-            world::MoveEvent::Replaced => "先前的移动被新的目标顶替了。".to_owned(),
-            world::MoveEvent::Cancelled => "你停下了移动。".to_owned(),
-            world::MoveEvent::ConnectionEnded => format!(
-                "前往 ({x}, {y}, {z}) 期间连接结束了，移动任务随连接收束；没有到达结论。"
-            ),
-        },
         world::JobFact::Mine {
             targets,
             done,

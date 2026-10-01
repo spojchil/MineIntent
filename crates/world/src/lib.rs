@@ -15,7 +15,6 @@ mod block;
 mod input;
 #[cfg(feature = "azalea")]
 mod machine;
-mod viewport;
 
 pub use block::*;
 pub use input::*;
@@ -24,10 +23,8 @@ pub use input::*;
 pub mod slots;
 
 #[cfg(feature = "azalea")]
-pub use machine::observed::{GoalKind, PathAttempt};
 #[cfg(feature = "azalea")]
 pub use machine::{ConnectionConfig, DoorCommand, Module};
-pub use viewport::*;
 
 /// 挂钟时刻，取证用。
 pub type Timestamp = SystemTime;
@@ -379,11 +376,6 @@ pub struct JobEntry {
 /// 自足可读**，不必维护一张 id → 参数的表。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JobFact {
-    /// 寻路移动（go_to 与 forward 共用——forward 化归为寻路目标）。
-    Move {
-        destination: [i32; 3],
-        event: MoveEvent,
-    },
     /// 按顺序挖一串方块。**队列而非单块**：模型一次给出坐标数组，机器逐块挖完。
     ///
     /// 之所以是队列，是因为 `start_mining` 是单目标槽——换目标即放弃上一个。
@@ -401,49 +393,8 @@ impl JobFact {
     /// 这条事实是不是终局。终局之后该任务不再有事实。
     pub fn is_terminal(&self) -> bool {
         match self {
-            JobFact::Move { event, .. } => event.is_terminal(),
             JobFact::Mine { event, .. } => event.is_terminal(),
         }
-    }
-}
-
-/// 移动任务的事件。前两个是进展（任务还在跑），其余是终局。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MoveEvent {
-    /// 多段行走：这一程打算走到哪。
-    ///
-    /// **不说为什么到此为止**——路径是不是被知识边界截断，`is_partial` 分不出
-    /// 超时与边界，说了就是把未知讲成已知。
-    Leg { to: [i32; 3] },
-    /// 卡住：较长时间没有推进。**不是终局**——寻路器还在自救，任务继续。
-    Stalled,
-    /// 按 Azalea 的身体格换算口径，当前位置精确等于目的地。
-    Arrived,
-    /// 底层路段停了但目标未达成；原因没有被进一步分类。
-    PathEnded,
-    /// 最终**身体格本身**已经观察为寻路安全策略不接受的状态；可能是实心或危险格。
-    DestinationRejected { at: [i32; 3] },
-    /// 本次战争迷雾导航消耗了有限工作预算。只说明机器主动收束；不证明目标不可达。
-    NavigationLimitReached {
-        at: [i32; 3],
-        plans: u64,
-        travelled: u64,
-    },
-    /// stamped 请求仍在 Azalea 队列，超过 listener 的调度履约边界。
-    DispatchNotObserved { at: [i32; 3], ticks: u64 },
-    /// 导航仍活跃，但真实身体格连续指定 tick 数没有变化；不是“目标不可达”证明。
-    NoBodyProgressLimitReached { at: [i32; 3], ticks: u64 },
-    /// 被新的意图顶替（单意图槽语义）。
-    Replaced,
-    /// 被停止动词取消。
-    Cancelled,
-    /// 服务器连接或整个接入模块结束；此后不再有 tick，任务随连接同步收束。
-    ConnectionEnded,
-}
-
-impl MoveEvent {
-    pub fn is_terminal(&self) -> bool {
-        !matches!(self, MoveEvent::Leg { .. } | MoveEvent::Stalled)
     }
 }
 
@@ -498,11 +449,6 @@ pub struct JobStatus {
 /// 在途任务的参数快照。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JobStatusKind {
-    Move {
-        destination: [i32; 3],
-        /// 最近一程的目标；还没开始走就是 None。
-        leg: Option<[i32; 3]>,
-    },
     Mine {
         targets: Vec<[i32; 3]>,
         done: usize,

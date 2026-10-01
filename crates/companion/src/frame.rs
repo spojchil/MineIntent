@@ -3,8 +3,7 @@
 //! # 这件东西是什么
 //!
 //! 一帧是三样东西合成的一条 user 消息：**处境变了的那几行**（见 [`situation`]）、
-//! **攒下的拾取**、**在途 job 的进展**。方块不在里面——那是眼睛的活，直接进
-//! `BlockMemory`，模型既不花轮次也看不见（见组合根里眼睛那段说明）。
+//! **攒下的拾取**、**在途 job 的进展**。方块不在里面——模型看世界走画面（`view`）。
 //!
 //! [`situation`]: crate::situation
 //!
@@ -28,17 +27,16 @@
 //!
 //! # 为什么只有进展能发车
 //!
-//! 处境里的位置走路时每 250 ms 都在变。让处境自己触发投递就等于每 250 ms 投一
+//! 处境里的位置移动时每 250 ms 都在变。让处境自己触发投递就等于每 250 ms 投一
 //! 帧：位置单行变化会淹没信箱，模型忙着时一次并进就是上万 token 的无意义重复。
-//! 走路的时候本来就有 job 进展在触发投递，位置顺势搭车出去，不必自己叫车。
+//! 有 job 进展时位置顺势搭车出去，不必自己叫车。
 //!
 //! 拾取同理，**搭车，不触发**：挖矿时进展本来就在发车，自己捡的东西顺势就出去
 //! 了；空闲时被人塞了东西则要等下一次投递，那属于「空闲唤醒源」（issue #135）。
 //!
-//! 代价是没有进展时处境一步也不动。真出过事：寻路坏掉反复重发 goto 时，每次重发
-//! 都把上一个 job 顶替掉，终局是 `Replaced`（`wake` 判它不值得叫醒），也不是进展
-//! ——两条通道都按设计沉默，模型连自己在哪都不再被告知。判据本身还没改，先让它
-//! 站到能被单测钉住的地方。
+//! 代价是没有进展时处境一步也不动：反复下达新任务、每次把上一个顶替掉时，终局
+//! 是 `Replaced`（`wake` 判它不值得叫醒），也不是进展——两条通道都按设计沉默。
+//! 判据本身还没改，先让它站到能被单测钉住的地方。
 
 use world::TickSnapshot;
 
@@ -140,7 +138,7 @@ impl FrameComposer {
 mod tests {
     use std::time::SystemTime;
 
-    use world::{ConnectionPhase, Epoch, JobEntry, JobFact, JobId, MoveEvent, PickupEntry};
+    use world::{ConnectionPhase, Epoch, JobEntry, JobFact, JobId, MineEvent, PickupEntry};
 
     use super::*;
 
@@ -159,14 +157,15 @@ mod tests {
         snap
     }
 
-    fn job(seq: u64, event: MoveEvent) -> JobEntry {
+    fn job(seq: u64, event: MineEvent) -> JobEntry {
         JobEntry {
             seq,
             tick: seq,
             occurred_at: SystemTime::now(),
             id: JobId(1),
-            fact: JobFact::Move {
-                destination: [10, 64, 0],
+            fact: JobFact::Mine {
+                targets: vec![[10, 64, 0], [11, 64, 0]],
+                done: 0,
                 event,
             },
         }
@@ -191,14 +190,14 @@ mod tests {
         assert!(frames.compose(&snap(1, 0.5), READ).is_none());
     }
 
-    /// 实盘 #146 的形状：goto 反复重发，每次把上一个顶替掉。`Replaced` 是终局，
+    /// 任务反复重发，每次把上一个顶替掉。`Replaced` 是终局，
     /// 走 `wake` 而不是帧，而 `wake` 判它「自己干的不必回报」——于是两条通道
     /// 都沉默。这条钉住的是**帧这一侧**确实不发车，不是说这样就对。
     #[test]
     fn a_replaced_job_alone_drives_nothing() {
         let mut frames = FrameComposer::new();
         let mut snapshot = snap(1, 0.5);
-        snapshot.jobs.entries.push(job(1, MoveEvent::Replaced));
+        snapshot.jobs.entries.push(job(1, MineEvent::Replaced));
         assert!(frames.compose(&snapshot, READ).is_none());
     }
 
@@ -215,7 +214,7 @@ mod tests {
         driving
             .jobs
             .entries
-            .push(job(1, MoveEvent::Leg { to: [5, 64, 0] }));
+            .push(job(1, MineEvent::Broke { done: 1, total: 2 }));
         let frame = frames.compose(&driving, READ).expect("有进展就该发车");
         assert!(
             frame.iter().any(|line| line.contains("coal")),
@@ -232,7 +231,7 @@ mod tests {
         first
             .jobs
             .entries
-            .push(job(1, MoveEvent::Leg { to: [5, 64, 0] }));
+            .push(job(1, MineEvent::Broke { done: 1, total: 2 }));
         let opening = frames.compose(&first, READ).expect("开局该投全量");
         assert!(opening.iter().any(|line| line.contains("位置 (0, 64, 0)")));
 
@@ -244,7 +243,7 @@ mod tests {
         later
             .jobs
             .entries
-            .push(job(2, MoveEvent::Leg { to: [20, 64, 0] }));
+            .push(job(2, MineEvent::Broke { done: 1, total: 2 }));
         let frame = frames.compose(&later, READ).expect("有进展就该发车");
         assert!(
             frame.iter().any(|line| line.contains("位置 (9, 64, 0)")),
@@ -268,7 +267,7 @@ mod tests {
         driving
             .jobs
             .entries
-            .push(job(1, MoveEvent::Leg { to: [5, 64, 0] }));
+            .push(job(1, MineEvent::Broke { done: 1, total: 2 }));
         let frame = frames.compose(&driving, READ).expect("有进展就该发车");
         assert!(
             !frame.iter().any(|line| line.contains("item_1 ")),
@@ -288,14 +287,14 @@ mod tests {
         first
             .jobs
             .entries
-            .push(job(1, MoveEvent::Leg { to: [5, 64, 0] }));
+            .push(job(1, MineEvent::Broke { done: 1, total: 2 }));
         let opening = frames.compose(&first, READ).expect("开局该投全量");
 
         let mut second = snap(2, 0.5);
         second
             .jobs
             .entries
-            .push(job(2, MoveEvent::Leg { to: [6, 64, 0] }));
+            .push(job(2, MineEvent::Broke { done: 1, total: 2 }));
         let quiet = frames.compose(&second, READ).expect("有进展就该发车");
         assert!(quiet.len() < opening.len(), "没变的行不该重复：{quiet:?}");
 
@@ -304,7 +303,7 @@ mod tests {
         third
             .jobs
             .entries
-            .push(job(3, MoveEvent::Leg { to: [7, 64, 0] }));
+            .push(job(3, MineEvent::Broke { done: 1, total: 2 }));
         let after = frames.compose(&third, READ).expect("有进展就该发车");
         assert_eq!(
             after.len(),
