@@ -206,24 +206,45 @@ pub(crate) fn build_lit(
     report: &mut Report,
 ) -> Vec<Vec<Triangle>> {
     let mut clock = std::time::Instant::now();
-    let mut sections: PositionMap<bool> = PositionMap::default();
-    let visible: Vec<&Block> = scene
-        .blocks
-        .iter()
-        .filter(|block| !is_air(&block.name))
-        .filter(|block| {
-            frustum.is_none_or(|frustum| {
-                *sections
-                    .entry(block.position.map(|c| c >> 4))
-                    .or_insert_with_key(|section| frustum.section_visible(*section))
-            })
-        })
-        .collect();
-    report.stage("geometry: frustum select", &mut clock);
-
     let workers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(8);
+    // 分段并行筛，按段的顺序接回。采集按区块段成批给方块：与上一个方块同段时沿用它的判定
+    // （判定只看段坐标，换段了就重算）。
+    let visible: Vec<&Block> = std::thread::scope(|scope| {
+        let handles: Vec<_> = scene
+            .blocks
+            .chunks(scene.blocks.len().div_ceil(workers).max(1))
+            .map(|blocks| {
+                scope.spawn(move || {
+                    let mut last: Option<([i32; 3], bool)> = None;
+                    blocks
+                        .iter()
+                        .filter(|block| !is_air(&block.name))
+                        .filter(|block| {
+                            frustum.is_none_or(|frustum| {
+                                let section = block.position.map(|c| c >> 4);
+                                match last {
+                                    Some((previous, visible)) if previous == section => visible,
+                                    _ => {
+                                        let visible = frustum.section_visible(section);
+                                        last = Some((section, visible));
+                                        visible
+                                    }
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("视锥筛选线程不 panic"))
+            .collect()
+    });
+    report.stage("geometry: frustum select", &mut clock);
+
     let chunk = visible.len().div_ceil(workers).max(1);
     // 状态键每个方块都要哈希、比较一次：按出三角形的分段并行，各段给自己的方块编本地状态号
     // （按首次出现的顺序），记下每种状态首次出现的方块。
