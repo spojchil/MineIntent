@@ -531,9 +531,12 @@ pub(crate) fn draw(
     camera: &Camera,
     options: Options,
     sky: Option<&Sky>,
+    report: &mut Report,
 ) -> RgbaImage {
+    let mut clock = std::time::Instant::now();
     let projection = Projection::new(camera, options);
     let projected = project(triangles, camera, &projection, options.far);
+    report.stage("project, clip, sort", &mut clock);
     // 分箱：每个三角形按（已排好的）顺序登记到它覆盖的每个 16 行条带，条带只扫自己的箱。
     let band_count = (options.height as usize).div_ceil(BAND);
     let mut bins: Vec<Vec<&Projected<'_>>> = vec![Vec::new(); band_count];
@@ -542,7 +545,9 @@ pub(crate) fn draw(
             bin.push(t);
         }
     }
+    report.stage("bin", &mut clock);
     let background = sky.map(|sky| sky.paint(&projection));
+    report.stage("sky", &mut clock);
     let mut pixels = vec![0; options.width as usize * options.height as usize * 4];
     let workers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
@@ -576,6 +581,7 @@ pub(crate) fn draw(
             });
         }
     });
+    report.stage("bands", &mut clock);
     RgbaImage::from_raw(options.width, options.height, pixels).expect("validated pixel dimensions")
 }
 
@@ -712,8 +718,8 @@ pub fn render(scene: &Scene, resources: &mut Resources, options: Options) -> Res
     report.stage("entities, lightmap", &mut clock);
     report.triangles = triangles.len();
     let sky = lighting.as_ref().map(|(_, _, sky)| sky);
-    let mut image = draw(&triangles, &scene.camera, options, sky);
-    report.stage("raster", &mut clock);
+    let mut image = draw(&triangles, &scene.camera, options, sky, &mut report);
+    clock = std::time::Instant::now();
     if options.crosshair {
         draw_crosshair(&mut image, resources, &mut report);
     }

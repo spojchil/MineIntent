@@ -481,7 +481,7 @@ fn transparency_is_depth_ordered_and_shared_diagonal_is_not_blended_twice() {
     let expected = trace::draw(make_mesh(), &camera, small());
     let mut mesh = make_mesh();
     for _ in 0..2 {
-        let image = crate::raster::draw(&mesh, &camera, small(), None);
+        let image = crate::raster::draw(&mesh, &camera, small(), None, &mut Default::default());
         assert_images_close(&image, &expected, 0);
         assert_eq!(image.get_pixel(4, 4).0, [128, 63, 63, 255]);
         mesh.reverse();
@@ -527,7 +527,7 @@ fn raster_clipping_perspective_uv_cutouts_and_far_distance_match_ray_reference()
             .collect::<Vec<_>>()
     };
     let expected = trace::draw(mesh(), &camera, options);
-    let actual = crate::raster::draw(&mesh(), &camera, options, None);
+    let actual = crate::raster::draw(&mesh(), &camera, options, None, &mut Default::default());
     assert_images_close(&actual, &expected, 0);
 }
 
@@ -553,7 +553,13 @@ fn many_translucent_layers_are_bounded_and_keep_the_nearest_surfaces() {
             .collect::<Vec<_>>()
     };
     let expected = trace::draw(make_mesh(), &camera, small());
-    let actual = crate::raster::draw(&make_mesh(), &camera, small(), None);
+    let actual = crate::raster::draw(
+        &make_mesh(),
+        &camera,
+        small(),
+        None,
+        &mut Default::default(),
+    );
     assert_images_close(&actual, &expected, 0);
 }
 

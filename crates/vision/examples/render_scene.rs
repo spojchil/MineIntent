@@ -13,6 +13,15 @@ fn main() -> Result<(), String> {
     } else {
         vision::fixture()
     };
+    // RENDER_REPEAT=n 时同一场景连渲 n 次（资源复用，与常驻工具一致），报最后一次的分段耗时。
+    let repeat: usize = std::env::var("RENDER_REPEAT")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    for _ in 1..repeat {
+        vision::render(&scene, &mut resources, vision::Options::default())?;
+    }
     let started = std::time::Instant::now();
     let frame = vision::render(&scene, &mut resources, vision::Options::default())?;
     std::fs::write(&args[1], frame.png()?).map_err(|e| e.to_string())?;
@@ -29,5 +38,10 @@ fn main() -> Result<(), String> {
         started.elapsed().as_secs_f64(),
         frame.report.warnings.len()
     );
+    if repeat > 1 {
+        for (stage, ms) in &frame.report.stage_ms {
+            println!("  {stage}: {ms:.0} ms");
+        }
+    }
     Ok(())
 }
