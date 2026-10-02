@@ -76,7 +76,14 @@ impl Resources {
         }
         chain.push(id.to_owned());
         let child = self.json(&resource_path(id, "models", "json")?)?;
-        let mut model = if let Some(parent) = child["parent"].as_str() {
+        // `builtin/generated`、`builtin/entity` 是代码里的根，不是文件：到此为止。
+        let builtin = |parent: &str| {
+            parent
+                .strip_prefix("minecraft:")
+                .unwrap_or(parent)
+                .starts_with("builtin/")
+        };
+        let mut model = if let Some(parent) = child["parent"].as_str().filter(|p| !builtin(p)) {
             self.model(parent, chain)?
         } else {
             serde_json::json!({})

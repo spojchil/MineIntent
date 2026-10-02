@@ -220,8 +220,12 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                     .lock()
                     .apply(update.x, update.z, &update.light_data, false);
             }
+            // 死后 20 tick 服务端收回全部区块，但原版死亡界面背后的世界一直在：
+            // 与 Azalea 留着区块同理，死着时光照也留着，复活时整份清掉重收。
             ClientboundGamePacket::ForgetLevelChunk(forget) => {
-                inner.light.lock().forget(forget.pos.x, forget.pos.z);
+                if bot.get_component::<azalea::entity::Dead>().is_none() {
+                    inner.light.lock().forget(forget.pos.x, forget.pos.z);
+                }
             }
             ClientboundGamePacket::SetChunkCacheRadius(radius) => {
                 inner
