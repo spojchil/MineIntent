@@ -2,7 +2,7 @@
 //!
 //! 信箱保留最近 100 条带序号事件；序号只在本身体进程内有效。每次回执只带上次
 //! 回执以来的新事件，处境也只说变了的行。新接入重送保留的事件与全量处境：新来
-//! 的代理没见过它们，上一个接入可能见过一部分，回执里如实说明。
+//! 的代理没见过它们，上一个接入可能见过一部分，回执里如实说明，并逐条注明多久以前。
 //!
 //! 实测（Claude Code 2.1.287）否决过「每次回执重送上一回执」：stdio 不丢消息，
 //! 它防的只是「回执已构造、恰在此时被取消」这一窄窗；代价是每次回执翻倍，代理
@@ -11,7 +11,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent::{
     ContentPart, PortFuture, RunId, ToolBatchId, ToolCall, ToolCallBatch, ToolDefinition,
@@ -32,6 +32,7 @@ const DURING: &str = "——期间——";
 struct WakeLine {
     seq: u64,
     text: String,
+    at: Instant,
 }
 
 #[derive(Default)]
@@ -65,10 +66,11 @@ impl Inbox {
         }
         {
             let mut state = self.state.lock().expect("信箱锁中毒");
+            let at = Instant::now();
             for text in lines {
                 state.sequence += 1;
                 let seq = state.sequence;
-                state.wakes.push_back(WakeLine { seq, text });
+                state.wakes.push_back(WakeLine { seq, text, at });
                 if state.wakes.len() > WAKE_BACKLOG {
                     state.wakes.pop_front();
                 }
@@ -142,16 +144,37 @@ impl Inbox {
                 ));
             }
         }
+        // 重送时每条注明多久以前：新来的代理凭这个分得清哪些是旧事，不把早就
+        // 过去的问话当成眼下在问。平常回执里的事件都是刚发生的，不注。
+        let now = Instant::now();
+        let replaying = state.replaying_connection;
         lines.extend(
             state
                 .wakes
                 .iter()
                 .filter(|line| line.seq > after)
-                .map(|line| format!("[事件 #{}] {}", line.seq, line.text)),
+                .map(|line| {
+                    if replaying {
+                        let ago = age(now.saturating_duration_since(line.at));
+                        format!("[事件 #{}，{ago}] {}", line.seq, line.text)
+                    } else {
+                        format!("[事件 #{}] {}", line.seq, line.text)
+                    }
+                }),
         );
         state.reported = state.sequence;
         state.replaying_connection = false;
         lines
+    }
+}
+
+/// 重送事件的年龄，粗到分钟就够分新旧。
+fn age(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    match seconds {
+        0..60 => format!("{seconds} 秒前"),
+        60..3600 => format!("{} 分钟前", seconds / 60),
+        _ => format!("{} 小时前", seconds / 3600),
     }
 }
 
@@ -522,7 +545,7 @@ mod tests {
         body.detached();
         body.attached();
         let reconnected = body.call(ToolCall::new("act-2", "act", json!({}))).await;
-        assert!(text_of(&reconnected).contains("[事件 #1]"));
+        assert!(text_of(&reconnected).contains("[事件 #1，0 秒前]"));
         assert!(text_of(&reconnected).contains("接入已重新建立"));
         assert_eq!(
             inbox.until_woken(Duration::ZERO).await,
@@ -652,6 +675,35 @@ mod tests {
         let replay = inbox.reply_lines().join("\n");
         assert!(replay.contains("接入已重新建立"));
         assert!(replay.contains("更早的 3 条事件"));
+    }
+
+    /// 新接入看到的旧事件带着年龄；之后的平常回执不带。
+    #[test]
+    fn replayed_events_say_how_long_ago_they_happened() {
+        let inbox = Inbox::new();
+        inbox.attached();
+        inbox.push_wakes(vec!["alex: 你在哪".to_owned()]);
+        {
+            let mut state = inbox.state.lock().unwrap();
+            let line = state.wakes.back_mut().unwrap();
+            line.at -= Duration::from_secs(5 * 60);
+        }
+        inbox.reply_lines();
+        inbox.attached();
+        let replay = inbox.reply_lines().join("\n");
+        assert!(
+            replay.contains("[事件 #1，5 分钟前] alex: 你在哪"),
+            "{replay}"
+        );
+        inbox.push_wakes(vec!["alex: 还在吗".to_owned()]);
+        assert_eq!(inbox.reply_lines(), vec!["[事件 #2] alex: 还在吗"]);
+    }
+
+    #[test]
+    fn age_is_coarse() {
+        assert_eq!(age(Duration::from_secs(42)), "42 秒前");
+        assert_eq!(age(Duration::from_secs(3599)), "59 分钟前");
+        assert_eq!(age(Duration::from_secs(7300)), "2 小时前");
     }
 
     #[test]
