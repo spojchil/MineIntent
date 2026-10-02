@@ -6,7 +6,7 @@
 //!
 //! 同类实体聚合呈现（数量 + 最近距离方位）——压缩方向是同质聚合，不是截断。
 
-use world::{ConnectionPhase, EntitySnapshot, PickupEntry, TickSnapshot, Window};
+use world::{ConnectionPhase, EntitySnapshot, PickupEntry, TickSnapshot};
 
 /// 处境的一行是哪一行。
 ///
@@ -683,35 +683,16 @@ pub fn render_damage_entry(entry: &world::DamageEntry) -> String {
 }
 
 /// 聊天未读数：窗内晚于已读水位的条数。纪元不同则整窗算新。
+/// 自己说的话不算——那不是「新消息」，算进去只会让模型多翻一次记录。
 pub fn unread_chat_count(snap: &TickSnapshot, chat_read: (u64, u64)) -> usize {
     let (read_epoch, read_tick) = chat_read;
-    count_after(&snap.chat, snap.epoch.0, read_epoch, read_tick)
-}
-
-fn count_after<T: WindowTick>(
-    window: &Window<T>,
-    window_epoch: u64,
-    read_epoch: u64,
-    read_tick: u64,
-) -> usize {
-    if window_epoch != read_epoch {
-        return window.entries.len();
-    }
-    window
+    let me = &snap.self_state;
+    snap.chat
         .entries
         .iter()
-        .filter(|entry| entry.tick() > read_tick)
+        .filter(|entry| snap.epoch.0 != read_epoch || entry.tick > read_tick)
+        .filter(|entry| !entry.sent_by(&me.entity_key, &me.username))
         .count()
-}
-
-trait WindowTick {
-    fn tick(&self) -> u64;
-}
-
-impl WindowTick for world::ChatEntry {
-    fn tick(&self) -> u64 {
-        self.tick
-    }
 }
 
 // 角度归一化随视口内核迁入 world；此处再导出维持渲染层的调用面。

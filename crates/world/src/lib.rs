@@ -267,6 +267,18 @@ pub struct ChatEntry {
     pub content: ChatContent,
 }
 
+impl ChatEntry {
+    /// 是不是自己说的：有 UUID 按 UUID 比，没有才退到用户名。系统消息不算。
+    pub fn sent_by(&self, entity_key: &str, username: &str) -> bool {
+        self.sender
+            .as_ref()
+            .is_some_and(|sender| match &sender.uuid {
+                Some(uuid) => uuid == entity_key,
+                None => sender.username == username,
+            })
+    }
+}
+
 /// azalea ChatPacket 的保真直译，不做文案化。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChatContent {

@@ -2,7 +2,7 @@ use std::time::SystemTime;
 
 use world::{
     ChatContent, ChatEntry, ConnectionPhase, EntitySnapshot, Epoch, FactSource, InventorySlot,
-    PickupEntry, StatusEffect, TickSnapshot, Vec3Value,
+    PickupEntry, PlayerRef, StatusEffect, TickSnapshot, Vec3Value,
 };
 
 use super::*;
@@ -206,6 +206,30 @@ fn nearby_lists_players_individually_and_aggregates_same_type_mobs() {
 #[test]
 fn empty_surroundings_render_nothing_instead_of_an_empty_header() {
     assert_eq!(render_nearby(&snapshot()), "");
+}
+
+#[test]
+fn unread_chat_skips_own_messages() {
+    let mut snap = snapshot();
+    let said_by = |tick, username: &str, uuid: Option<&str>| {
+        let mut entry = chat_entry(tick);
+        entry.sender = Some(PlayerRef {
+            username: username.to_owned(),
+            uuid: uuid.map(str::to_owned),
+        });
+        entry
+    };
+    snap.chat.entries = vec![
+        said_by(90, "steve", Some("other")),
+        said_by(91, "xiaoming", Some("self")),
+        // 没给 UUID 时按用户名认。
+        said_by(92, "xiaoming", None),
+        chat_entry(93),
+    ];
+
+    assert_eq!(unread_chat_count(&snap, (1, 80)), 2);
+    // 换纪元整窗算新，自己的话照样不算。
+    assert_eq!(unread_chat_count(&snap, (0, 0)), 2);
 }
 
 #[test]

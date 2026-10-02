@@ -89,11 +89,7 @@ impl WakeCursors {
                 // 系统广播没有发言者。当前不唤醒——它不是「有人对我说话」。
                 continue;
             };
-            let is_self = match &sender.uuid {
-                Some(uuid) => uuid == own.entity_key,
-                None => sender.username == own.username,
-            };
-            if is_self {
+            if entry.sent_by(own.entity_key, own.username) {
                 continue;
             }
             lines.push(format!("{}: {}", sender.username, entry.content.plain_text));
