@@ -209,7 +209,7 @@ fn empty_surroundings_render_nothing_instead_of_an_empty_header() {
 }
 
 #[test]
-fn unread_chat_skips_own_messages() {
+fn unread_chat_counts_only_messages_not_pushed() {
     let mut snap = snapshot();
     let said_by = |tick, username: &str, uuid: Option<&str>| {
         let mut entry = chat_entry(tick);
@@ -227,9 +227,10 @@ fn unread_chat_skips_own_messages() {
         chat_entry(93),
     ];
 
-    assert_eq!(unread_chat_count(&snap, (1, 80)), 2);
-    // 换纪元整窗算新，自己的话照样不算。
-    assert_eq!(unread_chat_count(&snap, (0, 0)), 2);
+    // 别人的话已推原文、自己的话是回显，只剩系统消息。
+    assert_eq!(unread_chat_count(&snap, (1, 80)), 1);
+    // 换纪元整窗算新，玩家的话照样不算。
+    assert_eq!(unread_chat_count(&snap, (0, 0)), 1);
 }
 
 #[test]
@@ -240,7 +241,7 @@ fn unread_chat_while_dead_says_it_waits_for_respawn() {
 
     let text = render_situation(&snap, (1, 80));
     assert!(
-        text.contains("聊天有 1 条新消息，复活后才能翻看。"),
+        text.contains("聊天有 1 条新的系统消息，复活后才能翻看。"),
         "{text}"
     );
 }
@@ -256,7 +257,7 @@ fn unread_chat_counts_entries_after_the_mark_and_resets_across_epochs() {
     assert_eq!(unread_chat_count(&snap, (0, 9_999)), 3);
 
     let text = render_situation(&snap, (1, 80));
-    assert!(text.contains("聊天有 1 条新消息。"), "{text}");
+    assert!(text.contains("聊天有 1 条新的系统消息。"), "{text}");
     assert!(
         !render_situation(&snap, (1, 95)).contains("聊天"),
         "清零后不提聊天"

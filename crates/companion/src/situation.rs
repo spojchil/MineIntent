@@ -129,7 +129,7 @@ mod tests {
     fn vanished_lines_are_silent() {
         let mut tracker = SituationTracker::new();
         let mut with_unread = full();
-        with_unread.push(line(SituationLine::Unread, "聊天有 2 条新消息。"));
+        with_unread.push(line(SituationLine::Unread, "聊天有 2 条新的系统消息。"));
         tracker.take(with_unread);
 
         assert!(tracker.take(full()).is_empty());

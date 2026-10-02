@@ -60,9 +60,9 @@ pub fn render_situation_lines(
     if unread > 0 {
         // 死着打不开聊天框（原版死亡屏挡住聊天键），只说有，不招呼去翻。
         let line = if snap.self_state.alive {
-            format!("聊天有 {unread} 条新消息。")
+            format!("聊天有 {unread} 条新的系统消息。")
         } else {
-            format!("聊天有 {unread} 条新消息，复活后才能翻看。")
+            format!("聊天有 {unread} 条新的系统消息，复活后才能翻看。")
         };
         lines.push((SituationLine::Unread, line));
     }
@@ -688,16 +688,18 @@ pub fn render_damage_entry(entry: &world::DamageEntry) -> String {
     line
 }
 
-/// 聊天未读数：窗内晚于已读水位的条数。纪元不同则整窗算新。
-/// 自己说的话不算——那不是「新消息」，算进去只会让模型多翻一次记录。
+/// 聊天未读数：窗内晚于已读水位、且没有推送过原文的条数。纪元不同则整窗算新。
+///
+/// 玩家说的话一律不计：别人的话经唤醒原文推给了模型（原版 HUD 上显示过就算
+/// 看过），自己的话是回显。剩下的是没有发言者的系统消息（命令反馈、公告、
+/// 死亡播报）——它们不推原文，只在这里提示有。
 pub fn unread_chat_count(snap: &TickSnapshot, chat_read: (u64, u64)) -> usize {
     let (read_epoch, read_tick) = chat_read;
-    let me = &snap.self_state;
     snap.chat
         .entries
         .iter()
         .filter(|entry| snap.epoch.0 != read_epoch || entry.tick > read_tick)
-        .filter(|entry| !entry.sent_by(&me.entity_key, &me.username))
+        .filter(|entry| entry.sender.is_none())
         .count()
 }
 

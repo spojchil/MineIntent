@@ -25,7 +25,7 @@ pub trait ChatHistory: Send + Sync {
     fn recent(&self, count: usize) -> Vec<String>;
 }
 
-/// 聊天已读水位。未读数 = 聊天窗里 (epoch, tick) 晚于水位的条数（读数在渲染层）；
+/// 聊天已读水位。未读数 = 聊天窗里 (epoch, tick) 晚于水位、且没推送过原文的条数（读数在渲染层）；
 /// 本类型只记"上次看到哪"。语义刻意从松：history 一看整体清零，
 /// 不追每条是否真的读过；重连换 epoch 后整窗算新。
 #[derive(Default)]
