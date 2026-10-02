@@ -21,8 +21,8 @@ use jobs::{JobsDoor, JobsTools};
 use memory::{MemoryFile, MemoryTools};
 use presence::{PresenceDoor, PresenceTools};
 use screens::{
-    ChatBox, ChatDoor, ChatHistory, ChatReadMark, ContainerScreen, InventoryDoor, InventoryScreen,
-    ScreenKind, ScreenState,
+    ChatBox, ChatDoor, ChatHistory, ContainerScreen, InventoryDoor, InventoryScreen, ScreenKind,
+    ScreenState,
 };
 use world::{ConnectionConfig, DoorCommand, Module, SnapshotSource};
 
@@ -539,7 +539,6 @@ async fn main() -> Result<(), String> {
     // ---- 中间层装配 ----
     let occupancy = Arc::new(Occupancy::new());
     let screen_state = Arc::new(ScreenState::new());
-    let read_mark = Arc::new(ChatReadMark::new());
     let snapshots: Arc<dyn SnapshotSource> = module.clone();
 
     // 门铃同时是等待工具的打断源和内核的观察者，所以要早于两者建出来。
@@ -551,8 +550,6 @@ async fn main() -> Result<(), String> {
             screen_state.clone(),
             Arc::new(ModuleChatDoor(module.clone())),
             Arc::new(ModuleChatHistory(module.clone())),
-            read_mark.clone(),
-            snapshots.clone(),
         )),
         Arc::new(InventoryScreen::new(
             occupancy.clone(),
@@ -610,7 +607,6 @@ async fn main() -> Result<(), String> {
             dispatcher,
             inbox,
             snapshots,
-            read_mark,
             screen_state,
             occupancy,
             username,
@@ -652,7 +648,6 @@ async fn main() -> Result<(), String> {
     {
         let session = session.clone();
         let snapshots = snapshots.clone();
-        let read_mark = read_mark.clone();
         let compacted = compacted.clone();
         tokio::spawn(async move {
             // 攒什么、什么时候发车，都在 `frame` 里，带单测；这里只负责取快照与投递。
@@ -680,7 +675,7 @@ async fn main() -> Result<(), String> {
                     frames.resend_situation();
                 }
                 let snapshot = snapshots.latest();
-                let Some(sections) = frames.compose(&snapshot, read_mark.position()) else {
+                let Some(sections) = frames.compose(&snapshot) else {
                     continue;
                 };
                 let text = sections.join("\n");

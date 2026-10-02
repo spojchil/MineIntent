@@ -335,11 +335,24 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             // （要开界面才看得见，措辞「当前是 X」），拾取是世界事件——物品
             // 飞过来、有声音，不开背包也知道。所以它不受开屏与否管。
             //
-            // 名字要在这一拍读完（见 `resolve_pickup`）：紧接着的
-            // RemoveEntities 会把那个掉落物实体删掉。
+            // 名字先在 ECS 里读（见 `resolve_pickup`）：紧接着的 RemoveEntities
+            // 会把那个掉落物实体删掉。
             ClientboundGamePacket::TakeItemEntity(take) => {
                 let (by_self, by, item_name) =
                     super::capture::resolve_pickup(&bot, take.item_id, take.player_id);
+                // 包事件经通道转来，可能已晚于删实体：ECS 里查不到时退回上一 tick
+                // 快照里那个掉落物的名字（快照逐 tick 记着每个掉落物是什么）。
+                let item_name = item_name.or_else(|| {
+                    inner
+                        .latest
+                        .read()
+                        .entities
+                        .iter()
+                        .find(|entity| {
+                            i64::from(entity.protocol_entity_id) == i64::from(take.item_id)
+                        })
+                        .and_then(|entity| entity.item_name.clone())
+                });
                 inner.push_pickup(by_self, by, item_name, take.amount);
             }
             _ => {}
@@ -365,7 +378,7 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                 let outcome = run_command(inner, &bot, pending_command.command);
                 let _ = pending_command.ack.send(outcome);
             }
-            super::input::poll_input(inner, &bot);
+            let finished_input = super::input::poll_input(inner, &bot);
             // 与容器组件对账：开/关变迁产屏事实（use_on 触发的服务端开屏
             // 也从这里被看见）。
             let open_screen = bot
@@ -387,6 +400,10 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             inner.track_open_screen(open_screen);
             if let Some(snapshot) = assemble_snapshot(inner, &bot) {
                 inner.publish(snapshot);
+            }
+            // 快照发布之后才交回执：拿到回执的一方读到的是这一 tick 的世界。
+            if let Some(finished) = finished_input {
+                finished.send();
             }
         }
         _ => {}

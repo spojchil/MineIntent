@@ -11,10 +11,10 @@
 //!
 //! # 只说变了的那几行
 //!
-//! 处境六行里逐轮都变的只有位置与附近实体；自称是静态的，环境、体征、未读数偶尔变。
+//! 处境各行里逐轮都变的主要是位置与准星；自称是静态的，环境、体征、快捷栏偶尔变。
 //! 整段重发等于每帧几十 token 的重复，所以按行比对，只投变了的。
 //!
-//! 消失的行不点名——「未读数归零」「不再悬空」由后续事实自然覆盖，为每个消失的行
+//! 消失的行不点名——「不再悬空」「手里空了」由后续事实自然覆盖，为每个消失的行
 //! 补一句「xx 没有了」只会制造噪音。
 
 use render::SituationLine;
@@ -128,9 +128,9 @@ mod tests {
     #[test]
     fn vanished_lines_are_silent() {
         let mut tracker = SituationTracker::new();
-        let mut with_unread = full();
-        with_unread.push(line(SituationLine::Unread, "聊天有 2 条新的系统消息。"));
-        tracker.take(with_unread);
+        let mut with_extra = full();
+        with_extra.push(line(SituationLine::Held, "手持 hotbar 0：木镐。"));
+        tracker.take(with_extra);
 
         assert!(tracker.take(full()).is_empty());
     }

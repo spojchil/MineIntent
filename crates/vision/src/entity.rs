@@ -872,7 +872,7 @@ fn dropped_item(
     );
     let [x, y, z] = entity.position;
     let lift = 0.1;
-    let block = crate::geometry::block_item_triangles(
+    let look = crate::geometry::item_look(
         name,
         resources,
         textures,
@@ -886,15 +886,18 @@ fn dropped_item(
             ]
         },
     );
-    if let Ok(block) = block {
-        triangles.extend(block);
-        return true;
-    }
-    let Ok(texture) = resources.texture(&format!("minecraft:item/{name}")) else {
-        report.warnings.insert(format!(
-            "item {name}: no block model or item texture, drawn as placeholder"
-        ));
-        return false;
+    let texture = match look {
+        Ok(crate::geometry::ItemLook::Solid(block)) => {
+            triangles.extend(block);
+            return true;
+        }
+        Ok(crate::geometry::ItemLook::Flat(texture)) => texture,
+        Err(reason) => {
+            report
+                .warnings
+                .insert(format!("item {name}: {reason}; drawn as placeholder"));
+            return false;
+        }
     };
     let texture = textures.id(&texture);
     // 水平方向朝向镜头的竖直方片。

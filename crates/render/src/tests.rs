@@ -1,8 +1,7 @@
 use std::time::SystemTime;
 
 use world::{
-    ChatContent, ChatEntry, ConnectionPhase, EntitySnapshot, Epoch, FactSource, InventorySlot,
-    PickupEntry, PlayerRef, StatusEffect, TickSnapshot, Vec3Value,
+    ConnectionPhase, Epoch, InventorySlot, PickupEntry, StatusEffect, TickSnapshot, Vec3Value,
 };
 
 use super::*;
@@ -15,6 +14,7 @@ fn input_outcome(ended: world::InputEnd, ticks: u32) -> world::InputOutcome {
         to: [0.5, 64.0, 0.5],
         yaw: 90.0,
         pitch: 0.0,
+        mouse: None,
         pressed_on: None,
         broken: Vec::new(),
     }
@@ -71,48 +71,9 @@ fn snapshot() -> TickSnapshot {
     snap
 }
 
-fn entity(key: &str, entity_type: &str, x: f64, z: f64) -> EntitySnapshot {
-    EntitySnapshot {
-        entity_key: key.to_owned(),
-        protocol_entity_id: 1,
-        entity_type: entity_type.to_owned(),
-        name: None,
-        username: None,
-        uuid: None,
-        position: Vec3Value { x, y: 64.0, z },
-        velocity: Vec3Value::default(),
-        yaw: 0.0,
-        pitch: 0.0,
-        head_yaw: None,
-        width: 0.6,
-        height: 1.8,
-        on_ground: true,
-        pose: None,
-        held_item_name: None,
-        item_name: None,
-        equipment: Vec::new(),
-        valid: true,
-    }
-}
-
-fn chat_entry(tick: u64) -> ChatEntry {
-    ChatEntry {
-        seq: tick,
-        tick,
-        occurred_at: SystemTime::now(),
-        source: FactSource::ServerObserved,
-        sender: None,
-        content: ChatContent {
-            plain_text: "hi".to_owned(),
-            position: None,
-            verified: None,
-        },
-    }
-}
-
 #[test]
 fn situation_covers_identity_environment_position_vitals_in_order() {
-    let text = render_situation(&snapshot(), (1, 100));
+    let text = render_situation(&snapshot());
     let lines: Vec<&str> = text.lines().collect();
 
     // 自称在最前：不知道自己叫什么的话，点名的聊天会被当成关于第三方的话，
@@ -123,11 +84,12 @@ fn situation_covers_identity_environment_position_vitals_in_order() {
     );
     assert_eq!(lines[1], "主世界。");
     assert_eq!(lines[2], "位置 (120, 64, -36)，面朝西。");
-    assert_eq!(lines[3], "生命 18/20，饥饿 15/20。");
-    // 快捷栏与手持排在生命之后、附近之前：都是「自己身上的事」。
-    assert_eq!(lines[4], "快捷栏九格都是空的。副手：空。");
-    assert_eq!(lines[5], "手持 hotbar 0：空手。");
-    assert_eq!(lines.len(), 6, "没实体没未读时不该有第七行：{text}");
+    assert_eq!(lines[3], "准星没有对着够得着的方块或实体。");
+    assert_eq!(lines[4], "生命 18/20，饥饿 15/20。");
+    // 快捷栏与手持排在生命之后：都是「自己身上的事」。
+    assert_eq!(lines[5], "快捷栏九格都是空的。副手：空。");
+    assert_eq!(lines[6], "手持 hotbar 0：空手。");
+    assert_eq!(lines.len(), 7, "{text}");
 }
 
 /// 用户名缺席（未就绪等）时不硬编一行空自称。
@@ -135,7 +97,7 @@ fn situation_covers_identity_environment_position_vitals_in_order() {
 fn identity_line_is_omitted_when_the_name_is_unknown() {
     let mut snap = snapshot();
     snap.self_state.username = String::new();
-    let text = render_situation(&snap, (1, 100));
+    let text = render_situation(&snap);
     assert!(!text.contains("名字是"), "{text}");
     assert!(text.starts_with("主世界"), "{text}");
 }
@@ -146,10 +108,10 @@ fn non_ready_phases_render_only_the_connection_fact() {
     snap.phase = ConnectionPhase::Disconnected {
         reason: "服务器关闭".to_owned(),
     };
-    assert_eq!(render_situation(&snap, (0, 0)), "已断线：服务器关闭");
+    assert_eq!(render_situation(&snap), "已断线：服务器关闭");
 
     snap.phase = ConnectionPhase::Connecting;
-    assert_eq!(render_situation(&snap, (0, 0)), "正在连接服务器。");
+    assert_eq!(render_situation(&snap), "正在连接服务器。");
 }
 
 #[test]
@@ -182,86 +144,6 @@ fn day_time_never_reaches_the_environment_line() {
     for word in ["清晨", "正午", "黄昏", "午夜", "黎明", "下午"] {
         assert!(!baseline.contains(word), "环境行不该有时段词：{baseline}");
     }
-}
-
-#[test]
-fn nearby_lists_players_individually_and_aggregates_same_type_mobs() {
-    let mut snap = snapshot();
-    let mut alice = entity("alice", "minecraft:player", 120.7, -38.2);
-    alice.username = Some("Alice".to_owned());
-    snap.entities = vec![
-        entity("z1", "minecraft:zombie", 126.7, -35.2),
-        alice,
-        entity("z2", "minecraft:zombie", 130.7, -35.2),
-        entity("self", "minecraft:player", 120.7, -35.2),
-    ];
-
-    let text = render_nearby(&snap);
-    assert_eq!(
-        text,
-        "附近：玩家 Alice（3 格·北）；zombie ×2（最近 6 格·东）。"
-    );
-}
-
-#[test]
-fn empty_surroundings_render_nothing_instead_of_an_empty_header() {
-    assert_eq!(render_nearby(&snapshot()), "");
-}
-
-#[test]
-fn unread_chat_counts_only_messages_not_pushed() {
-    let mut snap = snapshot();
-    let said_by = |tick, username: &str, uuid: Option<&str>| {
-        let mut entry = chat_entry(tick);
-        entry.sender = Some(PlayerRef {
-            username: username.to_owned(),
-            uuid: uuid.map(str::to_owned),
-        });
-        entry
-    };
-    snap.chat.entries = vec![
-        said_by(90, "steve", Some("other")),
-        said_by(91, "xiaoming", Some("self")),
-        // 没给 UUID 时按用户名认。
-        said_by(92, "xiaoming", None),
-        chat_entry(93),
-    ];
-
-    // 别人的话已推原文、自己的话是回显，只剩系统消息。
-    assert_eq!(unread_chat_count(&snap, (1, 80)), 1);
-    // 换纪元整窗算新，玩家的话照样不算。
-    assert_eq!(unread_chat_count(&snap, (0, 0)), 1);
-}
-
-#[test]
-fn unread_chat_while_dead_says_it_waits_for_respawn() {
-    let mut snap = snapshot();
-    snap.chat.entries = vec![chat_entry(90)];
-    snap.self_state.alive = false;
-
-    let text = render_situation(&snap, (1, 80));
-    assert!(
-        text.contains("聊天有 1 条新的系统消息，复活后才能翻看。"),
-        "{text}"
-    );
-}
-
-#[test]
-fn unread_chat_counts_entries_after_the_mark_and_resets_across_epochs() {
-    let mut snap = snapshot();
-    snap.chat.entries = vec![chat_entry(50), chat_entry(80), chat_entry(95)];
-
-    assert_eq!(unread_chat_count(&snap, (1, 80)), 1);
-    assert_eq!(unread_chat_count(&snap, (1, 95)), 0);
-    // 水位停在上一条连接（纪元 0）：本连接整窗算新。
-    assert_eq!(unread_chat_count(&snap, (0, 9_999)), 3);
-
-    let text = render_situation(&snap, (1, 80));
-    assert!(text.contains("聊天有 1 条新的系统消息。"), "{text}");
-    assert!(
-        !render_situation(&snap, (1, 95)).contains("聊天"),
-        "清零后不提聊天"
-    );
 }
 
 #[test]
@@ -570,9 +452,9 @@ fn hotbar_follows_the_active_slot_space_not_the_player_screen() {
 fn switching_slots_changes_only_the_held_line() {
     let mut snap = snapshot();
     snap.self_state.inventory.slots = vec![slot(36, "iron_pickaxe", 1)];
-    let before = render_situation_lines(&snap, (1, 0));
+    let before = render_situation_lines(&snap);
     snap.self_state.inventory.selected_hotbar_slot = 4;
-    let after = render_situation_lines(&snap, (1, 0));
+    let after = render_situation_lines(&snap);
 
     let changed: Vec<SituationLine> = before
         .iter()
@@ -689,18 +571,39 @@ fn looking_at_names_the_block_and_the_face() {
     );
 }
 
-/// 够不着任何东西时这一行不出现——原版此时也什么都不显示，
-/// 而处境的空行本来就不进差异。
+/// 够不着任何东西时也明说：处境只报变了的行，这一行要是消失，
+/// 「转到空处」和「没变」就分不开了。
 #[test]
-fn looking_at_nothing_produces_no_line() {
+fn looking_at_nothing_says_so() {
     let snap = snapshot();
-    assert_eq!(render_looking_at(&snap), "");
+    assert_eq!(render_looking_at(&snap), "准星没有对着够得着的方块或实体。");
+    assert!(render_situation_lines(&snap)
+        .iter()
+        .any(|(line, _)| *line == SituationLine::LookingAt));
+}
+
+/// 按了鼠标却没对着东西，回执明说；没按鼠标就不提准星。
+#[test]
+fn input_receipt_says_when_the_click_hit_nothing() {
+    let mut outcome = input_outcome(world::InputEnd::Elapsed, 100);
+    outcome.mouse = Some(world::MouseButton::Left);
+    let text = render_input_outcome(&outcome);
     assert!(
-        !render_situation_lines(&snap, (1, 100))
-            .iter()
-            .any(|(line, _)| *line == SituationLine::LookingAt),
-        "空的准星行不该进处境"
+        text.contains("按下时准星没有对着够得着的方块或实体。"),
+        "{text}"
     );
+
+    outcome.mouse = None;
+    assert!(!render_input_outcome(&outcome).contains("准星"));
+}
+
+/// 朝向连续转身会累加（-225°），回执里归一到 [-180, 180)。
+#[test]
+fn input_receipt_wraps_the_yaw() {
+    let mut outcome = input_outcome(world::InputEnd::Elapsed, 1);
+    outcome.yaw = -225.0;
+    let text = render_input_outcome(&outcome);
+    assert!(text.contains("yaw 135°"), "{text}");
 }
 
 /// 群系接在维度后面——同属「我在哪」，都是 F3 免费常驻的那一档。

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use image::RgbaImage;
 use serde_json::{json, Value};
 
-use crate::assets::{missing_texture, texture_id};
+use crate::assets::{missing_texture, resource_path, texture_id};
 use crate::biome::Biomes;
 use crate::light::{self, Cells, Coords, Direction, FULL_BRIGHT};
 use crate::{Block, Report, Resources, Scene};
@@ -476,49 +476,88 @@ fn direction_bit(direction: [i32; 3]) -> Option<usize> {
     }
 }
 
-/// 用方块自己的模型画一个缩小的方块（掉落在地上的方块物品）。`place` 把 0..1 的方块
-/// 空间换到世界坐标。方块状态取默认属性；需要属性才能选出模型的方块会返回 Err。
-pub(crate) fn block_item_triangles(
+/// 掉落物在原版里长什么样：物品定义（`items/<名>.json`）指向的模型有立体元素就是
+/// 一个小方块（原木、泥土），没有就是 `layer0` 贴图的一张平片（树苗、火把）。
+pub(crate) enum ItemLook {
+    /// 立体模型，已换到世界坐标。
+    Solid(Vec<Triangle>),
+    /// 平片物品的贴图。
+    Flat(Arc<RgbaImage>),
+}
+
+/// 按物品定义取掉落物的模型。`place` 把 0..1 的模型空间换到世界坐标。
+///
+/// 物品定义里按条件分支的（`select`、`condition`、`range_dispatch`）取兜底那支，
+/// `special`（箱子、床这类代码画的）取它声明的基础模型——都是近似，进 report。
+pub(crate) fn item_look(
     name: &str,
     resources: &mut Resources,
     textures: &mut Textures,
     report: &mut Report,
     light: Coords,
     place: impl Fn(V3) -> V3,
-) -> Result<Vec<Triangle>, String> {
-    let block = Block {
-        position: [0; 3],
-        name: name.to_owned(),
-        properties: Default::default(),
-        opaque: false,
-        covered: None,
-    };
-    let faces = block_faces(&block, resources, report)?;
-    if faces.is_empty() {
-        return Err(format!("{name}: empty block model"));
-    }
-    let mut triangles = Vec::new();
-    for face in faces {
-        let tint = match face.tint_index {
-            Some(index) => crate::biome::item_tint(name, &block.properties, index, resources),
-            None => [1.0; 3],
-        };
-        let color = mul(
-            std::array::from_fn(|i| face.tint[i] * tint[i]),
-            face.directional_shade(),
-        );
-        for indices in [[0, 1, 2], [0, 2, 3]] {
-            triangles.push(Triangle {
-                vertices: indices.map(|i| place(face.vertices[i])),
-                uv: indices.map(|i| face.uv[i]),
-                texture: textures.id(&face.texture),
-                color: [color; 3],
-                light: [light; 3],
-                alpha: face.alpha,
-            });
+) -> Result<ItemLook, String> {
+    let name = name.strip_prefix("minecraft:").unwrap_or(name);
+    let definition = resources.json(&resource_path(name, "items", "json")?)?;
+    let id = item_model_id(&definition["model"], report)
+        .ok_or_else(|| format!("{name}: item definition names no model"))?;
+    let model = resources.model(&id, &mut Vec::new())?;
+    if model["elements"].is_array() {
+        let mut faces = Vec::new();
+        model_faces(&id, 0.0, 0.0, resources, report, &mut faces)?;
+        let mut triangles = Vec::new();
+        for face in faces {
+            let tint = match face.tint_index {
+                Some(index) => crate::biome::item_tint(name, &Default::default(), index, resources),
+                None => [1.0; 3],
+            };
+            let color = mul(
+                std::array::from_fn(|i| face.tint[i] * tint[i]),
+                face.directional_shade(),
+            );
+            for indices in [[0, 1, 2], [0, 2, 3]] {
+                triangles.push(Triangle {
+                    vertices: indices.map(|i| place(face.vertices[i])),
+                    uv: indices.map(|i| face.uv[i]),
+                    texture: textures.id(&face.texture),
+                    color: [color; 3],
+                    light: [light; 3],
+                    alpha: face.alpha,
+                });
+            }
         }
+        return Ok(ItemLook::Solid(triangles));
     }
-    Ok(triangles)
+    let layer = texture_id(&model, "#layer0")?;
+    Ok(ItemLook::Flat(resources.texture(&layer)?))
+}
+
+/// 物品定义里的模型 id。分支取兜底，复合取第一个。
+fn item_model_id(model: &Value, report: &mut Report) -> Option<String> {
+    let kind = model["type"].as_str()?;
+    match kind.strip_prefix("minecraft:").unwrap_or(kind) {
+        "model" => model["model"].as_str().map(str::to_owned),
+        "special" => {
+            report
+                .warnings
+                .insert("code-drawn items (chests, beds…) use their base model".to_owned());
+            model["base"].as_str().map(str::to_owned)
+        }
+        "select" | "range_dispatch" => {
+            report
+                .warnings
+                .insert("conditional item models use their fallback".to_owned());
+            item_model_id(&model["fallback"], report)
+        }
+        "condition" => {
+            report
+                .warnings
+                .insert("conditional item models use their fallback".to_owned());
+            item_model_id(&model["on_false"], report)
+        }
+        "composite" => item_model_id(model["models"].as_array()?.first()?, report),
+        _ => None,
+    }
 }
 
 fn block_faces(
@@ -564,7 +603,6 @@ fn block_faces(
         let id = selection["model"]
             .as_str()
             .ok_or("model selection has no model identifier")?;
-        let model = resources.model(id, &mut Vec::new())?;
         let x = selection["x"].as_f64().unwrap_or(0.0);
         let y = selection["y"].as_f64().unwrap_or(0.0);
         if selection["uvlock"].as_bool() == Some(true) {
@@ -572,6 +610,22 @@ fn block_faces(
                 .warnings
                 .insert("uvlock is approximated: textures rotate with the model".to_owned());
         }
+        model_faces(id, x, y, resources, report, &mut result)?;
+    }
+    Ok(result)
+}
+
+/// 一个模型（按 `x`、`y` 度旋转后）的全部面，追加进 `result`。
+fn model_faces(
+    id: &str,
+    x: f64,
+    y: f64,
+    resources: &mut Resources,
+    report: &mut Report,
+    result: &mut Vec<Face>,
+) -> Result<(), String> {
+    {
+        let model = resources.model(id, &mut Vec::new())?;
         let ambient_occlusion = model["ambientocclusion"].as_bool() != Some(false);
         let elements = model["elements"]
             .as_array()
@@ -668,7 +722,7 @@ fn block_faces(
             }
         }
     }
-    Ok(result)
+    Ok(())
 }
 
 fn cube_faces(texture: Arc<RgbaImage>, tint: V3, alpha: f64, height: f64) -> Vec<Face> {
@@ -840,5 +894,46 @@ pub fn fixture() -> Scene {
         cells: Vec::new(),
         biome_names: Vec::new(),
         biomes: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod item_model_tests {
+    use serde_json::json;
+
+    use super::item_model_id;
+    use crate::Report;
+
+    /// 原木的物品定义直接指向方块模型；箱子是代码画的，取基础模型；
+    /// 按条件分支的取兜底。
+    #[test]
+    fn item_definitions_resolve_to_one_model() {
+        let mut report = Report::default();
+        let plain = json!({"type": "minecraft:model", "model": "minecraft:block/spruce_log"});
+        assert_eq!(
+            item_model_id(&plain, &mut report).as_deref(),
+            Some("minecraft:block/spruce_log")
+        );
+
+        let chest = json!({
+            "type": "minecraft:select",
+            "cases": [],
+            "fallback": {"type": "minecraft:special", "base": "minecraft:item/chest", "model": {}}
+        });
+        assert_eq!(
+            item_model_id(&chest, &mut report).as_deref(),
+            Some("minecraft:item/chest")
+        );
+
+        let flag = json!({
+            "type": "minecraft:condition",
+            "on_true": {"type": "minecraft:model", "model": "minecraft:item/a"},
+            "on_false": {"type": "minecraft:model", "model": "minecraft:item/b"}
+        });
+        assert_eq!(
+            item_model_id(&flag, &mut report).as_deref(),
+            Some("minecraft:item/b")
+        );
+        assert!(item_model_id(&json!({"type": "minecraft:empty"}), &mut report).is_none());
     }
 }

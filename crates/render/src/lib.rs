@@ -1,12 +1,10 @@
 //! 丙·渲染：tick 快照 → 模型可读文字，全部纯函数。
 //!
 //! 呈现选择政策归此处（给多少、怎么说）；事实归快照（world），本层不添不删事实，
-//! 只挑选与措辞。处境厚度为"中版"：环境 + 体征 + 位置朝向 + 周围实体概览
-//! + 聊天未读数；方块级细节看画面（view），不进每轮开场。
-//!
-//! 同类实体聚合呈现（数量 + 最近距离方位）——压缩方向是同质聚合，不是截断。
+//! 只挑选与措辞。处境只放 HUD 与 F3 上常显的东西：环境、体征、位置朝向、准星、
+//! 快捷栏；周围有什么、方块级细节都看画面（view），不进处境。
 
-use world::{ConnectionPhase, EntitySnapshot, PickupEntry, TickSnapshot};
+use world::{ConnectionPhase, PickupEntry, TickSnapshot};
 
 /// 处境的一行是哪一行。
 ///
@@ -23,18 +21,12 @@ pub enum SituationLine {
     LookingAt,
     Hotbar,
     Held,
-    Nearby,
-    Unread,
 }
 
-/// 处境逐行拆解。`chat_read` 是聊天已读水位 (epoch, tick)，
-/// 未读数 = 聊天窗里晚于水位的条数（重连换纪元后整窗算新）。
+/// 处境逐行拆解。
 ///
 /// 空行不出现在结果里——「没话可说」与「说了一句空话」对差异比对是两回事。
-pub fn render_situation_lines(
-    snap: &TickSnapshot,
-    chat_read: (u64, u64),
-) -> Vec<(SituationLine, String)> {
+pub fn render_situation_lines(snap: &TickSnapshot) -> Vec<(SituationLine, String)> {
     // 非就绪状态下世界数据是旧的，处境只说连接事实，不拿旧世界冒充现在。
     let connection = match &snap.phase {
         ConnectionPhase::Ready => None,
@@ -54,26 +46,15 @@ pub fn render_situation_lines(
         (SituationLine::Vitals, render_vitals(snap)),
         (SituationLine::Hotbar, render_hotbar(snap)),
         (SituationLine::Held, render_held(snap)),
-        (SituationLine::Nearby, render_nearby(snap)),
     ];
-    let unread = unread_chat_count(snap, chat_read);
-    if unread > 0 {
-        // 死着打不开聊天框（原版死亡屏挡住聊天键），只说有，不招呼去翻。
-        let line = if snap.self_state.alive {
-            format!("聊天有 {unread} 条新的系统消息。")
-        } else {
-            format!("聊天有 {unread} 条新的系统消息，复活后才能翻看。")
-        };
-        lines.push((SituationLine::Unread, line));
-    }
     lines.retain(|(_, line)| !line.is_empty());
     lines
 }
 
 /// 处境全文（开局与压缩之后投的那一份）。逐行拆解的直接拼接——
 /// 两者共用一个来源，不可能对不上。
-pub fn render_situation(snap: &TickSnapshot, chat_read: (u64, u64)) -> String {
-    render_situation_lines(snap, chat_read)
+pub fn render_situation(snap: &TickSnapshot) -> String {
+    render_situation_lines(snap)
         .into_iter()
         .map(|(_, line)| line)
         .collect::<Vec<_>>()
@@ -125,14 +106,16 @@ pub fn render_environment(snap: &TickSnapshot) -> String {
 /// 花一轮去看，就知道自己对着什么。
 ///
 /// 数据直接取 azalea 每 tick 维护的 `HitResultComponent`——我们不自己发射线，
-/// 也就不会和它算出两套结果。够不着任何东西时这一行不出现（原版此时也不显示），
-/// 而处境的空行本来就不进差异。
+/// 也就不会和它算出两套结果。够不着任何东西时也明说：处境只报变了的行，
+/// 这一行若消失，「对着空处」和「没变」就分不开了。
 pub fn render_looking_at(snap: &TickSnapshot) -> String {
     match &snap.self_state.looking_at {
-        None => String::new(),
+        None => NOTHING_IN_REACH.to_owned(),
         Some(target) => format!("准星对着 {}。", looking_at_words(target)),
     }
 }
+
+const NOTHING_IN_REACH: &str = "准星没有对着够得着的方块或实体。";
 
 fn looking_at_words(target: &world::LookingAt) -> String {
     match target {
@@ -167,8 +150,11 @@ pub fn render_input_outcome(outcome: &world::InputOutcome) -> String {
         world::InputEnd::Died => format!("按住 {} 秒时你死了。", trim_number(seconds)),
         world::InputEnd::Replaced => "这次输入被新的输入顶替，已松开。".to_owned(),
     }];
-    if let Some(target) = &outcome.pressed_on {
-        lines.push(format!("按下时准星对着 {}。", looking_at_words(target)));
+    match (&outcome.pressed_on, outcome.mouse) {
+        (Some(target), _) => lines.push(format!("按下时准星对着 {}。", looking_at_words(target))),
+        // 按了鼠标却没对着东西：明说，免得白按满时长还以为在挖。
+        (None, Some(_)) => lines.push(format!("按下时{NOTHING_IN_REACH}")),
+        (None, None) => {}
     }
     if !outcome.broken.is_empty() {
         lines.push(format!("挖碎了：{}。", outcome.broken.join("、")));
@@ -195,7 +181,7 @@ pub fn render_input_outcome(outcome: &world::InputOutcome) -> String {
     lines.push(format!(
         "现在面朝{}（yaw {:.0}°，pitch {:.0}°）。",
         compass_word(f64::from(outcome.yaw)),
-        outcome.yaw,
+        wrap_degrees(f64::from(outcome.yaw)),
         outcome.pitch
     ));
     lines.join("\n")
@@ -270,66 +256,6 @@ pub fn render_vitals(snap: &TickSnapshot) -> String {
     }
     line.push('。');
     line
-}
-
-/// 周围实体概览：玩家逐个列出，其余同类聚合（数量 + 最近距离方位）。
-/// 快照不过滤自身（直译义务在模块一），跳过自己是本层的呈现选择。
-pub fn render_nearby(snap: &TickSnapshot) -> String {
-    let this = &snap.self_state;
-    let mut described: Vec<(f64, String)> = Vec::new();
-
-    let mut groups: Vec<(&str, Vec<&EntitySnapshot>)> = Vec::new();
-    for entity in &snap.entities {
-        if entity.entity_key == this.entity_key {
-            continue;
-        }
-        if let Some(username) = &entity.username {
-            let distance = distance_between(this, entity);
-            described.push((
-                distance,
-                format!(
-                    "玩家 {username}（{} 格·{}）",
-                    distance.round() as i64,
-                    bearing_word(this, entity)
-                ),
-            ));
-            continue;
-        }
-        let type_word = entity
-            .entity_type
-            .strip_prefix("minecraft:")
-            .unwrap_or(&entity.entity_type);
-        match groups.iter_mut().find(|(word, _)| *word == type_word) {
-            Some((_, members)) => members.push(entity),
-            None => groups.push((type_word, vec![entity])),
-        }
-    }
-
-    for (type_word, members) in groups {
-        let nearest = members
-            .iter()
-            .min_by(|a, b| distance_between(this, a).total_cmp(&distance_between(this, b)))
-            .expect("组内至少一个成员");
-        let distance = distance_between(this, nearest);
-        let place = format!(
-            "{} 格·{}",
-            distance.round() as i64,
-            bearing_word(this, nearest)
-        );
-        let text = if members.len() > 1 {
-            format!("{type_word} ×{}（最近 {place}）", members.len())
-        } else {
-            format!("{type_word}（{place}）")
-        };
-        described.push((distance, text));
-    }
-
-    if described.is_empty() {
-        return String::new();
-    }
-    described.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let texts: Vec<String> = described.into_iter().map(|(_, text)| text).collect();
-    format!("附近：{}。", texts.join("；"))
 }
 
 /// 快捷栏一行：九格内容 + 副手。
@@ -688,21 +614,6 @@ pub fn render_damage_entry(entry: &world::DamageEntry) -> String {
     line
 }
 
-/// 聊天未读数：窗内晚于已读水位、且没有推送过原文的条数。纪元不同则整窗算新。
-///
-/// 玩家说的话一律不计：别人的话经唤醒原文推给了模型（原版 HUD 上显示过就算
-/// 看过），自己的话是回显。剩下的是没有发言者的系统消息（命令反馈、公告、
-/// 死亡播报）——它们不推原文，只在这里提示有。
-pub fn unread_chat_count(snap: &TickSnapshot, chat_read: (u64, u64)) -> usize {
-    let (read_epoch, read_tick) = chat_read;
-    snap.chat
-        .entries
-        .iter()
-        .filter(|entry| snap.epoch.0 != read_epoch || entry.tick > read_tick)
-        .filter(|entry| entry.sender.is_none())
-        .count()
-}
-
 // 角度归一化随视口内核迁入 world；此处再导出维持渲染层的调用面。
 pub use world::wrap_degrees;
 
@@ -739,20 +650,6 @@ fn compass_word(yaw: f64) -> &'static str {
     const WORDS: [&str; 8] = ["南", "西南", "西", "西北", "北", "东北", "东", "东南"];
     let normalized = wrap_degrees(yaw).rem_euclid(360.0);
     WORDS[(((normalized + 22.5) / 45.0) as usize) % 8]
-}
-
-/// 对方相对自己的方位（世界罗盘向，与自己面朝无关）。
-fn bearing_word(this: &world::SelfState, entity: &EntitySnapshot) -> &'static str {
-    let dx = entity.position.x - this.position.x;
-    let dz = entity.position.z - this.position.z;
-    compass_word((-dx).atan2(dz).to_degrees())
-}
-
-fn distance_between(this: &world::SelfState, entity: &EntitySnapshot) -> f64 {
-    let dx = entity.position.x - this.position.x;
-    let dy = entity.position.y - this.position.y;
-    let dz = entity.position.z - this.position.z;
-    (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
 /// 18.0 显示成 18，17.5 保留一位小数。

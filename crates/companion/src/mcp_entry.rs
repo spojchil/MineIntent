@@ -18,7 +18,7 @@ use agent::{
     ToolResult, ToolRuntime,
 };
 use dispatch::{Dispatcher, Occupancy};
-use screens::{ChatReadMark, ScreenState};
+use screens::ScreenState;
 use tokio::sync::Notify;
 use wait::{Interruptions, Woke};
 use world::{Module, SnapshotSource};
@@ -220,7 +220,6 @@ pub struct McpBody {
     inbox: Arc<Inbox>,
     frames: Mutex<FrameComposer>,
     snapshots: Arc<dyn SnapshotSource>,
-    read_mark: Arc<ChatReadMark>,
     /// 动作依次执行；wait 不拿这把锁，等待期间仍能调身体工具。
     turn: tokio::sync::Mutex<()>,
 }
@@ -230,14 +229,12 @@ impl McpBody {
         dispatcher: Arc<Dispatcher>,
         inbox: Arc<Inbox>,
         snapshots: Arc<dyn SnapshotSource>,
-        read_mark: Arc<ChatReadMark>,
     ) -> Self {
         Self {
             dispatcher,
             inbox,
             frames: Mutex::new(FrameComposer::new()),
             snapshots,
-            read_mark,
             turn: tokio::sync::Mutex::new(()),
         }
     }
@@ -288,7 +285,7 @@ impl bridge::body::Body for McpBody {
                 self.frames
                     .lock()
                     .expect("帧锁中毒")
-                    .compose_on_pull(&snapshot, self.read_mark.position()),
+                    .compose_on_pull(&snapshot),
             );
             if !during.is_empty() {
                 result.content.push(ContentPart::text(format!(
@@ -317,7 +314,6 @@ pub struct Parts {
     pub dispatcher: Arc<Dispatcher>,
     pub inbox: Arc<Inbox>,
     pub snapshots: Arc<dyn SnapshotSource>,
-    pub read_mark: Arc<ChatReadMark>,
     pub screen_state: Arc<ScreenState>,
     pub occupancy: Arc<Occupancy>,
     pub username: String,
@@ -331,17 +327,11 @@ pub async fn run(parts: Parts) -> Result<(), String> {
         dispatcher,
         inbox,
         snapshots,
-        read_mark,
         screen_state,
         occupancy,
         username,
     } = parts;
-    let body = Arc::new(McpBody::new(
-        dispatcher,
-        inbox.clone(),
-        snapshots.clone(),
-        read_mark,
-    ));
+    let body = Arc::new(McpBody::new(dispatcher, inbox.clone(), snapshots.clone()));
     let shutdown = bridge::CancellationToken::new();
     let serving = bridge::body::serve(listener, body, shutdown.clone());
     tokio::pin!(serving);
@@ -463,7 +453,6 @@ mod tests {
             dispatcher,
             inbox.clone(),
             Arc::new(Snapshots(Arc::new(snapshot))),
-            Arc::new(ChatReadMark::new()),
         ));
         body.attached();
         (body, inbox, actions)

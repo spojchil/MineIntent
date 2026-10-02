@@ -7,6 +7,11 @@
 //! 判定是纯函数（[`decide_end`]、[`walk_direction`]），副作用只在 [`poll_input`] 与
 //! [`release`] 里落。每次输入恰好一个回执：正常结束走 [`finish`]，连接结束时
 //! 丢掉发送端，等待方收到「连接已结束」。
+//!
+//! 回执在本 tick 的快照发布**之后**才交出（[`Finished::send`] 由 tick 收尾调用）：
+//! 收到回执的一方紧接着读最新快照拼处境，先交回执会让它读到上一 tick 的世界。
+//! 方块碎掉时先松手、下一 tick 再交回执：准星由 Azalea 在下一 tick 才对着
+//! 碎后的世界重算，早一 tick 交出，处境里的准星还是刚挖掉的那块。
 
 use azalea::core::hit_result::HitResult;
 use azalea::entity::metadata::{AbstractLivingUsingItem, Health};
@@ -60,7 +65,21 @@ pub(super) struct HeldInput {
     /// 上一 tick 准星下的方块。按着左键时它下一 tick 变成空气，就是挖碎了。
     crosshair_block: Option<([i32; 3], String)>,
     last_use_tick: u64,
+    /// 已松手、等下一 tick 交回执：为什么结束、在哪一 tick 结束。
+    ending: Option<(InputEnd, u64)>,
     done: oneshot::Sender<InputOutcome>,
+}
+
+/// 已结束、待交出的回执。
+pub(super) struct Finished {
+    done: oneshot::Sender<InputOutcome>,
+    outcome: InputOutcome,
+}
+
+impl Finished {
+    pub(super) fn send(self) {
+        let _ = self.done.send(self.outcome);
+    }
 }
 
 /// 接受一次新输入：顶替旧的、转向、记下起点。按键留到下一 tick。
@@ -78,7 +97,11 @@ pub(super) fn begin(
     let previous = inner.held_input.lock().take();
     if let Some(previous) = previous {
         release(bot, &previous.spec);
-        finish(bot, previous, InputEnd::Replaced, inner.now_tick());
+        // 已经结束、只差交回执的那次照它自己的结局回执，不算被顶替。
+        let (end, at) = previous
+            .ending
+            .unwrap_or((InputEnd::Replaced, inner.now_tick()));
+        finish(bot, previous, end, at).send();
     }
 
     if let Some(turn) = spec.turn {
@@ -96,24 +119,28 @@ pub(super) fn begin(
         broken: Vec::new(),
         crosshair_block: None,
         last_use_tick: 0,
+        ending: None,
         done,
     });
     Ok(())
 }
 
-/// 每 tick 推进在按的输入。
-pub(super) fn poll_input(inner: &Inner, bot: &Client) {
+/// 每 tick 推进在按的输入。结束了就交出待发的回执，由调用方在发布快照后发送。
+pub(super) fn poll_input(inner: &Inner, bot: &Client) -> Option<Finished> {
     let now = inner.now_tick();
     let mut slot = inner.held_input.lock();
-    let Some(held) = slot.as_mut() else {
-        return;
-    };
+    let held = slot.as_mut()?;
+
+    if let Some((end, at)) = held.ending {
+        let held = slot.take().expect("上面刚借到 Some");
+        return Some(finish(bot, held, end, at));
+    }
 
     let Some(pressed_tick) = held.pressed_tick else {
         if now > held.queued_tick {
             press(inner, bot, held, now);
         }
-        return;
+        return None;
     };
 
     let mut block_broke = false;
@@ -132,11 +159,13 @@ pub(super) fn poll_input(inner: &Inner, bot: &Client) {
         block_broke,
     };
     if let Some(end) = decide_end(pressed_tick, held.spec.ticks, now, observed) {
-        let held = slot.take().expect("上面刚借到 Some");
-        drop(slot);
         release(bot, &held.spec);
-        finish(bot, held, end, now);
-        return;
+        if end == InputEnd::BlockBroken {
+            held.ending = Some((end, now));
+            return None;
+        }
+        let held = slot.take().expect("上面刚借到 Some");
+        return Some(finish(bot, held, end, now));
     }
 
     // 重复右键只发生在还按着的 tick。松开那一刻若再补一次，使用请求排在
@@ -149,6 +178,7 @@ pub(super) fn poll_input(inner: &Inner, bot: &Client) {
         bot.start_use_item();
         held.last_use_tick = now;
     }
+    None
 }
 
 /// 连接结束：松开并丢掉发送端，等待方如实收到「连接已结束」。
@@ -227,7 +257,7 @@ fn release(bot: &Client, spec: &InputSpec) {
     }
 }
 
-fn finish(bot: &Client, held: HeldInput, ended: InputEnd, now: u64) {
+fn finish(bot: &Client, held: HeldInput, ended: InputEnd, now: u64) -> Finished {
     let look = bot.direction();
     let outcome = InputOutcome {
         ticks: held
@@ -239,10 +269,14 @@ fn finish(bot: &Client, held: HeldInput, ended: InputEnd, now: u64) {
         to: position(bot).unwrap_or(held.from),
         yaw: look.y_rot(),
         pitch: look.x_rot(),
+        mouse: held.spec.mouse,
         pressed_on: held.pressed_on,
         broken: held.broken,
     };
-    let _ = held.done.send(outcome);
+    Finished {
+        done: held.done,
+        outcome,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]

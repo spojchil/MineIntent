@@ -182,7 +182,7 @@ fn property_matches(block: &Block, key: &str, value: &str) -> bool {
     }
 }
 
-fn resource_path(id: &str, category: &str, extension: &str) -> Result<String, String> {
+pub(crate) fn resource_path(id: &str, category: &str, extension: &str) -> Result<String, String> {
     let (namespace, name) = id.split_once(':').unwrap_or(("minecraft", id));
     if namespace.is_empty()
         || name.is_empty()

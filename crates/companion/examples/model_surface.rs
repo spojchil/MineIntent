@@ -12,8 +12,7 @@ use agent::{ContentPart, PortFuture, ToolCall, ToolResult};
 use dispatch::{Occupancy, ToolClass, ToolProvider};
 use memory::{MemoryFile, MemoryTools};
 use screens::{
-    ChatBox, ChatDoor, ChatHistory, ChatReadMark, ContainerScreen, InventoryDoor, InventoryScreen,
-    ScreenState,
+    ChatBox, ChatDoor, ChatHistory, ContainerScreen, InventoryDoor, InventoryScreen, ScreenState,
 };
 use serde_json::json;
 use world::SnapshotSource;
@@ -88,6 +87,7 @@ impl input::InputDoor for NoDoor {
                 to: [11.7, 72.0, 3.5],
                 yaw: -90.0,
                 pitch: 20.0,
+                mouse: spec.mouse,
                 pressed_on: Some(world::LookingAt::Block {
                     name: "stone".to_owned(),
                     position: [12, 72, 3],
@@ -296,8 +296,6 @@ async fn main() {
     memory_file
         .write("我叫 companion。tester 最喜欢的方块是青金石块。")
         .unwrap();
-    let read_mark = Arc::new(ChatReadMark::new());
-    read_mark.mark_read(1, 2_300); // 看过第一条，第二条未读
     let strategy = context::ContextStrategy::new(PLACEHOLDER_PERSONA, memory_file.clone());
     for (index, item) in agent::PromptSource::base_context(&strategy)
         .unwrap()
@@ -364,8 +362,6 @@ async fn main() {
                 screen_state.clone(),
                 door.clone(),
                 door.clone(),
-                read_mark.clone(),
-                snapshots.clone(),
             )),
         ),
         (
@@ -571,7 +567,7 @@ async fn main() {
     println!("### 处境（随增量帧追加，不在前缀里）\n");
     println!("> 开局与压缩之后投全量，其余时候只投变了的那几行。\n");
     println!("```text");
-    for (_, line) in render::render_situation_lines(&snapshot, read_mark.position()) {
+    for (_, line) in render::render_situation_lines(&snapshot) {
         println!("{line}");
     }
     println!("```\n");
@@ -599,10 +595,7 @@ async fn main() {
     ] {
         let mut other = snapshot.clone();
         other.phase = phase;
-        println!(
-            "- {name}：`{}`",
-            render::render_situation(&other, read_mark.position())
-        );
+        println!("- {name}：`{}`", render::render_situation(&other));
     }
     println!();
     println!("聊天：`alice: 过来一下`（发言者名: 原文）\n");

@@ -1,7 +1,8 @@
 //! 唤醒判据的纯函数部分：从一帧快照里挑出「该把同伴叫起来」的事实。
 //!
 //! **这是脚手架，不是判据。** 正式的关注清单未裁（issue #135），
-//! 这里只做最朴素的三条：别人对我说话、我受伤了、我下的任务有果了。
+//! 这里只做最朴素的几条：聊天框里新出现的话（别人说的与系统消息）、我受伤了、
+//! 我下的任务有果了。
 //!
 //! 抽成纯函数的理由：它是组合根里唯一有分支的逻辑，而组合根跑起来要一台
 //! Minecraft 服务器和一个模型端点。分支判断不该只能靠实盘验证。
@@ -85,8 +86,10 @@ impl WakeCursors {
             if !advance(&mut self.chat, entry.seq) {
                 continue;
             }
+            // 系统消息（死因、命令反馈、公告）没有发言者，原文照送：原版聊天 HUD
+            // 与死亡界面都直接显示它们，死因只有这一处说。
             let Some(sender) = entry.sender.as_ref() else {
-                // 系统广播没有发言者。当前不唤醒——它不是「有人对我说话」。
+                lines.push(entry.content.plain_text.clone());
                 continue;
             };
             if entry.sent_by(own.entity_key, own.username) {
@@ -299,14 +302,17 @@ mod tests {
     }
 
     #[test]
-    fn system_broadcasts_do_not_wake_us() {
+    fn system_messages_are_delivered_verbatim() {
         let mut snap = snapshot();
         let mut cursors = WakeCursors::default();
         snap.chat = Window {
-            entries: vec![system_chat(1, "服务器将在 5 分钟后重启")],
+            entries: vec![system_chat(1, "companion was slain by Zombie")],
         };
 
-        assert!(cursors.collect(&snap, identity(), false).is_empty());
+        assert_eq!(
+            cursors.collect(&snap, identity(), false).lines,
+            vec!["companion was slain by Zombie".to_owned()]
+        );
     }
 
     #[test]
