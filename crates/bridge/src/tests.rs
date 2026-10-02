@@ -42,6 +42,7 @@ struct FakeBody {
     ended: Notify,
     released: Notify,
     produced: Notify,
+    knock: Notify,
     png: String,
 }
 
@@ -60,6 +61,7 @@ impl FakeBody {
             ended: Notify::new(),
             released: Notify::new(),
             produced: Notify::new(),
+            knock: Notify::new(),
             png: base64::engine::general_purpose::STANDARD.encode(bytes.into_inner()),
         })
     }
@@ -121,6 +123,13 @@ impl Body for FakeBody {
 
     fn attached(&self) {
         self.attached.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn next_nudge(&self) -> PortFuture<'_, u64> {
+        Box::pin(async move {
+            self.knock.notified().await;
+            3
+        })
     }
 
     fn detached(&self) {
@@ -242,7 +251,11 @@ async fn official_client_discovers_tools_and_decodes_a_real_png() {
     let client = Client::connect(server.addr).await;
     let info = client.service.peer_info().unwrap();
     assert_eq!(info.protocol_version, ProtocolVersion::V_2025_11_25);
-    assert!(info.capabilities.experimental.is_none());
+    assert!(info
+        .capabilities
+        .experimental
+        .as_ref()
+        .is_some_and(|experimental| experimental.contains_key("claude/channel")));
     let list = within(client.service.list_tools(None)).await.unwrap();
     assert_eq!(list.tools[0].name, "echo");
     assert_eq!(list.tools[0].description.as_deref(), Some("测试工具 echo"));
@@ -473,12 +486,70 @@ async fn unsupported_versions_fall_back_to_the_only_supported_version() {
         let mut client = RawClient::connect(server.addr);
         let reply = client.initialize(version).await;
         assert_eq!(reply["result"]["protocolVersion"], "2025-11-25");
-        assert!(reply["result"]["capabilities"]
-            .get("experimental")
-            .is_none());
+        assert!(reply["result"]["capabilities"]["experimental"]["claude/channel"].is_object());
         drop(client.input);
         within(client.task).await.unwrap().unwrap();
     }
+    server.shutdown().await;
+}
+
+/// Claude Code 2.1.287 实际的开场：先发 2026-07-28 的 `server/discover`，被拒后退回
+/// `initialize`，随后的 `tools/list` 不带 `_meta`。探测不能把会话锁进新规范。
+#[tokio::test]
+async fn a_rejected_discover_probe_still_allows_the_legacy_session() {
+    let server = BodyServer::start().await;
+    let mut client = RawClient::connect(server.addr);
+    client
+        .send(
+            json!({"jsonrpc":"2.0", "id":"server-discover-probe-1", "method":"server/discover",
+            "params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}),
+        )
+        .await;
+    let line = within(client.output.next_line()).await.unwrap().unwrap();
+    let refusal: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(refusal["id"], "server-discover-probe-1");
+    assert_eq!(refusal["error"]["code"], -32022);
+    assert_eq!(refusal["error"]["data"]["requested"], "2026-07-28");
+
+    let reply = client.initialize("2025-11-25").await;
+    assert_eq!(reply["result"]["protocolVersion"], "2025-11-25");
+    client
+        .send(json!({"jsonrpc":"2.0", "id":2, "method":"tools/list"}))
+        .await;
+    let tools = client.response(2).await;
+    assert!(tools.get("error").is_none(), "{tools}");
+    assert!(!tools["result"]["tools"].as_array().unwrap().is_empty());
+    drop(client.input);
+    within(client.task).await.unwrap().unwrap();
+    server.shutdown().await;
+}
+
+/// 身体敲门 → 客户端收到 Claude Code 的 channel 通知，只说件数不带内容。
+#[tokio::test]
+async fn a_body_nudge_becomes_a_channel_notification() {
+    let server = BodyServer::start().await;
+    let mut client = RawClient::connect(server.addr);
+    client.initialize("2025-11-25").await;
+    client
+        .send(json!({"jsonrpc":"2.0", "id":2, "method":"tools/list"}))
+        .await;
+    client.response(2).await;
+    // 身体那一侧每轮循环重建敲门 future；notify_one 留 permit，不怕错过。
+    server.body.knock.notify_one();
+    let notification = loop {
+        let line = within(client.output.next_line()).await.unwrap().unwrap();
+        let value: Value = serde_json::from_str(&line).unwrap();
+        if value["method"] == "notifications/claude/channel" {
+            break value;
+        }
+    };
+    assert_eq!(notification["params"]["meta"]["pending"], "3");
+    assert!(notification["params"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("3 件"));
+    drop(client.input);
+    within(client.task).await.unwrap().unwrap();
     server.shutdown().await;
 }
 

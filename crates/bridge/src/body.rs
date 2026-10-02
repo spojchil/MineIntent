@@ -27,6 +27,13 @@ pub trait Body: Send + Sync + 'static {
 
     /// 正常关闭时在回收全部调用后触发；任务异常退出时也会通知接入释放。
     fn detached(&self) {}
+
+    /// 等到「有未取走的事件、且此刻没有调用在途」，返回待取条数。
+    ///
+    /// future 可能在任意点被丢弃（每轮循环重建），实现须取消安全。默认永不敲门。
+    fn next_nudge(&self) -> PortFuture<'_, u64> {
+        Box::pin(std::future::pending())
+    }
 }
 
 struct Attachment {
@@ -184,6 +191,11 @@ async fn connection(stream: TcpStream, body: Arc<dyn Body>, stop: CancellationTo
                         None => continue,
                     };
                     if !send(&outgoing, &stop, message).await {
+                        break;
+                    }
+                }
+                pending = body.next_nudge() => {
+                    if !send(&outgoing, &stop, Message::Nudge { pending }).await {
                         break;
                     }
                 }

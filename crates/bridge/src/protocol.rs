@@ -54,6 +54,8 @@ pub enum Message {
     Failed { id: u64, reason: String },
     /// 身体已被另一个接入占着：连上后立刻收到这一条，随即断开。
     Occupied { reason: String },
+    /// 有代理还没取走的事件，而此刻没有调用在途——它不会自己知道。
+    Nudge { pending: u64 },
 }
 
 /// 编一行（含换行）。

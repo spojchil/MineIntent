@@ -1,8 +1,12 @@
-//! 外接代理共用身体工具；事件随工具回执拉取，不要求宿主能被通知主动唤醒。
+//! 外接代理共用身体工具；事件随工具回执拉取，空闲时另经转接器敲门。
 //!
-//! 信箱保留最近 100 条带序号事件；序号只在本身体进程内有效。回执重复上一回执
-//! 的新事件，重连接则重送保留历史，并说明可能重复及已丢失数量。这不是宿主
-//! 确认协议，也不保证恰好一次。
+//! 信箱保留最近 100 条带序号事件；序号只在本身体进程内有效。每次回执只带上次
+//! 回执以来的新事件，处境也只说变了的行。新接入重送保留的事件与全量处境：新来
+//! 的代理没见过它们，上一个接入可能见过一部分，回执里如实说明。
+//!
+//! 实测（Claude Code 2.1.287）否决过「每次回执重送上一回执」：stdio 不丢消息，
+//! 它防的只是「回执已构造、恰在此时被取消」这一窄窗；代价是每次回执翻倍，代理
+//! 自己反馈重复内容把新信息埋掉了，危急时尤甚。
 //! 取消发生在工具等待期间时不推进阅读位置；已经交给世界的输入不会因此回滚。
 
 use std::collections::VecDeque;
@@ -36,10 +40,12 @@ struct InboxState {
     sequence: u64,
     /// 已装入回执的末条，不表示宿主已经收到或读到。
     reported: u64,
-    /// 上一回执的新事件起点；下一回执将其重送一次。
-    replay_after: u64,
     attachments: u64,
     replaying_connection: bool,
+    /// 在途调用数：有调用在途就不必敲门，那次回执会把事件带回去。
+    in_flight: usize,
+    /// 已为哪一条之前的事件敲过门。
+    nudged_upto: u64,
 }
 
 #[derive(Default)]
@@ -76,32 +82,63 @@ impl Inbox {
         state.attachments += 1;
         state.replaying_connection = state.attachments > 1;
         state.reported = 0;
-        state.replay_after = 0;
+        state.nudged_upto = 0;
+        drop(state);
+        self.bell.notify_waiters();
+    }
+
+    fn begin_call(&self) -> CallInFlight<'_> {
+        let mut state = self.state.lock().expect("信箱锁中毒");
+        state.in_flight += 1;
+        CallInFlight {
+            inbox: self,
+            since: state.reported,
+        }
+    }
+
+    /// 等到有未取走的事件、且没有调用在途；同一批只敲一次。取消安全：只在返回时记账。
+    async fn next_nudge(&self) -> u64 {
+        loop {
+            let mut ringing = std::pin::pin!(self.bell.notified());
+            ringing.as_mut().enable();
+            {
+                let mut state = self.state.lock().expect("信箱锁中毒");
+                let seen = state.reported.max(state.nudged_upto);
+                if state.in_flight == 0 && state.sequence > seen {
+                    state.nudged_upto = state.sequence;
+                    return state.sequence - state.reported;
+                }
+            }
+            ringing.await;
+        }
     }
 
     /// 只在工具完成后的同步装配阶段推进；历史仍留在有界信箱里。
+    #[cfg(test)]
     fn reply_lines(&self) -> Vec<String> {
+        self.reply_lines_since(u64::MAX)
+    }
+
+    /// 带回 `since`（调用开始时的读取位置）与上次回执两者中较早那条之后的事件。
+    ///
+    /// 顺序调用时两者相同。调用重叠时（`wait` 挂着、代理又调了动作），重叠期间的
+    /// 事件两边回执都带：否则先返回的那次把事件带走，`wait` 被它叫醒却说「就在
+    /// 下面」而下面什么都没有。
+    fn reply_lines_since(&self, since: u64) -> Vec<String> {
         let mut state = self.state.lock().expect("信箱锁中毒");
-        let after = state.replay_after;
-        let previous = state.reported;
+        let after = state.reported.min(since);
         let mut lines = Vec::new();
         if state.replaying_connection {
             lines.push(
-                "接入已重新建立；以下是本进程保留的最近事件，可能重送，请按事件序号识别。"
+                "接入已重新建立；以下是本进程保留的最近事件，上一个接入可能见过其中一些，请按事件序号识别。"
                     .to_owned(),
             );
-        } else if state
-            .wakes
-            .iter()
-            .any(|line| line.seq > after && line.seq <= previous)
-        {
-            lines.push("以下包含上一回执中的事件，可能重送，请按事件序号识别。".to_owned());
         }
         if let Some(first) = state.wakes.front() {
             let dropped = first.seq.saturating_sub(after.saturating_add(1));
             if dropped > 0 {
                 lines.push(format!(
-                    "更早的 {dropped} 条事件已超出最近 {WAKE_BACKLOG} 条的保留范围，无法重送。"
+                    "更早的 {dropped} 条事件已超出最近 {WAKE_BACKLOG} 条的保留范围，没攒下。"
                 ));
             }
         }
@@ -112,7 +149,6 @@ impl Inbox {
                 .filter(|line| line.seq > after)
                 .map(|line| format!("[事件 #{}] {}", line.seq, line.text)),
         );
-        state.replay_after = previous;
         state.reported = state.sequence;
         state.replaying_connection = false;
         lines
@@ -141,20 +177,29 @@ impl Interruptions for Inbox {
     }
 }
 
+/// 在途调用的记账；调用被取消（future 丢弃）时同样归还。
+struct CallInFlight<'a> {
+    inbox: &'a Inbox,
+    /// 调用开始时信箱已装入回执的末条。
+    since: u64,
+}
+
+impl Drop for CallInFlight<'_> {
+    fn drop(&mut self) {
+        self.inbox.state.lock().expect("信箱锁中毒").in_flight -= 1;
+        // 在途数变了：等着敲门的一侧要重新判断。
+        self.inbox.bell.notify_waiters();
+    }
+}
+
 pub struct McpBody {
     dispatcher: Arc<Dispatcher>,
     inbox: Arc<Inbox>,
-    frames: Mutex<FrameReplies>,
+    frames: Mutex<FrameComposer>,
     snapshots: Arc<dyn SnapshotSource>,
     read_mark: Arc<ChatReadMark>,
     /// 动作依次执行；wait 不拿这把锁，等待期间仍能调身体工具。
     turn: tokio::sync::Mutex<()>,
-}
-
-struct FrameReplies {
-    composer: FrameComposer,
-    /// 同事件窗口一样，只重送上一回执新装配的行；不把重送再存一遍。
-    previous: Vec<String>,
 }
 
 impl McpBody {
@@ -167,10 +212,7 @@ impl McpBody {
         Self {
             dispatcher,
             inbox,
-            frames: Mutex::new(FrameReplies {
-                composer: FrameComposer::new(),
-                previous: Vec::new(),
-            }),
+            frames: Mutex::new(FrameComposer::new()),
             snapshots,
             read_mark,
             turn: tokio::sync::Mutex::new(()),
@@ -185,6 +227,7 @@ impl bridge::body::Body for McpBody {
 
     fn call(&self, call: ToolCall) -> PortFuture<'_, ToolResult> {
         Box::pin(async move {
+            let in_flight = self.inbox.begin_call();
             let call_id = call.id.clone();
             let outcome = {
                 let _turn = if call.name.as_str() == "wait" {
@@ -210,26 +253,15 @@ impl bridge::body::Body for McpBody {
             };
 
             // 此后没有 await：取消不会落在推进游标与构造回执之间。
-            // 构造回执仍不代表宿主收到；下一回执及重接有明确的有限重送。
-            let mut during = self.inbox.reply_lines();
+            // 构造回执仍不代表宿主收到；重新接入时重送保留的事件与全量处境。
+            let mut during = self.inbox.reply_lines_since(in_flight.since);
             let snapshot = self.snapshots.latest();
-            {
-                let mut frames = self.frames.lock().expect("帧锁中毒");
-                let current = frames
-                    .composer
-                    .compose_on_pull(&snapshot, self.read_mark.position());
-                let previous = std::mem::replace(&mut frames.previous, current.clone());
-                if !previous.is_empty() {
-                    during.push(
-                        "上次回执附带的处境、拾取与进展（可能重送；以下是当时的记录）：".to_owned(),
-                    );
-                    during.extend(previous);
-                }
-                if !current.is_empty() {
-                    during.push("本次拉取的处境与记录：".to_owned());
-                    during.extend(current);
-                }
-            }
+            during.extend(
+                self.frames
+                    .lock()
+                    .expect("帧锁中毒")
+                    .compose_on_pull(&snapshot, self.read_mark.position()),
+            );
             if !during.is_empty() {
                 result.content.push(ContentPart::text(format!(
                     "{DURING}\n{}",
@@ -242,8 +274,12 @@ impl bridge::body::Body for McpBody {
 
     fn attached(&self) {
         // 新接入重建处境与快照内事件的读取位置，并重送信箱保留历史。
-        self.frames.lock().expect("帧锁中毒").composer = FrameComposer::new();
+        *self.frames.lock().expect("帧锁中毒") = FrameComposer::new();
         self.inbox.attached();
+    }
+
+    fn next_nudge(&self) -> PortFuture<'_, u64> {
+        Box::pin(self.inbox.next_nudge())
     }
 }
 
@@ -482,7 +518,7 @@ mod tests {
         body.attached();
         let reconnected = body.call(ToolCall::new("act-2", "act", json!({}))).await;
         assert!(text_of(&reconnected).contains("[事件 #1]"));
-        assert!(text_of(&reconnected).contains("可能重送"));
+        assert!(text_of(&reconnected).contains("接入已重新建立"));
         assert_eq!(
             inbox.until_woken(Duration::ZERO).await,
             Woke::Timeout,
@@ -510,28 +546,22 @@ mod tests {
         assert!(text_of(&next).contains("[事件 #1]"));
     }
 
+    /// 处境只说一次；新接入从头再说一遍（新来的代理没见过）。
     #[tokio::test]
-    async fn the_previous_frame_repeats_pickups_even_after_the_snapshot_window_moves_on() {
+    async fn the_situation_is_said_once_and_again_for_a_new_attachment() {
         let (body, _, _) = fixture();
-        let discarded = body.call(ToolCall::new("lost", "act", json!({}))).await;
-        assert!(text_of(&discarded).contains("coal"));
-        // 首份回执被调用方丢弃；模拟下一张快照已不再保留那次拾取。
-        let mut body = match Arc::try_unwrap(body) {
-            Ok(body) => body,
-            Err(_) => panic!("没有在途调用，应可独占身体"),
-        };
-        body.snapshots = Arc::new(Snapshots(Arc::new(TickSnapshot::empty(
-            Epoch(1),
-            100,
-            ConnectionPhase::Ready,
-        ))));
+        let first = body.call(ToolCall::new("first", "act", json!({}))).await;
+        assert!(text_of(&first).contains("coal"));
+        let second = body.call(ToolCall::new("second", "act", json!({}))).await;
+        assert!(
+            !text_of(&second).contains("——期间——"),
+            "没变就不该重复：{}",
+            text_of(&second)
+        );
         body.detached();
         body.attached();
-        let recovered = body.call(ToolCall::new("after", "act", json!({}))).await;
-        assert!(text_of(&recovered).contains("可能重送"));
-        assert!(text_of(&recovered).contains("coal"));
-        let next = body.call(ToolCall::new("next", "act", json!({}))).await;
-        assert!(!text_of(&next).contains("coal"));
+        let reattached = body.call(ToolCall::new("third", "act", json!({}))).await;
+        assert!(text_of(&reattached).contains("——期间——"));
     }
 
     #[tokio::test]
@@ -591,24 +621,74 @@ mod tests {
         assert!(!first.contains("[事件 #3]"));
         inbox.attached();
         let replay = inbox.reply_lines().join("\n");
-        assert!(replay.contains("可能重送"));
+        assert!(replay.contains("接入已重新建立"));
         assert!(replay.contains("更早的 3 条事件"));
     }
 
     #[test]
-    fn the_previous_new_batch_is_repeated_once_without_draining_history() {
+    fn each_event_reaches_one_reply_without_draining_history() {
         let inbox = Inbox::new();
         inbox.push_wakes(vec!["甲".to_owned()]);
         assert!(inbox.reply_lines().join("\n").contains("[事件 #1] 甲"));
         inbox.push_wakes(vec!["乙".to_owned()]);
         let second = inbox.reply_lines().join("\n");
-        assert!(second.contains("可能重送"));
-        assert!(second.contains("[事件 #1] 甲"));
+        assert!(!second.contains("[事件 #1]"), "{second}");
         assert!(second.contains("[事件 #2] 乙"));
-        let third = inbox.reply_lines().join("\n");
-        assert!(!third.contains("[事件 #1]"));
-        assert!(third.contains("[事件 #2] 乙"));
         assert!(inbox.reply_lines().is_empty());
         assert_eq!(inbox.state.lock().unwrap().wakes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_idle_event_is_nudged_once_per_batch() {
+        let inbox = Inbox::new();
+        inbox.push_wakes(vec!["甲".to_owned()]);
+        assert_eq!(inbox.next_nudge().await, 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), inbox.next_nudge())
+                .await
+                .is_err(),
+            "同一批不该敲第二次"
+        );
+        inbox.push_wakes(vec!["乙".to_owned()]);
+        assert_eq!(inbox.next_nudge().await, 2);
+    }
+
+    /// 有调用在途就不敲：那次回执会把事件带回去。调用结束（含被取消）后才敲。
+    #[tokio::test]
+    async fn no_nudge_while_a_call_is_in_flight() {
+        let (body, inbox, actions) = fixture();
+        let acting = start_pending_call(
+            body.clone(),
+            ToolCall::new("blocked", "act", json!({"publish": true, "block": true})),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), inbox.next_nudge())
+                .await
+                .is_err(),
+            "调用在途时不该敲门"
+        );
+        acting.abort();
+        assert!(acting.await.unwrap_err().is_cancelled());
+        let pending = tokio::time::timeout(Duration::from_secs(1), inbox.next_nudge())
+            .await
+            .expect("取消的调用没带回事件，空闲后应敲门");
+        assert_eq!(pending, 1);
+        drop(actions);
+    }
+
+    /// 回执带走事件后，空闲也不再敲。
+    #[tokio::test]
+    async fn a_reply_that_carried_the_event_leaves_nothing_to_nudge() {
+        let (body, inbox, _) = fixture();
+        let reply = body
+            .call(ToolCall::new("act", "act", json!({"publish": true})))
+            .await;
+        assert!(text_of(&reply).contains("[事件 #1]"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), inbox.next_nudge())
+                .await
+                .is_err()
+        );
     }
 }
