@@ -64,6 +64,9 @@ pub(super) struct HeldInput {
     broken: Vec<String>,
     /// 上一 tick 准星下的方块。按着左键时它下一 tick 变成空气，就是挖碎了。
     crosshair_block: Option<([i32; 3], String)>,
+    placed: Vec<(String, [i32; 3])>,
+    /// 已经记进回执的放置序号；按下右键时取当时的，之后序号变大就是又放下了一块。
+    placement_seq: u32,
     last_use_tick: u64,
     /// 已松手、等下一 tick 交回执：为什么结束、在哪一 tick 结束。
     ending: Option<(InputEnd, u64)>,
@@ -118,6 +121,8 @@ pub(super) fn begin(
         pressed_on: None,
         broken: Vec::new(),
         crosshair_block: None,
+        placed: Vec::new(),
+        placement_seq: 0,
         last_use_tick: 0,
         ending: None,
         done,
@@ -142,6 +147,7 @@ pub(super) fn poll_input(inner: &Inner, bot: &Client) -> Option<Finished> {
         }
         return None;
     };
+    collect_placements(bot, held);
 
     let mut block_broke = false;
     if held.spec.mouse == Some(MouseButton::Left) {
@@ -201,6 +207,7 @@ fn press(inner: &Inner, bot: &Client, held: &mut HeldInput, now: u64) {
         }
         Some(MouseButton::Right) => {
             held.pressed_on = super::capture::capture_looking_at(bot);
+            held.placement_seq = latest_placement(bot).map_or(0, |last| last.seq);
             bot.start_use_item();
             held.last_use_tick = now;
         }
@@ -257,7 +264,32 @@ fn release(bot: &Client, spec: &InputSpec) {
     }
 }
 
-fn finish(bot: &Client, held: HeldInput, ended: InputEnd, now: u64) -> Finished {
+/// 右键预测出的放置（Azalea 按原版客户端逻辑判断；原版这时已经把方块放进了
+/// 自己的世界）。序号比上次记的大就是新放下的。
+fn collect_placements(bot: &Client, held: &mut HeldInput) {
+    if held.spec.mouse != Some(MouseButton::Right) {
+        return;
+    }
+    let Some(latest) = latest_placement(bot) else {
+        return;
+    };
+    if latest.seq > held.placement_seq {
+        held.placement_seq = latest.seq;
+        let pos = latest.placement.pos;
+        held.placed.push((
+            super::capture::canonical_registry_name(&latest.placement.block.to_string()),
+            [pos.x, pos.y, pos.z],
+        ));
+    }
+}
+
+fn latest_placement(bot: &Client) -> Option<azalea::interact::PredictedPlacement> {
+    bot.get_component::<azalea::interact::PredictedPlacement>()
+        .map(|placement| *placement)
+}
+
+fn finish(bot: &Client, mut held: HeldInput, ended: InputEnd, now: u64) -> Finished {
+    collect_placements(bot, &mut held);
     let look = bot.direction();
     let outcome = InputOutcome {
         ticks: held
@@ -272,6 +304,7 @@ fn finish(bot: &Client, held: HeldInput, ended: InputEnd, now: u64) -> Finished 
         mouse: held.spec.mouse,
         pressed_on: held.pressed_on,
         broken: held.broken,
+        placed: held.placed,
     };
     Finished {
         done: held.done,

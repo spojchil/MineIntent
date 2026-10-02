@@ -17,6 +17,7 @@ fn input_outcome(ended: world::InputEnd, ticks: u32) -> world::InputOutcome {
         mouse: None,
         pressed_on: None,
         broken: Vec::new(),
+        placed: Vec::new(),
     }
 }
 
@@ -595,6 +596,19 @@ fn input_receipt_says_when_the_click_hit_nothing() {
 
     outcome.mouse = None;
     assert!(!render_input_outcome(&outcome).contains("准星"));
+}
+
+/// 右键放下的方块写进回执：放置是瞬间动作，按客户端判断算数。
+#[test]
+fn input_receipt_lists_placed_blocks() {
+    let mut outcome = input_outcome(world::InputEnd::Elapsed, 1);
+    outcome.mouse = Some(world::MouseButton::Right);
+    outcome.placed = vec![("cobblestone".to_owned(), [0, 150, 1])];
+    let text = render_input_outcome(&outcome);
+    assert!(
+        text.contains("放下了：cobblestone（0, 150, 1）。"),
+        "{text}"
+    );
 }
 
 /// 朝向连续转身会累加（-225°），回执里归一到 [-180, 180)。

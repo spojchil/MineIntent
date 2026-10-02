@@ -221,6 +221,7 @@ mod tests {
                     mouse: spec.mouse,
                     pressed_on: None,
                     broken: Vec::new(),
+                    placed: Vec::new(),
                 })
             })
         }

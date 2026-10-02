@@ -159,6 +159,14 @@ pub fn render_input_outcome(outcome: &world::InputOutcome) -> String {
     if !outcome.broken.is_empty() {
         lines.push(format!("挖碎了：{}。", outcome.broken.join("、")));
     }
+    if !outcome.placed.is_empty() {
+        let placed: Vec<String> = outcome
+            .placed
+            .iter()
+            .map(|(name, [x, y, z])| format!("{name}（{x}, {y}, {z}）"))
+            .collect();
+        lines.push(format!("放下了：{}。", placed.join("、")));
+    }
     let [fx, fy, fz] = outcome.from;
     let [tx, ty, tz] = outcome.to;
     let horizontal = (tx - fx).hypot(tz - fz);

@@ -94,6 +94,7 @@ impl input::InputDoor for NoDoor {
                     face: "west".to_owned(),
                 }),
                 broken: vec!["stone".to_owned()],
+                placed: Vec::new(),
             })
         })
     }
