@@ -58,7 +58,13 @@ pub fn render_situation_lines(
     ];
     let unread = unread_chat_count(snap, chat_read);
     if unread > 0 {
-        lines.push((SituationLine::Unread, format!("聊天有 {unread} 条新消息。")));
+        // 死着打不开聊天框（原版死亡屏挡住聊天键），只说有，不招呼去翻。
+        let line = if snap.self_state.alive {
+            format!("聊天有 {unread} 条新消息。")
+        } else {
+            format!("聊天有 {unread} 条新消息，复活后才能翻看。")
+        };
+        lines.push((SituationLine::Unread, line));
     }
     lines.retain(|(_, line)| !line.is_empty());
     lines

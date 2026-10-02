@@ -233,6 +233,19 @@ fn unread_chat_skips_own_messages() {
 }
 
 #[test]
+fn unread_chat_while_dead_says_it_waits_for_respawn() {
+    let mut snap = snapshot();
+    snap.chat.entries = vec![chat_entry(90)];
+    snap.self_state.alive = false;
+
+    let text = render_situation(&snap, (1, 80));
+    assert!(
+        text.contains("聊天有 1 条新消息，复活后才能翻看。"),
+        "{text}"
+    );
+}
+
+#[test]
 fn unread_chat_counts_entries_after_the_mark_and_resets_across_epochs() {
     let mut snap = snapshot();
     snap.chat.entries = vec![chat_entry(50), chat_entry(80), chat_entry(95)];
