@@ -53,3 +53,7 @@ required-features = ["azalea"]
 [[example]]
 name = "input_probe"
 required-features = ["azalea"]
+
+[[example]]
+name = "right_click_probe"
+required-features = ["azalea"]

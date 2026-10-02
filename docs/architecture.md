@@ -1,7 +1,7 @@
 # 当前实现结构
 
 > 无产品权威。绑定 `feat/keymouse-actions` 当前工作树与
-> Azalea fork `4e29bc2eeee77bf81c21a0a803dfb6839d8371ae`、midturn
+> Azalea fork `950f9d73913fa9138101ef10c6ab273a7b6f7b1e`、midturn
 > `bf8bc7a7126dc2943145b03a0b4a3481de8177e1`。
 >
 > 本仓只有一条线。此前并存的两套实现都已移出：
@@ -146,7 +146,7 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
 | `state.rs` | `Inner`：共享状态、时间窗、写口队列——**可脱离 azalea 单测** |
 | `capture.rs` | ECS → `TickSnapshot` 直译 |
 | `job.rs` | `JobSlot`：后台任务的形状，**每个任务恰好一条终局**；现在没有动作接入 |
-| `input.rs` | 键鼠输入的时序：起手转向、下一 tick 按键、按满或提前结束后全部松开，回执经一次性通道送回 `Module::input` |
+| `input.rs` | 键鼠输入的时序：起手转向、下一 tick 按键、按满或提前结束后全部松开，回执经一次性通道送回 `Module::input`。右键交给 fork 的 `start_use_item`，它按原版 `startUseItem` 主手→副手逐步尝试（实体/方块 → 用物品），每步是否吃掉这次右键由 fork 的 `interact::predict` 按原版客户端分支预测 |
 | `connect.rs` | azalea 接入、客户端回调、停机 |
 | `door.rs` | `DoorCommand` 与 tick 内执行 |
 | `blocks.rs` | 成像拷贝的方块解码、渲染分类与原版光照属性表 |
