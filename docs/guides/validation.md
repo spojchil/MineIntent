@@ -82,13 +82,17 @@ npx @modelcontextprotocol/inspector --cli /abs/path/to/mineintent-mcp \
 - 协商版本、工具 schema、请求 ID 与错误形状正确；stdout 不混入日志。
 - 文字、执行失败和有效 PNG 图片回执能被客户端解码。
 - 取消、超时、EOF 后未完成调用得到清理；下一调用或下一控制者能继续操作。
-- 取消等待不消费事件；回执重送和重接历史可按 `seq` 识别，历史重送不使下一次
-  `wait` 反复立返。历史与序号仅属当前身体进程，此项不验证跨进程恢复、宿主确认
-  或 exactly-once 投递。
+- 取消等待不消费事件；顺序调用时每条事件只出现在一次回执里，`wait` 与动作重叠时
+  两边回执都带重叠期间的事件；重接历史可按 `seq` 识别，且不使下一次 `wait` 反复
+  立返。历史与序号仅属当前身体进程，此项不验证跨进程恢复、宿主确认或
+  exactly-once 投递。
+- 开场先发 `server/discover`（声明 `2026-07-28`）再 `initialize` 的客户端，探测得到
+  `-32022`，随后不带 `_meta` 的 `tools/list` 仍成功。
 - 身体不在线、迟启动和重启时，客户端获得明确失败并能主动重试；不声称客户端会
   自动重连或自动重新发现工具。
 - 不加载 channel 时，调用回执仍能带回事件，已有 `wait` 能提前返回；宿主完全空闲
-  时不要求模型自行开始新一轮。
+  时不要求模型自行开始新一轮。加载 channel 的 Claude Code 在空闲时收到敲门后自行
+  调用工具取回事件。
 
 [官方 Conformance](https://github.com/modelcontextprotocol/conformance) 的公开服务器
 检查入口使用 HTTP `--url`，不能直接指向本仓私有 TCP 端口。可先采用 Inspector、
