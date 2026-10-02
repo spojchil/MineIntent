@@ -228,9 +228,10 @@ impl bridge::body::Body for McpBody {
     fn call(&self, call: ToolCall) -> PortFuture<'_, ToolResult> {
         Box::pin(async move {
             let in_flight = self.inbox.begin_call();
+            let waiting = call.name.as_str() == "wait";
             let call_id = call.id.clone();
             let outcome = {
-                let _turn = if call.name.as_str() == "wait" {
+                let _turn = if waiting {
                     None
                 } else {
                     Some(self.turn.lock().await)
@@ -254,7 +255,11 @@ impl bridge::body::Body for McpBody {
 
             // 此后没有 await：取消不会落在推进游标与构造回执之间。
             // 构造回执仍不代表宿主收到；重新接入时重送保留的事件与全量处境。
-            let mut during = self.inbox.reply_lines_since(in_flight.since);
+            // 只有 wait 按自己开始时的位置取：它可能被重叠调用的回执带走的事件叫醒，
+            // 回执里得有那件事。排队的动作按此刻的位置取——并行发的两个动作若也按
+            // 开始位置，后一个会把前一个回执已带走的事件再带一遍。
+            let since = if waiting { in_flight.since } else { u64::MAX };
+            let mut during = self.inbox.reply_lines_since(since);
             let snapshot = self.snapshots.latest();
             during.extend(
                 self.frames
@@ -562,6 +567,30 @@ mod tests {
         body.attached();
         let reattached = body.call(ToolCall::new("third", "act", json!({}))).await;
         assert!(text_of(&reattached).contains("——期间——"));
+    }
+
+    /// 代理在一条消息里并行发两个动作：事件只随先返回的那个回执带回一次。
+    #[tokio::test]
+    async fn parallel_actions_do_not_repeat_each_others_events() {
+        let (body, _, actions) = fixture();
+        let first = start_pending_call(
+            body.clone(),
+            ToolCall::new("first", "act", json!({"publish": true, "block": true})),
+        )
+        .await;
+        let second =
+            start_pending_call(body.clone(), ToolCall::new("second", "act", json!({}))).await;
+        actions.release.notify_one();
+        let (first, second) = tokio::time::timeout(Duration::from_secs(1), async {
+            (first.await.unwrap(), second.await.unwrap())
+        })
+        .await
+        .unwrap();
+        let carried = [&first, &second]
+            .iter()
+            .filter(|reply| text_of(reply).contains("[事件 #1]"))
+            .count();
+        assert_eq!(carried, 1, "{}\n---\n{}", text_of(&first), text_of(&second));
     }
 
     #[tokio::test]
