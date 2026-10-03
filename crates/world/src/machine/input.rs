@@ -21,7 +21,14 @@ use azalea::{BlockPos, Client, SprintDirection, WalkDirection};
 use tokio::sync::oneshot;
 
 use super::state::Inner;
-use crate::{HeldKeys, InputEnd, InputOutcome, InputSpec, LookingAt, MouseButton};
+use crate::{HeldKeys, InputEnd, InputOutcome, InputSpec, LookingAt, MouseButton, Unconfirmed};
+
+/// 右键点在方块上之后，等服务端开界面最多等到按下后的第几 tick。
+///
+/// 开不开界面是服务端说了算（箱子、工作台……），客户端判断不了；高延迟的服务器
+/// 上回声可能晚到好几 tick。等，但不无限等：超时就照「没开」回执，界面后来开了
+/// 会作为事件另行送到。
+const SCREEN_WAIT_TICKS: u64 = 5;
 
 /// 按住右键时重复使用的间隔。原版 `Minecraft.rightClickDelay` 每次使用后置 4，
 /// 按住期间不在使用物品（不是在吃、拉弓）就每 4 tick 再按一次——连续放方块就靠它。
@@ -70,6 +77,9 @@ pub(super) struct HeldInput {
     last_use_tick: u64,
     /// 已松手、等下一 tick 交回执：为什么结束、在哪一 tick 结束。
     ending: Option<(InputEnd, u64)>,
+    /// 右键点在方块上、已松手，等服务端开界面：在哪一 tick 松的、最晚等到哪一 tick。
+    awaiting_screen: Option<(u64, u64)>,
+    unconfirmed: Option<Unconfirmed>,
     done: oneshot::Sender<InputOutcome>,
 }
 
@@ -103,6 +113,9 @@ pub(super) fn begin(
         // 已经结束、只差交回执的那次照它自己的结局回执，不算被顶替。
         let (end, at) = previous
             .ending
+            .or(previous
+                .awaiting_screen
+                .map(|(at, _)| (InputEnd::Elapsed, at)))
             .unwrap_or((InputEnd::Replaced, inner.now_tick()));
         finish(bot, previous, end, at).send();
     }
@@ -125,6 +138,8 @@ pub(super) fn begin(
         placement_seq: 0,
         last_use_tick: 0,
         ending: None,
+        awaiting_screen: None,
+        unconfirmed: None,
         done,
     });
     Ok(())
@@ -138,6 +153,22 @@ pub(super) fn poll_input(inner: &Inner, bot: &Client) -> Option<Finished> {
 
     if let Some((end, at)) = held.ending {
         let held = slot.take().expect("上面刚借到 Some");
+        return Some(finish(bot, held, end, at));
+    }
+    if let Some((at, deadline)) = held.awaiting_screen {
+        let end = if screen_open(bot) {
+            InputEnd::ScreenOpened
+        } else if is_dead(bot) {
+            InputEnd::Died
+        } else if now >= deadline {
+            InputEnd::Elapsed
+        } else {
+            return None;
+        };
+        let mut held = slot.take().expect("上面刚借到 Some");
+        if end == InputEnd::Elapsed {
+            held.unconfirmed = Some(Unconfirmed::Screen);
+        }
         return Some(finish(bot, held, end, at));
     }
 
@@ -170,6 +201,10 @@ pub(super) fn poll_input(inner: &Inner, bot: &Client) -> Option<Finished> {
             held.ending = Some((end, now));
             return None;
         }
+        if end == InputEnd::Elapsed && awaits_screen(held, pressed_tick, now) {
+            held.awaiting_screen = Some((now, pressed_tick + SCREEN_WAIT_TICKS));
+            return None;
+        }
         let held = slot.take().expect("上面刚借到 Some");
         return Some(finish(bot, held, end, now));
     }
@@ -185,6 +220,57 @@ pub(super) fn poll_input(inner: &Inner, bot: &Client) -> Option<Finished> {
         held.last_use_tick = now;
     }
     None
+}
+
+/// 右键点在方块上、什么也没放下、按下还不到 [`SCREEN_WAIT_TICKS`]：服务端可能
+/// 正要开界面，回执要等它。按得更久的，服务端早就来得及回了。
+fn awaits_screen(held: &HeldInput, pressed_tick: u64, now: u64) -> bool {
+    let Some(LookingAt::Block { name, .. }) = &held.pressed_on else {
+        return false;
+    };
+    held.spec.mouse == Some(MouseButton::Right)
+        // 潜行时原版不碰方块的交互，直接用手里的东西（手里有东西时）；保守起见潜行就不等。
+        && !held.spec.keys.sneak
+        && opens_menu(name)
+        && held.placed.is_empty()
+        && now < pressed_tick + SCREEN_WAIT_TICKS
+}
+
+/// 右键会让服务端开界面的方块（注册名，不带命名空间）。
+///
+/// 按 26.1.2 反编译：`world/level/block` 下 `useWithoutItem` 里 `openMenu` 的方块类——
+/// 铁砧、木桶、信标、高炉、酿造台、制图台、箱子（含陷阱箱）、合成器、工作台、发射器
+/// （含投掷器）、附魔台、末影箱、熔炉、砂轮、漏斗、讲台、织布机、潜影盒、锻造台、
+/// 烟熏炉、切石机。箱子上方被挡、潜影盒开口被挡时服务端也不开，那时就是等到超时。
+fn opens_menu(name: &str) -> bool {
+    const MENU_BLOCKS: &[&str] = &[
+        "anvil",
+        "chipped_anvil",
+        "damaged_anvil",
+        "barrel",
+        "beacon",
+        "blast_furnace",
+        "brewing_stand",
+        "cartography_table",
+        "chest",
+        "trapped_chest",
+        "crafter",
+        "crafting_table",
+        "dispenser",
+        "dropper",
+        "enchanting_table",
+        "ender_chest",
+        "furnace",
+        "grindstone",
+        "hopper",
+        "lectern",
+        "loom",
+        "smithing_table",
+        "smoker",
+        "stonecutter",
+    ];
+    let name = name.strip_prefix("minecraft:").unwrap_or(name);
+    MENU_BLOCKS.contains(&name) || name.ends_with("shulker_box")
 }
 
 /// 连接结束：松开并丢掉发送端，等待方如实收到「连接已结束」。
@@ -305,6 +391,7 @@ fn finish(bot: &Client, mut held: HeldInput, ended: InputEnd, now: u64) -> Finis
         pressed_on: held.pressed_on,
         broken: held.broken,
         placed: held.placed,
+        unconfirmed: held.unconfirmed,
     };
     Finished {
         done: held.done,
@@ -417,6 +504,71 @@ mod tests {
             right,
             ..HeldKeys::default()
         }
+    }
+
+    fn right_click_on(target: Option<LookingAt>) -> HeldInput {
+        let (done, _) = oneshot::channel();
+        HeldInput {
+            spec: InputSpec {
+                keys: HeldKeys::default(),
+                mouse: Some(MouseButton::Right),
+                turn: None,
+                ticks: 1,
+            },
+            queued_tick: 0,
+            pressed_tick: Some(10),
+            from: [0.0; 3],
+            pressed_on: target,
+            broken: Vec::new(),
+            crosshair_block: None,
+            placed: Vec::new(),
+            placement_seq: 0,
+            last_use_tick: 10,
+            ending: None,
+            awaiting_screen: None,
+            unconfirmed: None,
+            done,
+        }
+    }
+
+    /// 只有右键点在方块上、没放下东西、按下不到 5 tick 时才等服务端开界面。
+    #[test]
+    fn waits_for_a_screen_only_after_a_short_right_click_on_a_block() {
+        let chest = Some(LookingAt::Block {
+            name: "chest".to_owned(),
+            position: [0, 64, 0],
+            face: "north".to_owned(),
+        });
+        let mut held = right_click_on(chest.clone());
+        assert!(awaits_screen(&held, 10, 11));
+        assert!(!awaits_screen(&held, 10, 15), "按满 5 tick 就不再等");
+
+        held.placed.push(("cobblestone".to_owned(), [0, 65, 0]));
+        assert!(
+            !awaits_screen(&held, 10, 11),
+            "放下了方块就是客户端已有结果"
+        );
+
+        assert!(!awaits_screen(&right_click_on(None), 10, 11), "没对着方块");
+
+        let mut left = right_click_on(chest.clone());
+        left.spec.mouse = Some(MouseButton::Left);
+        assert!(!awaits_screen(&left, 10, 11));
+
+        let mut sneaking = right_click_on(chest);
+        sneaking.spec.keys.sneak = true;
+        assert!(!awaits_screen(&sneaking, 10, 11), "潜行右键不开界面");
+
+        let door = Some(LookingAt::Block {
+            name: "oak_door".to_owned(),
+            position: [0, 64, 0],
+            face: "north".to_owned(),
+        });
+        assert!(
+            !awaits_screen(&right_click_on(door), 10, 11),
+            "门不开界面，不等"
+        );
+        assert!(opens_menu("minecraft:lime_shulker_box"));
     }
 
     #[test]

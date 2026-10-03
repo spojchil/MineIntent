@@ -95,6 +95,15 @@ pub struct InputOutcome {
     /// 按住右键期间放下的方块（注册名、位置，按先后）。
     /// 和原版一样按客户端判断算放下，不等服务端；服务端若拒绝，下一张画面会显示出来。
     pub placed: Vec<(String, [i32; 3])>,
+    /// 要等服务端回声的结果，限时内没等到：结果未知，不是「没发生」。
+    pub unconfirmed: Option<Unconfirmed>,
+}
+
+/// 等服务端确认、但限时内没等到的那件事。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Unconfirmed {
+    /// 右键点了会开界面的方块，界面没在限时内打开。
+    Screen,
 }
 
 impl HeldKeys {

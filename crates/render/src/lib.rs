@@ -143,6 +143,9 @@ pub fn render_input_outcome(outcome: &world::InputOutcome) -> String {
         world::InputEnd::BlockBroken => {
             format!("准星下的方块碎了，按住 {} 秒时松手。", trim_number(seconds))
         }
+        world::InputEnd::ScreenOpened if outcome.ticks <= 1 => {
+            "点按了一下，界面打开了。".to_owned()
+        }
         world::InputEnd::ScreenOpened => format!(
             "按住 {} 秒时界面打开了，按键全部松开。",
             trim_number(seconds)
@@ -158,6 +161,13 @@ pub fn render_input_outcome(outcome: &world::InputOutcome) -> String {
     }
     if !outcome.broken.is_empty() {
         lines.push(format!("挖碎了：{}。", outcome.broken.join("、")));
+    }
+    if outcome.unconfirmed == Some(world::Unconfirmed::Screen) {
+        lines.push(
+            "这个方块右键会由服务端开界面，但服务端 0.25 秒内没有回应：可能是延迟过高，\
+暂时无法确定开没开。界面若稍后打开会另行通知；拿不准时先等一下再看画面，或再按一次。"
+                .to_owned(),
+        );
     }
     if !outcome.placed.is_empty() {
         let placed: Vec<String> = outcome

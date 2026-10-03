@@ -95,6 +95,7 @@ impl input::InputDoor for NoDoor {
                 }),
                 broken: vec!["stone".to_owned()],
                 placed: Vec::new(),
+                unconfirmed: None,
             })
         })
     }

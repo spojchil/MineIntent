@@ -18,6 +18,7 @@ fn input_outcome(ended: world::InputEnd, ticks: u32) -> world::InputOutcome {
         pressed_on: None,
         broken: Vec::new(),
         placed: Vec::new(),
+        unconfirmed: None,
     }
 }
 
@@ -609,6 +610,17 @@ fn input_receipt_lists_placed_blocks() {
         text.contains("放下了：cobblestone（0, 150, 1）。"),
         "{text}"
     );
+}
+
+/// 等服务端开界面超时：说清楚是不确定，不是没开。
+#[test]
+fn input_receipt_explains_an_unconfirmed_screen() {
+    let mut outcome = input_outcome(world::InputEnd::Elapsed, 1);
+    outcome.mouse = Some(world::MouseButton::Right);
+    outcome.unconfirmed = Some(world::Unconfirmed::Screen);
+    let text = render_input_outcome(&outcome);
+    assert!(text.contains("可能是延迟过高"), "{text}");
+    assert!(text.contains("暂时无法确定"), "{text}");
 }
 
 /// 朝向连续转身会累加（-225°），回执里归一到 [-180, 180)。
