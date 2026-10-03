@@ -87,6 +87,7 @@ impl input::InputDoor for NoDoor {
                 to: [11.7, 72.0, 3.5],
                 yaw: -90.0,
                 pitch: 20.0,
+                keys: spec.keys,
                 mouse: spec.mouse,
                 pressed_on: Some(world::LookingAt::Block {
                     name: "stone".to_owned(),

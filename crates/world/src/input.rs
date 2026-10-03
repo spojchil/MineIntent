@@ -85,6 +85,8 @@ pub struct InputOutcome {
     /// 松开时的朝向（度）。
     pub yaw: f32,
     pub pitch: f32,
+    /// 按住的键。
+    pub keys: HeldKeys,
     /// 按的是哪个鼠标键；没按鼠标为 None。
     pub mouse: Option<MouseButton>,
     /// 按下鼠标那一刻准星所指；没按鼠标或准星没指着东西时为 None。

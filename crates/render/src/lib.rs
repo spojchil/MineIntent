@@ -138,6 +138,9 @@ fn looking_at_words(target: &world::LookingAt) -> String {
 pub fn render_input_outcome(outcome: &world::InputOutcome) -> String {
     let seconds = f64::from(outcome.ticks) / 20.0;
     let mut lines = vec![match outcome.ended {
+        world::InputEnd::Elapsed if outcome.mouse.is_none() && !outcome.keys.any() => {
+            "只转了视角，没有按键。".to_owned()
+        }
         world::InputEnd::Elapsed if outcome.ticks <= 1 => "点按了一下，已松开。".to_owned(),
         world::InputEnd::Elapsed => format!("按住 {} 秒后松开。", trim_number(seconds)),
         world::InputEnd::BlockBroken => {
@@ -583,6 +586,26 @@ pub fn render_inventory_change(entry: &world::InventoryChangeEntry) -> String {
     match &entry.item_name {
         Some(name) => format!("{place}当前是 {name} ×{}。", entry.count),
         None => format!("{place}当前是空的。"),
+    }
+}
+
+/// 自己会变的容器（熔炉族、酿造台）里，服务端改了自有格的通知措辞。
+pub fn render_container_change(
+    kind: &str,
+    space: &world::slots::SlotSpace,
+    entry: &world::InventoryChangeEntry,
+) -> String {
+    let container = match kind {
+        "furnace" => "熔炉",
+        "blast_furnace" => "高炉",
+        "smoker" => "烟熏炉",
+        "brewing_stand" => "酿造台",
+        other => other,
+    };
+    let address = space.describe(entry.slot);
+    match &entry.item_name {
+        Some(name) => format!("{container} {address} 现在是 {name} ×{}。", entry.count),
+        None => format!("{container} {address} 现在空了。"),
     }
 }
 

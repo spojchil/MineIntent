@@ -14,6 +14,7 @@ fn input_outcome(ended: world::InputEnd, ticks: u32) -> world::InputOutcome {
         to: [0.5, 64.0, 0.5],
         yaw: 90.0,
         pitch: 0.0,
+        keys: Default::default(),
         mouse: None,
         pressed_on: None,
         broken: Vec::new(),
@@ -48,7 +49,9 @@ fn input_receipt_says_why_it_let_go_and_what_changed() {
 
 #[test]
 fn input_receipt_for_a_tap_that_moved_nothing() {
-    let text = render_input_outcome(&input_outcome(world::InputEnd::Elapsed, 1));
+    let mut outcome = input_outcome(world::InputEnd::Elapsed, 1);
+    outcome.keys.jump = true;
+    let text = render_input_outcome(&outcome);
     assert_eq!(
         text,
         "点按了一下，已松开。\n位置没有变。\n现在面朝西（yaw 90°，pitch 0°）。"
@@ -691,6 +694,19 @@ fn hand_receipts_say_what_is_in_hand() {
     });
     assert!(text.contains("可能是延迟过高"), "{text}");
     assert!(text.contains("主手：cobblestone ×12；副手：空"), "{text}");
+}
+
+/// 只转视角、什么键都没按：不说成「点按了一下」。
+#[test]
+fn input_receipt_for_a_turn_only_says_no_key_was_pressed() {
+    let outcome = input_outcome(world::InputEnd::Elapsed, 1);
+    let text = render_input_outcome(&outcome);
+    assert!(text.starts_with("只转了视角，没有按键。"), "{text}");
+
+    let mut outcome = input_outcome(world::InputEnd::Elapsed, 1);
+    outcome.keys.forward = true;
+    let text = render_input_outcome(&outcome);
+    assert!(text.starts_with("点按了一下，已松开。"), "{text}");
 }
 
 /// 朝向连续转身会累加（-225°），回执里归一到 [-180, 180)。

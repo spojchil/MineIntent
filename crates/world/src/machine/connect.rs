@@ -344,8 +344,8 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             ClientboundGamePacket::TakeItemEntity(take) => {
                 let (by_self, by, item_name) =
                     super::capture::resolve_pickup(&bot, take.item_id, take.player_id);
-                // 包事件经通道转来，可能已晚于删实体：ECS 里查不到时退回上一 tick
-                // 快照里那个掉落物的名字（快照逐 tick 记着每个掉落物是什么）。
+                // 兜底：Azalea 收包时没查到（极少见）就退回上一 tick 快照里那个
+                // 掉落物的名字。
                 let item_name = item_name.or_else(|| {
                     inner
                         .latest

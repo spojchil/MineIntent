@@ -1,7 +1,7 @@
 # 当前实现结构
 
 > 无产品权威。绑定 `feat/keymouse-actions` 当前工作树与
-> Azalea fork `3f973d7402f402b54441f0db0e2ea82dd77de58f`、midturn
+> Azalea fork `c3da849fa270c51b681df80770f32c6b17f57b5e`、midturn
 > `bf8bc7a7126dc2943145b03a0b4a3481de8177e1`。
 >
 > 本仓只有一条线。此前并存的两套实现都已移出：

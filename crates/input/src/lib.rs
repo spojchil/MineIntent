@@ -218,6 +218,7 @@ mod tests {
                     to: [0.5, 64.0, 3.5],
                     yaw: 0.0,
                     pitch: 0.0,
+                    keys: spec.keys,
                     mouse: spec.mouse,
                     pressed_on: None,
                     broken: Vec::new(),

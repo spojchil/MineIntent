@@ -69,10 +69,14 @@ impl WakeCursors {
     /// `entity_key` 是自身 UUID；服务端不给发言者 UUID 时退回用户名比较。
     /// `inventory_screen_open`：**物品栏屏**开着才投递格位变化。
     ///
-    /// 容器（工作台、箱子、熔炉）的格位变化不再推送——改由模型自己
-    /// `container list`。推送在容器屏上是坏的：写口回执早于服务端确认，
+    /// 容器（工作台、箱子）里因自己动作而起的格位变化不推送——改由模型自己
+    /// `container list`。那种推送在容器屏上是坏的：写口回执早于服务端确认，
     /// 而模型的下一次请求在回执那一刻就发出，于是读数恒定落在它的下一个
     /// 动作之后，且它无从知道这一点。实盘三段独立序列零例外。
+    ///
+    /// 例外是**自己会变的容器**（熔炉族、酿造台）的自有格：燃料烧掉、成品出炉
+    /// 是随时间发生的，不是哪个动作的回声，没有上面那个错位；不推就只能反复
+    /// list 去等。这些格由服务端改的变化各推一次。
     pub fn collect(
         &mut self,
         snapshot: &TickSnapshot,
@@ -117,11 +121,17 @@ impl WakeCursors {
 
         for entry in &snapshot.inventory_changes.entries {
             // 游标先推进（含屏关着时错过的条目——过了就是过了，不回放）。
-            if advance(&mut self.inventory, entry.seq)
-                && inventory_screen_open
-                && wakes_on_inventory(entry)
-            {
+            if !advance(&mut self.inventory, entry.seq) {
+                continue;
+            }
+            if inventory_screen_open && wakes_on_inventory(entry) {
                 lines.push(render_inventory_change(entry));
+            } else if let Some(kind) = self_changing_container(snapshot, entry) {
+                lines.push(render::render_container_change(
+                    kind,
+                    &snapshot.self_state.inventory.space,
+                    entry,
+                ));
             }
         }
 
@@ -182,6 +192,23 @@ fn wakes_on(stage: JobStage) -> bool {
 fn wakes_on_inventory(entry: &InventoryChangeEntry) -> bool {
     // 只认玩家物品栏屏（容器 0）。容器格位走拉取，见 `collect` 的说明。
     entry.container_id == 0 && entry.source == FactSource::ServerObserved
+}
+
+/// 这条变化是不是开着的「自己会变的容器」的自有格、由服务端改的；是则给出容器种类。
+fn self_changing_container<'a>(
+    snapshot: &'a TickSnapshot,
+    entry: &InventoryChangeEntry,
+) -> Option<&'a str> {
+    let open = snapshot.open_screen.as_ref()?;
+    if open.container_id != entry.container_id || entry.source != FactSource::ServerObserved {
+        return None;
+    }
+    let own_slots = match open.kind.as_str() {
+        "furnace" | "blast_furnace" | "smoker" => 3,
+        "brewing_stand" => 5,
+        _ => return None,
+    };
+    (entry.slot < own_slots).then_some(open.kind.as_str())
 }
 
 fn render_inventory_change(entry: &InventoryChangeEntry) -> String {
@@ -417,6 +444,42 @@ mod tests {
         let lines = cursors.collect(&snap, identity(), true).lines;
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("合成结果格"), "{lines:?}");
+    }
+
+    /// 熔炉开着：服务端改的自有格（燃料、成品）各推一次；自己动作的回声、
+    /// 玩家区的格、工作台都不推。
+    #[test]
+    fn self_changing_containers_push_their_own_slots() {
+        let mut snap = snapshot();
+        let mut cursors = WakeCursors::default();
+        snap.open_screen = Some(world::OpenScreenState {
+            kind: "furnace".to_owned(),
+            container_id: 7,
+            title: None,
+        });
+        snap.self_state.inventory.space =
+            world::slots::SlotSpace::new(30, 38, None, world::slots::OwnArea::Furnace);
+        let furnace = |seq, slot, source| world::InventoryChangeEntry {
+            container_id: 7,
+            item_name: Some("iron_ingot".to_owned()),
+            count: 1,
+            ..inventory_change(seq, slot, source)
+        };
+        snap.inventory_changes = Window {
+            entries: vec![
+                furnace(1, 2, FactSource::ServerObserved),
+                furnace(2, 1, FactSource::Commanded),
+                furnace(3, 30, FactSource::ServerObserved),
+            ],
+        };
+        let lines = cursors.collect(&snap, identity(), false).lines;
+        assert_eq!(lines, vec!["熔炉 result 现在是 iron_ingot ×1。"]);
+
+        snap.open_screen.as_mut().unwrap().kind = "crafting".to_owned();
+        snap.inventory_changes
+            .entries
+            .push(furnace(4, 0, FactSource::ServerObserved));
+        assert!(cursors.collect(&snap, identity(), false).is_empty());
     }
 
     fn screen_entry(seq: u64, source: FactSource, event: ScreenEvent) -> world::ScreenEntry {

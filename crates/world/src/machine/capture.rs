@@ -469,16 +469,23 @@ pub(super) fn resolve_pickup(
         .get_component::<azalea::core::entity_id::MinecraftEntityId>()
         .is_some_and(|own| *own == picker);
 
+    // 包事件经通道转来时掉落物多半已被删：Azalea 收包当刻记下了被捡的是什么。
+    let mut item_name = bot
+        .get_component::<azalea::packet::game::TakenItems>()
+        .and_then(|taken| {
+            taken
+                .get(item_entity)
+                .map(|item| canonical_registry_name(&item.kind().to_string()))
+        });
     let mut ecs = bot.ecs.write();
     let mut query = ecs.query::<(
         &azalea::core::entity_id::MinecraftEntityId,
         Option<&azalea::entity::metadata::ItemItem>,
         Option<&GameProfileComponent>,
     )>();
-    let mut item_name = None;
     let mut by = None;
     for (id, item, profile) in query.iter(&ecs) {
-        if *id == item_entity {
+        if *id == item_entity && item_name.is_none() {
             item_name = item.map(|item| canonical_registry_name(&item.0.kind().to_string()));
         }
         if *id == picker {

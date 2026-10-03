@@ -13,8 +13,9 @@
 //!
 //! 回执在本 tick 的快照发布**之后**才交出（[`Finished::send`] 由 tick 收尾调用）：
 //! 收到回执的一方紧接着读最新快照拼处境，先交回执会让它读到上一 tick 的世界。
-//! 方块碎掉时先松手、下一 tick 再交回执：准星由 Azalea 在下一 tick 才对着
-//! 碎后的世界重算，早一 tick 交出，处境里的准星还是刚挖掉的那块。
+//! 方块碎掉、右键放下或用了方块时，先松手、等 Azalea 再跑过一轮调度才交回执：
+//! 世界是在 Azalea 的游戏 tick 里改的，准星要到下一轮才对着改后的世界重算，
+//! 早交出去，处境里的准星还是改之前那块。
 
 use azalea::block::{BlockState, BlockTrait};
 use azalea::core::hit_result::HitResult;
@@ -83,8 +84,8 @@ pub(super) struct HeldInput {
     /// 已经记进回执的放置序号；按下右键时取当时的，之后序号变大就是又放下了一块。
     placement_seq: u32,
     last_use_tick: u64,
-    /// 已松手、等下一 tick 交回执：为什么结束、在哪一 tick 结束。
-    ending: Option<(InputEnd, u64)>,
+    /// 已松手、等 Azalea 再跑一轮调度后交回执。
+    ending: Option<Ending>,
     /// 按下右键时准星下的方块和它当时的状态：用过之后拿来比变了什么。
     pressed_block: Option<(BlockPos, BlockState)>,
     /// 已经记进回执的方块使用序号，规则同 `placement_seq`。
@@ -96,6 +97,14 @@ pub(super) struct HeldInput {
     awaiting: Option<Awaiting>,
     unconfirmed: Option<Unconfirmed>,
     done: oneshot::Sender<InputOutcome>,
+}
+
+/// 已松手、只差交回执：为什么结束、在哪一 tick 结束、当时 Azalea 的 `TicksConnected`。
+#[derive(Clone, Copy, Debug)]
+struct Ending {
+    end: InputEnd,
+    at: u64,
+    azalea_tick: u64,
 }
 
 /// 松手之后在等的服务端回声：等什么、在哪一 tick 松的、最晚等到哪一 tick。
@@ -136,6 +145,7 @@ pub(super) fn begin(
         // 已经结束、只差交回执的那次照它自己的结局回执，不算被顶替。
         let (end, at) = previous
             .ending
+            .map(|ending| (ending.end, ending.at))
             .or(previous
                 .awaiting
                 .map(|awaiting| (InputEnd::Elapsed, awaiting.at)))
@@ -179,7 +189,15 @@ pub(super) fn poll_input(inner: &Inner, bot: &Client) -> Option<Finished> {
     let mut slot = inner.held_input.lock();
     let held = slot.as_mut()?;
 
-    if let Some((end, at)) = held.ending {
+    if let Some(Ending {
+        end,
+        at,
+        azalea_tick,
+    }) = held.ending
+    {
+        if azalea_ticks(bot) <= azalea_tick {
+            return None;
+        }
         let held = slot.take().expect("上面刚借到 Some");
         return Some(finish(bot, held, end, at));
     }
@@ -233,7 +251,11 @@ pub(super) fn poll_input(inner: &Inner, bot: &Client) -> Option<Finished> {
     if let Some(end) = decide_end(pressed_tick, held.spec.ticks, now, observed) {
         release(bot, &held.spec);
         if end == InputEnd::BlockBroken {
-            held.ending = Some((end, now));
+            held.ending = Some(Ending {
+                end,
+                at: now,
+                azalea_tick: azalea_ticks(bot),
+            });
             return None;
         }
         let changed = block_changed(bot, held);
@@ -242,6 +264,15 @@ pub(super) fn poll_input(inner: &Inner, bot: &Client) -> Option<Finished> {
                 what,
                 at: now,
                 deadline: pressed_tick + SERVER_WAIT_TICKS,
+            });
+            return None;
+        }
+        // 右键可能刚放下或改了方块：同样等准星重算。
+        if held.spec.mouse == Some(MouseButton::Right) {
+            held.ending = Some(Ending {
+                end,
+                at: now,
+                azalea_tick: azalea_ticks(bot),
             });
             return None;
         }
@@ -549,6 +580,7 @@ fn finish(bot: &Client, mut held: HeldInput, ended: InputEnd, now: u64) -> Finis
         to: position(bot).unwrap_or(held.from),
         yaw: look.y_rot(),
         pitch: look.x_rot(),
+        keys: held.spec.keys,
         mouse: held.spec.mouse,
         pressed_on: held.pressed_on,
         broken: held.broken,
