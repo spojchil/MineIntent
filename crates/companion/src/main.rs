@@ -8,6 +8,7 @@
 //!
 //! 配置全走环境变量；API key 只从文件读，不进命令行与日志。
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,15 +28,18 @@ use screens::{
 use world::{ConnectionConfig, DoorCommand, Module, SnapshotSource};
 
 mod client_jar;
+mod console_log;
 mod doorbell;
 mod frame;
 mod language;
 mod mcp_entry;
 mod model_config;
+mod paths;
 mod picture;
 #[cfg(test)]
 mod picture_wire_tests;
 mod situation;
+mod transcript;
 mod wake;
 
 use doorbell::Doorbell;
@@ -186,13 +190,6 @@ impl InventoryDoor for ModuleInventoryDoor {
     }
 }
 
-/// 诊断轨迹：把每一轮模型说了什么、调了哪些工具、工具回了什么写进一个文件。
-///
-/// 只在 `MINEINTENT_TRACE_FILE` 给了路径时装配。默认不开的理由与内核 wire 日志
-/// 同款：内容**未经脱敏**（聊天原文都在里面），落盘或外传前要自己看一眼。
-///
-/// 不记 `ModelRequestTranscript`——那是每次请求的整份上下文，量级完全不同，
-/// 要看那个另说。这里只回答「它做了什么」。
 /// 压缩线设在**服务商上下文窗口的 95%**。
 ///
 /// 压缩本身当前是空实现（`context::ContextStrategy` 的 `Compaction`），所以这条线现在
@@ -270,133 +267,6 @@ impl agent::Observer for CompactionFlag {
     fn observe(&self, event: &agent::AgentEvent) {
         if matches!(event, agent::AgentEvent::CompactionFinished { .. }) {
             self.0.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-}
-
-struct TraceObserver(std::sync::Mutex<std::fs::File>);
-
-impl TraceObserver {
-    fn open(path: &str) -> Result<Self, String> {
-        std::fs::File::create(path)
-            .map(|file| Self(std::sync::Mutex::new(file)))
-            .map_err(|error| format!("诊断轨迹文件打不开（{path}）：{error}"))
-    }
-
-    fn write(&self, line: &str) {
-        use std::io::Write;
-        // 诊断出口失败不该拖垮同伴：写不进去就算了，别 panic 进观察端旁路。
-        if let Ok(mut file) = self.0.lock() {
-            let _ = writeln!(file, "{line}");
-            let _ = file.flush();
-        }
-    }
-}
-
-/// 每次模型请求一行：这一份上下文有多大、命中了多少、花了多久。
-/// 每一轮的起止各一行：它怎么开始的、怎么结束的。
-///
-/// 轮级的 `ModelUsage` 是**累加**的（midturn `types.rs` 的 merge），回答不了
-/// 「单次请求的上下文多大」——那正是评估上下文时唯一要看的数。逐请求的
-/// `ModelRequestFinished` 才带真实数字。
-///
-/// 轮的生命周期事件（`RunStarted` / `RunCompleted` / `RunStopped` / `RunFailed`）
-/// 必须接住：没有它们，一轮卡住时轨迹上只剩请求行，看不出这轮再也没结束。
-///
-/// 观察端是旁路，补记不改任何行为。
-impl agent::Observer for TraceObserver {
-    fn observe(&self, event: &agent::AgentEvent) {
-        match event {
-            agent::AgentEvent::ModelRequestStarted {
-                request_index,
-                transcript_items,
-                function_tools,
-                ..
-            } => self.write(&format!(
-                "[请求#{request_index}] 转录条目={transcript_items} 工具={function_tools}"
-            )),
-            agent::AgentEvent::ModelRequestFinished {
-                request_index,
-                duration_ms,
-                usage,
-                ..
-            } => {
-                let (input, cached, output) = usage
-                    .as_ref()
-                    .map(|u| {
-                        (
-                            u.input_tokens.unwrap_or(0),
-                            u.cached_input_tokens.unwrap_or(0),
-                            u.output_tokens.unwrap_or(0),
-                        )
-                    })
-                    .unwrap_or((0, 0, 0));
-                self.write(&format!(
-                    "[用量#{request_index}] 输入={input} 命中={cached} 未命中={} 输出={output} 耗时={duration_ms}ms",
-                    input.saturating_sub(cached)
-                ));
-            }
-            agent::AgentEvent::RunStarted {
-                run_id,
-                prior_transcript_items,
-                ..
-            } => self.write(&format!(
-                "[轮开始] id={run_id:?} 起始转录条目={prior_transcript_items}"
-            )),
-            agent::AgentEvent::RunCompleted {
-                run_id,
-                model_requests,
-                tool_batches,
-                ..
-            } => self.write(&format!(
-                "[轮结束] id={run_id:?} 结局=完成 请求数={model_requests} 工具批={tool_batches}"
-            )),
-            agent::AgentEvent::RunStopped { run_id, .. } => {
-                self.write(&format!("[轮结束] id={run_id:?} 结局=被停止"))
-            }
-            agent::AgentEvent::RunFailed {
-                run_id,
-                stage,
-                error_kind,
-                ..
-            } => self.write(&format!(
-                "[轮结束] id={run_id:?} 结局=失败 阶段={stage:?} 错误类别={error_kind:?}"
-            )),
-            _ => {}
-        }
-    }
-}
-
-impl agent::ContentObserver for TraceObserver {
-    fn observe(&self, event: &agent::ContentEvent) {
-        match event {
-            agent::ContentEvent::ModelResponseOutput { output, .. } => {
-                for part in &output.content {
-                    if let agent::ContentPart::Text { text } = part {
-                        self.write(&format!("[说] {text}"));
-                    }
-                }
-                for call in &output.tool_calls {
-                    self.write(&format!("[调用] {} {}", call.name.as_str(), call.arguments));
-                }
-            }
-            agent::ContentEvent::ToolBatchResults { results, .. } => {
-                for result in &results.results {
-                    let body: String = result
-                        .content
-                        .iter()
-                        .map(|part| match part {
-                            agent::ContentPart::Text { text } => text.clone(),
-                            agent::ContentPart::Json { value } => value.to_string(),
-                            agent::ContentPart::Image { .. } => "[图片]".to_owned(),
-                            other => format!("{other:?}"),
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    self.write(&format!("[回执/{:?}] {body}", result.status));
-                }
-            }
-            _ => {}
         }
     }
 }
@@ -491,7 +361,38 @@ fn retry_backoff(attempt: u32) -> Duration {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), String> {
+async fn main() -> std::process::ExitCode {
+    // 先接管控制台：此后所有输出（含 Azalea 自己的日志与 panic）都进 logs/latest.log。
+    let console = match paths::data_dir() {
+        Some(data) => match console_log::ConsoleLog::start(&data.join("logs")) {
+            Ok(console) => {
+                println!("[组合根] 日志：{}", console.path().display());
+                Some(console)
+            }
+            Err(reason) => {
+                println!("[组合根] 这次不写日志文件：{reason}");
+                None
+            }
+        },
+        None => {
+            println!("[组合根] 找不到数据目录，不写日志文件；可设 MINEINTENT_DATA_DIR");
+            None
+        }
+    };
+    let result = run().await;
+    if let Err(error) = &result {
+        eprintln!("[组合根] 退出：{error}");
+    }
+    if let Some(console) = console {
+        console.finish();
+    }
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(_) => std::process::ExitCode::FAILURE,
+    }
+}
+
+async fn run() -> Result<(), String> {
     // ---- 配置 ----
     let host = env_or("MINEINTENT_HOST", "127.0.0.1");
     let port: u16 = env_or("MINEINTENT_PORT", "25565")
@@ -503,7 +404,7 @@ async fn main() -> Result<(), String> {
     let pictures_usable = entry == "mcp" || env_or("MODEL_PROTOCOL", "chat") != "chat";
     let jar_path = client_jar::locate(pictures_usable).await;
     let brain = match entry.as_str() {
-        "model" => Some(Brain::from_env(jar_path.is_some())?),
+        "model" => Some(Brain::from_env(jar_path.is_some(), &username)?),
         "mcp" => None,
         other => {
             return Err(format!(
@@ -620,8 +521,10 @@ async fn main() -> Result<(), String> {
         println!("[组合根] 工具表：{names:?}");
     }
 
+    let transcript = transcript::open(&username);
     let (Some(brain), Some(memory_file)) = (brain, memory_file) else {
         return mcp_entry::run(mcp_entry::Parts {
+            transcript,
             listener: body_listener.expect("mcp入口已绑定监听端口"),
             module,
             dispatcher,
@@ -656,11 +559,9 @@ async fn main() -> Result<(), String> {
         Arc::new(CompactionFlag(compacted.clone())),
         doorbell.clone(),
     ];
-    if let Ok(path) = std::env::var("MINEINTENT_TRACE_FILE") {
-        let trace = Arc::new(TraceObserver::open(&path)?);
-        assembled = assembled.with_content_observer(trace.clone());
-        observers.push(trace);
-        println!("[组合根] 诊断轨迹：{path}（内容未脱敏）");
+    if let Some(transcript) = transcript {
+        assembled = assembled.with_content_observer(transcript.clone());
+        observers.push(transcript);
     }
     // 内核的观察者是单槽（装第二个会顶掉第一个），所以这里自己分发。
     assembled = assembled.with_observer(Arc::new(FanOut(observers)));
@@ -878,15 +779,48 @@ fn wake_lines(
     lines
 }
 
+/// 长期记忆放哪：`MINEINTENT_MEMORY_FILE` 优先；否则是这个身体数据目录里的
+/// `memory.md`（见 [`paths`]）。
+///
+/// 早先缺省是工作目录里的 `companion-memory.md`。新位置还没有记忆、工作目录里有
+/// 旧文件时，复制过去一次（旧文件留着不动），免得换了位置就失忆。
+fn memory_path(username: &str) -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os("MINEINTENT_MEMORY_FILE").filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    let dir = paths::profile_dir(username)
+        .ok_or("找不到数据目录放记忆；可设 MINEINTENT_DATA_DIR 或 MINEINTENT_MEMORY_FILE")?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("建数据目录 {} 失败：{error}", dir.display()))?;
+    let path = dir.join("memory.md");
+    let legacy = Path::new("companion-memory.md");
+    if !path.exists() && legacy.is_file() {
+        std::fs::copy(legacy, &path).map_err(|error| {
+            format!(
+                "把旧记忆 {} 复制到 {} 失败：{error}",
+                legacy.display(),
+                path.display()
+            )
+        })?;
+        println!(
+            "[组合根] 旧记忆 {} 已复制到 {}；旧文件不再使用",
+            legacy.display(),
+            path.display()
+        );
+    }
+    println!("[组合根] 记忆：{}", path.display());
+    Ok(path)
+}
+
 /// 内置模型入口独有配置；MCP入口不会读取模型密钥、人设或记忆文件。
 struct Brain {
     model: Arc<HttpModel>,
-    memory_path: String,
+    memory_path: PathBuf,
     persona: String,
 }
 
 impl Brain {
-    fn from_env(pictures: bool) -> Result<Self, String> {
+    fn from_env(pictures: bool, username: &str) -> Result<Self, String> {
         let protocol_name = env_or("MODEL_PROTOCOL", "chat");
         // 推理档位是端点方言：给了才发，没给就不出现在请求体里（DeepSeek 不认这个字段）。
         // 注意本地网关对非法取值回的是误导性的 upstream_error，不是参数错误。
@@ -907,7 +841,7 @@ impl Brain {
         if let Some(effort) = &reasoning_effort {
             println!("[组合根] 推理档位：{effort}");
         }
-        let memory_path = env_or("MINEINTENT_MEMORY_FILE", "companion-memory.md");
+        let memory_path = memory_path(username)?;
         let persona = match std::env::var("MINEINTENT_PERSONA_FILE") {
             Ok(path) => std::fs::read_to_string(&path)
                 .map_err(|error| format!("读取人设文件失败（{path}）：{error}"))?,

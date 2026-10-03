@@ -222,6 +222,8 @@ pub struct McpBody {
     snapshots: Arc<dyn SnapshotSource>,
     /// 动作依次执行；wait 不拿这把锁，等待期间仍能调身体工具。
     turn: tokio::sync::Mutex<()>,
+    /// 外接代理的对话在它自己那边；这里记下它经过身体的每次调用与回执。
+    transcript: Option<Arc<crate::transcript::Transcript>>,
 }
 
 impl McpBody {
@@ -236,7 +238,16 @@ impl McpBody {
             frames: Mutex::new(FrameComposer::new()),
             snapshots,
             turn: tokio::sync::Mutex::new(()),
+            transcript: None,
         }
+    }
+
+    pub fn with_transcript(
+        mut self,
+        transcript: Option<Arc<crate::transcript::Transcript>>,
+    ) -> Self {
+        self.transcript = transcript;
+        self
     }
 }
 
@@ -250,6 +261,9 @@ impl bridge::body::Body for McpBody {
             let in_flight = self.inbox.begin_call();
             let waiting = call.name.as_str() == "wait";
             let call_id = call.id.clone();
+            if let Some(transcript) = &self.transcript {
+                transcript.call(&call);
+            }
             let outcome = {
                 let _turn = if waiting {
                     None
@@ -293,6 +307,9 @@ impl bridge::body::Body for McpBody {
                     during.join("\n")
                 )));
             }
+            if let Some(transcript) = &self.transcript {
+                transcript.result(&result);
+            }
             result
         })
     }
@@ -317,6 +334,7 @@ pub struct Parts {
     pub screen_state: Arc<ScreenState>,
     pub occupancy: Arc<Occupancy>,
     pub username: String,
+    pub transcript: Option<Arc<crate::transcript::Transcript>>,
 }
 
 /// 监听错误与外部停机都先收束接入/调用，再关闭世界连接。
@@ -330,8 +348,11 @@ pub async fn run(parts: Parts) -> Result<(), String> {
         screen_state,
         occupancy,
         username,
+        transcript,
     } = parts;
-    let body = Arc::new(McpBody::new(dispatcher, inbox.clone(), snapshots.clone()));
+    let body = Arc::new(
+        McpBody::new(dispatcher, inbox.clone(), snapshots.clone()).with_transcript(transcript),
+    );
     let shutdown = bridge::CancellationToken::new();
     let serving = bridge::body::serve(listener, body, shutdown.clone());
     tokio::pin!(serving);

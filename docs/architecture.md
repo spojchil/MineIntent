@@ -141,7 +141,14 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
 （`MINEINTENT_LANG`，缺省 `zh_cn`：`en_us` 取自客户端 JAR，其余经官方资源索引下载并缓存）。
 `world` 用它把系统消息与容器标题这类翻译组件渲染成文字；`render` 用它把物品、方块、生物群系、
 实体的注册名写成「本地化名（注册名）」。没装表时只出注册名，系统消息用 Azalea 自带的英文。
-`ContentPart::Image` 在框架内保留结构化图片，经 HTTP adapter 编码；诊断轨迹仅记
+本地文件的位置归 `companion::paths`：缓存（JAR、语言文件）与数据分开。数据目录里
+`companion::console_log` 在文件描述符层把 stdout/stderr 同时写进 `logs/latest.log`
+（含 Azalea/Bevy 日志与 panic，旧日志轮换留 20 份）；`companion::transcript` 把每次
+运行的对话写进 `profiles/<用户名>/sessions/`——内置入口挂在内核观察端，外接入口在
+`McpBody::call` 记调用与回执；内置入口的记忆在 `profiles/<用户名>/memory.md`。
+内核的会话检查点（midturn `persistence`）没有接：重启后对话从空开始。
+
+`ContentPart::Image` 在框架内保留结构化图片，经 HTTP adapter 编码；对话记录仅记
 `[图片]`，不展开 Base64。图片随框架会话历史保留，当前上下文压缩仍是空实现。
 
 时间窗不是队列：条目自带 `tick` 与单调 `seq`，「取某 seq 之后的条目」

@@ -8,9 +8,13 @@ publish = false
 
 [dependencies]
 bridge = { path = "../bridge" }
+# 文件名与对话记录里的本地时间。
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 agent = { workspace = true, features = ["openai", "anthropic"] }
 context = { path = "../context" }
 dispatch = { path = "../dispatch" }
+# 控制台分流进 logs/latest.log：在文件描述符层接管 stdout/stderr，跨平台。
+filedescriptor = "0.8"
 hand = { path = "../hand" }
 input = { path = "../input" }
 jobs = { path = "../jobs" }

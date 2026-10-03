@@ -61,34 +61,18 @@ pub async fn locate(automatic: bool) -> Option<PathBuf> {
     }
 }
 
-/// 自管缓存里这个版本的目录。`MINEINTENT_CACHE_DIR` 可整体改到别处。
+/// 自管缓存里这个版本的目录（缓存根见 [`crate::paths::cache_dir`]）。
 pub(crate) fn version_cache_dir() -> Option<PathBuf> {
-    let base = match std::env::var_os("MINEINTENT_CACHE_DIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => platform_cache_dir()?.join("mineintent"),
-    };
-    Some(base.join("versions").join(CLIENT_VERSION))
+    Some(
+        crate::paths::cache_dir()?
+            .join("versions")
+            .join(CLIENT_VERSION),
+    )
 }
 
 /// 自管缓存里的 JAR 位置。
 fn cached_path() -> Option<PathBuf> {
     Some(version_cache_dir()?.join("client.jar"))
-}
-
-/// 各平台惯用的缓存目录：Windows `%LOCALAPPDATA%`、macOS `~/Library/Caches`、
-/// 其余 `$XDG_CACHE_HOME`，缺省 `~/.cache`。
-fn platform_cache_dir() -> Option<PathBuf> {
-    let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
-    if cfg!(windows) {
-        return var("LOCALAPPDATA").map(PathBuf::from);
-    }
-    let home = var("HOME").map(PathBuf::from);
-    if cfg!(target_os = "macos") {
-        return home.map(|home| home.join("Library").join("Caches"));
-    }
-    var("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home.map(|home| home.join(".cache")))
 }
 
 /// 官方清单里这个版本客户端的下载信息。
@@ -148,8 +132,9 @@ pub(crate) fn write_atomically(target: &Path, bytes: &[u8]) -> Result<(), String
     let dir = target.parent().ok_or("缓存路径没有上级目录")?;
     std::fs::create_dir_all(dir)
         .map_err(|error| format!("建目录 {} 失败：{error}", dir.display()))?;
+    // 临时名带进程号：多开时两个进程同时首次下载，不会写进同一个半截文件。
     let mut partial = target.as_os_str().to_owned();
-    partial.push(".part");
+    partial.push(format!(".{}.part", std::process::id()));
     let partial = PathBuf::from(partial);
     std::fs::write(&partial, bytes)
         .map_err(|error| format!("写入 {} 失败：{error}", partial.display()))?;

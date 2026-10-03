@@ -43,7 +43,8 @@ Windows `%LOCALAPPDATA%\mineintent`、macOS `~/Library/Caches/mineintent`），�
 已有 JAR 可用 `MINEINTENT_CLIENT_JAR` 指过去（启动器装过该版本后在
 `.minecraft/versions/26.1.2/26.1.2.jar`）。下载失败不影响开玩，只是没有 `view`。
 系统消息与物品名默认按简体中文显示（同样首次从官方资源下载），`MINEINTENT_LANG` 可换成
-其他原版语言代码。
+其他原版语言代码。日志、记忆与对话记录在数据目录（Linux `~/.local/share/mineintent`），
+布局见 [workspace 指南](./docs/guides/rust-workspace.md#本地文件)。
 身体报告就绪后，在客户端里把 `target/debug/mineintent-mcp` 的绝对路径注册为 stdio
 服务，例如 Claude Code：
 

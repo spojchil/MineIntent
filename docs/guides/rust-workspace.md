@@ -54,7 +54,7 @@ export PATH="$HOME/.rustup/toolchains/nightly-x86_64-apple-darwin/bin:$PATH"
 | `MINEINTENT_BODY_ADDR` | `127.0.0.1:25580` | 外接入口的本机 TCP 地址；身体与转接器需使用相同值 |
 | `MINEINTENT_HOST` / `MINEINTENT_PORT` | `127.0.0.1` / `25565` | 目标服务器 |
 | `MINEINTENT_USERNAME` | `companion` | 离线身份（本版本只支持 offline） |
-| `MINEINTENT_MEMORY_FILE` | `companion-memory.md` | 长期记忆文件 |
+| `MINEINTENT_MEMORY_FILE` | `<数据目录>/profiles/<用户名>/memory.md` | 长期记忆文件。工作目录里有旧的 `companion-memory.md`、新位置还没有时，启动时复制过去一次 |
 | `MINEINTENT_PERSONA_FILE` | 内置占位 | 人设全文；Q01 未裁前是占位文本 |
 | `MINEINTENT_MODEL_API_KEY_FILE` | 无 | **推荐**：密钥文件路径 |
 | `MODEL_API_KEY` | 无 | 退路：密钥本身（会进 shell 历史，不推荐） |
@@ -65,9 +65,33 @@ export PATH="$HOME/.rustup/toolchains/nightly-x86_64-apple-darwin/bin:$PATH"
 | `MODEL_TIMEOUT_SECONDS` | `180` | 单次模型请求超时；会话内核那层自动比它多 30 秒 |
 | `MINEINTENT_MODEL_CONTEXT_TOKENS` | `1048576` | 模型上下文窗口（token）；输入超过它的 95% 时记一次压缩观察点。服务商接口不给这个数，换模型时要手工改 |
 | `MINEINTENT_CLIENT_JAR` | 未设置 | 本地 26.1.2 客户端 JAR，只读；设置后加载资源并注册 `view` 图片工具。设为空串表示不要画面。未设置时：外接入口与 Responses/Anthropic 协议的内置入口用自管缓存里的 JAR，没有就从 Mojang 官方下载（校验 SHA1）；Chat 协议的内置入口不提供画面 |
+| `MINEINTENT_DATA_DIR` | 平台数据目录下的 `mineintent` | 删了就没了的东西：`logs/`（控制台日志）、`profiles/<用户名>/`（记忆、对话记录）。见下文「本地文件」 |
+| `MINEINTENT_TRACE_FILE` | `<数据目录>/profiles/<用户名>/sessions/<开始时间>.log` | 对话记录：说了什么、调了哪些工具、回执是什么，每行带时间。两条入口都记；设为空串表示不记。内容未脱敏 |
 | `MINEINTENT_CACHE_DIR` | 平台缓存目录下的 `mineintent` | 自管缓存的位置；JAR 在其下 `versions/26.1.2/client.jar`，语言文件在 `versions/26.1.2/lang/` |
 | `MINEINTENT_LANG` | `zh_cn` | 原版语言代码（如 `zh_cn`、`zh_tw`、`ja_jp`、`en_us`）。系统消息（死因、成就、命令反馈）、容器标题按它翻译，物品、方块、实体、生物群系名写成「本地化名（注册名）」。`en_us` 取自客户端 JAR，其余首次从 Mojang 官方资源下载（校验 SHA1）进缓存；取不到退回 `en_us`，再不行只出注册名。设为空串表示不翻译 |
 | `MINEINTENT_VIEW_SIZE` | `1920x1080` | `view` 的屏幕像素尺寸 `宽x高`（每边 1–2048）；`view` 的 `region` 只从这块屏幕上裁，不会更清楚 |
+
+### 本地文件
+
+和启动器一样，缓存与数据分开放：
+
+| | Linux | Windows | macOS |
+|---|---|---|---|
+| 缓存（`MINEINTENT_CACHE_DIR`） | `~/.cache/mineintent` | `%LOCALAPPDATA%\mineintent` | `~/Library/Caches/mineintent` |
+| 数据（`MINEINTENT_DATA_DIR`） | `~/.local/share/mineintent` | `%APPDATA%\mineintent` | `~/Library/Application Support/mineintent` |
+
+```text
+<缓存>/versions/26.1.2/client.jar        客户端 JAR（删了会重新下载）
+<缓存>/versions/26.1.2/lang/<code>.json  语言文件（同上）
+<数据>/logs/latest.log                   本次运行的全部控制台输出，含 Azalea 日志与 panic
+<数据>/logs/<开始时间>.log               之前的运行，留最近 20 份
+<数据>/profiles/<用户名>/memory.md        长期记忆（内置模型入口）
+<数据>/profiles/<用户名>/sessions/*.log   每次运行的对话记录
+```
+
+多开时按用户名分开，互不覆盖。日志与对话记录里有聊天原文和服务器地址，只在本机；
+外传前自己看一眼。重启后内置模型从空对话开始，只带着记忆文件；对话记录是给人看的，
+不会被读回模型。
 
 模型、密钥、人设与记忆变量只用于内置 `model` 入口。外接 `mcp` 入口的模型与会话
 配置由客户端管理。
