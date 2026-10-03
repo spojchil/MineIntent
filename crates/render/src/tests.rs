@@ -700,6 +700,11 @@ fn input_receipt_wraps_the_yaw() {
     outcome.yaw = -225.0;
     let text = render_input_outcome(&outcome);
     assert!(text.contains("yaw 135°"), "{text}");
+
+    outcome.yaw = -0.3;
+    outcome.pitch = -0.15;
+    let text = render_input_outcome(&outcome);
+    assert!(text.contains("yaw 0°，pitch 0°"), "{text}");
 }
 
 /// 群系接在维度后面——同属「我在哪」，都是 F3 免费常驻的那一档。

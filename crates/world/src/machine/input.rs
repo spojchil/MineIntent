@@ -1,7 +1,10 @@
 //! 键鼠输入的时序：起手转向 → 下一 tick 按键 → 按满时长（或提前结束）→ 全部松开。
 //!
-//! 为什么按键晚一 tick：准星（`HitResultComponent`）由 azalea 在自己的 tick 里
-//! 按当前朝向重算。转向和按鼠标若在同一刻，按下去的会是转之前指着的东西。
+//! 为什么按键要晚：准星（`HitResultComponent`）由 azalea 在自己的调度里按当前朝向
+//! 重算。转向和按鼠标若在同一刻，按下去的会是转之前指着的东西。我们的 tick 是
+//! azalea 经通道异步送来的 `Event::Tick`，处理慢了会积压，连着处理的两个 tick 之间
+//! azalea 未必跑过调度——所以不按我们的 tick 数算，等 azalea 自己的 `TicksConnected`
+//! 走过转向那一刻再按：那一轮调度跑完，准星已按新朝向重算。
 //!
 //! 同一时刻只有一次输入在按；新输入顶替旧输入（旧的以 [`InputEnd::Replaced`] 回执）。
 //! 判定是纯函数（[`decide_end`]、[`walk_direction`]），副作用只在 [`poll_input`] 与
@@ -67,6 +70,8 @@ impl std::fmt::Debug for InputCompletion {
 pub(super) struct HeldInput {
     spec: InputSpec,
     queued_tick: u64,
+    /// 转向时 azalea 的 `TicksConnected`；它变大之前不按键。
+    turned_at: u64,
     /// 真正按下的 tick；`None` = 已转向、等准星刷新。
     pressed_tick: Option<u64>,
     from: [f64; 3],
@@ -147,6 +152,7 @@ pub(super) fn begin(
     *inner.held_input.lock() = Some(HeldInput {
         spec,
         queued_tick: inner.now_tick(),
+        turned_at: azalea_ticks(bot),
         pressed_tick: None,
         from,
         pressed_on: None,
@@ -201,7 +207,7 @@ pub(super) fn poll_input(inner: &Inner, bot: &Client) -> Option<Finished> {
     }
 
     let Some(pressed_tick) = held.pressed_tick else {
-        if now > held.queued_tick {
+        if now > held.queued_tick && azalea_ticks(bot) > held.turned_at {
             press(inner, bot, held, now);
         }
         return None;
@@ -336,6 +342,12 @@ fn opens_menu(name: &str) -> bool {
 /// 连接结束：松开并丢掉发送端，等待方如实收到「连接已结束」。
 pub(super) fn connection_ended(inner: &Inner) {
     inner.held_input.lock().take();
+}
+
+/// azalea 自己跑过的游戏 tick 数（准星在它的调度里重算）。
+fn azalea_ticks(bot: &Client) -> u64 {
+    bot.get_component::<azalea::tick_counter::TicksConnected>()
+        .map_or(0, |ticks| ticks.0)
 }
 
 fn press(inner: &Inner, bot: &Client, held: &mut HeldInput, now: u64) {
@@ -667,6 +679,7 @@ mod tests {
                 ticks: 1,
             },
             queued_tick: 0,
+            turned_at: 0,
             pressed_tick: Some(10),
             from: [0.0; 3],
             pressed_on: target,

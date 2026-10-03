@@ -202,10 +202,20 @@ pub fn render_input_outcome(outcome: &world::InputOutcome) -> String {
     lines.push(format!(
         "现在面朝{}（yaw {:.0}°，pitch {:.0}°）。",
         compass_word(f64::from(outcome.yaw)),
-        wrap_degrees(f64::from(outcome.yaw)),
-        outcome.pitch
+        whole_degrees(wrap_degrees(f64::from(outcome.yaw))),
+        whole_degrees(f64::from(outcome.pitch))
     ));
     lines.join("\n")
+}
+
+/// 取整到度。-0.2° 取整是 -0，显示出来像有方向，其实就是 0。
+fn whole_degrees(value: f64) -> f64 {
+    let rounded = value.round();
+    if rounded == 0.0 {
+        0.0
+    } else {
+        rounded
+    }
 }
 
 /// 右键对方块本身的使用：变了什么，或为什么说不准。
