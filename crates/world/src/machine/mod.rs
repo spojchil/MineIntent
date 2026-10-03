@@ -46,9 +46,9 @@ const PICKUP_WINDOW_ENTRIES: usize = 64;
 const SOUND_WINDOW_ENTRIES: usize = 256;
 /// 屏开/关事实窗条目上限。开关稀疏，小窗足矣。
 const SCREEN_WINDOW_ENTRIES: usize = 16;
-/// F 对调后等服务端回声最多等几 tick。和右键等开界面同一个限：高延迟服务器上
-/// 回声会晚到，等一下；但不无限等，超时如实说没等到。
-const HAND_ECHO_TICKS: u64 = 5;
+/// 只由服务端决定的结果（F 对调、复活）等回声最多等几 tick。和右键等开界面同一个限：
+/// 高延迟服务器上回声会晚到，等一下；但不无限等，超时如实说没等到。
+const SERVER_ECHO_TICKS: u64 = 5;
 
 /// 连接配置。v1 只有离线身份、重连固定 Never。
 #[derive(Clone, Debug)]
@@ -248,7 +248,7 @@ impl Module {
     /// F：主副手对调。
     ///
     /// 原版客户端只发请求、自己不动两只手，对调由服务端做完再同步回来。所以等
-    /// 回声，但最多等 [`HAND_ECHO_TICKS`] tick：高延迟时如实说没等到，不猜。
+    /// 回声，但最多等 [`SERVER_ECHO_TICKS`] tick：高延迟时如实说没等到，不猜。
     pub async fn swap_hands(&self) -> Result<crate::HandOutcome, String> {
         let before = self.latest();
         let inventory = &before.self_state.inventory;
@@ -258,29 +258,55 @@ impl Module {
             return Ok(crate::HandOutcome::SwapNoChange { both: main });
         }
         self.execute(DoorCommand::SwapOffhand).await?;
-        let started = before.tick;
-        let waited = tokio::time::timeout(Duration::from_secs(2), async {
+        let swapped = self
+            .await_echo(&before, |now| {
+                let inventory = &now.self_state.inventory;
+                (inventory.main_hand(), inventory.offhand()) != (main.clone(), offhand.clone())
+            })
+            .await;
+        Ok(match swapped {
+            Some(now) => crate::HandOutcome::Swapped {
+                main: now.self_state.inventory.main_hand(),
+                offhand: now.self_state.inventory.offhand(),
+            },
+            None => crate::HandOutcome::SwapUnconfirmed { main, offhand },
+        })
+    }
+
+    /// 复活：由服务端决定，等它的回声（快照里活过来），最多 [`SERVER_ECHO_TICKS`] tick。
+    /// 返回活过来时的快照；没等到为 None（不是没复活，是还不知道）。
+    pub async fn respawn(&self) -> Result<Option<Arc<TickSnapshot>>, String> {
+        let before = self.latest();
+        self.execute(DoorCommand::Respawn).await?;
+        Ok(self.await_echo(&before, |now| now.self_state.alive).await)
+    }
+
+    /// 发出之后等服务端的回声：每个新快照问一次 `arrived`，到了就返回那一帧；
+    /// 过了 [`SERVER_ECHO_TICKS`] tick、换了纪元或断线就返回 None。墙钟另有 2 秒兜底，
+    /// 防快照停更时空等。
+    async fn await_echo(
+        &self,
+        before: &TickSnapshot,
+        arrived: impl Fn(&TickSnapshot) -> bool,
+    ) -> Option<Arc<TickSnapshot>> {
+        tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 self.ticked().await;
                 let now = self.latest();
-                let inventory = &now.self_state.inventory;
-                let after = (inventory.main_hand(), inventory.offhand());
-                if after != (main.clone(), offhand.clone()) {
-                    return Some(after);
+                if arrived(&now) {
+                    return Some(now);
                 }
                 if now.epoch != before.epoch
                     || now.phase != ConnectionPhase::Ready
-                    || now.tick >= started + HAND_ECHO_TICKS
+                    || now.tick >= before.tick + SERVER_ECHO_TICKS
                 {
                     return None;
                 }
             }
         })
-        .await;
-        Ok(match waited {
-            Ok(Some((main, offhand))) => crate::HandOutcome::Swapped { main, offhand },
-            _ => crate::HandOutcome::SwapUnconfirmed { main, offhand },
-        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// 聊天出站：一行 = 一次原版输入循环，`/` 开头由 azalea 按原版语义路由为命令。

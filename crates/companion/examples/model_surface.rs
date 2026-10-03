@@ -453,7 +453,7 @@ async fn main() {
         call(
             inventory.as_ref(),
             "inventory",
-            json!({"action":"move","from":10,"to":38})
+            json!({"action":"move","from":"pack 1","to":"hotbar 2"})
         )
         .await
     );
@@ -462,7 +462,7 @@ async fn main() {
         call(
             inventory.as_ref(),
             "inventory",
-            json!({"action":"move","from":10,"to":99})
+            json!({"action":"move","from":"pack 1","to":"drop"})
         )
         .await
     );
@@ -479,7 +479,7 @@ async fn main() {
         call(
             container.as_ref(),
             "container",
-            json!({"action":"move","from":0,"to":40})
+            json!({"action":"move","from":"result","to":"hotbar 3"})
         )
         .await
     );
@@ -488,7 +488,7 @@ async fn main() {
         call(
             container.as_ref(),
             "container",
-            json!({"action":"move","from":37,"to":2,"count":1})
+            json!({"action":"move","from":"hotbar 0","to":"craft 1","count":1})
         )
         .await
     );
@@ -523,7 +523,7 @@ async fn main() {
         call(
             inventory.as_ref(),
             "inventory",
-            json!({"action":"move","from":1,"to":2}),
+            json!({"action":"move","from":"pack 1","to":"hotbar 2"}),
         )
         .await
     });
@@ -532,7 +532,7 @@ async fn main() {
         call(
             container.as_ref(),
             "container",
-            json!({"action":"move","from":1,"to":2})
+            json!({"action":"move","from":"pack 1","to":"hotbar 2"})
         )
         .await
     );
@@ -669,7 +669,7 @@ async fn main() {
             },
         ];
         println!(
-            "开屏（hand use_on 工作台后，服务器打开界面）：\n\n```text\n{}\n```\n",
+            "开屏（input 右键工作台后，服务器打开界面）：\n\n```text\n{}\n```\n",
             render::render_container_opened(&crafting_snap, "crafting", false)
         );
         let mut chest_snap = crafting_snap.clone();

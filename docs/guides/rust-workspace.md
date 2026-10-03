@@ -89,7 +89,7 @@ MINEINTENT_ENTRY=mcp MINEINTENT_HOST=127.0.0.1 MINEINTENT_PORT=25565 \
 
 该命令不请求模型，但会以默认用户名 `companion` 进入实际 Minecraft 世界。需要改名时
 设置 `MINEINTENT_USERNAME`。需要图片时在身体进程设置 `MINEINTENT_CLIENT_JAR`，
-指向本地 26.1.2 客户端 JAR；图片尺寸仍由 `MINEINTENT_VIEW_SIZE` 决定。未设置 JAR
+指向本地 26.1.2 客户端 JAR（官方启动器装过该版本后在 `.minecraft/versions/26.1.2/26.1.2.jar`）；图片尺寸仍由 `MINEINTENT_VIEW_SIZE` 决定。未设置 JAR
 时不提供 `view`，文字处境和其他工具仍可用。客户端和它选择的模型是否支持图片，
 需要分别验证。
 

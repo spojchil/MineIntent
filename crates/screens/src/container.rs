@@ -1,7 +1,7 @@
 //! 容器屏：所有服务端容器（工作台、箱子、熔炉……）共用的一件工具。
 //!
 //! 与物品栏屏的本质差异在**开/关路径**：容器真相在服务端——没有 open
-//! 动作，模型对容器方块使用（hand use_on），服务器发 OpenScreen，组合根
+//! 动作，模型用 input 右键点容器方块，服务器发 OpenScreen，组合根
 //! 随屏事实占域并投递格位清单与用法；关闭要通知服务器（ContainerClose），
 //! 服务器也可以强关。格子层面各容器只是"几个格子的差别"：move（移动/
 //! 合堆/对调）与丢弃动词一律通用（机器按活动菜单现状仲裁），每种容器的
@@ -115,7 +115,7 @@ impl ContainerScreen {
             None => {
                 return ToolResult::failure(
                     call_id,
-                    "没有开着的容器界面；先对容器方块使用（hand use_on），等界面打开的通知",
+                    "没有开着的容器界面；先用 input 的右键点容器方块，等界面打开的通知",
                 );
             }
         }
@@ -168,11 +168,11 @@ impl ContainerScreen {
         // 告诉它「一块木板的结果」，放第三块时告诉它「两块的结果」。它据此
         // 推出过一条几何结论，然后拿整局去验证一个错的前提。
         let summary = if to == DISCARD {
-            format!("已丢弃格 {from}")
+            format!("已丢弃格 {from}。")
         } else {
-            "已完成".to_owned()
+            "已完成。".to_owned()
         };
-        ToolResult::success_json(call_id, json!({ "done": summary }))
+        ToolResult::success(call_id, vec![ContentPart::text(summary)])
     }
 
     /// 现在的界面长什么样。
@@ -190,7 +190,7 @@ impl ContainerScreen {
         let Some(open) = snapshot.open_screen.as_ref() else {
             return ToolResult::failure(
                 call_id,
-                "现在没有开着的容器界面；先对容器方块使用（hand use_on），等界面打开的通知",
+                "现在没有开着的容器界面；先用 input 的右键点容器方块，等界面打开的通知",
             );
         };
         ToolResult::success(
@@ -222,7 +222,10 @@ impl ContainerScreen {
         self.state.close(ScreenKind::Container);
         self.occupancy.release(Domain::Screen);
         match outcome {
-            Ok(()) => ToolResult::success_json(call_id, json!({ "state": "closed" })),
+            Ok(()) => ToolResult::success(
+                call_id,
+                vec![ContentPart::text("容器界面关上了。".to_owned())],
+            ),
             Err(reason) => ToolResult::failure(call_id, reason),
         }
     }
@@ -249,14 +252,14 @@ impl dispatch::ToolProvider for ContainerScreen {
             }),
         );
         definition.description = Some(
-            "当前开着的容器界面（工作台、箱子、熔炉等共用）。没有 open：对容器方块\
-使用（hand use_on）后界面由服务器打开，你会收到格位清单；不确定这种容器怎么用就 \
-describe。开着期间用 move 搬动/合堆/摆料/取物，list 看现在的界面，close 关闭。\
+            "当前开着的容器界面（工作台、箱子、熔炉等共用）。没有 open：用 input 的右键\
+点容器方块，界面由服务器打开，你会收到格位清单；不确定这种容器怎么用就 describe。\
+开着期间用 move 搬动/合堆/摆料/取物，list 看现在的界面，close 关闭。\
 开着时无法移动或与世界交互。\
 容器在服务端，动作的效果不会立刻反映出来，回执只说这一步做完了、不报格位现状；\
-**要确认摆成什么样了就 list 一次**。\
-**一条消息里可以连发多个动作**——想好整套摆法就一次发全，比一次一格来回等快得多，\
-也不会看到摆到一半的中间产物。"
+**要确认摆成什么样了就 list 一次**。熔炉、酿造台里自己变的格（燃料烧掉、成品出炉）\
+会主动通知你，等它时用 wait 就行。\
+**一条消息里可以连发多个动作**——想好整套摆法就一次发全，比一次一格来回等快得多。"
                 .to_owned(),
         );
         vec![(
@@ -459,7 +462,7 @@ mod tests {
         )
         .await;
         assert_eq!(closed.status, ToolResultStatus::Error);
-        assert!(text_of(&closed).contains("hand use_on"));
+        assert!(text_of(&closed).contains("input 的右键"));
         assert!(fixture.door.calls.lock().unwrap().is_empty());
 
         server_opens(&fixture);
@@ -624,7 +627,7 @@ mod tests {
         let fixture = fixture(false);
         let refused = invoke(&fixture, json!({"action": "list"})).await;
         assert_eq!(refused.status, ToolResultStatus::Error);
-        assert!(text_of(&refused).contains("hand use_on"), "{refused:?}");
+        assert!(text_of(&refused).contains("input 的右键"), "{refused:?}");
 
         let screen = ContainerScreen::new(
             Arc::new(Occupancy::new()),

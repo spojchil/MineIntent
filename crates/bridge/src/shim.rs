@@ -39,7 +39,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_IN_FLIGHT: usize = 64;
 const INSTRUCTIONS: &str = "这组工具操作 Minecraft 世界里的一名玩家。\
-每次调用工具，回执末尾都可能附一段「——期间——」：周围情况的变化，以及上一次调用以来发生的事。";
+每次调用工具，回执末尾都可能附一段「——期间——」：周围情况的变化，以及上一次调用以来发生的事。\
+刚接入时第一次回执会带完整的处境（在哪、对着什么、身上有什么）；想看周围就用 view，\
+这是唯一看得见世界的方式。";
 
 /// 敲门通知的方法名（Claude Code channel 扩展）。
 const CHANNEL_METHOD: &str = "notifications/claude/channel";

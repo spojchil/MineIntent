@@ -136,8 +136,14 @@ impl JobsDoor for ModuleJobsDoor {
 struct ModulePresenceDoor(Arc<Module>);
 
 impl PresenceDoor for ModulePresenceDoor {
-    fn respawn<'a>(&'a self) -> agent::PortFuture<'a, Result<(), String>> {
-        Box::pin(async move { self.0.execute(DoorCommand::Respawn).await })
+    fn respawn<'a>(&'a self) -> agent::PortFuture<'a, Result<Option<[f64; 3]>, String>> {
+        Box::pin(async move {
+            let revived = self.0.respawn().await?;
+            Ok(revived.map(|now| {
+                let position = &now.self_state.position;
+                [position.x, position.y, position.z]
+            }))
+        })
     }
 }
 

@@ -309,7 +309,7 @@ impl Inner {
     /// 每 tick 与 ECS 的容器组件对账：变迁产开/关事实。
     ///
     /// 关闭是否自己下令由预期标记判定（close 动词先 [`Self::mark_expected_close`]）；
-    /// 打开一律 ServerObserved——即便由我们 use_on 触发，界面内容仍是服务器决定的。
+    /// 打开一律 ServerObserved——即便由我们右键触发，界面内容仍是服务器决定的。
     pub(super) fn track_open_screen(&self, current: Option<OpenScreenState>) {
         let mut open = self.open_screen.lock();
         if *open == current {

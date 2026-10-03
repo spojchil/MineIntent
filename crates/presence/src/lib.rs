@@ -23,13 +23,14 @@
 
 use std::sync::Arc;
 
-use agent::{PortFuture, ToolCall, ToolDefinition, ToolResult};
+use agent::{ContentPart, PortFuture, ToolCall, ToolDefinition, ToolResult};
 use dispatch::{ToolClass, ToolProvider};
 use serde_json::{json, Value};
 
 /// 接入模块写口的窄化。Err 是机器的如实拒绝（未连接、还活着等），原文转达。
+/// Ok 带回复活结果：服务端回声到了就是活过来的位置，没等到为 None。
 pub trait PresenceDoor: Send + Sync {
-    fn respawn<'a>(&'a self) -> PortFuture<'a, Result<(), String>>;
+    fn respawn<'a>(&'a self) -> PortFuture<'a, Result<Option<[f64; 3]>, String>>;
 }
 
 const TOOL_NAME: &str = "presence";
@@ -50,11 +51,19 @@ impl PresenceTools {
         };
         match arguments.get("action").and_then(Value::as_str) {
             Some("respawn") => match self.door.respawn().await {
-                // 只回执「请求已送达」。真的活过来是服务端的事，会由体征与
-                // 伤害窗自己说话——工具面替它宣布复活成功就是替被测系统作证。
-                Ok(()) => {
-                    ToolResult::success_json(call_id, json!({ "state": "respawn_requested" }))
-                }
+                // 活没活过来是服务端的事：只照服务端的回声（快照里活了）说，
+                // 限时没等到就如实说不确定，不替它宣布。
+                Ok(outcome) => ToolResult::success(
+                    call_id,
+                    vec![ContentPart::text(match outcome {
+                        Some([x, y, z]) => {
+                            format!("复活了，在 ({}, {}, {})。", x.floor(), y.floor(), z.floor())
+                        }
+                        None => "已请求复活，但服务端 0.25 秒内没有回应：可能是延迟过高，\
+暂时无法确定活没活过来。稍等再看处境里的生命一行；还是死亡状态再请求一次。"
+                            .to_owned(),
+                    })],
+                ),
                 Err(reason) => ToolResult::failure(call_id, reason),
             },
             Some(other) => ToolResult::failure(
@@ -106,14 +115,14 @@ mod tests {
     use super::*;
 
     struct FakeDoor {
-        outcome: Mutex<Result<(), String>>,
+        outcome: Mutex<Result<Option<[f64; 3]>, String>>,
         calls: Mutex<u32>,
     }
 
     impl Default for FakeDoor {
         fn default() -> Self {
             Self {
-                outcome: Mutex::new(Ok(())),
+                outcome: Mutex::new(Ok(Some([1.5, 64.0, -2.5]))),
                 calls: Mutex::new(0),
             }
         }
@@ -129,7 +138,7 @@ mod tests {
     }
 
     impl PresenceDoor for FakeDoor {
-        fn respawn<'a>(&'a self) -> PortFuture<'a, Result<(), String>> {
+        fn respawn<'a>(&'a self) -> PortFuture<'a, Result<Option<[f64; 3]>, String>> {
             Box::pin(async move {
                 *self.calls.lock().expect("计数锁") += 1;
                 self.outcome.lock().expect("结局锁").clone()
@@ -159,6 +168,18 @@ mod tests {
         let result = tools.call(call(json!({"action": "respawn"}))).await;
         assert_eq!(result.status, ToolResultStatus::Success);
         assert_eq!(*door.calls.lock().expect("计数锁"), 1);
+        assert_eq!(text_of(&result), "复活了，在 (1, 64, -3)。");
+    }
+
+    /// 服务端限时没回声：说不确定，不说复活了。
+    #[tokio::test]
+    async fn an_unanswered_respawn_says_it_is_unknown() {
+        let door = Arc::new(FakeDoor::default());
+        *door.outcome.lock().expect("结局锁") = Ok(None);
+        let tools = PresenceTools::new(door);
+        let text = text_of(&tools.call(call(json!({"action": "respawn"}))).await);
+        assert!(text.contains("可能是延迟过高"), "{text}");
+        assert!(!text.starts_with("复活了"), "{text}");
     }
 
     /// 门的拒绝原文必须原样转达，不改写成好听的说法。
@@ -169,18 +190,6 @@ mod tests {
         let result = tools.call(call(json!({"action": "respawn"}))).await;
         assert_eq!(result.status, ToolResultStatus::Error);
         assert!(text_of(&result).contains("你还活着"), "{result:?}");
-    }
-
-    /// 回执只说「请求已送达」。复活成没成由体征说话，工具面不替它宣布。
-    #[tokio::test]
-    async fn success_claims_only_that_the_request_was_sent() {
-        let door = Arc::new(FakeDoor::default());
-        let tools = PresenceTools::new(door);
-        let result = tools.call(call(json!({"action": "respawn"}))).await;
-        let ContentPart::Json { value } = &result.content[0] else {
-            panic!("期望 JSON 结果，得到 {:?}", result.content[0]);
-        };
-        assert_eq!(value["state"], "respawn_requested");
     }
 
     #[tokio::test]

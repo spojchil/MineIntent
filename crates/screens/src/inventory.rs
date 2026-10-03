@@ -31,7 +31,7 @@ pub const DISCARD: &str = "drop";
 pub enum ScreenKind {
     Chat,
     Inventory,
-    /// 服务端容器（工作台、箱子、熔炉等）：真相在服务端（use_on 触发开、
+    /// 服务端容器（工作台、箱子、熔炉等）：真相在服务端（右键容器方块触发开、
     /// 可被强关），本地状态由组合根随屏事实翻转。具体种类在快照
     /// `open_screen` 里，这里只管互斥。
     Container,
@@ -239,17 +239,20 @@ impl InventoryScreen {
         // 回执只说动作结论，不报格位现状（理由见 container.rs 同处注释：
         // 读的是上一 tick 的快照，且格位现状是事实、归快照与格位变化窗）。
         let summary = if to == DISCARD {
-            format!("已丢弃格 {from}")
+            format!("已丢弃格 {from}。")
         } else {
-            "已完成".to_owned()
+            "已完成。".to_owned()
         };
-        ToolResult::success_json(call_id, json!({ "done": summary }))
+        ToolResult::success(call_id, vec![ContentPart::text(summary)])
     }
 
     fn close(&self, call_id: agent::ToolCallId) -> ToolResult {
         self.state.close(ScreenKind::Inventory);
         self.occupancy.release(Domain::Screen);
-        ToolResult::success_json(call_id, json!({ "state": "closed" }))
+        ToolResult::success(
+            call_id,
+            vec![ContentPart::text("物品栏关上了。".to_owned())],
+        )
     }
 }
 
@@ -276,8 +279,7 @@ impl dispatch::ToolProvider for InventoryScreen {
         definition.description = Some(
             "物品栏。打开才能看到格位并整理（搬动/合堆/穿装备/摆随身合成/丢弃）；\
 打开期间无法移动或与世界交互，看完记得关。\
-**一条消息里可以连发多个动作**——想好整套摆法就一次发全，比一次一格来回等快得多，\
-也不会看到摆到一半的中间产物。"
+**一条消息里可以连发多个动作**——想好整套摆法就一次发全，比一次一格来回等快得多。"
                 .to_owned(),
         );
         vec![(

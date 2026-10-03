@@ -133,17 +133,20 @@ impl ChatBox {
                 return ToolResult {
                     call_id,
                     status: agent::ToolResultStatus::Error,
-                    content: vec![ContentPart::json(json!({
-                        "sent_lines": index,
-                        "summary": format!("发送第 {} 行时失败：{reason}", index + 1),
-                    }))],
+                    content: vec![ContentPart::text(format!(
+                        "发送第 {} 行时失败：{reason}。前 {index} 行已发出。",
+                        index + 1
+                    ))],
                     metadata: agent::JsonObject::new(),
                 };
             }
         }
         self.state.close(ScreenKind::Chat);
         self.occupancy.release(Domain::Screen);
-        ToolResult::success_json(call_id, json!({ "sent_lines": lines.len() }))
+        ToolResult::success(
+            call_id,
+            vec![ContentPart::text(format!("已发出 {} 行。", lines.len()))],
+        )
     }
 
     fn browse_history(&self, call_id: agent::ToolCallId, count: Option<&Value>) -> ToolResult {
@@ -157,7 +160,14 @@ impl ChatBox {
         let lines = self.history.recent(count as usize);
         self.state.close(ScreenKind::Chat);
         self.occupancy.release(Domain::Screen);
-        ToolResult::success_json(call_id, json!({ "lines": lines }))
+        ToolResult::success(
+            call_id,
+            vec![ContentPart::text(if lines.is_empty() {
+                "聊天记录是空的。".to_owned()
+            } else {
+                lines.join("\n")
+            })],
+        )
     }
 
     fn open(&self, call_id: agent::ToolCallId) -> ToolResult {
@@ -165,7 +175,7 @@ impl ChatBox {
             return ToolResult::failure(call_id, reason);
         }
         self.occupancy.occupy(Domain::Screen);
-        ToolResult::success_json(call_id, json!({ "state": "open" }))
+        ToolResult::success(call_id, vec![ContentPart::text("聊天框开着。".to_owned())])
     }
 
     /// 用法全文按需取。
@@ -180,7 +190,10 @@ impl ChatBox {
     fn close(&self, call_id: agent::ToolCallId) -> ToolResult {
         self.state.close(ScreenKind::Chat);
         self.occupancy.release(Domain::Screen);
-        ToolResult::success_json(call_id, json!({ "state": "closed" }))
+        ToolResult::success(
+            call_id,
+            vec![ContentPart::text("聊天框关上了。".to_owned())],
+        )
     }
 }
 
@@ -285,10 +298,10 @@ mod tests {
         ToolCall::new("call-1", TOOL_NAME, arguments)
     }
 
-    fn json_payload(result: &ToolResult) -> &Value {
+    fn text_payload(result: &ToolResult) -> &str {
         match &result.content[0] {
-            ContentPart::Json { value } => value,
-            other => panic!("期望 JSON 结果，得到 {other:?}"),
+            ContentPart::Text { text } => text,
+            other => panic!("期望文字结果，得到 {other:?}"),
         }
     }
 
@@ -305,7 +318,7 @@ mod tests {
             .await;
 
         assert_eq!(result.status, agent::ToolResultStatus::Success);
-        assert_eq!(json_payload(&result)["sent_lines"], 2);
+        assert_eq!(text_payload(&result), "已发出 2 行。");
         assert_eq!(*fixture.door.sent.lock().unwrap(), vec!["到了", "/help"]);
         // 发送期间界面域占用，结束后必释放。
         assert_eq!(
@@ -324,7 +337,10 @@ mod tests {
             .await;
 
         assert_eq!(result.status, agent::ToolResultStatus::Error);
-        assert_eq!(json_payload(&result)["sent_lines"], 1);
+        assert!(
+            text_payload(&result).ends_with("前 1 行已发出。"),
+            "{result:?}"
+        );
         assert!(!screen_occupied(&fixture));
     }
 
@@ -345,9 +361,8 @@ mod tests {
     async fn open_keeps_the_screen_and_say_still_releases_at_the_end() {
         let fixture = fixture(None);
         let opened = fixture.chat.call(call(json!({"action": "open"}))).await;
-        assert_eq!(json_payload(&opened)["state"], "open");
+        assert_eq!(text_payload(&opened), "聊天框开着。");
         // 开屏回执里不带用法：它是静态文本，要看自己调 describe。
-        assert!(json_payload(&opened).get("usage").is_none());
         assert!(screen_occupied(&fixture));
 
         fixture
@@ -386,10 +401,7 @@ mod tests {
             .call(call(json!({"action": "history", "count": 2})))
             .await;
 
-        assert_eq!(
-            json_payload(&result)["lines"],
-            json!(["乙：在吗", "丙：走了"])
-        );
+        assert_eq!(text_payload(&result), "乙：在吗\n丙：走了");
         assert!(!screen_occupied(&fixture));
     }
 
@@ -397,7 +409,7 @@ mod tests {
     async fn close_is_idempotent() {
         let fixture = fixture(None);
         let closed = fixture.chat.call(call(json!({"action": "close"}))).await;
-        assert_eq!(json_payload(&closed)["state"], "closed");
+        assert_eq!(text_payload(&closed), "聊天框关上了。");
 
         fixture.chat.call(call(json!({"action": "open"}))).await;
         fixture.chat.call(call(json!({"action": "close"}))).await;

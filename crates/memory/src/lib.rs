@@ -10,7 +10,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use agent::{PortFuture, ToolCall, ToolDefinition, ToolResult};
+use agent::{ContentPart, PortFuture, ToolCall, ToolDefinition, ToolResult};
 use dispatch::{ToolClass, ToolProvider};
 use serde_json::{json, Value};
 
@@ -72,7 +72,7 @@ impl MemoryTools {
             return ToolResult::failure(call_id, "remember 需要字符串参数 full_text；请改写调用");
         };
         match self.file.write(full_text) {
-            Ok(()) => ToolResult::success_json(call_id, json!({ "state": "saved" })),
+            Ok(()) => ToolResult::success(call_id, vec![ContentPart::text("记下了。".to_owned())]),
             Err(error) => ToolResult::failure(call_id, format!("记忆写入失败：{error}")),
         }
     }
@@ -128,10 +128,10 @@ mod tests {
         dir
     }
 
-    fn json_payload(result: &ToolResult) -> &Value {
+    fn text_payload(result: &ToolResult) -> &str {
         match &result.content[0] {
-            ContentPart::Json { value } => value,
-            other => panic!("期望 JSON 结果，得到 {other:?}"),
+            ContentPart::Text { text } => text,
+            other => panic!("期望文字结果，得到 {other:?}"),
         }
     }
 
@@ -181,7 +181,7 @@ mod tests {
             .await;
 
         assert_eq!(result.status, ToolResultStatus::Success);
-        assert_eq!(json_payload(&result)["state"], "saved");
+        assert_eq!(text_payload(&result), "记下了。");
         assert_eq!(file.read().unwrap(), "新的全文");
     }
 

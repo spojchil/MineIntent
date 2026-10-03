@@ -117,7 +117,7 @@ pub struct TickSnapshot {
     pub sounds: Window<SoundEntry>,
     /// 尺寸约束与 chat 同理：关注类窗口 ≥ 最长一轮时长，不得抄声音的 60 tick。
     pub damage: Window<DamageEntry>,
-    /// 后台任务（寻路等）的变化事实。窗装全部事件（顶替/停止也是事实）；
+    /// 后台任务的变化事实。窗装全部事件（顶替/停止也是事实）；
     /// 哪些值得唤醒是己的第二个判据，不在这里裁。
     pub jobs: Window<JobEntry>,
     /// 物品栏格位变化的事实（容器 0 的 ContainerSetSlot 包直译）。

@@ -27,6 +27,27 @@ cargo run -p companion
 默认连 `127.0.0.1:25565`，用户名 `companion`。`Ctrl+C` 停机。
 完整配置、模型接入与已知越界见 [workspace 指南](./docs/guides/rust-workspace.md)。
 
+### 用自己的代理来玩（MCP）
+
+不用内置模型，改由支持 MCP（stdio）的客户端（如 Claude Code）驱动身体。先起身体，
+它常驻并连上服务器：
+
+```sh
+cargo build -p companion -p bridge --bins --locked
+MINEINTENT_ENTRY=mcp MINEINTENT_CLIENT_JAR=/path/to/26.1.2.jar ./target/debug/companion
+```
+
+`MINEINTENT_CLIENT_JAR` 是本机原版 26.1.2 客户端 JAR（官方启动器装过该版本后在
+`.minecraft/versions/26.1.2/26.1.2.jar`），只读；不设就没有 `view` 画面工具。
+身体报告就绪后，在客户端里把 `target/debug/mineintent-mcp` 的绝对路径注册为 stdio
+服务，例如 Claude Code：
+
+```sh
+claude mcp add mineintent /abs/path/to/MineIntent/target/debug/mineintent-mcp
+```
+
+同一时刻只接受一个控制者。细节与验证步骤见 [workspace 指南](./docs/guides/rust-workspace.md#外接代理mcp)。
+
 ## 实现线
 
 本仓库只有一条实现线：**Rust 单进程**——`crates/`，`companion` 是唯一可执行，
