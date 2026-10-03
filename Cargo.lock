@@ -974,8 +974,10 @@ dependencies = [
  "perception",
  "presence",
  "render",
+ "reqwest",
  "screens",
  "serde_json",
+ "sha1",
  "tokio",
  "vision",
  "wait",
@@ -1646,8 +1648,10 @@ version = "0.0.1"
 dependencies = [
  "dispatch",
  "midturn",
+ "render",
  "serde_json",
  "tokio",
+ "world",
 ]
 
 [[package]]

@@ -126,7 +126,8 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
 快照里的实体（种类、脚底位置、朝向、玩家 UUID、掉落物的物品名）交给 `vision`，
 几何按 26.1.2 客户端模型类转录，深度缓冲决定遮挡——墙后的实体不会出现在画面里。
 
-配置 `MINEINTENT_CLIENT_JAR` 后，组合根注册 `perception::PictureTools` 的 `view {}`
+有客户端 JAR 时（`MINEINTENT_CLIENT_JAR`，或 `companion::client_jar` 从自管缓存取、
+首次从 Mojang 官方版本清单下载并校验 SHA1），组合根注册 `perception::PictureTools` 的 `view {}`
 工具（Free 类）。`companion::picture::ModulePictureDoor` 在阻塞池里采集视距内表面方块、
 检查身边已加载、调用 `vision` 渲染并编码 PNG；资源在进程内复用。图片回执
 只含图片及通用限制，不发送原始方块清单或包含被遮挡方块名称的渲染报告，也不据此

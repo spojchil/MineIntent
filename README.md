@@ -34,11 +34,14 @@ cargo run -p companion
 
 ```sh
 cargo build -p companion -p bridge --bins --locked
-MINEINTENT_ENTRY=mcp MINEINTENT_CLIENT_JAR=/path/to/26.1.2.jar ./target/debug/companion
+MINEINTENT_ENTRY=mcp ./target/debug/companion
 ```
 
-`MINEINTENT_CLIENT_JAR` 是本机原版 26.1.2 客户端 JAR（官方启动器装过该版本后在
-`.minecraft/versions/26.1.2/26.1.2.jar`），只读；不设就没有 `view` 画面工具。
+画面工具 `view` 要用原版 26.1.2 客户端 JAR 里的资源。首次启动时身体会像启动器那样
+从 Mojang 官方下载它（约 38 MB，校验 SHA1），放进自管的缓存（Linux `~/.cache/mineintent`、
+Windows `%LOCALAPPDATA%\mineintent`、macOS `~/Library/Caches/mineintent`），以后直接复用；
+已有 JAR 可用 `MINEINTENT_CLIENT_JAR` 指过去（启动器装过该版本后在
+`.minecraft/versions/26.1.2/26.1.2.jar`）。下载失败不影响开玩，只是没有 `view`。
 身体报告就绪后，在客户端里把 `target/debug/mineintent-mcp` 的绝对路径注册为 stdio
 服务，例如 Claude Code：
 

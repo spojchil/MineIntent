@@ -61,7 +61,8 @@ export PATH="$HOME/.rustup/toolchains/nightly-x86_64-apple-darwin/bin:$PATH"
 | `MODEL_PROTOCOL` | `chat` | `chat` / `responses` / `anthropic`；图片工具要求后两者 |
 | `MODEL_ENDPOINT` | 对应协议的 DeepSeek endpoint | 完整 endpoint，含协议路径；Responses 默认 `https://api.deepseek.com/responses` |
 | `MODEL_NAME` | Chat 为 `deepseek-chat`，其余为 `deepseek-flash` | 模型必须支持所选协议；启用图片还需视觉能力 |
-| `MINEINTENT_CLIENT_JAR` | 未设置 | 本地 26.1.2 客户端 JAR；设置后加载资源并注册 `view` 图片工具，JAR 只读 |
+| `MINEINTENT_CLIENT_JAR` | 未设置 | 本地 26.1.2 客户端 JAR，只读；设置后加载资源并注册 `view` 图片工具。设为空串表示不要画面。未设置时：外接入口与 Responses/Anthropic 协议的内置入口用自管缓存里的 JAR，没有就从 Mojang 官方下载（校验 SHA1）；Chat 协议的内置入口不提供画面 |
+| `MINEINTENT_CACHE_DIR` | 平台缓存目录下的 `mineintent` | 自管缓存的位置；JAR 在其下 `versions/26.1.2/client.jar` |
 | `MINEINTENT_VIEW_SIZE` | `1920x1080` | `view` 的屏幕像素尺寸 `宽x高`（每边 1–2048）；`view` 的 `region` 只从这块屏幕上裁，不会更清楚 |
 
 模型、密钥、人设与记忆变量只用于内置 `model` 入口。外接 `mcp` 入口的模型与会话
@@ -88,9 +89,11 @@ MINEINTENT_ENTRY=mcp MINEINTENT_HOST=127.0.0.1 MINEINTENT_PORT=25565 \
 ```
 
 该命令不请求模型，但会以默认用户名 `companion` 进入实际 Minecraft 世界。需要改名时
-设置 `MINEINTENT_USERNAME`。需要图片时在身体进程设置 `MINEINTENT_CLIENT_JAR`，
-指向本地 26.1.2 客户端 JAR（官方启动器装过该版本后在 `.minecraft/versions/26.1.2/26.1.2.jar`）；图片尺寸仍由 `MINEINTENT_VIEW_SIZE` 决定。未设置 JAR
-时不提供 `view`，文字处境和其他工具仍可用。客户端和它选择的模型是否支持图片，
+设置 `MINEINTENT_USERNAME`。图片要用 26.1.2 客户端 JAR：首次启动时身体从 Mojang
+官方版本清单下载并校验 SHA1，放进自管缓存（见上表 `MINEINTENT_CACHE_DIR`），以后
+复用；已有 JAR 时用 `MINEINTENT_CLIENT_JAR` 指过去（官方启动器装过该版本后在
+`.minecraft/versions/26.1.2/26.1.2.jar`）。图片尺寸由 `MINEINTENT_VIEW_SIZE` 决定。
+下载失败或设为空串时不提供 `view`，文字处境和其他工具仍可用。客户端和它选择的模型是否支持图片，
 需要分别验证。
 
 等身体报告就绪，再在客户端添加 stdio 服务。支持 `mcpServers` 配置格式的客户端可用：

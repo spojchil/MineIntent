@@ -26,6 +26,7 @@ use screens::{
 };
 use world::{ConnectionConfig, DoorCommand, Module, SnapshotSource};
 
+mod client_jar;
 mod doorbell;
 mod frame;
 mod mcp_entry;
@@ -496,10 +497,12 @@ async fn main() -> Result<(), String> {
         .parse()
         .map_err(|error| format!("MINEINTENT_PORT 无效：{error}"))?;
     let username = env_or("MINEINTENT_USERNAME", "companion");
-    let client_jar = std::env::var_os("MINEINTENT_CLIENT_JAR");
     let entry = env_or("MINEINTENT_ENTRY", "model");
+    // 内置入口走 Chat 协议时画面用不上（工具回执只能是文本），不自动下载；见 client_jar。
+    let pictures_usable = entry == "mcp" || env_or("MODEL_PROTOCOL", "chat") != "chat";
+    let jar_path = client_jar::locate(pictures_usable).await;
     let brain = match entry.as_str() {
-        "model" => Some(Brain::from_env(client_jar.is_some())?),
+        "model" => Some(Brain::from_env(jar_path.is_some())?),
         "mcp" => None,
         other => {
             return Err(format!(
@@ -508,11 +511,14 @@ async fn main() -> Result<(), String> {
         }
     };
     let screen = picture::parse_screen(&env_or("MINEINTENT_VIEW_SIZE", "1920x1080"))?;
-    let picture_resources = client_jar
+    let picture_resources = jar_path
         .map(|path| {
-            let resources = vision::Resources::open(std::path::PathBuf::from(path))?;
-            if resources.version() != "26.1.2" {
-                return Err("图片资源必须是当前协议对应的 26.1.2 client.jar".to_owned());
+            let resources = vision::Resources::open(path)?;
+            if resources.version() != client_jar::CLIENT_VERSION {
+                return Err(format!(
+                    "图片资源必须是当前协议对应的 {} client.jar",
+                    client_jar::CLIENT_VERSION
+                ));
             }
             Ok(resources)
         })

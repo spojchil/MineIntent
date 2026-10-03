@@ -18,7 +18,10 @@ perception = { path = "../perception" }
 presence = { path = "../presence" }
 memory = { path = "../memory" }
 render = { path = "../render" }
+# 首次使用时从 Mojang 官方下载客户端 JAR（见 src/client_jar.rs）；与 midturn 的声明一致，不引入新依赖。
+reqwest = { version = "0.13", features = ["json"] }
 serde_json = "1"
+sha1 = "0.11"
 screens = { path = "../screens" }
 wait = { path = "../wait" }
 vision = { path = "../vision" }
