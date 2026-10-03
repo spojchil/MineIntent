@@ -617,8 +617,8 @@ async fn main() {
     }
     println!(
         "\n库存变化通知（**只有物品栏屏**开着才投递；自己动作的回声不投递）。\
-容器的格位变化不再推送——那条通道恒定晚一个动作且模型无从知道，改由 \
-`container list` 自己看：\n"
+容器里只推熔炉族、酿造台由服务端改的自有格（原料、燃料、成品）；其余容器的格位 \
+变化恒定晚一个动作且模型无从知道，改由 `container list` 自己看：\n"
     );
     for (container_id, slot, item, count) in [
         (0_i32, 38_u16, Some("emerald"), 5_u32),

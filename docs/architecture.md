@@ -51,7 +51,7 @@ context perception screens   input    hand    jobs   presence   memory  wait
 | `perception` | 按需图片（`view`） | 图片通过 `PictureDoor` 获取，保留为原生图片回执；模型看世界只经画面 |
 | `screens` | 界面互斥域（`chat_box`/`inventory`/`container`） | 屏的状态转换在此，占用账本在 dispatch；容器屏真相在服务端，组合根随屏事实翻转 |
 | `input` | 键鼠（`input`）：WASD/空格/Shift/Ctrl、左右键、鼠标相对转动 | 一次调用按住若干秒后全部松开，松开后才返回回执；左右键作用于准星所指，**不收坐标**；合法性由原版物理与服务端自我仲裁 |
-| `hand` | 瞬时键（`hand`）：快捷栏、丢弃、主副手对调 | 发出即完，结果由物品栏变化证实 |
+| `hand` | 瞬时键（`hand`）：快捷栏、丢弃、主副手对调 | 数字键与 Q 照原版客户端当场生效、当场回执手里的东西；F 由服务端对调，回执等它的回声最多 5 tick，超时如实说没等到 |
 | `jobs` | 任务表（`list`） | 只读、`ToolClass::Free`；槽位是唯一真相源，不另建镜像 |
 | `presence` | 生死去留（`respawn`） | 死亡时唯一还放行的一类（`ToolClass::Vital`）；自动重生已关，起不起来是模型自己的事 |
 | `memory` | 单文件长期记忆 | 一个文件、两张脸（工具面 `remember` 与策略面落盘）、一个出口 |
@@ -151,7 +151,7 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
 | `state.rs` | `Inner`：共享状态、时间窗、写口队列——**可脱离 azalea 单测** |
 | `capture.rs` | ECS → `TickSnapshot` 直译 |
 | `job.rs` | `JobSlot`：后台任务的形状，**每个任务恰好一条终局**；现在没有动作接入 |
-| `input.rs` | 键鼠输入的时序：起手转向、下一 tick 按键、按满或提前结束后全部松开，回执经一次性通道送回 `Module::input`。右键交给 fork 的 `start_use_item`，它按原版 `startUseItem` 主手→副手逐步尝试（实体/方块 → 用物品），每步是否吃掉这次右键由 fork 的 `interact::predict` 按原版客户端分支预测 |
+| `input.rs` | 键鼠输入的时序：起手转向，等 Azalea 的 `TicksConnected` 前进（准星已按新朝向重算）再按键，按满或提前结束后全部松开，回执经一次性通道送回 `Module::input`。挖碎方块或右键后再等 Azalea 跑过一轮调度才交回执，处境里的准星已对着改后的世界。右键交给 fork 的 `start_use_item`，它按原版 `startUseItem` 主手→副手逐步尝试（实体/方块 → 用物品），每步是否吃掉这次右键由 fork 的 `interact::predict` 按原版客户端分支预测；原版客户端当场生效的结果（放置、开门等）fork 也当场写进本地世界，回执照算。只有服务端决定的结果（开界面、拉杆等）回执等服务端回声，最多到按下后 5 tick，超时标为未确认 |
 | `connect.rs` | azalea 接入、客户端回调、停机 |
 | `door.rs` | `DoorCommand` 与 tick 内执行 |
 | `blocks.rs` | 成像拷贝的方块解码、渲染分类与原版光照属性表 |

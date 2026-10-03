@@ -825,9 +825,9 @@ fn wake_lines(
     let wake = cursors.collect(
         snapshot,
         identity,
-        // 格位变化只在**物品栏屏**开着时投递：关着屏时格号对模型
-        // 无意义（它看不见界面）。容器屏不再走推送——那条通道恒定
-        // 晚一个动作且无法自我定位，改由 `container list` 拉取。
+        // 玩家物品栏的格位变化只在**物品栏屏**开着时投递：关着屏时格号对模型
+        // 无意义（它看不见界面）。容器屏里只推熔炉族、酿造台自己变的格，判据在
+        // `wake`；其余容器格位由 `container list` 拉取。
         screen_state.current() == Some(ScreenKind::Inventory),
     );
     if wake.is_empty() {
