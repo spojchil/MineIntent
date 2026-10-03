@@ -95,8 +95,25 @@ pub struct InputOutcome {
     /// 按住右键期间放下的方块（注册名、位置，按先后）。
     /// 和原版一样按客户端判断算放下，不等服务端；服务端若拒绝，下一张画面会显示出来。
     pub placed: Vec<(String, [i32; 3])>,
+    /// 右键直接作用在准星下的方块上（开门、拨拉杆、调中继器……）的结果。
+    pub used: Option<BlockUsed>,
     /// 要等服务端回声的结果，限时内没等到：结果未知，不是「没发生」。
     pub unconfirmed: Option<Unconfirmed>,
+}
+
+/// 右键对方块本身的使用。
+///
+/// 门、活板门、栅栏门、按钮、中继器、比较器、花盆原版客户端当场就改，回执照
+/// 客户端算；拉杆、音符盒、蛋糕这类只有服务端改，回执等服务端的方块更新。
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlockUsed {
+    /// 按下时的方块注册名与位置。
+    pub block: String,
+    pub position: [i32; 3],
+    /// 按住期间用了几次（按住右键每 4 tick 再用一次）。
+    pub times: u32,
+    /// 和按下前比变了的状态：（属性、之前、现在）。方块整个换了时属性名是 `block`。
+    pub changes: Vec<(String, String, String)>,
 }
 
 /// 等服务端确认、但限时内没等到的那件事。
@@ -104,6 +121,29 @@ pub struct InputOutcome {
 pub enum Unconfirmed {
     /// 右键点了会开界面的方块，界面没在限时内打开。
     Screen,
+    /// 右键用了只由服务端改动的方块（拉杆等），方块没在限时内变。
+    BlockUse,
+}
+
+/// 手里的一件东西：注册名与数量。
+pub type HeldStack = Option<(String, u32)>;
+
+/// 手上瞬时键（数字键、Q、F）的结果。
+#[derive(Clone, Debug, PartialEq)]
+pub enum HandOutcome {
+    /// 换到了快捷栏第几格（0 起），现在手里是什么。客户端当场生效。
+    Selected { slot: u8, held: HeldStack },
+    /// 丢出了手里的东西。和原版 `LocalPlayer.drop` 一样客户端当场从手里拿走，
+    /// 不等服务端；服务端若不认，物品会回到手里，画面上看得到。
+    Dropped { item: String, count: u32 },
+    /// 手里是空的，没有可丢的。
+    NothingToDrop,
+    /// 主副手对调了（服务端已回声）：对调后的主手、副手。
+    Swapped { main: HeldStack, offhand: HeldStack },
+    /// 两手拿的一样（或都空），对调了也看不出区别。
+    SwapNoChange { both: HeldStack },
+    /// 对调要由服务端做，限时内没等到它的回声：两手还是按之前的样子。
+    SwapUnconfirmed { main: HeldStack, offhand: HeldStack },
 }
 
 impl HeldKeys {

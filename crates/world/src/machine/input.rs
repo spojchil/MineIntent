@@ -13,6 +13,7 @@
 //! 方块碎掉时先松手、下一 tick 再交回执：准星由 Azalea 在下一 tick 才对着
 //! 碎后的世界重算，早一 tick 交出，处境里的准星还是刚挖掉的那块。
 
+use azalea::block::{BlockState, BlockTrait};
 use azalea::core::hit_result::HitResult;
 use azalea::entity::metadata::{AbstractLivingUsingItem, Health};
 use azalea::entity::Position;
@@ -21,14 +22,16 @@ use azalea::{BlockPos, Client, SprintDirection, WalkDirection};
 use tokio::sync::oneshot;
 
 use super::state::Inner;
-use crate::{HeldKeys, InputEnd, InputOutcome, InputSpec, LookingAt, MouseButton, Unconfirmed};
+use crate::{
+    BlockUsed, HeldKeys, InputEnd, InputOutcome, InputSpec, LookingAt, MouseButton, Unconfirmed,
+};
 
-/// 右键点在方块上之后，等服务端开界面最多等到按下后的第几 tick。
+/// 右键点在方块上之后，等服务端回声最多等到按下后的第几 tick。
 ///
-/// 开不开界面是服务端说了算（箱子、工作台……），客户端判断不了；高延迟的服务器
-/// 上回声可能晚到好几 tick。等，但不无限等：超时就照「没开」回执，界面后来开了
-/// 会作为事件另行送到。
-const SCREEN_WAIT_TICKS: u64 = 5;
+/// 开不开界面（箱子、工作台……）、拉杆拨没拨过去是服务端说了算，客户端判断不了；
+/// 高延迟的服务器上回声可能晚到好几 tick。等，但不无限等：超时如实说没等到，
+/// 界面后来开了会作为事件另行送到，方块后来变了画面上看得到。
+const SERVER_WAIT_TICKS: u64 = 5;
 
 /// 按住右键时重复使用的间隔。原版 `Minecraft.rightClickDelay` 每次使用后置 4，
 /// 按住期间不在使用物品（不是在吃、拉弓）就每 4 tick 再按一次——连续放方块就靠它。
@@ -77,10 +80,25 @@ pub(super) struct HeldInput {
     last_use_tick: u64,
     /// 已松手、等下一 tick 交回执：为什么结束、在哪一 tick 结束。
     ending: Option<(InputEnd, u64)>,
-    /// 右键点在方块上、已松手，等服务端开界面：在哪一 tick 松的、最晚等到哪一 tick。
-    awaiting_screen: Option<(u64, u64)>,
+    /// 按下右键时准星下的方块和它当时的状态：用过之后拿来比变了什么。
+    pressed_block: Option<(BlockPos, BlockState)>,
+    /// 已经记进回执的方块使用序号，规则同 `placement_seq`。
+    block_use_seq: u32,
+    /// 对 `pressed_block` 用了几次；最近一次是不是只有服务端会改它。
+    uses: u32,
+    server_use: bool,
+    /// 已松手，等服务端的回声。
+    awaiting: Option<Awaiting>,
     unconfirmed: Option<Unconfirmed>,
     done: oneshot::Sender<InputOutcome>,
+}
+
+/// 松手之后在等的服务端回声：等什么、在哪一 tick 松的、最晚等到哪一 tick。
+#[derive(Clone, Copy, Debug)]
+struct Awaiting {
+    what: Unconfirmed,
+    at: u64,
+    deadline: u64,
 }
 
 /// 已结束、待交出的回执。
@@ -114,8 +132,8 @@ pub(super) fn begin(
         let (end, at) = previous
             .ending
             .or(previous
-                .awaiting_screen
-                .map(|(at, _)| (InputEnd::Elapsed, at)))
+                .awaiting
+                .map(|awaiting| (InputEnd::Elapsed, awaiting.at)))
             .unwrap_or((InputEnd::Replaced, inner.now_tick()));
         finish(bot, previous, end, at).send();
     }
@@ -138,7 +156,11 @@ pub(super) fn begin(
         placement_seq: 0,
         last_use_tick: 0,
         ending: None,
-        awaiting_screen: None,
+        pressed_block: None,
+        block_use_seq: 0,
+        uses: 0,
+        server_use: false,
+        awaiting: None,
         unconfirmed: None,
         done,
     });
@@ -155,9 +177,15 @@ pub(super) fn poll_input(inner: &Inner, bot: &Client) -> Option<Finished> {
         let held = slot.take().expect("上面刚借到 Some");
         return Some(finish(bot, held, end, at));
     }
-    if let Some((at, deadline)) = held.awaiting_screen {
-        let end = if screen_open(bot) {
+    if let Some(Awaiting { what, at, deadline }) = held.awaiting {
+        let answered = match what {
+            Unconfirmed::Screen => screen_open(bot),
+            Unconfirmed::BlockUse => block_changed(bot, held),
+        };
+        let end = if answered && what == Unconfirmed::Screen {
             InputEnd::ScreenOpened
+        } else if answered {
+            InputEnd::Elapsed
         } else if is_dead(bot) {
             InputEnd::Died
         } else if now >= deadline {
@@ -166,8 +194,8 @@ pub(super) fn poll_input(inner: &Inner, bot: &Client) -> Option<Finished> {
             return None;
         };
         let mut held = slot.take().expect("上面刚借到 Some");
-        if end == InputEnd::Elapsed {
-            held.unconfirmed = Some(Unconfirmed::Screen);
+        if !answered && end == InputEnd::Elapsed {
+            held.unconfirmed = Some(what);
         }
         return Some(finish(bot, held, end, at));
     }
@@ -179,6 +207,7 @@ pub(super) fn poll_input(inner: &Inner, bot: &Client) -> Option<Finished> {
         return None;
     };
     collect_placements(bot, held);
+    collect_block_uses(bot, held);
 
     let mut block_broke = false;
     if held.spec.mouse == Some(MouseButton::Left) {
@@ -201,8 +230,13 @@ pub(super) fn poll_input(inner: &Inner, bot: &Client) -> Option<Finished> {
             held.ending = Some((end, now));
             return None;
         }
-        if end == InputEnd::Elapsed && awaits_screen(held, pressed_tick, now) {
-            held.awaiting_screen = Some((now, pressed_tick + SCREEN_WAIT_TICKS));
+        let changed = block_changed(bot, held);
+        if let Some(what) = server_wait(held, end, pressed_tick, now, changed) {
+            held.awaiting = Some(Awaiting {
+                what,
+                at: now,
+                deadline: pressed_tick + SERVER_WAIT_TICKS,
+            });
             return None;
         }
         let held = slot.take().expect("上面刚借到 Some");
@@ -222,9 +256,30 @@ pub(super) fn poll_input(inner: &Inner, bot: &Client) -> Option<Finished> {
     None
 }
 
-/// 右键点在方块上、什么也没放下、按下还不到 [`SCREEN_WAIT_TICKS`]：服务端可能
-/// 正要开界面，回执要等它。按得更久的，服务端早就来得及回了。
-fn awaits_screen(held: &HeldInput, pressed_tick: u64, now: u64) -> bool {
+/// 按满时长松手时，回执要不要再等服务端的回声、等的是什么。
+///
+/// 只在按下还不到 [`SERVER_WAIT_TICKS`] 时等；按得更久的，服务端早就来得及回了。
+/// `changed`：按下时准星下的方块现在变没变。
+fn server_wait(
+    held: &HeldInput,
+    end: InputEnd,
+    pressed_tick: u64,
+    now: u64,
+    changed: bool,
+) -> Option<Unconfirmed> {
+    if end != InputEnd::Elapsed || now >= pressed_tick + SERVER_WAIT_TICKS {
+        None
+    } else if awaits_screen(held) {
+        Some(Unconfirmed::Screen)
+    } else if awaits_block_use(held) && !changed {
+        Some(Unconfirmed::BlockUse)
+    } else {
+        None
+    }
+}
+
+/// 右键点在会开界面的方块上、什么也没放下：服务端可能正要开界面，回执要等它。
+fn awaits_screen(held: &HeldInput) -> bool {
     let Some(LookingAt::Block { name, .. }) = &held.pressed_on else {
         return false;
     };
@@ -233,7 +288,12 @@ fn awaits_screen(held: &HeldInput, pressed_tick: u64, now: u64) -> bool {
         && !held.spec.keys.sneak
         && opens_menu(name)
         && held.placed.is_empty()
-        && now < pressed_tick + SCREEN_WAIT_TICKS
+}
+
+/// 只用了一次、只有服务端会改的方块（拉杆、音符盒……）：等它的方块更新。
+/// 用了好几次的不等——来回拨几下之后「没变」说明不了服务端回没回。
+fn awaits_block_use(held: &HeldInput) -> bool {
+    held.server_use && held.uses == 1
 }
 
 /// 右键会让服务端开界面的方块（注册名，不带命名空间）。
@@ -294,6 +354,13 @@ fn press(inner: &Inner, bot: &Client, held: &mut HeldInput, now: u64) {
         Some(MouseButton::Right) => {
             held.pressed_on = super::capture::capture_looking_at(bot);
             held.placement_seq = latest_placement(bot).map_or(0, |last| last.seq);
+            held.block_use_seq = latest_block_use(bot).map_or(0, |last| last.seq);
+            held.pressed_block = match hit_result(bot) {
+                Some(HitResult::Block(hit)) if !hit.miss => {
+                    block_state(bot, hit.block_pos).map(|state| (hit.block_pos, state))
+                }
+                _ => None,
+            };
             bot.start_use_item();
             held.last_use_tick = now;
         }
@@ -374,8 +441,91 @@ fn latest_placement(bot: &Client) -> Option<azalea::interact::PredictedPlacement
         .map(|placement| *placement)
 }
 
+/// 右键预测出的方块使用（Azalea 按原版客户端逻辑判断；门这类原版客户端当场就改的，
+/// Azalea 也已经改进了自己的世界）。只记按下时准星下那一块的。
+fn collect_block_uses(bot: &Client, held: &mut HeldInput) {
+    if held.spec.mouse != Some(MouseButton::Right) {
+        return;
+    }
+    let Some(latest) = latest_block_use(bot) else {
+        return;
+    };
+    if latest.seq > held.block_use_seq {
+        held.block_use_seq = latest.seq;
+        if held.pressed_block.is_some_and(|(pos, _)| pos == latest.pos) {
+            held.uses += 1;
+            held.server_use = latest.block_use == azalea::interact::predict::BlockUse::Server;
+        }
+    }
+}
+
+fn latest_block_use(bot: &Client) -> Option<azalea::interact::PredictedBlockUse> {
+    bot.get_component::<azalea::interact::PredictedBlockUse>()
+        .map(|block_use| (*block_use).clone())
+}
+
+fn block_state(bot: &Client, pos: BlockPos) -> Option<BlockState> {
+    bot.world().read().get_block_state(pos)
+}
+
+/// 按下时准星下那一块现在和按下时不一样了。
+fn block_changed(bot: &Client, held: &HeldInput) -> bool {
+    held.pressed_block
+        .is_some_and(|(pos, before)| block_state(bot, pos).is_some_and(|now| now != before))
+}
+
+/// 两个方块状态差在哪：（属性、之前、现在）。整个方块换了时只报 `block`。
+fn state_changes(before: BlockState, after: BlockState) -> Vec<(String, String, String)> {
+    let before: Box<dyn BlockTrait> = Box::from(before);
+    let after: Box<dyn BlockTrait> = Box::from(after);
+    if before.id() != after.id() {
+        return vec![(
+            "block".to_owned(),
+            super::capture::canonical_registry_name(before.id()),
+            super::capture::canonical_registry_name(after.id()),
+        )];
+    }
+    let old = before.property_map();
+    let mut changes: Vec<(String, String, String)> = after
+        .property_map()
+        .into_iter()
+        .filter(|(name, value)| old.get(name) != Some(value))
+        .map(|(name, value)| {
+            (
+                name.to_owned(),
+                old.get(name).copied().unwrap_or_default().to_owned(),
+                value.to_owned(),
+            )
+        })
+        .collect();
+    changes.sort();
+    changes
+}
+
 fn finish(bot: &Client, mut held: HeldInput, ended: InputEnd, now: u64) -> Finished {
     collect_placements(bot, &mut held);
+    collect_block_uses(bot, &mut held);
+    let used = match held.pressed_block {
+        Some((pos, before)) if held.uses > 0 => {
+            let after = block_state(bot, pos).unwrap_or(before);
+            let named: Box<dyn BlockTrait> = Box::from(before);
+            Some(BlockUsed {
+                block: super::capture::canonical_registry_name(named.id()),
+                position: [pos.x, pos.y, pos.z],
+                times: held.uses,
+                changes: state_changes(before, after),
+            })
+        }
+        _ => None,
+    };
+    // 按得久、松手时已过了等待期：服务端该回早回了，没变就是没等到。
+    if held.unconfirmed.is_none()
+        && ended == InputEnd::Elapsed
+        && awaits_block_use(&held)
+        && used.as_ref().is_some_and(|used| used.changes.is_empty())
+    {
+        held.unconfirmed = Some(Unconfirmed::BlockUse);
+    }
     let look = bot.direction();
     let outcome = InputOutcome {
         ticks: held
@@ -391,6 +541,7 @@ fn finish(bot: &Client, mut held: HeldInput, ended: InputEnd, now: u64) -> Finis
         pressed_on: held.pressed_on,
         broken: held.broken,
         placed: held.placed,
+        used,
         unconfirmed: held.unconfirmed,
     };
     Finished {
@@ -525,10 +676,18 @@ mod tests {
             placement_seq: 0,
             last_use_tick: 10,
             ending: None,
-            awaiting_screen: None,
+            pressed_block: None,
+            block_use_seq: 0,
+            uses: 0,
+            server_use: false,
+            awaiting: None,
             unconfirmed: None,
             done,
         }
+    }
+
+    fn waits(held: &HeldInput, now: u64) -> Option<Unconfirmed> {
+        server_wait(held, InputEnd::Elapsed, 10, now, false)
     }
 
     /// 只有右键点在方块上、没放下东西、按下不到 5 tick 时才等服务端开界面。
@@ -540,35 +699,82 @@ mod tests {
             face: "north".to_owned(),
         });
         let mut held = right_click_on(chest.clone());
-        assert!(awaits_screen(&held, 10, 11));
-        assert!(!awaits_screen(&held, 10, 15), "按满 5 tick 就不再等");
-
-        held.placed.push(("cobblestone".to_owned(), [0, 65, 0]));
-        assert!(
-            !awaits_screen(&held, 10, 11),
-            "放下了方块就是客户端已有结果"
+        assert_eq!(waits(&held, 11), Some(Unconfirmed::Screen));
+        assert_eq!(waits(&held, 15), None, "按满 5 tick 就不再等");
+        assert_eq!(
+            server_wait(&held, InputEnd::Died, 10, 11, false),
+            None,
+            "死了就不等"
         );
 
-        assert!(!awaits_screen(&right_click_on(None), 10, 11), "没对着方块");
+        held.placed.push(("cobblestone".to_owned(), [0, 65, 0]));
+        assert_eq!(waits(&held, 11), None, "放下了方块就是客户端已有结果");
+
+        assert_eq!(waits(&right_click_on(None), 11), None, "没对着方块");
 
         let mut left = right_click_on(chest.clone());
         left.spec.mouse = Some(MouseButton::Left);
-        assert!(!awaits_screen(&left, 10, 11));
+        assert_eq!(waits(&left, 11), None);
 
         let mut sneaking = right_click_on(chest);
         sneaking.spec.keys.sneak = true;
-        assert!(!awaits_screen(&sneaking, 10, 11), "潜行右键不开界面");
+        assert_eq!(waits(&sneaking, 11), None, "潜行右键不开界面");
 
         let door = Some(LookingAt::Block {
             name: "oak_door".to_owned(),
             position: [0, 64, 0],
             face: "north".to_owned(),
         });
-        assert!(
-            !awaits_screen(&right_click_on(door), 10, 11),
-            "门不开界面，不等"
-        );
+        assert_eq!(waits(&right_click_on(door), 11), None, "门不开界面，不等");
         assert!(opens_menu("minecraft:lime_shulker_box"));
+    }
+
+    /// 只由服务端改的方块用了一次、还没变：等它的方块更新；变了或用了多次就不等。
+    #[test]
+    fn waits_for_a_server_block_use_only_while_unchanged() {
+        let lever = Some(LookingAt::Block {
+            name: "lever".to_owned(),
+            position: [0, 64, 0],
+            face: "north".to_owned(),
+        });
+        let mut held = right_click_on(lever);
+        assert_eq!(waits(&held, 11), None, "预测没说用到了方块");
+
+        held.uses = 1;
+        held.server_use = true;
+        assert_eq!(waits(&held, 11), Some(Unconfirmed::BlockUse));
+        assert_eq!(
+            server_wait(&held, InputEnd::Elapsed, 10, 11, true),
+            None,
+            "已经变了"
+        );
+        assert_eq!(waits(&held, 15), None, "按满 5 tick 就不再等");
+
+        held.uses = 2;
+        assert_eq!(waits(&held, 11), None, "来回拨了几下，看不出服务端回没回");
+
+        held.uses = 1;
+        held.server_use = false;
+        assert_eq!(waits(&held, 11), None, "客户端当场改的不等");
+    }
+
+    #[test]
+    fn state_changes_name_the_changed_properties() {
+        use azalea::block::BlockTrait as _;
+        let closed = azalea::block::blocks::OakDoor {
+            open: false,
+            ..Default::default()
+        };
+        let mut opened = closed;
+        opened.open = true;
+        assert_eq!(
+            state_changes(closed.as_block_state(), opened.as_block_state()),
+            vec![("open".to_owned(), "false".to_owned(), "true".to_owned())]
+        );
+        assert_eq!(
+            state_changes(closed.as_block_state(), azalea::block::BlockState::AIR),
+            vec![("block".to_owned(), "oak_door".to_owned(), "air".to_owned())]
+        );
     }
 
     #[test]

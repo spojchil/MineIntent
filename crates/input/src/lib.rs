@@ -222,6 +222,7 @@ mod tests {
                     pressed_on: None,
                     broken: Vec::new(),
                     placed: Vec::new(),
+                    used: None,
                     unconfirmed: None,
                 })
             })

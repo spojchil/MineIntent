@@ -169,6 +169,9 @@ pub fn render_input_outcome(outcome: &world::InputOutcome) -> String {
                 .to_owned(),
         );
     }
+    if let Some(used) = &outcome.used {
+        lines.push(block_used_words(used, outcome.unconfirmed));
+    }
     if !outcome.placed.is_empty() {
         let placed: Vec<String> = outcome
             .placed
@@ -203,6 +206,77 @@ pub fn render_input_outcome(outcome: &world::InputOutcome) -> String {
         outcome.pitch
     ));
     lines.join("\n")
+}
+
+/// 右键对方块本身的使用：变了什么，或为什么说不准。
+fn block_used_words(used: &world::BlockUsed, unconfirmed: Option<world::Unconfirmed>) -> String {
+    let [x, y, z] = used.position;
+    let what = format!("{}（{x}, {y}, {z}）", used.block);
+    let times = if used.times > 1 {
+        format!("（按住期间用了 {} 次）", used.times)
+    } else {
+        String::new()
+    };
+    if !used.changes.is_empty() {
+        let changes: Vec<String> = used
+            .changes
+            .iter()
+            .map(|(property, before, after)| {
+                if property == "block" {
+                    format!("变成了 {after}")
+                } else {
+                    format!("{property} {before}→{after}")
+                }
+            })
+            .collect();
+        return format!("用了 {what}{times}：{}。", changes.join("，"));
+    }
+    if unconfirmed == Some(world::Unconfirmed::BlockUse) {
+        return format!(
+            "用了 {what}。这个方块只由服务端改，但服务端 0.25 秒内没有回应：可能是延迟过高，\
+暂时无法确定它变没变。若稍后变了，画面上看得到；拿不准时先等一下再看画面，\
+别急着再按——再按一次可能把它拨回去。"
+        );
+    }
+    if used.times > 1 {
+        return format!("用了 {what} {} 次，来回之后和按下前一样。", used.times);
+    }
+    format!("用了 {what}，但它现在和按下前一样：服务端没认这次使用。")
+}
+
+/// 手上瞬时键（数字键、Q、F）的回执。
+pub fn render_hand_outcome(outcome: &world::HandOutcome) -> String {
+    fn stack(held: &world::HeldStack) -> String {
+        match held {
+            Some((name, count)) => format!("{name} ×{count}"),
+            None => "空".to_owned(),
+        }
+    }
+    match outcome {
+        world::HandOutcome::Selected { slot, held } => {
+            format!("换到 hotbar {slot}，手里：{}。", stack(held))
+        }
+        world::HandOutcome::Dropped { item, count } => format!("丢出了 {item} ×{count}。"),
+        world::HandOutcome::NothingToDrop => "手里是空的，没有东西可丢。".to_owned(),
+        world::HandOutcome::Swapped { main, offhand } => format!(
+            "主副手对调了。现在主手：{}；副手：{}。",
+            stack(main),
+            stack(offhand)
+        ),
+        world::HandOutcome::SwapNoChange { both: None } => {
+            "两只手都是空的，对调了也没有变化。".to_owned()
+        }
+        world::HandOutcome::SwapNoChange { both } => {
+            format!("两只手拿的都是 {}，对调了也看不出变化。", stack(both))
+        }
+        world::HandOutcome::SwapUnconfirmed { main, offhand } => format!(
+            "已请求主副手对调，但服务端 0.25 秒内没有回应：可能是延迟过高，暂时无法确定换没换。\
+眼下两手仍按换之前算（主手：{}；副手：{}）。若稍后换过来，背包和画面会变；\
+拿不准时先等一下再看，别急着再按——再按一次会把它换回去。",
+            stack(main),
+            stack(offhand)
+        ),
+    }
 }
 
 /// 命中面的中文。放置要贴在这一面上，所以说清楚。

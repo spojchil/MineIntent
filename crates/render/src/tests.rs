@@ -18,6 +18,7 @@ fn input_outcome(ended: world::InputEnd, ticks: u32) -> world::InputOutcome {
         pressed_on: None,
         broken: Vec::new(),
         placed: Vec::new(),
+        used: None,
         unconfirmed: None,
     }
 }
@@ -621,6 +622,75 @@ fn input_receipt_explains_an_unconfirmed_screen() {
     let text = render_input_outcome(&outcome);
     assert!(text.contains("可能是延迟过高"), "{text}");
     assert!(text.contains("暂时无法确定"), "{text}");
+}
+
+/// 右键开门：客户端当场改的状态写进回执。
+#[test]
+fn input_receipt_names_what_a_block_use_changed() {
+    let mut outcome = input_outcome(world::InputEnd::Elapsed, 1);
+    outcome.mouse = Some(world::MouseButton::Right);
+    outcome.used = Some(world::BlockUsed {
+        block: "oak_door".to_owned(),
+        position: [1, 64, 2],
+        times: 1,
+        changes: vec![("open".to_owned(), "false".to_owned(), "true".to_owned())],
+    });
+    let text = render_input_outcome(&outcome);
+    assert!(
+        text.contains("用了 oak_door（1, 64, 2）：open false→true。"),
+        "{text}"
+    );
+}
+
+/// 拉杆这类只有服务端改：限时内没变就说不确定，并提醒别再按。
+#[test]
+fn input_receipt_explains_an_unconfirmed_block_use() {
+    let mut outcome = input_outcome(world::InputEnd::Elapsed, 1);
+    outcome.mouse = Some(world::MouseButton::Right);
+    outcome.used = Some(world::BlockUsed {
+        block: "lever".to_owned(),
+        position: [1, 64, 2],
+        times: 1,
+        changes: Vec::new(),
+    });
+    outcome.unconfirmed = Some(world::Unconfirmed::BlockUse);
+    let text = render_input_outcome(&outcome);
+    assert!(text.contains("用了 lever（1, 64, 2）"), "{text}");
+    assert!(text.contains("可能是延迟过高"), "{text}");
+    assert!(text.contains("别急着再按"), "{text}");
+}
+
+/// 手上瞬时键各有一句回执；对调超时要明说不确定。
+#[test]
+fn hand_receipts_say_what_is_in_hand() {
+    let cobble = Some(("cobblestone".to_owned(), 12));
+    assert_eq!(
+        render_hand_outcome(&world::HandOutcome::Dropped {
+            item: "cobblestone".to_owned(),
+            count: 1
+        }),
+        "丢出了 cobblestone ×1。"
+    );
+    assert_eq!(
+        render_hand_outcome(&world::HandOutcome::Swapped {
+            main: None,
+            offhand: cobble.clone()
+        }),
+        "主副手对调了。现在主手：空；副手：cobblestone ×12。"
+    );
+    assert_eq!(
+        render_hand_outcome(&world::HandOutcome::Selected {
+            slot: 3,
+            held: cobble.clone()
+        }),
+        "换到 hotbar 3，手里：cobblestone ×12。"
+    );
+    let text = render_hand_outcome(&world::HandOutcome::SwapUnconfirmed {
+        main: cobble,
+        offhand: None,
+    });
+    assert!(text.contains("可能是延迟过高"), "{text}");
+    assert!(text.contains("主手：cobblestone ×12；副手：空"), "{text}");
 }
 
 /// 朝向连续转身会累加（-225°），回执里归一到 [-180, 180)。

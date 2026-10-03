@@ -37,7 +37,7 @@ publish = false
 # 次编译中的 feature 取并集：分开声明只会让「构建口径不同、azalea 编出来的
 # 东西也不同」，`-p world` 与 `--workspace` 得到两套指纹，来回切就整棵重编。
 # 现在只有一个消费者，统一声明既真实又省事。
-azalea = { git = "https://github.com/spojchil/azalea", rev = "3e1d7e64a4315bb57267df44d6bb53aeee6a4b5c", default-features = false, features = [
+azalea = { git = "https://github.com/spojchil/azalea", rev = "3f973d7402f402b54441f0db0e2ea82dd77de58f", default-features = false, features = [
     "log",
     "packet-event",
 ] }

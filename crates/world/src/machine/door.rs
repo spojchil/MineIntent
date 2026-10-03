@@ -145,16 +145,8 @@ pub(super) fn run_command(inner: &Inner, bot: &Client, command: DoorCommand) -> 
             Ok(())
         }
         DoorCommand::DropItem { whole_stack } => {
-            bot.write_packet(s_player_action::ServerboundPlayerAction {
-                action: if whole_stack {
-                    s_player_action::Action::DropAllItems
-                } else {
-                    s_player_action::Action::DropItem
-                },
-                pos: BlockPos::new(0, 0, 0),
-                direction: Default::default(),
-                seq: 0,
-            });
+            // 原版 `LocalPlayer.drop`：先从本地手里拿走，再告诉服务端。
+            bot.drop_held_item(whole_stack);
             Ok(())
         }
         DoorCommand::SwapOffhand => {

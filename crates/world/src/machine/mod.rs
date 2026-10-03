@@ -46,6 +46,10 @@ const PICKUP_WINDOW_ENTRIES: usize = 64;
 const SOUND_WINDOW_ENTRIES: usize = 256;
 /// 屏开/关事实窗条目上限。开关稀疏，小窗足矣。
 const SCREEN_WINDOW_ENTRIES: usize = 16;
+/// F 对调后等服务端回声最多等几 tick。和右键等开界面同一个限：高延迟服务器上
+/// 回声会晚到，等一下；但不无限等，超时如实说没等到。
+const HAND_ECHO_TICKS: u64 = 5;
+
 /// 连接配置。v1 只有离线身份、重连固定 Never。
 #[derive(Clone, Debug)]
 pub struct ConnectionConfig {
@@ -211,6 +215,72 @@ impl Module {
         let (completion, released) = InputCompletion::new();
         self.execute(DoorCommand::Input(spec, completion)).await?;
         released.await.map_err(|_| "按键期间连接结束了".to_owned())
+    }
+
+    /// 数字键：换快捷栏格。客户端当场生效，回执换过去后手里是什么。
+    pub async fn select_slot(&self, slot: u8) -> Result<crate::HandOutcome, String> {
+        self.execute(DoorCommand::SelectSlot(slot)).await?;
+        let mut inventory = self.latest().self_state.inventory.clone();
+        // 快照是上一 tick 的；选中格以刚执行的为准。
+        inventory.selected_hotbar_slot = slot;
+        Ok(crate::HandOutcome::Selected {
+            slot,
+            held: inventory.main_hand(),
+        })
+    }
+
+    /// Q（`whole_stack` 为 Ctrl+Q）：丢手里的东西。
+    ///
+    /// 和原版 `LocalPlayer.drop` 一样客户端先从手里拿走再告诉服务端，所以不等回声：
+    /// 丢的是什么按按下前的手算。
+    pub async fn drop_held(&self, whole_stack: bool) -> Result<crate::HandOutcome, String> {
+        let held = self.latest().self_state.inventory.main_hand();
+        self.execute(DoorCommand::DropItem { whole_stack }).await?;
+        Ok(match held {
+            Some((item, count)) => crate::HandOutcome::Dropped {
+                item,
+                count: if whole_stack { count } else { 1 },
+            },
+            None => crate::HandOutcome::NothingToDrop,
+        })
+    }
+
+    /// F：主副手对调。
+    ///
+    /// 原版客户端只发请求、自己不动两只手，对调由服务端做完再同步回来。所以等
+    /// 回声，但最多等 [`HAND_ECHO_TICKS`] tick：高延迟时如实说没等到，不猜。
+    pub async fn swap_hands(&self) -> Result<crate::HandOutcome, String> {
+        let before = self.latest();
+        let inventory = &before.self_state.inventory;
+        let (main, offhand) = (inventory.main_hand(), inventory.offhand());
+        if main == offhand {
+            self.execute(DoorCommand::SwapOffhand).await?;
+            return Ok(crate::HandOutcome::SwapNoChange { both: main });
+        }
+        self.execute(DoorCommand::SwapOffhand).await?;
+        let started = before.tick;
+        let waited = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                self.ticked().await;
+                let now = self.latest();
+                let inventory = &now.self_state.inventory;
+                let after = (inventory.main_hand(), inventory.offhand());
+                if after != (main.clone(), offhand.clone()) {
+                    return Some(after);
+                }
+                if now.epoch != before.epoch
+                    || now.phase != ConnectionPhase::Ready
+                    || now.tick >= started + HAND_ECHO_TICKS
+                {
+                    return None;
+                }
+            }
+        })
+        .await;
+        Ok(match waited {
+            Ok(Some((main, offhand))) => crate::HandOutcome::Swapped { main, offhand },
+            _ => crate::HandOutcome::SwapUnconfirmed { main, offhand },
+        })
     }
 
     /// 聊天出站：一行 = 一次原版输入循环，`/` 开头由 azalea 按原版语义路由为命令。

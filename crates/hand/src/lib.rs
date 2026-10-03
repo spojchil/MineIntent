@@ -1,19 +1,21 @@
 //! 手：快捷栏、丢弃、主副手对调——原版里按一下就完成的几个键（1–9、Q、F）。
 //!
 //! 攻击、挖掘、使用都是鼠标键，在 `input` 工具里按住若干时长、作用于准星所指；
-//! 这里只剩没有持续、不看准星的瞬时键。发出即完，结果由物品栏变化证实。
+//! 这里只剩没有持续、不看准星的瞬时键。数字键和 Q 客户端当场生效，当场回执；
+//! F 由服务端对调，回执等它的回声（限时）。
 
 use std::sync::Arc;
 
-use agent::{PortFuture, ToolCall, ToolDefinition, ToolResult};
+use agent::{ContentPart, PortFuture, ToolCall, ToolDefinition, ToolResult};
 use dispatch::{Domain, ToolClass, ToolProvider};
 use serde_json::{json, Value};
+use world::HandOutcome;
 
 /// 模块一写口的窄化。
 pub trait HandDoor: Send + Sync {
-    fn drop_item<'a>(&'a self, whole_stack: bool) -> PortFuture<'a, Result<(), String>>;
-    fn swap_offhand<'a>(&'a self) -> PortFuture<'a, Result<(), String>>;
-    fn select_slot<'a>(&'a self, slot: u8) -> PortFuture<'a, Result<(), String>>;
+    fn drop_item<'a>(&'a self, whole_stack: bool) -> PortFuture<'a, Result<HandOutcome, String>>;
+    fn swap_offhand<'a>(&'a self) -> PortFuture<'a, Result<HandOutcome, String>>;
+    fn select_slot<'a>(&'a self, slot: u8) -> PortFuture<'a, Result<HandOutcome, String>>;
 }
 
 const TOOL_NAME: &str = "hand";
@@ -68,9 +70,10 @@ impl HandTools {
             }
         };
         match outcome {
-            Ok(()) => {
-                ToolResult::success_json(call_id, json!({ "accepted": action.unwrap_or_default() }))
-            }
+            Ok(outcome) => ToolResult::success(
+                call_id,
+                vec![ContentPart::text(render::render_hand_outcome(&outcome))],
+            ),
             Err(reason) => ToolResult::failure(call_id, reason),
         }
     }
@@ -127,22 +130,25 @@ mod tests {
     }
 
     impl RecordingDoor {
-        fn log<'a>(&'a self, entry: String) -> PortFuture<'a, Result<(), String>> {
+        fn log<'a>(&'a self, entry: String) -> PortFuture<'a, Result<HandOutcome, String>> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push(entry);
-                Ok(())
+                Ok(HandOutcome::NothingToDrop)
             })
         }
     }
 
     impl HandDoor for RecordingDoor {
-        fn drop_item<'a>(&'a self, whole_stack: bool) -> PortFuture<'a, Result<(), String>> {
+        fn drop_item<'a>(
+            &'a self,
+            whole_stack: bool,
+        ) -> PortFuture<'a, Result<HandOutcome, String>> {
             self.log(format!("drop({whole_stack})"))
         }
-        fn swap_offhand<'a>(&'a self) -> PortFuture<'a, Result<(), String>> {
+        fn swap_offhand<'a>(&'a self) -> PortFuture<'a, Result<HandOutcome, String>> {
             self.log("swap_offhand".to_owned())
         }
-        fn select_slot<'a>(&'a self, slot: u8) -> PortFuture<'a, Result<(), String>> {
+        fn select_slot<'a>(&'a self, slot: u8) -> PortFuture<'a, Result<HandOutcome, String>> {
             self.log(format!("select_slot({slot})"))
         }
     }

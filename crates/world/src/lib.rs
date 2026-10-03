@@ -573,6 +573,27 @@ pub struct Inventory {
     pub space: crate::slots::SlotSpace,
 }
 
+impl Inventory {
+    /// 主手（选中的快捷栏格）里的东西。
+    pub fn main_hand(&self) -> HeldStack {
+        self.stack_at(self.space.hotbar_slot(self.selected_hotbar_slot))
+    }
+
+    /// 副手里的东西；这一屏够不到副手时为 None。
+    pub fn offhand(&self) -> HeldStack {
+        self.space
+            .offhand_slot()
+            .and_then(|slot| self.stack_at(slot))
+    }
+
+    fn stack_at(&self, slot: u16) -> HeldStack {
+        self.slots
+            .iter()
+            .find(|entry| entry.slot == u32::from(slot))
+            .map(|entry| (entry.item_name.clone(), entry.count))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InventorySlot {
     pub slot: u32,

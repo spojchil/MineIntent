@@ -95,20 +95,21 @@ impl input::InputDoor for NoDoor {
                 }),
                 broken: vec!["stone".to_owned()],
                 placed: Vec::new(),
+                used: None,
                 unconfirmed: None,
             })
         })
     }
 }
 impl hand::HandDoor for NoDoor {
-    fn drop_item<'a>(&'a self, _w: bool) -> PortFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
+    fn drop_item<'a>(&'a self, _w: bool) -> PortFuture<'a, Result<world::HandOutcome, String>> {
+        Box::pin(async { Ok(world::HandOutcome::NothingToDrop) })
     }
-    fn swap_offhand<'a>(&'a self) -> PortFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
+    fn swap_offhand<'a>(&'a self) -> PortFuture<'a, Result<world::HandOutcome, String>> {
+        Box::pin(async { Ok(world::HandOutcome::NothingToDrop) })
     }
-    fn select_slot<'a>(&'a self, _s: u8) -> PortFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
+    fn select_slot<'a>(&'a self, _s: u8) -> PortFuture<'a, Result<world::HandOutcome, String>> {
+        Box::pin(async { Ok(world::HandOutcome::NothingToDrop) })
     }
 }
 /// 导出只打印工具定义，不真的等；给一个永远等满的打断源即可。

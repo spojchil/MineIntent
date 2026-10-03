@@ -102,18 +102,24 @@ impl InputDoor for ModuleInputDoor {
     }
 }
 
-/// 手门：瞬时键直译为接入模块的写口命令。
+/// 手门：瞬时键交给接入模块，回执按键之后手里的样子。
 struct ModuleHandDoor(Arc<Module>);
 
 impl HandDoor for ModuleHandDoor {
-    fn drop_item<'a>(&'a self, whole_stack: bool) -> agent::PortFuture<'a, Result<(), String>> {
-        Box::pin(async move { self.0.execute(DoorCommand::DropItem { whole_stack }).await })
+    fn drop_item<'a>(
+        &'a self,
+        whole_stack: bool,
+    ) -> agent::PortFuture<'a, Result<world::HandOutcome, String>> {
+        Box::pin(async move { self.0.drop_held(whole_stack).await })
     }
-    fn swap_offhand<'a>(&'a self) -> agent::PortFuture<'a, Result<(), String>> {
-        Box::pin(async move { self.0.execute(DoorCommand::SwapOffhand).await })
+    fn swap_offhand<'a>(&'a self) -> agent::PortFuture<'a, Result<world::HandOutcome, String>> {
+        Box::pin(async move { self.0.swap_hands().await })
     }
-    fn select_slot<'a>(&'a self, slot: u8) -> agent::PortFuture<'a, Result<(), String>> {
-        Box::pin(async move { self.0.execute(DoorCommand::SelectSlot(slot)).await })
+    fn select_slot<'a>(
+        &'a self,
+        slot: u8,
+    ) -> agent::PortFuture<'a, Result<world::HandOutcome, String>> {
+        Box::pin(async move { self.0.select_slot(slot).await })
     }
 }
 
