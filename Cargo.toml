@@ -41,6 +41,9 @@ azalea = { git = "https://github.com/spojchil/azalea", rev = "c3da849fa270c51b68
     "log",
     "packet-event",
 ] }
+# 聊天组件的翻译参数类型 azalea 没有导出；同一 fork 同一 rev，与 azalea 用的是同一份。
+# 升 azalea 的 rev 时这里一起改。
+azalea-chat = { git = "https://github.com/spojchil/azalea", rev = "c3da849fa270c51b681df80770f32c6b17f57b5e" }
 # 模型内核（上游独立仓，曾用名 agent/toolturn）。rev 钉死；升级流程：
 # 上游更新→本地跑验收（测试+对抗读）→改此处 rev→修下游破口→推送。
 # 依赖键保持 `agent`，源码里仍写 `agent::`，改名不惊动下游。

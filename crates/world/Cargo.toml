@@ -8,11 +8,13 @@ publish = false
 
 [features]
 # 连接机器(azalea 接入)。纯类型消费者不开此 feature,不拖 bevy 编译。
-azalea = ["dep:azalea", "dep:tokio", "dep:parking_lot"]
+azalea = ["dep:azalea", "dep:azalea-chat", "dep:tokio", "dep:parking_lot"]
 
 [dependencies]
 azalea = { workspace = true, optional = true }
+azalea-chat = { workspace = true, optional = true }
 parking_lot = { workspace = true, optional = true }
+serde_json = "1"
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"], optional = true }
 
 [lints]

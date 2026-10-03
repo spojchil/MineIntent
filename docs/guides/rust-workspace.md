@@ -62,7 +62,8 @@ export PATH="$HOME/.rustup/toolchains/nightly-x86_64-apple-darwin/bin:$PATH"
 | `MODEL_ENDPOINT` | 对应协议的 DeepSeek endpoint | 完整 endpoint，含协议路径；Responses 默认 `https://api.deepseek.com/responses` |
 | `MODEL_NAME` | Chat 为 `deepseek-chat`，其余为 `deepseek-flash` | 模型必须支持所选协议；启用图片还需视觉能力 |
 | `MINEINTENT_CLIENT_JAR` | 未设置 | 本地 26.1.2 客户端 JAR，只读；设置后加载资源并注册 `view` 图片工具。设为空串表示不要画面。未设置时：外接入口与 Responses/Anthropic 协议的内置入口用自管缓存里的 JAR，没有就从 Mojang 官方下载（校验 SHA1）；Chat 协议的内置入口不提供画面 |
-| `MINEINTENT_CACHE_DIR` | 平台缓存目录下的 `mineintent` | 自管缓存的位置；JAR 在其下 `versions/26.1.2/client.jar` |
+| `MINEINTENT_CACHE_DIR` | 平台缓存目录下的 `mineintent` | 自管缓存的位置；JAR 在其下 `versions/26.1.2/client.jar`，语言文件在 `versions/26.1.2/lang/` |
+| `MINEINTENT_LANG` | `zh_cn` | 原版语言代码（如 `zh_cn`、`zh_tw`、`ja_jp`、`en_us`）。系统消息（死因、成就、命令反馈）、容器标题按它翻译，物品、方块、实体、生物群系名写成「本地化名（注册名）」。`en_us` 取自客户端 JAR，其余首次从 Mojang 官方资源下载（校验 SHA1）进缓存；取不到退回 `en_us`，再不行只出注册名。设为空串表示不翻译 |
 | `MINEINTENT_VIEW_SIZE` | `1920x1080` | `view` 的屏幕像素尺寸 `宽x高`（每边 1–2048）；`view` 的 `region` 只从这块屏幕上裁，不会更清楚 |
 
 模型、密钥、人设与记忆变量只用于内置 `model` 入口。外接 `mcp` 入口的模型与会话

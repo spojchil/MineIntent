@@ -136,6 +136,11 @@ azalea ECS ──每 tick──→ TickSnapshot (latest-wins, Arc)
 
 内置模型入口中，`MODEL_PROTOCOL` 选择 Chat Completions / Responses / Anthropic（默认仍是 Chat）。
 `view` 需要后两者的原生图片工具回执；不兼容的配置在连接服务器前报错。
+
+语言表是进程级的一份（`world::lang`），组合根在连接前由 `companion::language` 装好
+（`MINEINTENT_LANG`，缺省 `zh_cn`：`en_us` 取自客户端 JAR，其余经官方资源索引下载并缓存）。
+`world` 用它把系统消息与容器标题这类翻译组件渲染成文字；`render` 用它把物品、方块、生物群系、
+实体的注册名写成「本地化名（注册名）」。没装表时只出注册名，系统消息用 Azalea 自带的英文。
 `ContentPart::Image` 在框架内保留结构化图片，经 HTTP adapter 编码；诊断轨迹仅记
 `[图片]`，不展开 Base64。图片随框架会话历史保留，当前上下文压缩仍是空实现。
 

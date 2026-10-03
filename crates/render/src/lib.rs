@@ -89,7 +89,7 @@ pub fn render_environment(snap: &TickSnapshot) -> String {
     let meta = &snap.world_meta;
     let mut line = dimension_word(&meta.dimension).to_owned();
     if let Some(biome) = &snap.self_state.biome {
-        line.push_str(&format!("，{biome}"));
+        line.push_str(&format!("，{}", world::lang::biome(biome)));
     }
     if meta.thunder_level >= 0.5 {
         line.push_str("，雷雨");
@@ -123,10 +123,14 @@ fn looking_at_words(target: &world::LookingAt) -> String {
             name,
             position: [x, y, z],
             face,
-        } => format!("{name}（{x}, {y}, {z}），命中{}面", face_word(face)),
+        } => format!(
+            "{} ({x}, {y}, {z})，命中{}面",
+            world::lang::block(name),
+            face_word(face)
+        ),
         world::LookingAt::Entity { kind, name } => match name {
-            Some(name) => format!("{name}（{kind}）"),
-            None => kind.clone(),
+            Some(name) => format!("{name}（{}）", world::lang::entity(kind)),
+            None => world::lang::entity(kind),
         },
     }
 }
@@ -163,7 +167,12 @@ pub fn render_input_outcome(outcome: &world::InputOutcome) -> String {
         (None, None) => {}
     }
     if !outcome.broken.is_empty() {
-        lines.push(format!("挖碎了：{}。", outcome.broken.join("、")));
+        let broken: Vec<String> = outcome
+            .broken
+            .iter()
+            .map(|id| world::lang::block(id))
+            .collect();
+        lines.push(format!("挖碎了：{}。", broken.join("、")));
     }
     if outcome.unconfirmed == Some(world::Unconfirmed::Screen) {
         lines.push(
@@ -179,7 +188,7 @@ pub fn render_input_outcome(outcome: &world::InputOutcome) -> String {
         let placed: Vec<String> = outcome
             .placed
             .iter()
-            .map(|(name, [x, y, z])| format!("{name}（{x}, {y}, {z}）"))
+            .map(|(name, [x, y, z])| format!("{} ({x}, {y}, {z})", world::lang::block(name)))
             .collect();
         lines.push(format!("放下了：{}。", placed.join("、")));
     }
@@ -224,7 +233,7 @@ fn whole_degrees(value: f64) -> f64 {
 /// 右键对方块本身的使用：变了什么，或为什么说不准。
 fn block_used_words(used: &world::BlockUsed, unconfirmed: Option<world::Unconfirmed>) -> String {
     let [x, y, z] = used.position;
-    let what = format!("{}（{x}, {y}, {z}）", used.block);
+    let what = format!("{} ({x}, {y}, {z})", world::lang::block(&used.block));
     let times = if used.times > 1 {
         format!("（按住期间用了 {} 次）", used.times)
     } else {
@@ -236,7 +245,7 @@ fn block_used_words(used: &world::BlockUsed, unconfirmed: Option<world::Unconfir
             .iter()
             .map(|(property, before, after)| {
                 if property == "block" {
-                    format!("变成了 {after}")
+                    format!("变成了 {}", world::lang::block(after))
                 } else {
                     format!("{property} {before}→{after}")
                 }
@@ -261,7 +270,7 @@ fn block_used_words(used: &world::BlockUsed, unconfirmed: Option<world::Unconfir
 pub fn render_hand_outcome(outcome: &world::HandOutcome) -> String {
     fn stack(held: &world::HeldStack) -> String {
         match held {
-            Some((name, count)) => format!("{name} ×{count}"),
+            Some((name, count)) => items(name, *count),
             None => "空".to_owned(),
         }
     }
@@ -269,7 +278,7 @@ pub fn render_hand_outcome(outcome: &world::HandOutcome) -> String {
         world::HandOutcome::Selected { slot, held } => {
             format!("换到 hotbar {slot}，手里：{}。", stack(held))
         }
-        world::HandOutcome::Dropped { item, count } => format!("丢出了 {item} ×{count}。"),
+        world::HandOutcome::Dropped { item, count } => format!("丢出了 {}。", items(item, *count)),
         world::HandOutcome::NothingToDrop => "手里是空的，没有东西可丢。".to_owned(),
         world::HandOutcome::Swapped { main, offhand } => format!(
             "主副手对调了。现在主手：{}；副手：{}。",
@@ -379,7 +388,7 @@ pub fn render_hotbar(snap: &TickSnapshot) -> String {
             .slots
             .iter()
             .find(|entry| entry.slot == u32::from(slot))
-            .map(|entry| format!("{} ×{}", entry.item_name, entry.count))
+            .map(|entry| items(&entry.item_name, entry.count))
     };
     let mut filled = Vec::new();
     let mut empty = 0usize;
@@ -419,7 +428,7 @@ pub fn render_held(snap: &TickSnapshot) -> String {
         .iter()
         .find(|entry| entry.slot == u32::from(slot))
     {
-        Some(entry) => format!("手持 {address}：{} ×{}。", entry.item_name, entry.count),
+        Some(entry) => format!("手持 {address}：{}。", items(&entry.item_name, entry.count)),
         None => format!("手持 {address}：空手。"),
     }
 }
@@ -436,14 +445,16 @@ pub fn render_inventory(snap: &TickSnapshot) -> String {
         .slots
         .iter()
         .find(|slot| slot.slot == held_menu_slot)
-        .map(|slot| slot.item_name.as_str())
-        .unwrap_or("空手");
-    let items: Vec<String> = inventory
+        .map_or_else(
+            || "空手".to_owned(),
+            |slot| world::lang::item(&slot.item_name),
+        );
+    let listed: Vec<String> = inventory
         .slots
         .iter()
-        .map(|slot| format!("{} ×{}", slot.item_name, slot.count))
+        .map(|slot| items(&slot.item_name, slot.count))
         .collect();
-    format!("手持：{held}。背包：{}。", items.join("、"))
+    format!("手持：{held}。背包：{}。", listed.join("、"))
 }
 
 /// 一格画成一个方格。**空格也要画出来。**
@@ -528,7 +539,7 @@ fn slot_reader(snap: &TickSnapshot) -> impl Fn(u32) -> Option<String> + '_ {
             .slots
             .iter()
             .find(|entry| entry.slot == slot)
-            .map(|entry| format!("{} ×{}", entry.item_name, entry.count))
+            .map(|entry| items(&entry.item_name, entry.count))
     }
 }
 
@@ -585,7 +596,7 @@ pub fn render_inventory_change(entry: &world::InventoryChangeEntry) -> String {
         slot => format!("物品栏 {} ", space.describe(slot)),
     };
     match &entry.item_name {
-        Some(name) => format!("{place}当前是 {name} ×{}。", entry.count),
+        Some(name) => format!("{place}当前是 {}。", items(name, entry.count)),
         None => format!("{place}当前是空的。"),
     }
 }
@@ -605,7 +616,10 @@ pub fn render_container_change(
     };
     let address = space.describe(entry.slot);
     match &entry.item_name {
-        Some(name) => format!("{container} {address} 现在是 {name} ×{}。", entry.count),
+        Some(name) => format!(
+            "{container} {address} 现在是 {}。",
+            items(name, entry.count)
+        ),
         None => format!("{container} {address} 现在空了。"),
     }
 }
@@ -702,10 +716,9 @@ pub fn render_container_menu(snap: &TickSnapshot, kind: &str) -> String {
         .iter()
         .map(|entry| {
             format!(
-                "{}={} ×{}",
+                "{}={}",
                 space.describe(entry.slot as u16),
-                entry.item_name,
-                entry.count
+                items(&entry.item_name, entry.count)
             )
         })
         .collect();
@@ -778,6 +791,11 @@ fn compass_word(yaw: f64) -> &'static str {
     WORDS[(((normalized + 22.5) / 45.0) as usize) % 8]
 }
 
+/// 一叠物品：`圆石（cobblestone） ×12`。名字按当前语言表，见 [`world::lang`]。
+fn items(id: &str, count: u32) -> String {
+    format!("{} ×{count}", world::lang::item(id))
+}
+
 /// 18.0 显示成 18，17.5 保留一位小数。
 fn trim_number(value: f64) -> String {
     if (value - value.round()).abs() < 1e-9 {
@@ -822,7 +840,7 @@ pub fn render_pickups(entries: &[PickupEntry]) -> Vec<String> {
         .zip(totals)
         .map(|((by_self, by, item_name), count)| {
             let what = match item_name {
-                Some(name) => format!("{name} ×{count}"),
+                Some(name) => items(&name, count),
                 // 掉落物实体的元数据还没到就认不出来。说不知道，不编一个名字。
                 None => format!("{count} 件没认出来的东西"),
             };

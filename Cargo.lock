@@ -4233,7 +4233,9 @@ name = "world"
 version = "0.0.1"
 dependencies = [
  "azalea",
+ "azalea-chat",
  "parking_lot",
+ "serde_json",
  "tokio",
 ]
 

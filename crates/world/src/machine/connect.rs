@@ -179,7 +179,15 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
             let sender = packet
                 .sender()
                 .map(|username| (username, packet.sender_uuid().map(|uuid| uuid.to_string())));
-            inner.push_chat(sender, packet.content());
+            // 系统消息（死因、成就、进出、命令反馈）是翻译键加参数，按语言表出字，
+            // 和玩家在客户端里看到的一样；玩家发言保留原文。
+            let content = match (&sender, &packet) {
+                (None, azalea::chat::ChatPacket::System(_)) => {
+                    crate::lang::render(&packet.message())
+                }
+                _ => packet.content(),
+            };
+            inner.push_chat(sender, content);
         }
         Event::Packet(packet) => match &*packet {
             ClientboundGamePacket::SetTime(set_time) => {
@@ -396,7 +404,7 @@ async fn handle_client(bot: Client, event: Event, state: BotState) {
                             title: inventory
                                 .container_menu_title
                                 .as_ref()
-                                .map(ToString::to_string),
+                                .map(crate::lang::render),
                         })
                 })
                 .ok()

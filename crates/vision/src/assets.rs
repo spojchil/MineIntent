@@ -41,6 +41,11 @@ impl Resources {
         &self.version
     }
 
+    /// JAR 里自带的语言文件原文。原版 JAR 只带 `en_us`，其余语言在资源索引里。
+    pub fn language_file(&mut self, code: &str) -> Result<Vec<u8>, String> {
+        self.bytes(&format!("assets/minecraft/lang/{code}.json"))
+    }
+
     fn bytes(&mut self, path: &str) -> Result<Vec<u8>, String> {
         let file = self
             .archive

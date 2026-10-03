@@ -40,7 +40,7 @@ fn input_receipt_says_why_it_let_go_and_what_changed() {
         "{text}"
     );
     assert!(
-        text.contains("按下时准星对着 grass_block（0, 63, 0），命中上面。"),
+        text.contains("按下时准星对着 grass_block (0, 63, 0)，命中上面。"),
         "{text}"
     );
     assert!(text.contains("挖碎了：grass_block。"), "{text}");
@@ -558,23 +558,20 @@ fn looking_at_names_the_block_and_the_face() {
     });
     assert_eq!(
         render_looking_at(&snap),
-        "准星对着 oak_log（46, 70, 40），命中上面。"
+        "准星对着 oak_log (46, 70, 40)，命中上面。"
     );
 
     snap.self_state.looking_at = Some(world::LookingAt::Entity {
         kind: "minecraft:zombie".to_owned(),
         name: None,
     });
-    assert_eq!(render_looking_at(&snap), "准星对着 minecraft:zombie。");
+    assert_eq!(render_looking_at(&snap), "准星对着 zombie。");
 
     snap.self_state.looking_at = Some(world::LookingAt::Entity {
         kind: "minecraft:player".to_owned(),
         name: Some("Alice".to_owned()),
     });
-    assert_eq!(
-        render_looking_at(&snap),
-        "准星对着 Alice（minecraft:player）。"
-    );
+    assert_eq!(render_looking_at(&snap), "准星对着 Alice（player）。");
 }
 
 /// 够不着任何东西时也明说：处境只报变了的行，这一行要是消失，
@@ -610,10 +607,7 @@ fn input_receipt_lists_placed_blocks() {
     outcome.mouse = Some(world::MouseButton::Right);
     outcome.placed = vec![("cobblestone".to_owned(), [0, 150, 1])];
     let text = render_input_outcome(&outcome);
-    assert!(
-        text.contains("放下了：cobblestone（0, 150, 1）。"),
-        "{text}"
-    );
+    assert!(text.contains("放下了：cobblestone (0, 150, 1)。"), "{text}");
 }
 
 /// 等服务端开界面超时：说清楚是不确定，不是没开。
@@ -640,7 +634,7 @@ fn input_receipt_names_what_a_block_use_changed() {
     });
     let text = render_input_outcome(&outcome);
     assert!(
-        text.contains("用了 oak_door（1, 64, 2）：open false→true。"),
+        text.contains("用了 oak_door (1, 64, 2)：open false→true。"),
         "{text}"
     );
 }
@@ -658,7 +652,7 @@ fn input_receipt_explains_an_unconfirmed_block_use() {
     });
     outcome.unconfirmed = Some(world::Unconfirmed::BlockUse);
     let text = render_input_outcome(&outcome);
-    assert!(text.contains("用了 lever（1, 64, 2）"), "{text}");
+    assert!(text.contains("用了 lever (1, 64, 2)"), "{text}");
     assert!(text.contains("可能是延迟过高"), "{text}");
     assert!(text.contains("别急着再按"), "{text}");
 }
@@ -729,5 +723,5 @@ fn biome_rides_the_environment_line_after_the_dimension() {
     let mut snap = snapshot();
     assert_eq!(render_environment(&snap), "主世界。");
     snap.self_state.biome = Some("minecraft:taiga".to_owned());
-    assert_eq!(render_environment(&snap), "主世界，minecraft:taiga。");
+    assert_eq!(render_environment(&snap), "主世界，taiga。");
 }

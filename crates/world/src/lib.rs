@@ -13,6 +13,7 @@ use std::time::SystemTime;
 
 mod block;
 mod input;
+pub mod lang;
 #[cfg(feature = "azalea")]
 mod machine;
 

@@ -42,6 +42,8 @@ MINEINTENT_ENTRY=mcp ./target/debug/companion
 Windows `%LOCALAPPDATA%\mineintent`、macOS `~/Library/Caches/mineintent`），以后直接复用；
 已有 JAR 可用 `MINEINTENT_CLIENT_JAR` 指过去（启动器装过该版本后在
 `.minecraft/versions/26.1.2/26.1.2.jar`）。下载失败不影响开玩，只是没有 `view`。
+系统消息与物品名默认按简体中文显示（同样首次从官方资源下载），`MINEINTENT_LANG` 可换成
+其他原版语言代码。
 身体报告就绪后，在客户端里把 `target/debug/mineintent-mcp` 的绝对路径注册为 stdio
 服务，例如 Claude Code：
 

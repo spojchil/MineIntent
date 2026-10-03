@@ -29,6 +29,7 @@ use world::{ConnectionConfig, DoorCommand, Module, SnapshotSource};
 mod client_jar;
 mod doorbell;
 mod frame;
+mod language;
 mod mcp_entry;
 mod model_config;
 mod picture;
@@ -511,7 +512,7 @@ async fn main() -> Result<(), String> {
         }
     };
     let screen = picture::parse_screen(&env_or("MINEINTENT_VIEW_SIZE", "1920x1080"))?;
-    let picture_resources = jar_path
+    let mut picture_resources = jar_path
         .map(|path| {
             let resources = vision::Resources::open(path)?;
             if resources.version() != client_jar::CLIENT_VERSION {
@@ -523,6 +524,7 @@ async fn main() -> Result<(), String> {
             Ok(resources)
         })
         .transpose()?;
+    language::install(picture_resources.as_mut()).await;
     // 本机端口必须先绑定成功，才进入游戏；配置错误不留下多余身体。
     let body_listener = if brain.is_none() {
         let addr = bridge::protocol::parse_addr(&env_or(

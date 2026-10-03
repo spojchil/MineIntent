@@ -61,17 +61,18 @@ pub async fn locate(automatic: bool) -> Option<PathBuf> {
     }
 }
 
-/// 自管缓存里的 JAR 位置。`MINEINTENT_CACHE_DIR` 可整体改到别处。
-fn cached_path() -> Option<PathBuf> {
+/// 自管缓存里这个版本的目录。`MINEINTENT_CACHE_DIR` 可整体改到别处。
+pub(crate) fn version_cache_dir() -> Option<PathBuf> {
     let base = match std::env::var_os("MINEINTENT_CACHE_DIR") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => platform_cache_dir()?.join("mineintent"),
     };
-    Some(
-        base.join("versions")
-            .join(CLIENT_VERSION)
-            .join("client.jar"),
-    )
+    Some(base.join("versions").join(CLIENT_VERSION))
+}
+
+/// 自管缓存里的 JAR 位置。
+fn cached_path() -> Option<PathBuf> {
+    Some(version_cache_dir()?.join("client.jar"))
 }
 
 /// 各平台惯用的缓存目录：Windows `%LOCALAPPDATA%`、macOS `~/Library/Caches`、
@@ -100,42 +101,66 @@ struct ClientDownload {
 
 async fn download(target: &Path) -> Result<(), String> {
     let http = reqwest::Client::new();
-    let manifest = get_json(&http, VERSION_MANIFEST).await?;
-    let version_url = version_url(&manifest, CLIENT_VERSION)?;
-    let version = get_json(&http, &version_url).await?;
+    let version = version_json(&http).await?;
     let client = client_download(&version)?;
+    let bytes = fetch_verified(&http, &client.url, &client.sha1, Some(client.size)).await?;
+    write_atomically(target, &bytes)
+}
+
+/// 这个版本的官方版本详情（含客户端下载与资源索引地址）。
+pub(crate) async fn version_json(http: &reqwest::Client) -> Result<serde_json::Value, String> {
+    let manifest = get_json(http, VERSION_MANIFEST).await?;
+    let version_url = version_url(&manifest, CLIENT_VERSION)?;
+    get_json(http, &version_url).await
+}
+
+/// 下载并核对 SHA1（给了大小也核对大小）。
+pub(crate) async fn fetch_verified(
+    http: &reqwest::Client,
+    url: &str,
+    sha1: &str,
+    size: Option<u64>,
+) -> Result<Vec<u8>, String> {
     let bytes = http
-        .get(&client.url)
+        .get(url)
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .map_err(|error| format!("下载 {} 失败：{error}", client.url))?
+        .map_err(|error| format!("下载 {url} 失败：{error}"))?
         .bytes()
         .await
         .map_err(|error| format!("读取下载内容失败：{error}"))?;
-    if bytes.len() as u64 != client.size {
+    if let Some(size) = size.filter(|size| bytes.len() as u64 != *size) {
         return Err(format!(
-            "大小不对：应为 {} 字节，收到 {} 字节",
-            client.size,
+            "大小不对：应为 {size} 字节，收到 {} 字节",
             bytes.len()
         ));
     }
     let digest = sha1_hex(&bytes);
-    if digest != client.sha1 {
-        return Err(format!("SHA1 不对：应为 {}，算得 {digest}", client.sha1));
+    if !digest.eq_ignore_ascii_case(sha1) {
+        return Err(format!("SHA1 不对：应为 {sha1}，算得 {digest}"));
     }
+    Ok(bytes.to_vec())
+}
+
+/// 写进缓存：先写临时文件再改名，半截文件永远不会以正式名字出现。
+pub(crate) fn write_atomically(target: &Path, bytes: &[u8]) -> Result<(), String> {
     let dir = target.parent().ok_or("缓存路径没有上级目录")?;
     std::fs::create_dir_all(dir)
         .map_err(|error| format!("建目录 {} 失败：{error}", dir.display()))?;
-    // 先写临时文件再改名：半截文件永远不会以 client.jar 的名字出现。
-    let partial = target.with_extension("jar.part");
-    std::fs::write(&partial, &bytes)
+    let mut partial = target.as_os_str().to_owned();
+    partial.push(".part");
+    let partial = PathBuf::from(partial);
+    std::fs::write(&partial, bytes)
         .map_err(|error| format!("写入 {} 失败：{error}", partial.display()))?;
     std::fs::rename(&partial, target)
         .map_err(|error| format!("改名为 {} 失败：{error}", target.display()))
 }
 
-async fn get_json(http: &reqwest::Client, url: &str) -> Result<serde_json::Value, String> {
+pub(crate) async fn get_json(
+    http: &reqwest::Client,
+    url: &str,
+) -> Result<serde_json::Value, String> {
     http.get(url)
         .send()
         .await
